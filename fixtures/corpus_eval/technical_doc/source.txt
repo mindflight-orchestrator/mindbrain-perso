@@ -1,0 +1,11 @@
+# Installation
+
+Run `mindbrain-standalone-tool document-ingest` with a database path and a content file.
+
+## Configuration
+
+The command accepts chunk size options, source references, and ontology identifiers.
+
+```bash
+mindbrain-standalone-tool document-ingest --db data.sqlite --content-file guide.md
+```

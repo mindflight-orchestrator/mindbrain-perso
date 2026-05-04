@@ -1,0 +1,29 @@
+# docker-compose.test.yml
+# Starts a PostgreSQL instance with pg_dgraph pre-installed for Go integration tests.
+# The host runs "go test"; this compose file only manages the database container.
+#
+# Usage:
+#   cd extensions/pg_dgraph/examples/golang
+#   make test        # Full cycle: build + start + test + clean
+#   make start-db    # Start container only (then run tests manually)
+
+services:
+  pg_dgraph_examples_test:
+    build:
+      context: ../..
+      dockerfile: examples/golang/Dockerfile.test
+    container_name: pg_dgraph_examples_test
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "5436:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # Ephemeral data — every test run starts with a clean database.
+    tmpfs:
+      - /var/lib/postgresql/data

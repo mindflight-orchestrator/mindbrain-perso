@@ -1,0 +1,11 @@
+services:
+    database:
+      build:
+        context: .
+        dockerfile: ./Dockerfile
+      environment:
+        - POSTGRES_USER=admin
+        - POSTGRES_PASSWORD=123456
+        - POSTGRES_DB=test
+      ports:
+        - "5432:5432"

@@ -1,0 +1,106 @@
+{
+  "meta": {
+    "fixture_id": "hybrid-search-baseline-v1",
+    "title": "Hybrid search golden fixture",
+    "purpose": "Freeze the first standalone hybrid ranking behavior as a golden reference for future engine changes.",
+    "primary_entrypoint": "standalone.hybrid_search",
+    "target_engine_api": "standalone.hybrid_search",
+    "tags": ["hybrid", "bm25", "vector", "baseline"]
+  },
+  "schema": {
+    "schema_name": "public",
+    "table_name": "docs_fixture",
+    "key_column": "id",
+    "content_column": "content",
+    "metadata_column": "metadata",
+    "vector_column": "embedding",
+    "created_at_column": "created_at",
+    "updated_at_column": "updated_at",
+    "language": "english"
+  },
+  "documents": [
+    {
+      "doc_id": 1,
+      "content": "roaring bitmap indexing with hybrid search and vectors",
+      "metadata": {
+        "category": "search",
+        "jurisdiction": "eu",
+        "tags": ["roaring", "bm25", "hybrid"]
+      }
+    },
+    {
+      "doc_id": 2,
+      "content": "vector search with embedding ranking and approximate nearest neighbors",
+      "metadata": {
+        "category": "search",
+        "jurisdiction": "us",
+        "tags": ["vector", "embedding"]
+      }
+    },
+    {
+      "doc_id": 3,
+      "content": "bitmap intersections for local document filtering",
+      "metadata": {
+        "category": "filtering",
+        "jurisdiction": "eu",
+        "tags": ["bitmap", "facets"]
+      }
+    },
+    {
+      "doc_id": 4,
+      "content": "sqlite metadata storage for standalone indexing",
+      "metadata": {
+        "category": "storage",
+        "jurisdiction": "eu",
+        "tags": ["sqlite", "metadata"]
+      }
+    }
+  ],
+  "embeddings": [
+    { "doc_id": 1, "values": [0.82, 0.12, 0.21] },
+    { "doc_id": 2, "values": [0.95, 0.05, 0.10] },
+    { "doc_id": 3, "values": [0.30, 0.65, 0.11] },
+    { "doc_id": 4, "values": [0.12, 0.10, 0.91] }
+  ],
+  "queries": [
+    {
+      "query_id": "hybrid-search-01",
+      "kind": "hybrid_search",
+      "entrypoint": "standalone.hybrid_search",
+      "engine_api": "standalone.hybrid_search",
+      "params": {
+        "schema_name": "public",
+        "table_name": "docs_fixture",
+        "query": "bitmap vector search",
+        "vector_column": "embedding",
+        "content_column": "content",
+        "metadata_column": "metadata",
+        "limit": 3,
+        "offset": 0,
+        "min_score": 0.0,
+        "vector_weight": 0.85,
+        "language": "english",
+        "query_vector": [0.99, 0.04, 0.08]
+      }
+    }
+  ],
+  "expected": {
+    "hybrid-search-01": {
+      "ordered_doc_ids": [2, 1, 3],
+      "top_k": 3,
+      "total_found": 3,
+      "scores": {
+        "2": 1.108682519125,
+        "1": 1.033073065799,
+        "3": 0.503586534554
+      }
+    }
+  },
+  "comparison": {
+    "score_tolerance": 0.0001,
+    "allow_extra_fields": true,
+    "order_required": true,
+    "compare_total_found": true,
+    "notes": "Score values are intentionally null until the first standalone golden capture is recorded. Order and total_found are the first frozen assertions."
+  }
+}

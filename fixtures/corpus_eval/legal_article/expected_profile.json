@@ -1,0 +1,14 @@
+{
+  "document_kind": "legal_text",
+  "language": "en",
+  "jurisdiction": "city",
+  "authority": "city authority",
+  "structure_markers": ["title", "article"],
+  "reference_density": "medium",
+  "temporal_model": "static",
+  "recommended_splitter": "legal_article",
+  "target_tokens": 384,
+  "max_chars": 4096,
+  "risks": ["internal reference", "external decree reference"],
+  "confidence": 0.9
+}

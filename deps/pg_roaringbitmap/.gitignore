@@ -1,0 +1,9 @@
+*.o
+*.a
+*.so
+*.pc
+*~
+.*.sw?
+regression.diffs
+regression.out
+results/

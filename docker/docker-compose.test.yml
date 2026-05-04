@@ -1,0 +1,38 @@
+services:
+  pg_mindbrain_test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pg_mindbrain_test
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  test_runner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    container_name: pg_mindbrain_test_runner
+    depends_on:
+      pg_mindbrain_test:
+        condition: service_healthy
+    environment:
+      - PGHOST=pg_mindbrain_test
+      - PGPORT=5432
+      - PGUSER=postgres
+      - PGPASSWORD=postgres
+      - PGDATABASE=postgres
+    volumes:
+      - ../test:/tests:ro
+    command: >
+      bash -lc "/tests/run_all_tests.sh"

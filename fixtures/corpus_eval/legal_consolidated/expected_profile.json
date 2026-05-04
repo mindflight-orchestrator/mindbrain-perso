@@ -1,0 +1,14 @@
+{
+  "document_kind": "legal_consolidated",
+  "language": "en",
+  "jurisdiction": "city",
+  "authority": "market authority",
+  "structure_markers": ["article", "historical_note", "effective_date"],
+  "reference_density": "medium",
+  "temporal_model": "consolidated",
+  "recommended_splitter": "legal_consolidated",
+  "target_tokens": 512,
+  "max_chars": 4096,
+  "risks": ["current text mixed with historical amendment"],
+  "confidence": 0.88
+}

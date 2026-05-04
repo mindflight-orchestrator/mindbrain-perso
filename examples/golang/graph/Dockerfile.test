@@ -1,0 +1,111 @@
+# Dockerfile.test
+# Builds a PostgreSQL image with pg_dgraph pre-installed for Go integration tests.
+# Build context: extensions/pg_dgraph root (two levels above this file).
+#
+# Used by docker-compose.test.yml (context: ../.. → extensions/pg_dgraph/).
+
+# =============================================================================
+# Stage 1: Builder — compile roaringbitmap and pg_dgraph
+# =============================================================================
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PG_MAJOR=17 \
+    ZIG_VERSION=0.15.2
+
+# System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        ca-certificates \
+        gnupg2 \
+        git \
+        cmake \
+        gcc \
+        libc-dev \
+        make \
+        pkg-config \
+        libssl-dev \
+        wget \
+        xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL development headers
+RUN curl -sSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
+    echo "deb http://apt.postgresql.org/pub/repos/apt/ jammy-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-server-dev-$PG_MAJOR && \
+    rm -rf /var/lib/apt/lists/*
+
+# Zig (multi-arch) and explicit GNU libc target for extension builds.
+ARG TARGETARCH=amd64
+RUN MACHINE="$(uname -m)" && \
+    case "${MACHINE}" in \
+      aarch64|arm64) RUNTIME_ARCH=arm64;; \
+      x86_64|amd64) RUNTIME_ARCH=amd64;; \
+      *) RUNTIME_ARCH="${TARGETARCH}";; \
+    esac && \
+    if [ "${TARGETARCH}" != "${RUNTIME_ARCH}" ]; then \
+      echo "WARN: TARGETARCH=${TARGETARCH} differs from runtime arch ${RUNTIME_ARCH}; using runtime arch."; \
+    fi && \
+    case "${RUNTIME_ARCH}" in \
+      arm64) ZIG_ARCH=aarch64-linux; ZIG_TARGET=aarch64-linux-gnu;; \
+      *) ZIG_ARCH=x86_64-linux; ZIG_TARGET=x86_64-linux-gnu;; \
+    esac && \
+    printf '%s' "${ZIG_TARGET}" > /tmp/zig_target && \
+    cd /tmp && \
+    wget https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz && \
+    tar -xf zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz && \
+    mv zig-${ZIG_ARCH}-${ZIG_VERSION} /usr/local/zig && \
+    ln -s /usr/local/zig/zig /usr/local/bin/zig && \
+    rm zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz
+
+# Build pg_roaringbitmap
+COPY deps/pg_roaringbitmap /tmp/pg_roaringbitmap
+RUN cd /tmp/pg_roaringbitmap && \
+    make && \
+    make install
+
+# Build pg_dgraph
+WORKDIR /tmp/pg_dgraph
+COPY src/           ./src/
+COPY sql/           ./sql/
+COPY build.zig      ./
+COPY build.zig.zon  ./
+COPY pg_dgraph.control ./
+COPY deps/pg_roaringbitmap ./deps/pg_roaringbitmap/
+
+RUN ZIG_TARGET="$(tr -d '\n' </tmp/zig_target)" && \
+    zig build -Dtarget="${ZIG_TARGET}" -Doptimize=ReleaseFast
+
+# Verify build
+RUN test -f /tmp/pg_dgraph/pg_dgraph.control && \
+    test -f /tmp/pg_dgraph/zig-out/lib/libpg_dgraph.so && \
+    echo "pg_dgraph built successfully"
+
+# =============================================================================
+# Stage 2: Final image — stock Postgres 17 with extensions
+# =============================================================================
+FROM postgres:17
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PG_MAJOR=17
+
+# pg_roaringbitmap
+COPY --from=builder /usr/lib/postgresql/$PG_MAJOR/lib/roaringbitmap.so        /usr/lib/postgresql/$PG_MAJOR/lib/
+COPY --from=builder /usr/share/postgresql/$PG_MAJOR/extension/roaringbitmap*  /usr/share/postgresql/$PG_MAJOR/extension/
+
+# pg_dgraph
+COPY --from=builder /tmp/pg_dgraph/zig-out/lib/libpg_dgraph.so                /usr/lib/postgresql/$PG_MAJOR/lib/pg_dgraph.so
+COPY --from=builder /tmp/pg_dgraph/pg_dgraph.control                          /usr/share/postgresql/$PG_MAJOR/extension/
+COPY --from=builder /tmp/pg_dgraph/sql/pg_dgraph--*.sql                       /usr/share/postgresql/$PG_MAJOR/extension/
+
+# Verify installation
+RUN test -f /usr/share/postgresql/$PG_MAJOR/extension/pg_dgraph.control && \
+    test -f /usr/lib/postgresql/$PG_MAJOR/lib/pg_dgraph.so && \
+    echo "pg_dgraph extension installed successfully"
+
+EXPOSE 5432
+CMD ["postgres"]

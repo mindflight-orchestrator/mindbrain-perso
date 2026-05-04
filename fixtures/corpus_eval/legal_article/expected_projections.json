@@ -1,0 +1,17 @@
+[
+  {
+    "chunk_index": 0,
+    "proj_type": "CONSTRAINT",
+    "contains": "Operators must inspect the machine before use"
+  },
+  {
+    "chunk_index": 1,
+    "proj_type": "STEP",
+    "contains": "Operators must report incidents within 24 hours"
+  },
+  {
+    "chunk_index": 2,
+    "proj_type": "FACT",
+    "contains": "The ordinance cites Decree 2024-10"
+  }
+]

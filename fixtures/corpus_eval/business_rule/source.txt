@@ -1,0 +1,5 @@
+Refund Approval Rule
+
+If the refund amount is greater than 500 EUR, the support agent must request manager approval before issuing the refund.
+
+Exception: refunds caused by duplicate card charges may be approved automatically if the payment provider confirms the duplicate.

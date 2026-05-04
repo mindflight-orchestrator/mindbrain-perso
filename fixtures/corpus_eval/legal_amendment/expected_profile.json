@@ -1,0 +1,14 @@
+{
+  "document_kind": "legal_amendment",
+  "language": "en",
+  "jurisdiction": "city",
+  "authority": "city authority",
+  "structure_markers": ["article", "replacement_clause", "repeal_clause"],
+  "reference_density": "high",
+  "temporal_model": "amended",
+  "recommended_splitter": "legal_amendment",
+  "target_tokens": 384,
+  "max_chars": 3072,
+  "risks": ["must preserve replacement target and replacement text"],
+  "confidence": 0.9
+}

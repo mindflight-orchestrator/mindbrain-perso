@@ -1,0 +1,6 @@
+[submodule "docs/third_party/CRoaring"]
+	path = docs/third_party/CRoaring
+	url = git@github.com:RoaringBitmap/CRoaring.git
+[submodule "docs/third_party/pg_roaringbitmap"]
+	path = docs/third_party/pg_roaringbitmap
+	url = git@github.com:ChenHuajun/pg_roaringbitmap.git

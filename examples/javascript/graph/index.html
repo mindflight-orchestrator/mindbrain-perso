@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MindBrain Graph SSE Demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: rgba(16, 22, 40, 0.88);
+        --line: rgba(155, 180, 255, 0.18);
+        --text: #e8ecff;
+        --muted: #9aa7cf;
+        --accent: #76d5ff;
+        --seed: #ffd36e;
+        --node: #7cf0c8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(118, 213, 255, 0.18), transparent 32%),
+          radial-gradient(circle at top right, rgba(155, 140, 255, 0.16), transparent 28%),
+          linear-gradient(180deg, #09101f 0%, #0b1020 100%);
+      }
+
+      .shell {
+        width: min(1200px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 24px 0 36px;
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        gap: 24px;
+        align-items: end;
+        margin-bottom: 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 4vw, 3.25rem);
+        line-height: 0.95;
+        letter-spacing: -0.05em;
+      }
+
+      .lede {
+        margin: 10px 0 0;
+        max-width: 66ch;
+        color: var(--muted);
+      }
+
+      .status {
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(10, 15, 28, 0.72);
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 340px minmax(0, 1fr);
+        gap: 16px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        box-shadow: 0 18px 70px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(10px);
+      }
+
+      .controls {
+        padding: 18px;
+      }
+
+      .controls label {
+        display: block;
+        font-size: 0.88rem;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+
+      .field {
+        margin-bottom: 14px;
+      }
+
+      input,
+      button {
+        width: 100%;
+        border-radius: 12px;
+        border: 1px solid rgba(155, 180, 255, 0.2);
+        background: rgba(7, 11, 24, 0.8);
+        color: var(--text);
+        padding: 12px 14px;
+        font: inherit;
+      }
+
+      input:focus {
+        outline: 2px solid rgba(118, 213, 255, 0.36);
+        outline-offset: 2px;
+      }
+
+      button {
+        cursor: pointer;
+        font-weight: 600;
+        background: linear-gradient(135deg, rgba(118, 213, 255, 0.22), rgba(155, 140, 255, 0.22));
+      }
+
+      button.secondary {
+        margin-top: 8px;
+        background: rgba(7, 11, 24, 0.8);
+      }
+
+      .hint {
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 0.9rem;
+        line-height: 1.45;
+      }
+
+      .canvas {
+        padding: 12px;
+      }
+
+      .canvas-wrap {
+        position: relative;
+        height: min(70vh, 760px);
+        overflow: hidden;
+        border-radius: 16px;
+        background:
+          radial-gradient(circle at center, rgba(118, 213, 255, 0.08), transparent 42%),
+          linear-gradient(180deg, rgba(6, 10, 20, 0.92), rgba(8, 12, 22, 0.96));
+        border: 1px solid rgba(155, 180, 255, 0.12);
+      }
+
+      svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      .legend {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 0 12px 12px;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+
+      .legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        display: inline-block;
+      }
+
+      .swatch.seed { background: var(--seed); }
+      .swatch.node { background: var(--node); }
+      .swatch.edge { background: var(--accent); }
+
+      @media (max-width: 960px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        header {
+          flex-direction: column;
+          align-items: start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <div>
+          <h1>Graph stream in the browser</h1>
+          <p class="lede">
+            Incremental SSE consumer for the `graph.streamSubgraph(...)` contract.
+            Seed nodes arrive first, then nodes and edges, and the UI redraws as each
+            event lands.
+          </p>
+        </div>
+        <div class="status" id="status">idle</div>
+      </header>
+
+      <div class="grid">
+        <section class="card controls">
+          <form id="stream-form">
+            <div class="field">
+              <label for="stream-url">Stream URL</label>
+              <input id="stream-url" name="stream-url" value="http://localhost:8091/api/mindbrain/graph/subgraph" />
+            </div>
+            <div class="field">
+              <label for="seed-ids">Seed IDs</label>
+              <input id="seed-ids" name="seed-ids" value="1,2" />
+            </div>
+            <div class="field">
+              <label for="hops">Hops</label>
+              <input id="hops" name="hops" type="number" min="1" step="1" value="2" />
+            </div>
+            <div class="field">
+              <label for="edge-types">Edge types</label>
+              <input id="edge-types" name="edge-types" placeholder="requires,writes_about" />
+            </div>
+            <button type="submit">Connect</button>
+            <button type="button" class="secondary" id="disconnect">Disconnect</button>
+          </form>
+
+          <div class="hint">
+            The page listens for SSE events named `seed_node`, `node`, `edge`, and
+            `done`. If the stream endpoint is on another origin, the server must
+            allow CORS.
+          </div>
+        </section>
+
+        <section class="card canvas">
+          <div class="canvas-wrap">
+            <svg id="graph" viewBox="0 0 1000 760" aria-label="Incremental graph visualization"></svg>
+          </div>
+          <div class="legend">
+            <span><i class="swatch seed"></i> Seed node</span>
+            <span><i class="swatch node"></i> Graph node</span>
+            <span><i class="swatch edge"></i> Graph edge</span>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>

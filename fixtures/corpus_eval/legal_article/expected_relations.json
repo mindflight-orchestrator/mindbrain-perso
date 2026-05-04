@@ -1,0 +1,12 @@
+[
+  {
+    "source": "operator",
+    "edge_type": "requires",
+    "target": "incident report"
+  },
+  {
+    "source": "ordinance",
+    "edge_type": "cites",
+    "target": "Decree 2024-10"
+  }
+]

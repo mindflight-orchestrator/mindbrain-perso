@@ -1,0 +1,14 @@
+{
+  "document_kind": "technical",
+  "language": "en",
+  "jurisdiction": "none",
+  "authority": null,
+  "structure_markers": ["heading", "paragraph", "code_block"],
+  "reference_density": "low",
+  "temporal_model": "static",
+  "recommended_splitter": "technical_structure",
+  "target_tokens": 384,
+  "max_chars": 2048,
+  "risks": ["code block must stay intact"],
+  "confidence": 0.92
+}

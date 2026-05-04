@@ -1,0 +1,21 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PG_MAJOR=17
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        gnupg2 && \
+    curl -sSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
+    echo "deb http://apt.postgresql.org/pub/repos/apt/ jammy-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-client-$PG_MAJOR && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tests
+
+CMD ["bash"]

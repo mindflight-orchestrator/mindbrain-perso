@@ -1,0 +1,14 @@
+[
+  {
+    "name": "operator",
+    "entity_type": "actor"
+  },
+  {
+    "name": "city authority",
+    "entity_type": "authority"
+  },
+  {
+    "name": "Decree 2024-10",
+    "entity_type": "legal_instrument"
+  }
+]

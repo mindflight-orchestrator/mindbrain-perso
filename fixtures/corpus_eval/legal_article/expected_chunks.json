@@ -1,0 +1,14 @@
+[
+  {
+    "contains": "Article 1. Operators must inspect",
+    "strategy": "legal_article"
+  },
+  {
+    "contains": "Article 2. The operator shall report incidents",
+    "strategy": "legal_article"
+  },
+  {
+    "contains": "Article 3. This ordinance cites Decree 2024-10",
+    "strategy": "legal_article"
+  }
+]

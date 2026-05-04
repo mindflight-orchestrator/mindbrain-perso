@@ -1,0 +1,14 @@
+{
+  "document_kind": "business_rule",
+  "language": "en",
+  "jurisdiction": "none",
+  "authority": "support policy",
+  "structure_markers": ["condition", "action", "exception"],
+  "reference_density": "none",
+  "temporal_model": "static",
+  "recommended_splitter": "business_rule",
+  "target_tokens": 320,
+  "max_chars": 2048,
+  "risks": ["exception must stay linked to the rule"],
+  "confidence": 0.93
+}

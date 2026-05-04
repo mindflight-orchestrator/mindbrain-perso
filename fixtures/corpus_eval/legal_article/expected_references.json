@@ -1,0 +1,12 @@
+[
+  {
+    "text": "Article 2 of this ordinance",
+    "kind": "internal",
+    "resolved": true
+  },
+  {
+    "text": "Decree 2024-10",
+    "kind": "external",
+    "resolved": false
+  }
+]
