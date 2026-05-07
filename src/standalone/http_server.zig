@@ -636,6 +636,9 @@ const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projection-get")) {
             return self.handleGhostcrabProjectionGet(allocator, query);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/graph-search")) {
+            return self.handleGhostcrabGraphSearch(allocator, query);
+        }
 
         return self.handleStatic(allocator, path);
     }
@@ -722,6 +725,52 @@ const MindbrainHttpApp = struct {
             .linked_evidence = linked_evidence,
             .deltas = deltas,
             .report = report,
+        };
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
+    fn handleGhostcrabGraphSearch(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const query_text = (try queryValue(allocator, query, "query")) orelse "";
+        const collection_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "collection_id"));
+        const metadata_filters = normalizeOptionalQueryValue(try queryValue(allocator, query, "metadata_filters"));
+        const entity_types = try queryValues(allocator, query, "entity_type");
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            20;
+
+        const rows = try loadGhostcrabGraphSearchEntities(
+            allocator,
+            db,
+            workspace_id,
+            collection_id,
+            query_text,
+            entity_types,
+            metadata_filters,
+            @min(limit, 100),
+        );
+        defer deinitGhostcrabGraphSearchRows(allocator, rows);
+
+        const payload = .{
+            .workspace_id = workspace_id,
+            .collection_id = collection_id,
+            .query = query_text,
+            .entity_types = entity_types,
+            .returned = rows.len,
+            .rows = rows,
+            .searched_layers = [_][]const u8{"graph_entity"},
         };
 
         var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1260,6 +1309,15 @@ const GhostcrabProjectionEvidenceRow = struct {
     evidence_metadata_json: []const u8,
 };
 
+const GhostcrabGraphSearchRow = struct {
+    entity_id: u32,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f32,
+    metadata_json: []const u8,
+    score: f32,
+};
+
 fn parseBoolQuery(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true") or
@@ -1280,6 +1338,156 @@ fn bindOptionalText(stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int, value: ?[]
     } else {
         try facet_sqlite.bindNull(stmt, index);
     }
+}
+
+fn loadGhostcrabGraphSearchEntities(
+    allocator: std.mem.Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    query_text: []const u8,
+    entity_types: []const []const u8,
+    metadata_filters: ?[]const u8,
+    limit: usize,
+) ![]GhostcrabGraphSearchRow {
+    const sql =
+        \\SELECT entity_id, entity_type, name, confidence, metadata_json
+        \\FROM graph_entity e
+        \\WHERE workspace_id = ?1
+        \\  AND deprecated_at IS NULL
+        \\  AND (?2 IS NULL OR json_extract(metadata_json, '$.collection_id') = ?2)
+        \\  AND (?3 IS NULL OR NOT EXISTS (
+        \\    SELECT 1
+        \\    FROM json_each(?3) f
+        \\    WHERE json_extract(e.metadata_json, '$.' || f.key) IS NOT f.value
+        \\       OR json_extract(e.metadata_json, '$.' || f.key) IS NULL
+        \\  ))
+        \\ORDER BY confidence DESC, entity_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try bindOptionalText(stmt, 2, collection_id);
+    try bindOptionalText(stmt, 3, metadata_filters);
+
+    const query_terms = try splitSimpleTerms(allocator, query_text);
+    defer freeStringSlice(allocator, query_terms);
+
+    var rows = std.ArrayList(GhostcrabGraphSearchRow).empty;
+    errdefer {
+        for (rows.items) |row| {
+            allocator.free(row.entity_type);
+            allocator.free(row.name);
+            allocator.free(row.metadata_json);
+        }
+        rows.deinit(allocator);
+    }
+
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const entity_type = try helper_api.dupeColText(allocator, stmt, 1);
+        if (!matchesAnyString(entity_type, entity_types)) {
+            allocator.free(entity_type);
+            continue;
+        }
+
+        const name = try helper_api.dupeColText(allocator, stmt, 2);
+        const metadata_json = try helper_api.dupeColText(allocator, stmt, 4);
+        const score = graphSearchScore(query_terms, entity_type, name, metadata_json);
+        if (query_terms.len > 0 and score <= 0) {
+            allocator.free(entity_type);
+            allocator.free(name);
+            allocator.free(metadata_json);
+            continue;
+        }
+
+        try rows.append(allocator, .{
+            .entity_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .entity_type = entity_type,
+            .name = name,
+            .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
+            .metadata_json = metadata_json,
+            .score = if (query_terms.len == 0) @as(f32, @floatCast(c.sqlite3_column_double(stmt, 3))) else score,
+        });
+    }
+
+    std.mem.sort(GhostcrabGraphSearchRow, rows.items, {}, struct {
+        fn lessThan(_: void, lhs: GhostcrabGraphSearchRow, rhs: GhostcrabGraphSearchRow) bool {
+            if (lhs.score != rhs.score) return lhs.score > rhs.score;
+            if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;
+            return lhs.entity_id < rhs.entity_id;
+        }
+    }.lessThan);
+
+    if (rows.items.len > limit) {
+        for (rows.items[limit..]) |row| {
+            allocator.free(row.entity_type);
+            allocator.free(row.name);
+            allocator.free(row.metadata_json);
+        }
+        rows.shrinkRetainingCapacity(limit);
+    }
+
+    return rows.toOwnedSlice(allocator);
+}
+
+fn deinitGhostcrabGraphSearchRows(allocator: std.mem.Allocator, rows: []GhostcrabGraphSearchRow) void {
+    for (rows) |row| {
+        allocator.free(row.entity_type);
+        allocator.free(row.name);
+        allocator.free(row.metadata_json);
+    }
+    allocator.free(rows);
+}
+
+fn splitSimpleTerms(allocator: std.mem.Allocator, query_text: []const u8) ![]const []const u8 {
+    var terms = std.ArrayList([]const u8).empty;
+    errdefer freeStringSlice(allocator, terms.items);
+
+    var it = std.mem.tokenizeAny(u8, query_text, " \t\r\n");
+    while (it.next()) |term| {
+        try terms.append(allocator, try allocator.dupe(u8, term));
+    }
+
+    return terms.toOwnedSlice(allocator);
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
+fn matchesAnyString(value: []const u8, candidates: []const []const u8) bool {
+    if (candidates.len == 0) return true;
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, value, candidate)) return true;
+    }
+    return false;
+}
+
+fn graphSearchScore(terms: []const []const u8, entity_type: []const u8, name: []const u8, metadata_json: []const u8) f32 {
+    var score: f32 = 0;
+    for (terms) |term| {
+        if (containsIgnoreCase(name, term)) score += 4;
+        if (containsIgnoreCase(entity_type, term)) score += 3;
+        if (containsIgnoreCase(metadata_json, term)) score += 1;
+    }
+    return score;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn loadGhostcrabProjectionEntities(
