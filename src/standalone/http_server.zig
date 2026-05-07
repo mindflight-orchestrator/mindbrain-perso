@@ -633,6 +633,9 @@ const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/pack-projections")) {
             return self.handleGhostcrabPackProjections(allocator, query);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projection-get")) {
+            return self.handleGhostcrabProjectionGet(allocator, query);
+        }
 
         return self.handleStatic(allocator, path);
     }
@@ -674,6 +677,60 @@ const MindbrainHttpApp = struct {
             .status = .ok,
             .content_type = "application/json; charset=utf-8",
             .body = body,
+        };
+    }
+
+    fn handleGhostcrabProjectionGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const projection_id = (try queryValue(allocator, query, "projection_id")) orelse return error.BadRequest;
+        const collection_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "collection_id"));
+        const include_evidence = parseBoolQuery((try queryValue(allocator, query, "include_evidence")) orelse "false");
+        const include_deltas = parseBoolQuery((try queryValue(allocator, query, "include_deltas")) orelse "false");
+
+        const projection_results = try loadGhostcrabProjectionEntities(allocator, db, workspace_id, collection_id, projection_id, "ProjectionResult", "projection_id");
+        defer deinitGhostcrabProjectionEntities(allocator, projection_results);
+
+        const linked_evidence = if (include_evidence)
+            try loadGhostcrabProjectionEvidence(allocator, db, workspace_id, collection_id, projection_id)
+        else
+            try allocator.alloc(GhostcrabProjectionEvidenceRow, 0);
+        defer deinitGhostcrabProjectionEvidence(allocator, linked_evidence);
+
+        const deltas = if (include_deltas)
+            try loadGhostcrabProjectionEntities(allocator, db, workspace_id, collection_id, projection_id, "DeltaFinding", "metric")
+        else
+            try allocator.alloc(GhostcrabProjectionEntityRow, 0);
+        defer deinitGhostcrabProjectionEntities(allocator, deltas);
+
+        const report = .{
+            .workspace_id = workspace_id,
+            .collection_id = collection_id,
+            .projection_id = projection_id,
+            .projection_result_count = projection_results.len,
+            .linked_evidence_count = linked_evidence.len,
+            .delta_count = deltas.len,
+            .has_projection = projection_results.len > 0,
+        };
+        const payload = .{
+            .workspace_id = workspace_id,
+            .collection_id = collection_id,
+            .projection_id = projection_id,
+            .projection_results = projection_results,
+            .linked_evidence = linked_evidence,
+            .deltas = deltas,
+            .report = report,
+        };
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
         };
     }
 
@@ -1181,6 +1238,196 @@ const Response = struct {
         _ = allocator;
     }
 };
+
+const GhostcrabProjectionEntityRow = struct {
+    entity_id: u32,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f32,
+    metadata_json: []const u8,
+};
+
+const GhostcrabProjectionEvidenceRow = struct {
+    relation_id: u32,
+    relation_type: []const u8,
+    source_id: u32,
+    target_id: u32,
+    relation_metadata_json: []const u8,
+    evidence_entity_id: u32,
+    evidence_entity_type: []const u8,
+    evidence_name: []const u8,
+    evidence_confidence: f32,
+    evidence_metadata_json: []const u8,
+};
+
+fn parseBoolQuery(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn normalizeOptionalQueryValue(value: ?[]const u8) ?[]const u8 {
+    const text = value orelse return null;
+    if (text.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(text, "null")) return null;
+    if (std.ascii.eqlIgnoreCase(text, "nil")) return null;
+    return text;
+}
+
+fn bindOptionalText(stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int, value: ?[]const u8) !void {
+    if (value) |text| {
+        try facet_sqlite.bindText(stmt, index, text);
+    } else {
+        try facet_sqlite.bindNull(stmt, index);
+    }
+}
+
+fn loadGhostcrabProjectionEntities(
+    allocator: std.mem.Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    projection_id: []const u8,
+    entity_type: []const u8,
+    metadata_key: []const u8,
+) ![]GhostcrabProjectionEntityRow {
+    const sql =
+        \\SELECT entity_id, entity_type, name, confidence, metadata_json
+        \\FROM graph_entity
+        \\WHERE workspace_id = ?1
+        \\  AND entity_type = ?2
+        \\  AND json_extract(metadata_json, '$.' || ?3) = ?4
+        \\  AND (?5 IS NULL OR json_extract(metadata_json, '$.collection_id') = ?5)
+        \\  AND deprecated_at IS NULL
+        \\ORDER BY confidence DESC, entity_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, entity_type);
+    try facet_sqlite.bindText(stmt, 3, metadata_key);
+    try facet_sqlite.bindText(stmt, 4, projection_id);
+    try bindOptionalText(stmt, 5, collection_id);
+
+    var rows = std.ArrayList(GhostcrabProjectionEntityRow).empty;
+    errdefer {
+        for (rows.items) |row| {
+            allocator.free(row.entity_type);
+            allocator.free(row.name);
+            allocator.free(row.metadata_json);
+        }
+        rows.deinit(allocator);
+    }
+
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(allocator, .{
+            .entity_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .entity_type = try helper_api.dupeColText(allocator, stmt, 1),
+            .name = try helper_api.dupeColText(allocator, stmt, 2),
+            .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
+            .metadata_json = try helper_api.dupeColText(allocator, stmt, 4),
+        });
+    }
+
+    return rows.toOwnedSlice(allocator);
+}
+
+fn deinitGhostcrabProjectionEntities(allocator: std.mem.Allocator, rows: []GhostcrabProjectionEntityRow) void {
+    for (rows) |row| {
+        allocator.free(row.entity_type);
+        allocator.free(row.name);
+        allocator.free(row.metadata_json);
+    }
+    allocator.free(rows);
+}
+
+fn loadGhostcrabProjectionEvidence(
+    allocator: std.mem.Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    projection_id: []const u8,
+) ![]GhostcrabProjectionEvidenceRow {
+    const sql =
+        \\SELECT
+        \\  r.relation_id,
+        \\  r.relation_type,
+        \\  r.source_id,
+        \\  r.target_id,
+        \\  r.metadata_json,
+        \\  e.entity_id,
+        \\  e.entity_type,
+        \\  e.name,
+        \\  e.confidence,
+        \\  e.metadata_json
+        \\FROM graph_entity p
+        \\JOIN graph_relation r ON r.source_id = p.entity_id
+        \\JOIN graph_entity e ON e.entity_id = r.target_id
+        \\WHERE p.workspace_id = ?1
+        \\  AND p.entity_type = 'ProjectionResult'
+        \\  AND json_extract(p.metadata_json, '$.projection_id') = ?2
+        \\  AND (?3 IS NULL OR json_extract(p.metadata_json, '$.collection_id') = ?3)
+        \\  AND p.deprecated_at IS NULL
+        \\  AND r.deprecated_at IS NULL
+        \\  AND e.deprecated_at IS NULL
+        \\ORDER BY r.relation_id ASC, e.entity_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, projection_id);
+    try bindOptionalText(stmt, 3, collection_id);
+
+    var rows = std.ArrayList(GhostcrabProjectionEvidenceRow).empty;
+    errdefer {
+        for (rows.items) |row| {
+            allocator.free(row.relation_type);
+            allocator.free(row.relation_metadata_json);
+            allocator.free(row.evidence_entity_type);
+            allocator.free(row.evidence_name);
+            allocator.free(row.evidence_metadata_json);
+        }
+        rows.deinit(allocator);
+    }
+
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(allocator, .{
+            .relation_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .relation_type = try helper_api.dupeColText(allocator, stmt, 1),
+            .source_id = @intCast(c.sqlite3_column_int64(stmt, 2)),
+            .target_id = @intCast(c.sqlite3_column_int64(stmt, 3)),
+            .relation_metadata_json = try helper_api.dupeColText(allocator, stmt, 4),
+            .evidence_entity_id = @intCast(c.sqlite3_column_int64(stmt, 5)),
+            .evidence_entity_type = try helper_api.dupeColText(allocator, stmt, 6),
+            .evidence_name = try helper_api.dupeColText(allocator, stmt, 7),
+            .evidence_confidence = @floatCast(c.sqlite3_column_double(stmt, 8)),
+            .evidence_metadata_json = try helper_api.dupeColText(allocator, stmt, 9),
+        });
+    }
+
+    return rows.toOwnedSlice(allocator);
+}
+
+fn deinitGhostcrabProjectionEvidence(allocator: std.mem.Allocator, rows: []GhostcrabProjectionEvidenceRow) void {
+    for (rows) |row| {
+        allocator.free(row.relation_type);
+        allocator.free(row.relation_metadata_json);
+        allocator.free(row.evidence_entity_type);
+        allocator.free(row.evidence_name);
+        allocator.free(row.evidence_metadata_json);
+    }
+    allocator.free(rows);
+}
 
 fn mimeTypeForPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
