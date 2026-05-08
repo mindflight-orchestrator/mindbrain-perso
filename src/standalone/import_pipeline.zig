@@ -52,6 +52,8 @@ pub const RelationImport = struct {
     target_id: u32,
     relation_type: []const u8,
     confidence: f32 = 1.0,
+    valid_from_unix: ?i64 = null,
+    valid_to_unix: ?i64 = null,
 };
 
 pub const EntityDocumentImport = struct {
@@ -146,6 +148,8 @@ pub const Pipeline = struct {
             .target_id = relation.target_id,
             .relation_type = relation.relation_type,
             .confidence = relation.confidence,
+            .valid_from_unix = relation.valid_from_unix,
+            .valid_to_unix = relation.valid_to_unix,
         });
         try graph_sqlite.upsertRelation(self.db.*, .{
             .relation_id = relation.relation_id,
@@ -153,6 +157,8 @@ pub const Pipeline = struct {
             .target_id = relation.target_id,
             .relation_type = relation.relation_type,
             .confidence = relation.confidence,
+            .valid_from_unix = relation.valid_from_unix,
+            .valid_to_unix = relation.valid_to_unix,
         });
 
         try syncAdjacencyForNode(self, relation.source_id, true);
@@ -247,7 +253,7 @@ pub const Pipeline = struct {
     pub fn upsertEntityFull(self: *Pipeline, spec: collections_sqlite.EntityRawSpec) !void {
         try collections_sqlite.upsertEntityRaw(self.db.*, spec);
         const eid32: u32 = std.math.cast(u32, spec.entity_id) orelse return error.ValueOutOfRange;
-        try graph_sqlite.upsertEntity(self.db.*, eid32, spec.entity_type, spec.name);
+        try graph_sqlite.upsertEntityFull(self.db.*, eid32, spec.workspace_id, spec.entity_type, spec.name, @floatCast(spec.confidence), spec.metadata_json);
     }
 
     pub fn upsertEntityAlias(self: *Pipeline, spec: collections_sqlite.EntityAliasRawSpec) !void {
@@ -259,13 +265,18 @@ pub const Pipeline = struct {
         const rid: u32 = std.math.cast(u32, spec.relation_id) orelse return error.ValueOutOfRange;
         const src: u32 = std.math.cast(u32, spec.source_entity_id) orelse return error.ValueOutOfRange;
         const tgt: u32 = std.math.cast(u32, spec.target_entity_id) orelse return error.ValueOutOfRange;
+        const valid_from_unix = try unixepochText(self.db.*, spec.valid_from);
+        const valid_to_unix = try unixepochText(self.db.*, spec.valid_to);
         try self.addRelation(.{
             .relation_id = rid,
             .source_id = src,
             .target_id = tgt,
             .relation_type = spec.edge_type,
             .confidence = @floatCast(spec.confidence),
+            .valid_from_unix = valid_from_unix,
+            .valid_to_unix = valid_to_unix,
         });
+        try graph_sqlite.upsertRelationFull(self.db.*, rid, spec.workspace_id, spec.edge_type, src, tgt, valid_from_unix, valid_to_unix, @floatCast(spec.confidence), spec.metadata_json);
     }
 
     pub fn linkEntityToDocument(self: *Pipeline, spec: collections_sqlite.EntityDocumentRawSpec, table_id: ?u64) !void {
@@ -278,6 +289,8 @@ pub const Pipeline = struct {
 
     pub fn linkEntityToChunk(self: *Pipeline, spec: collections_sqlite.EntityChunkRawSpec) !void {
         try collections_sqlite.linkEntityChunkRaw(self.db.*, spec);
+        const eid32: u32 = std.math.cast(u32, spec.entity_id) orelse return error.ValueOutOfRange;
+        try graph_sqlite.upsertEntityChunk(self.db.*, eid32, spec.workspace_id, spec.collection_id, spec.doc_id, spec.chunk_index, spec.role, @floatCast(spec.confidence), "{}");
     }
 
     pub fn linkDocuments(self: *Pipeline, spec: collections_sqlite.DocumentLinkRawSpec) !void {
@@ -620,10 +633,20 @@ pub const Pipeline = struct {
     /// graph store and adjacency tables. Currently this assumes entity ids
     /// fit in u32 (which is the legacy graph_entity contract).
     pub fn reindexGraph(self: *Pipeline, workspace_id: []const u8) !u64 {
+        return try self.reindexGraphWithDocumentTable(workspace_id, null);
+    }
+
+    /// Replays the raw graph layer into the derived graph tables. When
+    /// `document_table_id` is provided, raw entity-document links are projected
+    /// into `graph_entity_document`; chunk links are always projected into
+    /// `graph_entity_chunk`.
+    pub fn reindexGraphWithDocumentTable(self: *Pipeline, workspace_id: []const u8, document_table_id: ?u64) !u64 {
+        var projected_count: u64 = 0;
+
         // Entities first so relations can reference them.
         {
             const sql =
-                \\SELECT entity_id, entity_type, name
+                \\SELECT entity_id, entity_type, name, confidence, metadata_json
                 \\FROM entities_raw
                 \\WHERE workspace_id = ?1
                 \\ORDER BY entity_id
@@ -642,13 +665,41 @@ pub const Pipeline = struct {
                 defer self.allocator.free(etype);
                 const name = try facet_sqlite.dupeColumnText(self.allocator, stmt, 2);
                 defer self.allocator.free(name);
-                try graph_sqlite.upsertEntity(self.db.*, eid32, etype, name);
+                const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(stmt, 3));
+                const metadata_json = try facet_sqlite.dupeColumnText(self.allocator, stmt, 4);
+                defer self.allocator.free(metadata_json);
+                try graph_sqlite.upsertEntityFull(self.db.*, eid32, workspace_id, etype, name, confidence, metadata_json);
+                projected_count += 1;
             }
         }
 
-        var relation_count: u64 = 0;
+        {
+            const sql =
+                \\SELECT entity_id, term, confidence
+                \\FROM entity_aliases_raw
+                \\WHERE workspace_id = ?1
+                \\ORDER BY entity_id, term
+            ;
+            const stmt = try facet_sqlite.prepare(self.db.*, sql);
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, workspace_id);
+            while (true) {
+                const status = facet_sqlite.c.sqlite3_step(stmt);
+                if (status == facet_sqlite.c.SQLITE_DONE) break;
+                if (status != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+
+                const eid64 = try facet_sqlite.columnU64(stmt, 0);
+                const eid: u32 = std.math.cast(u32, eid64) orelse return error.ValueOutOfRange;
+                const term = try facet_sqlite.dupeColumnText(self.allocator, stmt, 1);
+                defer self.allocator.free(term);
+                const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(stmt, 2));
+                try graph_sqlite.insertEntityAlias(self.db.*, term, eid, confidence);
+                projected_count += 1;
+            }
+        }
+
         const sql =
-            \\SELECT relation_id, edge_type, source_entity_id, target_entity_id, confidence
+            \\SELECT relation_id, edge_type, source_entity_id, target_entity_id, unixepoch(valid_from), unixepoch(valid_to), confidence, metadata_json
             \\FROM relations_raw
             \\WHERE workspace_id = ?1
             \\ORDER BY relation_id
@@ -669,7 +720,11 @@ pub const Pipeline = struct {
             const tgt64 = try facet_sqlite.columnU64(stmt, 3);
             const src: u32 = std.math.cast(u32, src64) orelse return error.ValueOutOfRange;
             const tgt: u32 = std.math.cast(u32, tgt64) orelse return error.ValueOutOfRange;
-            const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(stmt, 4));
+            const valid_from_unix = columnOptionalI64(stmt, 4);
+            const valid_to_unix = columnOptionalI64(stmt, 5);
+            const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(stmt, 6));
+            const metadata_json = try facet_sqlite.dupeColumnText(self.allocator, stmt, 7);
+            defer self.allocator.free(metadata_json);
 
             try self.addRelation(.{
                 .relation_id = rid,
@@ -677,10 +732,96 @@ pub const Pipeline = struct {
                 .target_id = tgt,
                 .relation_type = edge,
                 .confidence = confidence,
+                .valid_from_unix = valid_from_unix,
+                .valid_to_unix = valid_to_unix,
             });
-            relation_count += 1;
+            try graph_sqlite.upsertRelationFull(self.db.*, rid, workspace_id, edge, src, tgt, valid_from_unix, valid_to_unix, confidence, metadata_json);
+            projected_count += 1;
         }
-        return relation_count;
+
+        if (document_table_id) |tid| {
+            {
+                const delete_sql =
+                    \\DELETE FROM graph_entity_document
+                    \\WHERE table_id = ?1
+                    \\  AND entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?2)
+                ;
+                const delete_stmt = try facet_sqlite.prepare(self.db.*, delete_sql);
+                defer facet_sqlite.finalize(delete_stmt);
+                try facet_sqlite.bindInt64(delete_stmt, 1, tid);
+                try facet_sqlite.bindText(delete_stmt, 2, workspace_id);
+                try facet_sqlite.stepDone(delete_stmt);
+            }
+
+            const doc_sql =
+                \\SELECT entity_id, doc_id, role, MAX(confidence)
+                \\FROM entity_documents_raw
+                \\WHERE workspace_id = ?1
+                \\GROUP BY entity_id, doc_id
+                \\ORDER BY entity_id, doc_id
+            ;
+            const doc_stmt = try facet_sqlite.prepare(self.db.*, doc_sql);
+            defer facet_sqlite.finalize(doc_stmt);
+            try facet_sqlite.bindText(doc_stmt, 1, workspace_id);
+            while (true) {
+                const status = facet_sqlite.c.sqlite3_step(doc_stmt);
+                if (status == facet_sqlite.c.SQLITE_DONE) break;
+                if (status != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+
+                const eid64 = try facet_sqlite.columnU64(doc_stmt, 0);
+                const eid: u32 = std.math.cast(u32, eid64) orelse return error.ValueOutOfRange;
+                const doc_id = try facet_sqlite.columnU64(doc_stmt, 1);
+                const role = if (facet_sqlite.c.sqlite3_column_type(doc_stmt, 2) == facet_sqlite.c.SQLITE_NULL)
+                    null
+                else
+                    try facet_sqlite.dupeColumnText(self.allocator, doc_stmt, 2);
+                defer if (role) |value| self.allocator.free(value);
+                const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(doc_stmt, 3));
+                try graph_sqlite.upsertEntityDocument(self.db.*, eid, doc_id, tid, role, confidence);
+                projected_count += 1;
+            }
+        }
+
+        {
+            const delete_sql = "DELETE FROM graph_entity_chunk WHERE workspace_id = ?1";
+            const delete_stmt = try facet_sqlite.prepare(self.db.*, delete_sql);
+            defer facet_sqlite.finalize(delete_stmt);
+            try facet_sqlite.bindText(delete_stmt, 1, workspace_id);
+            try facet_sqlite.stepDone(delete_stmt);
+        }
+
+        const chunk_sql =
+            \\SELECT entity_id, collection_id, doc_id, chunk_index, role, MAX(confidence)
+            \\FROM entity_chunks_raw
+            \\WHERE workspace_id = ?1
+            \\GROUP BY entity_id, collection_id, doc_id, chunk_index
+            \\ORDER BY entity_id, collection_id, doc_id, chunk_index
+        ;
+        const chunk_stmt = try facet_sqlite.prepare(self.db.*, chunk_sql);
+        defer facet_sqlite.finalize(chunk_stmt);
+        try facet_sqlite.bindText(chunk_stmt, 1, workspace_id);
+        while (true) {
+            const status = facet_sqlite.c.sqlite3_step(chunk_stmt);
+            if (status == facet_sqlite.c.SQLITE_DONE) break;
+            if (status != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+
+            const eid64 = try facet_sqlite.columnU64(chunk_stmt, 0);
+            const eid: u32 = std.math.cast(u32, eid64) orelse return error.ValueOutOfRange;
+            const collection_id = try facet_sqlite.dupeColumnText(self.allocator, chunk_stmt, 1);
+            defer self.allocator.free(collection_id);
+            const doc_id = try facet_sqlite.columnU64(chunk_stmt, 2);
+            const chunk_index: u32 = @intCast(facet_sqlite.c.sqlite3_column_int64(chunk_stmt, 3));
+            const role = if (facet_sqlite.c.sqlite3_column_type(chunk_stmt, 4) == facet_sqlite.c.SQLITE_NULL)
+                null
+            else
+                try facet_sqlite.dupeColumnText(self.allocator, chunk_stmt, 4);
+            defer if (role) |value| self.allocator.free(value);
+            const confidence: f32 = @floatCast(facet_sqlite.c.sqlite3_column_double(chunk_stmt, 5));
+            try graph_sqlite.upsertEntityChunk(self.db.*, eid, workspace_id, collection_id, doc_id, chunk_index, role, confidence, "{}");
+            projected_count += 1;
+        }
+
+        return projected_count;
     }
 
     pub fn reindexAll(
@@ -691,12 +832,26 @@ pub const Pipeline = struct {
     ) !void {
         _ = try self.reindexBm25(workspace_id, collection_id, .{ .table_id = table_id });
         _ = try self.reindexFacets(workspace_id, collection_id, table_id);
-        _ = try self.reindexGraph(workspace_id);
+        _ = try self.reindexGraphWithDocumentTable(workspace_id, table_id);
     }
 };
 
 fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) u64 {
     return (doc_id << chunk_bits) | @as(u64, chunk_index);
+}
+
+fn columnOptionalI64(stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int) ?i64 {
+    if (facet_sqlite.c.sqlite3_column_type(stmt, index) == facet_sqlite.c.SQLITE_NULL) return null;
+    return facet_sqlite.c.sqlite3_column_int64(stmt, index);
+}
+
+fn unixepochText(db: facet_sqlite.Database, value: ?[]const u8) !?i64 {
+    const text = value orelse return null;
+    const stmt = try facet_sqlite.prepare(db, "SELECT unixepoch(?1)");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, text);
+    if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+    return columnOptionalI64(stmt, 0);
 }
 
 fn flushFacetGroup(
@@ -878,6 +1033,8 @@ test "import pipeline keeps search, facet, and graph state in sync" {
         .entity_id = 1,
         .entity_type = "person",
         .name = "Ada",
+        .confidence = 0.91,
+        .metadata_json = "{\"collection_id\":\"ws_test::docs\",\"role\":\"engineer\"}",
     });
     try pipeline.upsertEntityFull(.{
         .workspace_id = "ws_test",
@@ -893,9 +1050,28 @@ test "import pipeline keeps search, facet, and graph state in sync" {
         .edge_type = "works_for",
         .source_entity_id = 1,
         .target_entity_id = 2,
+        .valid_from = "2024-01-01",
+        .valid_to = "2024-12-31",
         .confidence = 0.9,
+        .metadata_json = "{\"source\":\"fixture\"}",
     });
-    try pipeline.linkEntityDocument(.{ .entity_id = 1, .doc_id = 42, .table_id = 1, .role = "author", .confidence = 0.95 });
+    try pipeline.linkEntityToDocument(.{
+        .workspace_id = "ws_test",
+        .entity_id = 1,
+        .collection_id = "ws_test::docs",
+        .doc_id = 42,
+        .role = "author",
+        .confidence = 0.95,
+    }, 1);
+    try pipeline.linkEntityToChunk(.{
+        .workspace_id = "ws_test",
+        .entity_id = 1,
+        .collection_id = "ws_test::docs",
+        .doc_id = 42,
+        .chunk_index = 0,
+        .role = "mention",
+        .confidence = 0.88,
+    });
 
     // Cross-collection link in raw — exercises the new document_links_raw path.
     try pipeline.createCollection(.{
@@ -1018,8 +1194,36 @@ test "import pipeline keeps search, facet, and graph state in sync" {
     try std.testing.expectEqual(@as(u64, 0), bm25_counts.chunks);
     const facet_count = try rebuild.reindexFacets("ws_test", "ws_test::docs", 1);
     try std.testing.expectEqual(@as(u64, 1), facet_count);
-    const relation_count = try rebuild.reindexGraph("ws_test");
-    try std.testing.expectEqual(@as(u64, 1), relation_count);
+    const graph_count = try rebuild.reindexGraphWithDocumentTable("ws_test", 1);
+    try std.testing.expectEqual(@as(u64, 5), graph_count);
+
+    var rebuilt_entity = try graph_sqlite.loadEntityFull(db, std.testing.allocator, 1);
+    defer rebuilt_entity.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f32, 0.91), rebuilt_entity.confidence);
+    try std.testing.expect(std.mem.indexOf(u8, rebuilt_entity.metadata_json, "\"role\":\"engineer\"") != null);
+
+    var rebuilt_relation = (try graph_sqlite.findRelationByIds(db, std.testing.allocator, 1, 2, "works_for")).?;
+    defer rebuilt_relation.deinit(std.testing.allocator);
+    try std.testing.expect(rebuilt_relation.valid_from_unix != null);
+    try std.testing.expect(rebuilt_relation.valid_to_unix != null);
+    try std.testing.expect(std.mem.indexOf(u8, rebuilt_relation.metadata_json, "\"source\":\"fixture\"") != null);
+
+    const rebuilt_docs = try graph_sqlite.loadEntityDocuments(db, std.testing.allocator, 1);
+    defer {
+        for (rebuilt_docs) |doc| if (doc.role) |role| std.testing.allocator.free(role);
+        std.testing.allocator.free(rebuilt_docs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rebuilt_docs.len);
+    try std.testing.expectEqual(@as(u64, 42), rebuilt_docs[0].doc_id);
+
+    const rebuilt_chunks = try graph_sqlite.loadEntityChunks(db, std.testing.allocator, 1);
+    defer {
+        for (rebuilt_chunks) |*chunk| chunk.deinit(std.testing.allocator);
+        std.testing.allocator.free(rebuilt_chunks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rebuilt_chunks.len);
+    try std.testing.expectEqual(@as(u32, 0), rebuilt_chunks[0].chunk_index);
+    try std.testing.expectEqualStrings("ws_test::docs", rebuilt_chunks[0].collection_id);
 
     var rebuilt_filter = (try facet_store.filterDocuments(
         std.testing.allocator,

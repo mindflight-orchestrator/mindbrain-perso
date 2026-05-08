@@ -21,6 +21,7 @@ The graph stores a typed knowledge graph alongside facet-indexed documents. Nati
 | **`graph.entity_alias`** | Maps text terms → `entity_id` with confidence |
 | **`graph.relation`** | Directed edges: `type`, `source_id`, `target_id`, optional validity dates and confidence |
 | **`graph.entity_document`** | Links entities to facet document rows (`doc_id`, `table_oid`, `role`) |
+| **`graph.entity_chunk`** | Links entities to raw collection chunks (`workspace_id`, `collection_id`, `doc_id`, `chunk_index`, `role`) |
 
 Additional tables (execution runs, learning pipeline, etc.) exist in the same schema for higher-level workflows; inspect the SQL file for the full set.
 

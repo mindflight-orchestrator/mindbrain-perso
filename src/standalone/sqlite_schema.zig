@@ -281,6 +281,25 @@ pub const metadata_schema_statements = [_][]const u8{
     \\    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
     \\);
     ,
+    \\CREATE TABLE IF NOT EXISTS graph_entity_chunk (
+    \\    entity_id INTEGER NOT NULL,
+    \\    workspace_id TEXT NOT NULL,
+    \\    collection_id TEXT NOT NULL,
+    \\    doc_id INTEGER NOT NULL,
+    \\    chunk_index INTEGER NOT NULL,
+    \\    role TEXT,
+    \\    confidence REAL NOT NULL DEFAULT 1.0,
+    \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+    \\    PRIMARY KEY(entity_id, workspace_id, collection_id, doc_id, chunk_index),
+    \\    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
+    \\);
+    ,
+    \\CREATE INDEX IF NOT EXISTS graph_entity_chunk_entity_idx
+    \\    ON graph_entity_chunk(entity_id);
+    ,
+    \\CREATE INDEX IF NOT EXISTS graph_entity_chunk_source_idx
+    \\    ON graph_entity_chunk(workspace_id, collection_id, doc_id, chunk_index);
+    ,
     \\CREATE TABLE IF NOT EXISTS graph_lj_out (
     \\    entity_id INTEGER PRIMARY KEY,
     \\    relation_ids_blob BLOB NOT NULL,
@@ -1146,6 +1165,8 @@ test "sqlite schema includes the first standalone metadata tables" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_relation") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_source_id_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_target_id_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_entity_chunk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_entity_chunk_source_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_lj_out") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_lj_in") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_execution_run") != null);

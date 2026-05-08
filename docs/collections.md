@@ -129,6 +129,8 @@ try pipeline.reindexAll("ws", "ws::docs", facet_table_id);
 _ = try pipeline.reindexBm25("ws", "ws::docs", facet_table_id);
 _ = try pipeline.reindexFacets("ws", "ws::docs", facet_table_id);
 _ = try pipeline.reindexGraph("ws");
+// or include document grounding in graph_entity_document:
+_ = try pipeline.reindexGraphWithDocumentTable("ws", facet_table_id);
 ```
 
 ### Backup & restore — `collections_io.zig`

@@ -101,6 +101,25 @@ pub const EntityDocumentLink = struct {
     confidence: f32,
 };
 
+pub const EntityChunkLink = struct {
+    entity_id: u32,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    doc_id: u64,
+    chunk_index: u32,
+    role: ?[]const u8,
+    confidence: f32,
+    metadata_json: []const u8,
+
+    pub fn deinit(self: *EntityChunkLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.collection_id);
+        if (self.role) |role| allocator.free(role);
+        allocator.free(self.metadata_json);
+        self.* = undefined;
+    }
+};
+
 pub const RelationRecordFull = struct {
     relation_id: u32,
     workspace_id: []const u8,
@@ -542,6 +561,29 @@ pub fn upsertEntityWithMetadata(
     try stepDone(stmt);
 }
 
+pub fn upsertEntityFull(
+    db: Database,
+    entity_id: u32,
+    workspace_id: []const u8,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f32,
+    metadata_json: []const u8,
+) !void {
+    const stmt = try prepare(
+        db,
+        "INSERT OR REPLACE INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json, deprecated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, entity_id);
+    try bindText(stmt, 2, workspace_id);
+    try bindText(stmt, 3, entity_type);
+    try bindText(stmt, 4, name);
+    if (c.sqlite3_bind_double(stmt, 5, confidence) != c.SQLITE_OK) return error.BindFailed;
+    try bindText(stmt, 6, metadata_json);
+    try stepDone(stmt);
+}
+
 pub fn insertRelation(db: Database, relation: graph_store.RelationRecord) !void {
     const stmt = try prepare(db, "INSERT INTO graph_relation(relation_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
     defer finalize(stmt);
@@ -565,6 +607,35 @@ pub fn upsertRelation(db: Database, relation: graph_store.RelationRecord) !void 
     if (relation.valid_from_unix) |value| try bindInt64(stmt, 5, value) else try bindNull(stmt, 5);
     if (relation.valid_to_unix) |value| try bindInt64(stmt, 6, value) else try bindNull(stmt, 6);
     if (c.sqlite3_bind_double(stmt, 7, relation.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try stepDone(stmt);
+}
+
+pub fn upsertRelationFull(
+    db: Database,
+    relation_id: u32,
+    workspace_id: []const u8,
+    relation_type: []const u8,
+    source_id: u32,
+    target_id: u32,
+    valid_from_unix: ?i64,
+    valid_to_unix: ?i64,
+    confidence: f32,
+    metadata_json: []const u8,
+) !void {
+    const stmt = try prepare(
+        db,
+        "INSERT OR REPLACE INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, metadata_json, deprecated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, relation_id);
+    try bindText(stmt, 2, workspace_id);
+    try bindText(stmt, 3, relation_type);
+    try bindInt64(stmt, 4, source_id);
+    try bindInt64(stmt, 5, target_id);
+    if (valid_from_unix) |value| try bindInt64(stmt, 6, value) else try bindNull(stmt, 6);
+    if (valid_to_unix) |value| try bindInt64(stmt, 7, value) else try bindNull(stmt, 7);
+    if (c.sqlite3_bind_double(stmt, 8, confidence) != c.SQLITE_OK) return error.BindFailed;
+    try bindText(stmt, 9, metadata_json);
     try stepDone(stmt);
 }
 
@@ -626,7 +697,11 @@ pub fn upsertRelationNatural(
 }
 
 pub fn insertEntityAlias(db: Database, term: []const u8, entity_id: u32, confidence: f32) !void {
-    const stmt = try prepare(db, "INSERT INTO graph_entity_alias(term, entity_id, confidence) VALUES (?1, ?2, ?3)");
+    const stmt = try prepare(
+        db,
+        "INSERT INTO graph_entity_alias(term, entity_id, confidence) VALUES (?1, ?2, ?3) " ++
+            "ON CONFLICT(term, entity_id) DO UPDATE SET confidence = MAX(graph_entity_alias.confidence, excluded.confidence)",
+    );
     defer finalize(stmt);
     try bindText(stmt, 1, term);
     try bindInt64(stmt, 2, entity_id);
@@ -649,6 +724,56 @@ pub fn insertEntityDocument(
     try bindInt64(stmt, 3, table_id);
     if (role) |value| try bindText(stmt, 4, value) else try bindNull(stmt, 4);
     if (c.sqlite3_bind_double(stmt, 5, confidence) != c.SQLITE_OK) return error.BindFailed;
+    try stepDone(stmt);
+}
+
+pub fn upsertEntityDocument(
+    db: Database,
+    entity_id: u32,
+    doc_id: u64,
+    table_id: u64,
+    role: ?[]const u8,
+    confidence: f32,
+) !void {
+    const stmt = try prepare(
+        db,
+        "INSERT INTO graph_entity_document(entity_id, doc_id, table_id, role, confidence) VALUES (?1, ?2, ?3, ?4, ?5) " ++
+            "ON CONFLICT(entity_id, doc_id, table_id) DO UPDATE SET role = excluded.role, confidence = excluded.confidence",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, entity_id);
+    try bindInt64(stmt, 2, doc_id);
+    try bindInt64(stmt, 3, table_id);
+    if (role) |value| try bindText(stmt, 4, value) else try bindNull(stmt, 4);
+    if (c.sqlite3_bind_double(stmt, 5, confidence) != c.SQLITE_OK) return error.BindFailed;
+    try stepDone(stmt);
+}
+
+pub fn upsertEntityChunk(
+    db: Database,
+    entity_id: u32,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    doc_id: u64,
+    chunk_index: u32,
+    role: ?[]const u8,
+    confidence: f32,
+    metadata_json: []const u8,
+) !void {
+    const stmt = try prepare(
+        db,
+        "INSERT INTO graph_entity_chunk(entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) " ++
+            "ON CONFLICT(entity_id, workspace_id, collection_id, doc_id, chunk_index) DO UPDATE SET role = excluded.role, confidence = excluded.confidence, metadata_json = excluded.metadata_json",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, entity_id);
+    try bindText(stmt, 2, workspace_id);
+    try bindText(stmt, 3, collection_id);
+    try bindInt64(stmt, 4, doc_id);
+    try bindInt64(stmt, 5, chunk_index);
+    if (role) |value| try bindText(stmt, 6, value) else try bindNull(stmt, 6);
+    if (c.sqlite3_bind_double(stmt, 7, confidence) != c.SQLITE_OK) return error.BindFailed;
+    try bindText(stmt, 8, metadata_json);
     try stepDone(stmt);
 }
 
@@ -2285,6 +2410,44 @@ pub fn loadEntityDocuments(
     }
 
     return docs.toOwnedSlice(allocator);
+}
+
+pub fn loadEntityChunks(
+    db: Database,
+    allocator: std.mem.Allocator,
+    entity_id: u32,
+) ![]EntityChunkLink {
+    const stmt = try prepare(
+        db,
+        "SELECT entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json FROM graph_entity_chunk WHERE entity_id = ?1 ORDER BY confidence DESC, doc_id ASC, chunk_index ASC",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, entity_id);
+
+    var chunks = std.ArrayList(EntityChunkLink).empty;
+    defer {
+        for (chunks.items) |*chunk| chunk.deinit(allocator);
+        chunks.deinit(allocator);
+    }
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        try chunks.append(allocator, .{
+            .entity_id = try columnU32(stmt, 0),
+            .workspace_id = try dupeColumnText(allocator, stmt, 1),
+            .collection_id = try dupeColumnText(allocator, stmt, 2),
+            .doc_id = try columnU64(stmt, 3),
+            .chunk_index = try columnU32(stmt, 4),
+            .role = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else try dupeColumnText(allocator, stmt, 5),
+            .confidence = @floatCast(c.sqlite3_column_double(stmt, 6)),
+            .metadata_json = try dupeColumnText(allocator, stmt, 7),
+        });
+    }
+
+    return chunks.toOwnedSlice(allocator);
 }
 
 pub fn findRelationByIds(

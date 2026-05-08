@@ -256,9 +256,12 @@ test "facet delta merge nests cleanly inside an outer savepoint" {
     try facet_sqlite.upsertPostingBitmap(db, std.testing.allocator, 22, 1, "technology", 0, initial);
 
     try db.exec("SAVEPOINT outer_facet_tx");
+    var outer_released = false;
     defer {
-        _ = db.exec("ROLLBACK TO SAVEPOINT outer_facet_tx") catch {};
-        _ = db.exec("RELEASE SAVEPOINT outer_facet_tx") catch {};
+        if (!outer_released) {
+            _ = db.exec("ROLLBACK TO SAVEPOINT outer_facet_tx") catch {};
+            _ = db.exec("RELEASE SAVEPOINT outer_facet_tx") catch {};
+        }
     }
 
     try facet_sqlite.queueFacetDelta(db, 22, 1, "technology", 2, 1);
@@ -266,6 +269,7 @@ test "facet delta merge nests cleanly inside an outer savepoint" {
 
     try db.exec("ROLLBACK TO SAVEPOINT outer_facet_tx");
     try db.exec("RELEASE SAVEPOINT outer_facet_tx");
+    outer_released = true;
 
     var restored = try facet_sqlite.loadPostingBitmap(db, 22, 1, "technology", 0);
     defer restored.deinit();
