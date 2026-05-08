@@ -485,6 +485,15 @@ CREATE TABLE IF NOT EXISTS search_documents (
     PRIMARY KEY(table_id, doc_id)
 );
 
+CREATE TABLE IF NOT EXISTS search_fts_docs (
+    fts_rowid INTEGER PRIMARY KEY,
+    table_id INTEGER NOT NULL,
+    doc_id INTEGER NOT NULL,
+    UNIQUE(table_id, doc_id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(content);
+
 CREATE TABLE IF NOT EXISTS search_embeddings (
     table_id INTEGER NOT NULL,
     doc_id INTEGER NOT NULL,

@@ -548,6 +548,15 @@ pub const metadata_schema_statements = [_][]const u8{
     \\    PRIMARY KEY(table_id, doc_id)
     \\);
     ,
+    \\CREATE TABLE IF NOT EXISTS search_fts_docs (
+    \\    fts_rowid INTEGER PRIMARY KEY,
+    \\    table_id INTEGER NOT NULL,
+    \\    doc_id INTEGER NOT NULL,
+    \\    UNIQUE(table_id, doc_id)
+    \\);
+    ,
+    \\CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(content);
+    ,
     \\CREATE TABLE IF NOT EXISTS search_embeddings (
     \\    table_id INTEGER NOT NULL,
     \\    doc_id INTEGER NOT NULL,
@@ -1149,6 +1158,8 @@ test "sqlite schema includes the first standalone metadata tables" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS memory_projections") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS memory_edges") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS search_documents") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS search_fts_docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS search_embeddings") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS search_document_stats") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS search_collection_stats") != null);

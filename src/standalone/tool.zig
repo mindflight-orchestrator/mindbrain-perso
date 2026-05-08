@@ -10,7 +10,7 @@ const corpus_profile_prompt = mindbrain.corpus_profile_prompt;
 const document_normalize = mindbrain.document_normalize;
 const facet_sqlite = mindbrain.facet_sqlite;
 const graph_sqlite = mindbrain.graph_sqlite;
-const hybrid_search = mindbrain.hybrid_search;
+const interfaces = mindbrain.interfaces;
 const legal_chunker = mindbrain.legal_chunker;
 const llm = mindbrain.llm;
 const nanoid = mindbrain.nanoid;
@@ -19,7 +19,6 @@ const queue_sqlite = mindbrain.queue_sqlite;
 const query_executor = mindbrain.query_executor;
 const ontology_sqlite = mindbrain.ontology_sqlite;
 const search_sqlite = mindbrain.search_sqlite;
-const tokenization_sqlite = mindbrain.tokenization_sqlite;
 const toon_exports = mindbrain.toon_exports;
 const db_benchmark = mindbrain.db_benchmark;
 const vector_blob = mindbrain.vector_blob;
@@ -2393,9 +2392,6 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
     var store = try search_sqlite.loadSearchStore(db, allocator);
     defer store.deinit();
 
-    const term_hashes = try tokenization_sqlite.tokenizeSearchHashes(allocator, query.?, null);
-    defer allocator.free(term_hashes);
-
     const query_embedding = try embedContextualText(allocator, query.?, .{
         .enabled = true,
         .embedding_base_url = base_url,
@@ -2404,19 +2400,20 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
     });
     defer allocator.free(query_embedding);
 
-    const matches = try hybrid_search.search(allocator, store.bm25Repository(), store.vectorRepository(), .{
-        .bm25_table_id = table_id.?,
-        .bm25_term_hashes = term_hashes,
-        .vector = .{
-            .table_name = "search_embeddings",
-            .key_column = "doc_id",
-            .vector_column = "embedding_blob",
-            .query_vector = query_embedding,
-            .limit = limit,
-        },
-        .vector_weight = vector_weight,
+    const bm25_matches = try search_sqlite.searchFts5Bm25(db, allocator, table_id.?, query.?, limit);
+    defer allocator.free(bm25_matches);
+
+    const vector_repo = store.vectorRepository();
+    const vector_matches = try vector_repo.searchNearestFn(vector_repo.ctx, allocator, .{
+        .table_name = "search_embeddings",
+        .key_column = "doc_id",
+        .vector_column = "embedding_blob",
+        .query_vector = query_embedding,
         .limit = limit,
     });
+    defer allocator.free(vector_matches);
+
+    const matches = try fuseBm25AndVectorMatches(allocator, bm25_matches, vector_matches, vector_weight, limit);
     defer allocator.free(matches);
 
     try writeStdout("{f}\n", .{std.json.fmt(.{
@@ -2425,6 +2422,67 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
         .vector_weight = vector_weight,
         .matches = matches,
     }, .{})});
+}
+
+const FusionScore = struct {
+    bm25_score: f64 = 0.0,
+    vector_score: f64 = 0.0,
+};
+
+fn fuseBm25AndVectorMatches(
+    allocator: Allocator,
+    bm25_matches: []const search_sqlite.Bm25Match,
+    vector_matches: []const interfaces.VectorSearchMatch,
+    vector_weight: f64,
+    limit: usize,
+) ![]interfaces.HybridSearchMatch {
+    var scores = std.AutoHashMap(interfaces.DocId, FusionScore).init(allocator);
+    defer scores.deinit();
+
+    for (bm25_matches) |match| {
+        const entry = try getOrPutFusionScore(&scores, match.doc_id);
+        entry.bm25_score = match.score;
+    }
+
+    for (vector_matches) |match| {
+        const entry = try getOrPutFusionScore(&scores, match.doc_id);
+        if (match.similarity > entry.vector_score) entry.vector_score = match.similarity;
+    }
+
+    var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
+    defer results.deinit(allocator);
+
+    var it = scores.iterator();
+    while (it.next()) |entry| {
+        const bm25_score = if (std.math.isFinite(entry.value_ptr.bm25_score)) entry.value_ptr.bm25_score else 0.0;
+        const vector_score = if (std.math.isFinite(entry.value_ptr.vector_score)) entry.value_ptr.vector_score else 0.0;
+        var combined_score = bm25_score * (1.0 - vector_weight) + vector_score * vector_weight;
+        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
+        try results.append(allocator, .{
+            .doc_id = entry.key_ptr.*,
+            .bm25_score = bm25_score,
+            .vector_score = vector_score,
+            .combined_score = combined_score,
+        });
+    }
+
+    std.mem.sort(interfaces.HybridSearchMatch, results.items, {}, struct {
+        fn lessThan(_: void, a: interfaces.HybridSearchMatch, b: interfaces.HybridSearchMatch) bool {
+            return a.combined_score > b.combined_score;
+        }
+    }.lessThan);
+
+    if (results.items.len > limit) results.shrinkRetainingCapacity(limit);
+    return results.toOwnedSlice(allocator);
+}
+
+fn getOrPutFusionScore(
+    scores: *std.AutoHashMap(interfaces.DocId, FusionScore),
+    doc_id: interfaces.DocId,
+) !*FusionScore {
+    const gop = try scores.getOrPut(doc_id);
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    return gop.value_ptr;
 }
 
 fn profileMetadataJson(

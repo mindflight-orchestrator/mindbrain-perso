@@ -22,6 +22,11 @@ pub const CompactSearchSnapshot = struct {
     embeddings: usize,
 };
 
+pub const Bm25Match = struct {
+    doc_id: interfaces.DocId,
+    score: f64,
+};
+
 pub const SearchTableSetupSpec = struct {
     table_id: u64,
     workspace_id: []const u8 = "default",
@@ -129,7 +134,7 @@ pub fn syncSearchDocument(
     language: []const u8,
 ) !void {
     try upsertSearchDocument(db, table_id, doc_id, content, language);
-    try upsertSearchArtifactsForDocument(db, allocator, table_id, doc_id);
+    _ = allocator;
 }
 
 pub fn syncSearchDocumentIfTriggered(
@@ -150,8 +155,8 @@ pub fn syncDeleteSearchDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
-    try deleteSearchArtifactsForDocument(db, allocator, table_id, doc_id);
     try deleteSearchDocument(db, table_id, doc_id);
+    try rebuildSearchArtifacts(db, allocator);
 }
 
 pub fn syncDeleteSearchDocumentIfTriggered(
@@ -181,6 +186,8 @@ pub fn upsertSearchDocument(
     try bindText(stmt, 3, content);
     try bindText(stmt, 4, language);
     try stepDone(stmt);
+
+    try upsertSearchFtsDocument(db, table_id, doc_id, content);
 }
 
 pub fn upsertSearchEmbedding(
@@ -205,7 +212,53 @@ pub fn upsertSearchEmbedding(
     try stepDone(stmt);
 }
 
+pub fn searchFts5Bm25(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    query: []const u8,
+    limit: usize,
+) ![]Bm25Match {
+    if (limit == 0) return allocator.alloc(Bm25Match, 0);
+
+    const match_query = try buildFts5OrQuery(allocator, query);
+    defer allocator.free(match_query);
+    if (match_query.len == 0) return allocator.alloc(Bm25Match, 0);
+
+    const sql =
+        \\SELECT d.doc_id, -bm25(search_fts) AS score
+        \\FROM search_fts
+        \\JOIN search_fts_docs d ON d.fts_rowid = search_fts.rowid
+        \\WHERE d.table_id = ?1 AND search_fts MATCH ?2
+        \\ORDER BY bm25(search_fts) ASC
+        \\LIMIT ?3
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    try bindInt64(stmt, 1, table_id);
+    try bindText(stmt, 2, match_query);
+    try bindInt64(stmt, 3, limit);
+
+    var matches = std.ArrayList(Bm25Match).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try matches.append(allocator, .{
+            .doc_id = try columnDocId(stmt, 0),
+            .score = c.sqlite3_column_double(stmt, 1),
+        });
+    }
+
+    return matches.toOwnedSlice(allocator);
+}
+
 pub fn deleteSearchDocument(db: Database, table_id: u64, doc_id: u64) !void {
+    try deleteSearchFtsDocument(db, table_id, doc_id);
+
     const embedding_sql = "DELETE FROM search_embeddings WHERE table_id = ?1 AND doc_id = ?2";
     const embedding_stmt = try prepare(db, embedding_sql);
     defer finalize(embedding_stmt);
@@ -219,6 +272,63 @@ pub fn deleteSearchDocument(db: Database, table_id: u64, doc_id: u64) !void {
     try bindInt64(doc_stmt, 1, table_id);
     try bindInt64(doc_stmt, 2, doc_id);
     try stepDone(doc_stmt);
+}
+
+fn upsertSearchFtsDocument(db: Database, table_id: u64, doc_id: u64, content: []const u8) !void {
+    const fts_rowid = try ensureFtsRowid(db, table_id, doc_id);
+    try deleteSearchFtsRow(db, fts_rowid);
+
+    const stmt = try prepare(db, "INSERT INTO search_fts(rowid, content) VALUES (?1, ?2)");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, fts_rowid);
+    try bindText(stmt, 2, content);
+    try stepDone(stmt);
+}
+
+fn deleteSearchFtsDocument(db: Database, table_id: u64, doc_id: u64) !void {
+    const maybe_rowid = try loadFtsRowid(db, table_id, doc_id);
+    if (maybe_rowid) |fts_rowid| {
+        try deleteSearchFtsRow(db, fts_rowid);
+    }
+
+    const stmt = try prepare(db, "DELETE FROM search_fts_docs WHERE table_id = ?1 AND doc_id = ?2");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, doc_id);
+    try stepDone(stmt);
+}
+
+fn deleteSearchFtsRow(db: Database, fts_rowid: u64) !void {
+    const stmt = try prepare(db, "DELETE FROM search_fts WHERE rowid = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, fts_rowid);
+    try stepDone(stmt);
+}
+
+fn ensureFtsRowid(db: Database, table_id: u64, doc_id: u64) !u64 {
+    if (try loadFtsRowid(db, table_id, doc_id)) |fts_rowid| return fts_rowid;
+
+    const insert_stmt = try prepare(db, "INSERT INTO search_fts_docs(table_id, doc_id) VALUES (?1, ?2)");
+    defer finalize(insert_stmt);
+    try bindInt64(insert_stmt, 1, table_id);
+    try bindInt64(insert_stmt, 2, doc_id);
+    try stepDone(insert_stmt);
+
+    const rowid = c.sqlite3_last_insert_rowid(db.handle);
+    if (rowid < 0) return error.ValueOutOfRange;
+    return @intCast(rowid);
+}
+
+fn loadFtsRowid(db: Database, table_id: u64, doc_id: u64) !?u64 {
+    const stmt = try prepare(db, "SELECT fts_rowid FROM search_fts_docs WHERE table_id = ?1 AND doc_id = ?2");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, doc_id);
+
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return null;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
 }
 
 pub fn loadSearchStore(db: Database, allocator: std.mem.Allocator) !search_store.Store {
@@ -277,6 +387,8 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
     try db.exec("DELETE FROM search_term_stats");
     try db.exec("DELETE FROM search_term_frequencies");
     try db.exec("DELETE FROM search_postings");
+    try db.exec("DELETE FROM search_fts");
+    try db.exec("DELETE FROM search_fts_docs");
 
     var writer = try ArtifactWriter.init(db);
     defer writer.deinit();
@@ -292,12 +404,6 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
     defer doc_lengths.deinit();
     var term_doc_freq = std.AutoHashMap(u128, u64).init(allocator);
     defer term_doc_freq.deinit();
-    var term_doc_ids = std.AutoHashMap(u128, std.ArrayList(u32)).init(allocator);
-    defer {
-        var it = term_doc_ids.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
-        term_doc_ids.deinit();
-    }
 
     while (true) {
         const rc = c.sqlite3_step(doc_stmt);
@@ -310,6 +416,8 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
         defer allocator.free(content);
         const language = try columnTextOwned(allocator, doc_stmt, 3);
         defer allocator.free(language);
+
+        try upsertSearchFtsDocument(db, table_id, doc_id, content);
 
         const sw = try stop_cache.sliceFor(db, language);
         const tokens = try tokenization_sqlite.tokenizeSearchHashes(allocator, content, sw);
@@ -347,10 +455,6 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
             } else {
                 df_entry.value_ptr.* = 1;
             }
-
-            const postings_entry = try term_doc_ids.getOrPut(key);
-            if (!postings_entry.found_existing) postings_entry.value_ptr.* = .empty;
-            try postings_entry.value_ptr.append(allocator, @intCast(doc_id));
         }
     }
 
@@ -365,14 +469,6 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
         const unpacked = unpackArtifactKey(entry.key_ptr.*);
         try writer.upsertTermStat(unpacked.table_id, unpacked.term_hash, entry.value_ptr.*);
     }
-
-    var postings_it = term_doc_ids.iterator();
-    while (postings_it.next()) |entry| {
-        const unpacked = unpackArtifactKey(entry.key_ptr.*);
-        var bitmap = try roaring.Bitmap.fromSlice(entry.value_ptr.items);
-        defer bitmap.deinit();
-        try writer.upsertPosting(allocator, unpacked.table_id, unpacked.term_hash, bitmap);
-    }
 }
 
 pub fn upsertSearchArtifactsForDocument(
@@ -384,69 +480,8 @@ pub fn upsertSearchArtifactsForDocument(
     const row = try loadSearchDocumentContentAndLanguage(db, allocator, table_id, doc_id);
     defer allocator.free(row.content);
     defer allocator.free(row.language);
-
-    var stop_cache = bm25_stopwords_sqlite.StopwordCache.init(allocator);
-    defer stop_cache.deinit();
-    const sw = try stop_cache.sliceFor(db, row.language);
-    const tokens = try tokenization_sqlite.tokenizeSearchHashes(allocator, row.content, sw);
-    defer allocator.free(tokens);
-
-    var new_counts = std.AutoHashMap(u64, u32).init(allocator);
-    defer new_counts.deinit();
-    for (tokens) |token| {
-        const entry = try new_counts.getOrPut(token);
-        if (entry.found_existing) {
-            entry.value_ptr.* += 1;
-        } else {
-            entry.value_ptr.* = 1;
-        }
-    }
-
-    const maybe_old_doc_stats = try loadDocumentStat(db, table_id, doc_id);
-    var old_counts = try loadTermFrequencyMapForDoc(db, allocator, table_id, doc_id);
-    defer old_counts.deinit();
-
-    const collection = try loadCollectionStat(db, table_id);
-    const had_old_doc = maybe_old_doc_stats != null;
-    const old_length: u64 = if (maybe_old_doc_stats) |doc_stats| doc_stats.document_length else 0;
-    const new_length: u64 = tokens.len;
-    const total_documents = if (had_old_doc) collection.total_documents else collection.total_documents + 1;
-    const total_length = if (had_old_doc)
-        (collection.total_length - old_length) + new_length
-    else
-        collection.total_length + new_length;
-
-    if (total_documents == 0) {
-        try deleteCollectionStat(db, table_id);
-    } else {
-        const avg_length = @as(f64, @floatFromInt(total_length)) / @as(f64, @floatFromInt(total_documents));
-        try upsertCollectionStat(db, table_id, total_documents, total_length, avg_length);
-    }
-
-    try upsertDocumentStat(db, table_id, doc_id, tokens.len, new_counts.count());
-
-    var processed = std.AutoHashMap(u64, void).init(allocator);
-    defer processed.deinit();
-
-    var old_it = old_counts.iterator();
-    while (old_it.next()) |entry| {
-        try reconcileTermArtifact(
-            db,
-            allocator,
-            table_id,
-            doc_id,
-            entry.key_ptr.*,
-            entry.value_ptr.*,
-            new_counts.get(entry.key_ptr.*) orelse 0,
-        );
-        try processed.put(entry.key_ptr.*, {});
-    }
-
-    var new_it = new_counts.iterator();
-    while (new_it.next()) |entry| {
-        if (processed.contains(entry.key_ptr.*)) continue;
-        try reconcileTermArtifact(db, allocator, table_id, doc_id, entry.key_ptr.*, 0, entry.value_ptr.*);
-    }
+    try upsertSearchFtsDocument(db, table_id, doc_id, row.content);
+    try rebuildSearchArtifacts(db, allocator);
 }
 
 pub fn deleteSearchArtifactsForDocument(
@@ -455,30 +490,8 @@ pub fn deleteSearchArtifactsForDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
-    const maybe_old_doc_stats = try loadDocumentStat(db, table_id, doc_id);
-    if (maybe_old_doc_stats == null) return;
-
-    const old_doc_stats = maybe_old_doc_stats.?;
-    const collection = try loadCollectionStat(db, table_id);
-    const total_documents = collection.total_documents - 1;
-    const total_length = collection.total_length - old_doc_stats.document_length;
-
-    if (total_documents == 0) {
-        try deleteCollectionStat(db, table_id);
-    } else {
-        const avg_length = @as(f64, @floatFromInt(total_length)) / @as(f64, @floatFromInt(total_documents));
-        try upsertCollectionStat(db, table_id, total_documents, total_length, avg_length);
-    }
-
-    var old_counts = try loadTermFrequencyMapForDoc(db, allocator, table_id, doc_id);
-    defer old_counts.deinit();
-
-    var old_it = old_counts.iterator();
-    while (old_it.next()) |entry| {
-        try reconcileTermArtifact(db, allocator, table_id, doc_id, entry.key_ptr.*, entry.value_ptr.*, 0);
-    }
-
-    try deleteDocumentStat(db, table_id, doc_id);
+    try deleteSearchFtsDocument(db, table_id, doc_id);
+    try rebuildSearchArtifacts(db, allocator);
 }
 
 pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !search_compact_store.Store {
@@ -667,7 +680,6 @@ const ArtifactWriter = struct {
     term_frequency_stmt: *c.sqlite3_stmt,
     collection_stat_stmt: *c.sqlite3_stmt,
     term_stat_stmt: *c.sqlite3_stmt,
-    posting_stmt: *c.sqlite3_stmt,
 
     fn init(db: Database) !ArtifactWriter {
         return .{
@@ -675,7 +687,6 @@ const ArtifactWriter = struct {
             .term_frequency_stmt = try prepare(db, "INSERT OR REPLACE INTO search_term_frequencies(table_id, doc_id, term_hash, frequency) VALUES (?1, ?2, ?3, ?4)"),
             .collection_stat_stmt = try prepare(db, "INSERT OR REPLACE INTO search_collection_stats(table_id, total_documents, total_document_length, avg_document_length) VALUES (?1, ?2, ?3, ?4)"),
             .term_stat_stmt = try prepare(db, "INSERT OR REPLACE INTO search_term_stats(table_id, term_hash, document_frequency) VALUES (?1, ?2, ?3)"),
-            .posting_stmt = try prepare(db, "INSERT OR REPLACE INTO search_postings(table_id, term_hash, posting_blob) VALUES (?1, ?2, ?3)"),
         };
     }
 
@@ -684,7 +695,6 @@ const ArtifactWriter = struct {
         finalize(self.term_frequency_stmt);
         finalize(self.collection_stat_stmt);
         finalize(self.term_stat_stmt);
-        finalize(self.posting_stmt);
     }
 
     fn reset(stmt: *c.sqlite3_stmt) !void {
@@ -725,16 +735,6 @@ const ArtifactWriter = struct {
         try bindHashU64(self.term_stat_stmt, 2, term_hash);
         try bindInt64(self.term_stat_stmt, 3, document_frequency);
         try stepDone(self.term_stat_stmt);
-    }
-
-    fn upsertPosting(self: *ArtifactWriter, allocator: std.mem.Allocator, table_id: u64, term_hash: u64, bitmap: roaring.Bitmap) !void {
-        try reset(self.posting_stmt);
-        const bytes = try bitmap.serializePortableStable(allocator);
-        defer allocator.free(bytes);
-        try bindInt64(self.posting_stmt, 1, table_id);
-        try bindHashU64(self.posting_stmt, 2, term_hash);
-        try bindBlob(self.posting_stmt, 3, bytes);
-        try stepDone(self.posting_stmt);
     }
 };
 
@@ -1075,6 +1075,58 @@ fn columnTextOwned(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, index: c
     return allocator.dupe(u8, slice);
 }
 
+fn buildFts5OrQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var token_count: usize = 0;
+    var i: usize = 0;
+    while (i < query.len) {
+        while (i < query.len and !isFtsTokenChar(query[i])) : (i += 1) {}
+        if (i >= query.len) break;
+
+        const start = i;
+        while (i < query.len and isFtsTokenChar(query[i])) : (i += 1) {}
+        if (start == i) continue;
+        if (isEnglishStopWordAscii(query[start..i])) continue;
+
+        if (token_count > 0) try out.appendSlice(allocator, " OR ");
+        try out.append(allocator, '"');
+        for (query[start..i]) |char| {
+            try out.append(allocator, std.ascii.toLower(char));
+        }
+        try out.append(allocator, '"');
+        token_count += 1;
+    }
+
+    if (token_count == 0) return try allocator.dupe(u8, "");
+    return out.toOwnedSlice(allocator);
+}
+
+fn isFtsTokenChar(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or char >= 0x80;
+}
+
+fn isEnglishStopWordAscii(word: []const u8) bool {
+    const stop_words = [_][]const u8{
+        "a",    "an",   "and",  "are", "as",  "at",   "be",   "by",   "for", "from",
+        "has",  "have", "he",   "in",  "is",  "it",   "its",  "of",   "on",  "or",
+        "that", "the",  "this", "to",  "was", "were", "will", "with",
+    };
+    for (stop_words) |stop| {
+        if (word.len != stop.len) continue;
+        var matches = true;
+        for (word, 0..) |char, index| {
+            if (std.ascii.toLower(char) != stop[index]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
 test "search sqlite persists and reloads standalone search state" {
     var db = try Database.openInMemory();
     defer db.close();
@@ -1120,12 +1172,11 @@ test "search sqlite rebuilds compact artifacts and reloads compact store" {
     var store = try loadCompactSearchStore(db, std.testing.allocator);
     defer store.deinit();
 
-    const bm25_repo = store.bm25Repository();
-    var bitmap = (try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, tokenization_sqlite.hashTermLexeme("roaring"))).?;
-    defer bitmap.deinit();
-    try std.testing.expect(bitmap.contains(7));
-    try std.testing.expect(bitmap.contains(9));
+    const bm25_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "roaring", 10);
+    defer std.testing.allocator.free(bm25_matches);
+    try std.testing.expectEqual(@as(usize, 2), bm25_matches.len);
 
+    const bm25_repo = store.bm25Repository();
     const doc_stats = (try bm25_repo.getDocumentStatsFn(bm25_repo.ctx, std.testing.allocator, 1, 7)).?;
     try std.testing.expect(doc_stats.document_length > 0);
 
@@ -1162,7 +1213,7 @@ test "search sqlite rebuild clears stale collection stats for removed tables" {
     try std.testing.expectEqual(@as(usize, 0), store.postings.items.len);
 }
 
-test "search sqlite incremental artifact upsert updates postings without full rebuild" {
+test "search sqlite fts upsert updates bm25 results" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
@@ -1173,16 +1224,18 @@ test "search sqlite incremental artifact upsert updates postings without full re
     try upsertSearchDocument(db, 1, 7, "graph traversal with roaring", "english");
     try upsertSearchArtifactsForDocument(db, std.testing.allocator, 1, 7);
 
+    const zig_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "zig", 10);
+    defer std.testing.allocator.free(zig_matches);
+    try std.testing.expectEqual(@as(usize, 0), zig_matches.len);
+
+    const graph_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "graph", 10);
+    defer std.testing.allocator.free(graph_matches);
+    try std.testing.expectEqual(@as(usize, 1), graph_matches.len);
+    try std.testing.expectEqual(@as(u64, 7), graph_matches[0].doc_id);
+
     var store = try loadCompactSearchStore(db, std.testing.allocator);
     defer store.deinit();
-
     const bm25_repo = store.bm25Repository();
-    try std.testing.expect((try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, tokenization_sqlite.hashTermLexeme("zig"))) == null);
-
-    var graph_bitmap = (try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, tokenization_sqlite.hashTermLexeme("graph"))).?;
-    defer graph_bitmap.deinit();
-    try std.testing.expect(graph_bitmap.contains(7));
-
     const doc_stats = (try bm25_repo.getDocumentStatsFn(bm25_repo.ctx, std.testing.allocator, 1, 7)).?;
     try std.testing.expect(doc_stats.document_length > 0);
 
@@ -1190,7 +1243,7 @@ test "search sqlite incremental artifact upsert updates postings without full re
     try std.testing.expectEqual(@as(u64, 1), collection_stats.total_documents);
 }
 
-test "search sqlite incremental artifact delete removes postings without full rebuild" {
+test "search sqlite delete removes fts bm25 rows" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
@@ -1199,18 +1252,17 @@ test "search sqlite incremental artifact delete removes postings without full re
     try upsertSearchDocument(db, 1, 9, "graph traversal with roaring", "english");
     try rebuildSearchArtifacts(db, std.testing.allocator);
 
-    try deleteSearchArtifactsForDocument(db, std.testing.allocator, 1, 7);
-    try deleteSearchDocument(db, 1, 7);
+    try syncDeleteSearchDocument(db, std.testing.allocator, 1, 7);
 
     var store = try loadCompactSearchStore(db, std.testing.allocator);
     defer store.deinit();
 
-    const bm25_repo = store.bm25Repository();
-    var roaring_bitmap = (try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, tokenization_sqlite.hashTermLexeme("roaring"))).?;
-    defer roaring_bitmap.deinit();
-    try std.testing.expect(!roaring_bitmap.contains(7));
-    try std.testing.expect(roaring_bitmap.contains(9));
+    const roaring_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "roaring", 10);
+    defer std.testing.allocator.free(roaring_matches);
+    try std.testing.expectEqual(@as(usize, 1), roaring_matches.len);
+    try std.testing.expectEqual(@as(u64, 9), roaring_matches[0].doc_id);
 
+    const bm25_repo = store.bm25Repository();
     try std.testing.expect((try bm25_repo.getDocumentStatsFn(bm25_repo.ctx, std.testing.allocator, 1, 7)) == null);
 
     const collection_stats = try bm25_repo.getCollectionStatsFn(bm25_repo.ctx, std.testing.allocator, 1);
@@ -1225,16 +1277,14 @@ test "search sqlite bm25 rebuild applies bm25_stopwords for document language" {
     try upsertSearchDocument(db, 1, 1, "the graph test", "english");
     try rebuildSearchArtifacts(db, std.testing.allocator);
 
-    var store = try loadCompactSearchStore(db, std.testing.allocator);
-    defer store.deinit();
+    const stopword_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "the", 10);
+    defer std.testing.allocator.free(stopword_matches);
+    try std.testing.expectEqual(@as(usize, 0), stopword_matches.len);
 
-    const bm25_repo = store.bm25Repository();
-    const the_hash = tokenization_sqlite.hashTermLexeme("the");
-    try std.testing.expect((try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, the_hash)) == null);
-
-    var graph_bm = (try bm25_repo.getPostingBitmapFn(bm25_repo.ctx, std.testing.allocator, 1, tokenization_sqlite.hashTermLexeme("graph"))).?;
-    defer graph_bm.deinit();
-    try std.testing.expect(graph_bm.contains(1));
+    const graph_matches = try searchFts5Bm25(db, std.testing.allocator, 1, "graph", 10);
+    defer std.testing.allocator.free(graph_matches);
+    try std.testing.expectEqual(@as(usize, 1), graph_matches.len);
+    try std.testing.expectEqual(@as(u64, 1), graph_matches[0].doc_id);
 }
 
 test "search sqlite compact snapshot reports persisted artifact counts" {
@@ -1253,7 +1303,7 @@ test "search sqlite compact snapshot reports persisted artifact counts" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.document_stats);
     try std.testing.expectEqual(@as(usize, 5), snapshot.term_stats);
     try std.testing.expectEqual(@as(usize, 6), snapshot.term_frequencies);
-    try std.testing.expectEqual(@as(usize, 5), snapshot.postings);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.postings);
     try std.testing.expectEqual(@as(usize, 2), snapshot.embeddings);
 
     const toon = try compactSearchSnapshotToon(db, std.testing.allocator);

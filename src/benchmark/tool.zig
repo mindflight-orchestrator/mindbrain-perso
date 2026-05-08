@@ -25,6 +25,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "fts5-compare")) {
+        try runFts5CompareCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "yago-import")) {
         try runYagoBenchmarkCommand(allocator, args[2..]);
         return;
@@ -46,6 +51,7 @@ fn printUsage() !void {
         \\usage:
         \\  mindbrain-benchmark-tool imdb-benchmark --db <sqlite_path> --imdb-dir <path> [--limit <n>]
         \\      [--workspace-id <id>] [--collection-id <id>] [--ontology-id <id>]
+        \\  mindbrain-benchmark-tool fts5-compare [--db <sqlite_path>] [--limit <n>] [--query <text>]...
         \\  mindbrain-benchmark-tool yago-import --db <sqlite_path> --yago-dir <path> [--limit <n>]
         \\      [--workspace-id <id>] [--collection-id <id>] [--ontology-id <id>]
         \\  mindbrain-benchmark-tool yago-benchmark --db <sqlite_path> --yago-dir <path> [--limit <n>]
@@ -53,6 +59,45 @@ fn printUsage() !void {
         \\
     );
     try stderr.flush();
+}
+
+fn runFts5CompareCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var limit: usize = 10;
+    var queries = std.ArrayList([]const u8).empty;
+    defer queries.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--query")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            try queries.append(allocator, args[index]);
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    const summary = try benchmark.fts5_compare.run(allocator, .{
+        .db_path = db_path,
+        .limit = limit,
+        .queries = queries.items,
+    });
+    defer benchmark.fts5_compare.deinitSummary(allocator, summary);
+
+    var stdout_file_writer = std.Io.File.stdout().writer(benchmark.zig16_compat.io(), &.{});
+    const stdout = &stdout_file_writer.interface;
+    try stdout.print("{f}\n", .{std.json.fmt(summary, .{})});
+    try stdout.flush();
 }
 
 fn runImdbBenchmarkCommand(allocator: Allocator, args: []const []const u8) !void {
