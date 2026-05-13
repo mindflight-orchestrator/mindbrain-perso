@@ -100,6 +100,23 @@ invalid_status="$(
 test "${invalid_status}" = "400"
 rm -f /tmp/mindbrain-http-contract-invalid.json
 
+lock_session_open="$(post_json /api/mindbrain/sql/session/open '{}')"
+lock_session_id="$(json_field "${lock_session_open}" "value.session_id")"
+second_open_body="$(mktemp "/tmp/mindbrain-http-contract-second-open.XXXXXX.json")"
+second_open_status="$(
+  curl -sS --max-time 10 -o "${second_open_body}" -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X POST "${BASE_URL}/api/mindbrain/sql/session/open" \
+    --data '{}'
+)"
+test "${second_open_status}" = "500"
+second_open_error="$(cat "${second_open_body}")"
+rm -f "${second_open_body}"
+assert_json "${second_open_error}" "value.ok === false && value.error.kind === 'ExecFailed' && value.error.operation === 'BEGIN IMMEDIATE' && value.error.sqlite_message.includes('locked')"
+lock_session_close="$(post_json /api/mindbrain/sql/session/close "{\"session_id\":${lock_session_id},\"commit\":false}")"
+assert_json "${lock_session_close}" "value.ok === true && value.session_id === ${lock_session_id} && value.committed === false"
+curl -fsS "${BASE_URL}/health" >/dev/null
+
 constraint_error="$(
   curl -sS -H "Content-Type: application/json" -X POST "${BASE_URL}/api/mindbrain/sql" \
     --data '{"sql":"INSERT INTO facets (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES (\"dup-doc\", \"ghostcrab.fact\", \"dup\", \"{}\", \"{}\", \"default\", 1)","params":[]}'

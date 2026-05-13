@@ -289,8 +289,10 @@ const MindbrainHttpApp = struct {
         errdefer session.db.close();
 
         session.db.exec("BEGIN IMMEDIATE") catch |err| {
+            const response = try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "BEGIN IMMEDIATE", err, null);
             session.db.close();
-            return err;
+            self.allocator.destroy(session);
+            return response;
         };
 
         self.sql_sessions_mutex.lockUncancelable(self.io);
