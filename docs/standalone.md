@@ -43,6 +43,7 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 |-------------|-------------|-------|
 | `POST /api/mindbrain/sql*` | High | Arbitrary SQL and transaction/session control. Trusted operators only. |
 | `POST /api/mindbrain/facts/write` | High | Durable fact-store mutation. Allocates `doc_id` and writes `facets` rows for downstream retrieval/packing clients. |
+| `GET /api/mindbrain/sql/write-status` | Medium | Reports serialized writer-lane status and counters. |
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
 | `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get` | High | Retrieval/projection output can expose packed context, evidence, or operational projection rows. |
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |

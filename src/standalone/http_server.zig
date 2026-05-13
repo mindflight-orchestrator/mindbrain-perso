@@ -23,9 +23,18 @@ fn milliTimestamp() i64 {
     return std.Io.Timestamp.now(mindbrain.zig16_compat.io(), .real).toMilliseconds();
 }
 
+fn applyReadConnectionPragmas(db: facet_sqlite.Database) !void {
+    try db.exec("PRAGMA busy_timeout=30000");
+}
+
+fn applyWriterConnectionPragmas(db: facet_sqlite.Database) !void {
+    try applyReadConnectionPragmas(db);
+    try db.exec("PRAGMA journal_mode=WAL");
+    try db.exec("PRAGMA synchronous=NORMAL");
+}
+
 const SqlSession = struct {
-    db: facet_sqlite.Database,
-    mutex: std.Io.Mutex = .init,
+    active: bool = true,
 };
 
 const SqlRequest = struct {
@@ -79,6 +88,11 @@ const MindbrainHttpApp = struct {
     sql_sessions_mutex: std.Io.Mutex,
     sql_sessions: std.AutoHashMap(u64, *SqlSession),
     next_sql_session_id: u64,
+    writer_db: facet_sqlite.Database,
+    writer_mutex: std.Io.Mutex,
+    writer_active_session_id: ?u64,
+    writer_completed: u64,
+    writer_failed: u64,
     connection_slots_mutex: std.Io.Mutex,
     active_connections: u32,
 
@@ -115,6 +129,15 @@ const MindbrainHttpApp = struct {
             allocator.free(listen_addr_text_owned);
             return err;
         };
+        if (std.fs.path.dirname(db_path_owned)) |dir| {
+            if (dir.len != 0 and !std.mem.eql(u8, dir, ".")) {
+                try std.Io.Dir.cwd().createDirPath(io, dir);
+            }
+        }
+        var writer_db = try facet_sqlite.Database.open(db_path_owned);
+        errdefer writer_db.close();
+        try applyWriterConnectionPragmas(writer_db);
+
         var app = MindbrainHttpApp{
             .allocator = allocator,
             .io = io,
@@ -131,6 +154,11 @@ const MindbrainHttpApp = struct {
             .sql_sessions_mutex = .init,
             .sql_sessions = std.AutoHashMap(u64, *SqlSession).init(allocator),
             .next_sql_session_id = 1,
+            .writer_db = writer_db,
+            .writer_mutex = .init,
+            .writer_active_session_id = null,
+            .writer_completed = 0,
+            .writer_failed = 0,
             .connection_slots_mutex = .init,
             .active_connections = 0,
         };
@@ -142,6 +170,7 @@ const MindbrainHttpApp = struct {
     pub fn deinit(self: *MindbrainHttpApp) void {
         self.closeAllSqlSessions();
         self.sql_sessions.deinit();
+        self.writer_db.close();
         self.allocator.free(self.db_path_owned);
         self.allocator.free(self.static_dir_owned);
         self.allocator.free(self.listen_addr_text_owned);
@@ -231,6 +260,7 @@ const MindbrainHttpApp = struct {
 
         var db = try facet_sqlite.Database.open(self.db_path);
         defer db.close();
+        try applyWriterConnectionPragmas(db);
         try db.applyStandaloneSchema();
         try workspace_sqlite.upsertWorkspace(db, "default", "{\"domain\":\"ghostcrab\"}");
 
@@ -262,10 +292,13 @@ const MindbrainHttpApp = struct {
         self.sql_sessions_mutex.lockUncancelable(self.io);
         defer self.sql_sessions_mutex.unlock(self.io);
 
+        if (self.writer_active_session_id != null) {
+            _ = self.writer_db.exec("ROLLBACK") catch {};
+            self.writer_active_session_id = null;
+        }
         var it = self.sql_sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
-            session.db.close();
             self.allocator.destroy(session);
         }
         self.sql_sessions.clearRetainingCapacity();
@@ -280,18 +313,20 @@ const MindbrainHttpApp = struct {
         _ = request;
         _ = body_buffer;
 
-        var session = try self.allocator.create(SqlSession);
-        errdefer self.allocator.destroy(session);
-        session.* = .{
-            .db = try self.openDb(),
-            .mutex = .init,
-        };
-        errdefer session.db.close();
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
 
-        session.db.exec("BEGIN IMMEDIATE") catch |err| {
-            const response = try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "BEGIN IMMEDIATE", err, null);
-            session.db.close();
-            self.allocator.destroy(session);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const session = try self.allocator.create(SqlSession);
+        errdefer self.allocator.destroy(session);
+        session.* = .{};
+
+        self.writer_db.exec("BEGIN IMMEDIATE") catch |err| {
+            self.writer_failed += 1;
+            const response = try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "BEGIN IMMEDIATE", err, null);
             return response;
         };
 
@@ -301,6 +336,8 @@ const MindbrainHttpApp = struct {
         const session_id = self.next_sql_session_id;
         self.next_sql_session_id += 1;
         try self.sql_sessions.put(session_id, session);
+        self.writer_active_session_id = session_id;
+        self.writer_completed += 1;
 
         return toResponse(
             try helper_api.jsonResponse(allocator, .{
@@ -322,24 +359,32 @@ const MindbrainHttpApp = struct {
 
         const session = try self.takeSqlSession(session_id);
         defer self.allocator.destroy(session);
+        session.active = false;
 
-        session.mutex.lockUncancelable(self.io);
-        defer session.mutex.unlock(self.io);
-        defer session.db.close();
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        if (self.writer_active_session_id != session_id) {
+            return try self.writerSessionMismatchResponse(allocator, session_id);
+        }
+        defer self.writer_active_session_id = null;
 
         if (commit) {
-            session.db.exec("COMMIT") catch |commit_err| {
+            self.writer_db.exec("COMMIT") catch |commit_err| {
                 var rollback_err: ?anyerror = null;
-                session.db.exec("ROLLBACK") catch |err| {
+                self.writer_db.exec("ROLLBACK") catch |err| {
                     rollback_err = err;
                 };
-                return try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "COMMIT", commit_err, rollback_err);
+                self.writer_failed += 1;
+                return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "COMMIT", commit_err, rollback_err);
             };
         } else {
-            session.db.exec("ROLLBACK") catch |rollback_err| {
-                return try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "ROLLBACK", rollback_err, null);
+            self.writer_db.exec("ROLLBACK") catch |rollback_err| {
+                self.writer_failed += 1;
+                return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "ROLLBACK", rollback_err, null);
             };
         }
+        self.writer_completed += 1;
 
         return toResponse(
             try helper_api.jsonResponse(allocator, .{
@@ -365,11 +410,36 @@ const MindbrainHttpApp = struct {
         }
 
         if (sql_request.session_id) |session_id| {
-            const session = try self.getSqlSession(session_id);
-            session.mutex.lockUncancelable(self.io);
-            defer session.mutex.unlock(self.io);
+            _ = try self.getSqlSession(session_id);
 
-            return try self.executeSql(allocator, session.db, sql_request.sql, sql_request.params);
+            self.writer_mutex.lockUncancelable(self.io);
+            defer self.writer_mutex.unlock(self.io);
+
+            if (self.writer_active_session_id != session_id) {
+                return try self.writerSessionMismatchResponse(allocator, session_id);
+            }
+
+            const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
+                self.writer_failed += 1;
+                return err;
+            };
+            self.writer_completed += 1;
+            return response;
+        }
+
+        if (shouldUseWriterLane(sql_request.sql, sql_request.params)) {
+            self.writer_mutex.lockUncancelable(self.io);
+            defer self.writer_mutex.unlock(self.io);
+
+            if (self.writer_active_session_id != null) {
+                return try self.writerSessionBusyResponse(allocator);
+            }
+            const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
+                self.writer_failed += 1;
+                return err;
+            };
+            self.writer_completed += 1;
+            return response;
         }
 
         var db = try self.openDb();
@@ -625,6 +695,11 @@ const MindbrainHttpApp = struct {
             return try self.handleSqlRequest(allocator, request, body_buffer, true);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
+            if (request.head.method != .GET) return error.MethodNotAllowed;
+            return try self.handleSqlWriteStatus(allocator);
+        }
+
         if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
 
         if (std.mem.eql(u8, path, "/health")) {
@@ -696,10 +771,13 @@ const MindbrainHttpApp = struct {
         facts_sqlite.validateFacetsJsonObject(allocator, facets_json) catch return error.BadRequest;
 
         const source_ref = normalizeOptionalText(write_request.source_ref);
-        var db = try self.openDb();
-        defer db.close();
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
 
-        const result = facts_sqlite.writeFact(db, allocator, .{
+        const result = facts_sqlite.writeFact(self.writer_db, allocator, .{
             .id = write_request.id,
             .workspace_id = workspace_id,
             .schema_id = schema_id,
@@ -713,10 +791,12 @@ const MindbrainHttpApp = struct {
         }) catch |err| switch (err) {
             error.InvalidFactWrite, error.InvalidFacetsJson => return error.BadRequest,
             error.PrepareFailed, error.StepFailed, error.BindFailed, error.ExecFailed => {
-                return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "facts.write", err, null);
+                self.writer_failed += 1;
+                return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "facts.write", err, null);
             },
             else => return err,
         };
+        self.writer_completed += 1;
         defer facts_sqlite.deinitFactWriteResult(allocator, result);
 
         return toResponse(
@@ -754,22 +834,26 @@ const MindbrainHttpApp = struct {
     }
 
     fn handleSimulate(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
-        var db = try self.openDb();
-        defer db.close();
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
 
-        var queue = queue_sqlite.QueueStore.init(db, allocator);
+        var queue = queue_sqlite.QueueStore.init(self.writer_db, allocator);
         const event = .{
             .type = "simulation",
             .event = "manual-trigger",
             .stream = "demo_firehose",
             .source = "mindbrain-http",
             .ts_unix = unixTimestamp(),
-            .graph_entities = try self.countRows(db, "graph_entity"),
-            .graph_relations = try self.countRows(db, "graph_relation"),
-            .search_documents = try self.countRows(db, "search_documents"),
-            .registered_queues = try self.countRows(db, "queue_registry"),
+            .graph_entities = try self.countRows(self.writer_db, "graph_entity"),
+            .graph_relations = try self.countRows(self.writer_db, "graph_relation"),
+            .search_documents = try self.countRows(self.writer_db, "search_documents"),
+            .registered_queues = try self.countRows(self.writer_db, "queue_registry"),
         };
         const msg_id = try queue.sendJson("demo_firehose", event);
+        self.writer_completed += 1;
 
         const summary = .{
             .ok = true,
@@ -1319,6 +1403,79 @@ const MindbrainHttpApp = struct {
         return count;
     }
 
+    fn shouldUseWriterLane(sql: []const u8, params: []const std.json.Value) bool {
+        if (params.len == 0 and countSqlStatements(sql) > 1) return true;
+
+        const trimmed = trimSqlPrefix(sql);
+        if (trimmed.len == 0) return false;
+        return !isReadOnlySql(trimmed);
+    }
+
+    fn trimSqlPrefix(sql: []const u8) []const u8 {
+        var rest = trimSqlLeft(sql);
+        while (true) {
+            if (std.mem.startsWith(u8, rest, "--")) {
+                const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+                rest = trimSqlLeft(rest[newline + 1 ..]);
+                continue;
+            }
+            if (std.mem.startsWith(u8, rest, "/*")) {
+                const end = std.mem.indexOf(u8, rest, "*/") orelse return "";
+                rest = trimSqlLeft(rest[end + 2 ..]);
+                continue;
+            }
+            break;
+        }
+        return rest;
+    }
+
+    fn isReadOnlySql(sql: []const u8) bool {
+        if (startsWithSqlKeyword(sql, "SELECT")) return true;
+        if (startsWithSqlKeyword(sql, "WITH")) return true;
+        if (startsWithSqlKeyword(sql, "EXPLAIN")) return true;
+        if (!startsWithSqlKeyword(sql, "PRAGMA")) return false;
+
+        const after_pragma = trimSqlLeft(sql["PRAGMA".len..]);
+        if (std.mem.indexOfScalar(u8, after_pragma, '=') != null) return false;
+        return startsWithSqlIdent(after_pragma, "table_info") or
+            startsWithSqlIdent(after_pragma, "table_xinfo") or
+            startsWithSqlIdent(after_pragma, "index_list") or
+            startsWithSqlIdent(after_pragma, "index_info") or
+            startsWithSqlIdent(after_pragma, "foreign_key_list") or
+            startsWithSqlIdent(after_pragma, "database_list");
+    }
+
+    fn startsWithSqlKeyword(sql: []const u8, keyword: []const u8) bool {
+        if (sql.len < keyword.len) return false;
+        if (!std.ascii.eqlIgnoreCase(sql[0..keyword.len], keyword)) return false;
+        if (sql.len == keyword.len) return true;
+        return isSqlBoundary(sql[keyword.len]);
+    }
+
+    fn startsWithSqlIdent(sql: []const u8, ident: []const u8) bool {
+        var trimmed = trimSqlLeft(sql);
+        if (std.mem.indexOfScalar(u8, trimmed, '.')) |dot| {
+            const prefix = trimmed[0..dot];
+            if (std.mem.indexOfAny(u8, prefix, " \t\r\n(") == null) {
+                trimmed = trimmed[dot + 1 ..];
+            }
+        }
+        if (trimmed.len < ident.len) return false;
+        if (!std.ascii.eqlIgnoreCase(trimmed[0..ident.len], ident)) return false;
+        if (trimmed.len == ident.len) return true;
+        return isSqlBoundary(trimmed[ident.len]);
+    }
+
+    fn isSqlBoundary(ch: u8) bool {
+        return std.ascii.isWhitespace(ch) or ch == '(' or ch == ';';
+    }
+
+    fn trimSqlLeft(sql: []const u8) []const u8 {
+        var start: usize = 0;
+        while (start < sql.len and std.mem.indexOfScalar(u8, " \t\r\n", sql[start]) != null) : (start += 1) {}
+        return sql[start..];
+    }
+
     fn toResponse(api_response: helper_api.ApiResponse) Response {
         return .{
             .status = api_response.status,
@@ -1328,7 +1485,25 @@ const MindbrainHttpApp = struct {
     }
 
     fn openDb(self: *MindbrainHttpApp) !facet_sqlite.Database {
-        return try facet_sqlite.Database.open(self.db_path);
+        var db = try facet_sqlite.Database.open(self.db_path);
+        errdefer db.close();
+        try applyReadConnectionPragmas(db);
+        return db;
+    }
+
+    fn handleSqlWriteStatus(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        return toResponse(
+            try helper_api.jsonResponse(allocator, .{
+                .ok = true,
+                .mode = "serialized-writer",
+                .active_session_id = self.writer_active_session_id,
+                .completed = self.writer_completed,
+                .failed = self.writer_failed,
+            }),
+        );
     }
 
     fn handleStatic(self: *MindbrainHttpApp, allocator: std.mem.Allocator, path: []const u8) !Response {
@@ -1415,6 +1590,38 @@ const MindbrainHttpApp = struct {
             try out.writer.print(",\"rollback_error\":{f}", .{std.json.fmt(@errorName(rollback), .{})});
         }
         try out.writer.writeAll("}}");
+        return .{
+            .status = status,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
+    fn writerSessionBusyResponse(_: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        return jsonResponseWithStatus(allocator, .service_unavailable, .{
+            .ok = false,
+            .@"error" = .{
+                .code = "sql_session_busy",
+                .message = "a SQL write session is already active",
+            },
+        });
+    }
+
+    fn writerSessionMismatchResponse(_: *MindbrainHttpApp, allocator: std.mem.Allocator, session_id: u64) !Response {
+        return jsonResponseWithStatus(allocator, .conflict, .{
+            .ok = false,
+            .@"error" = .{
+                .code = "sql_session_not_active",
+                .message = "the SQL session is not the active writer session",
+                .session_id = session_id,
+            },
+        });
+    }
+
+    fn jsonResponseWithStatus(allocator: std.mem.Allocator, status: http.Status, value: anytype) !Response {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(value, .{})});
         return .{
             .status = status,
             .content_type = "application/json; charset=utf-8",
@@ -1984,4 +2191,18 @@ test "graph subgraph sse encoder emits expected frames" {
     try std.testing.expect(std.mem.indexOf(u8, body, "data: {\"entity\":{\"entity_id\":1}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "event: done\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"subgraph\"") != null);
+}
+
+test "http sql writer lane classifier separates reads from writes" {
+    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("SELECT 1", &.{}));
+    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane(" -- inspect\nPRAGMA table_info(workspaces)", &.{}));
+    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("/* inspect */\nselect 1", &.{}));
+    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("WITH rows AS (SELECT 1) SELECT * FROM rows", &.{}));
+    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("PRAGMA main.table_xinfo(workspaces)", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA busy_timeout=1", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA journal_mode", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("VACUUM", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("CREATE TABLE t(id INTEGER)", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("INSERT INTO t(id) VALUES (?)", &.{std.json.Value{ .integer = 1 }}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("SELECT 1; SELECT 2", &.{}));
 }

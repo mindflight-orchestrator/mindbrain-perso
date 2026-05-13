@@ -71,8 +71,18 @@ post_json() {
   curl -fsS -H "Content-Type: application/json" -X POST "${BASE_URL}${path}" --data "${body}"
 }
 
+get_json() {
+  local path="$1"
+  curl -fsS "${BASE_URL}${path}"
+}
+
+initial_write_status="$(get_json /api/mindbrain/sql/write-status)"
+assert_json "${initial_write_status}" "value.ok === true && value.mode === 'serialized-writer' && value.active_session_id === null && typeof value.completed === 'number' && typeof value.failed === 'number'"
+
 append="$(post_json /api/mindbrain/facts/write '{"schema_id":"ghostcrab.fact","content":"append smoke","facets_json":"{\"kind\":\"note\"}"}')"
 assert_json "${append}" "value.ok === true && value.created === true && value.updated === false && value.doc_id === 1"
+after_append_status="$(get_json /api/mindbrain/sql/write-status)"
+assert_json "${after_append_status}" "value.ok === true && value.completed >= 1 && value.active_session_id === null"
 
 source_create="$(post_json /api/mindbrain/facts/write '{"workspace_id":"ws","schema_id":"ghostcrab.fact","content":"source smoke","facets_json":"{\"kind\":\"state\"}","source_ref":"sync:1"}')"
 assert_json "${source_create}" "value.ok === true && value.created === true && value.updated === false && value.doc_id === 2"
@@ -102,6 +112,8 @@ rm -f /tmp/mindbrain-http-contract-invalid.json
 
 lock_session_open="$(post_json /api/mindbrain/sql/session/open '{}')"
 lock_session_id="$(json_field "${lock_session_open}" "value.session_id")"
+active_write_status="$(get_json /api/mindbrain/sql/write-status)"
+assert_json "${active_write_status}" "value.ok === true && value.active_session_id === ${lock_session_id}"
 second_open_body="$(mktemp "/tmp/mindbrain-http-contract-second-open.XXXXXX.json")"
 second_open_status="$(
   curl -sS --max-time 10 -o "${second_open_body}" -w "%{http_code}" \
@@ -109,12 +121,25 @@ second_open_status="$(
     -X POST "${BASE_URL}/api/mindbrain/sql/session/open" \
     --data '{}'
 )"
-test "${second_open_status}" = "500"
+test "${second_open_status}" = "503"
 second_open_error="$(cat "${second_open_body}")"
 rm -f "${second_open_body}"
-assert_json "${second_open_error}" "value.ok === false && value.error.kind === 'ExecFailed' && value.error.operation === 'BEGIN IMMEDIATE' && value.error.sqlite_message.includes('locked')"
+assert_json "${second_open_error}" "value.ok === false && value.error.code === 'sql_session_busy'"
+busy_write_body="$(mktemp "/tmp/mindbrain-http-contract-busy-write.XXXXXX.json")"
+busy_write_status="$(
+  curl -sS --max-time 10 -o "${busy_write_body}" -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X POST "${BASE_URL}/api/mindbrain/sql" \
+    --data '{"sql":"INSERT INTO facets (schema_id, content, facets, workspace_id) VALUES (\"busy:http\", \"busy raw\", \"{}\", \"default\")","params":[]}'
+)"
+test "${busy_write_status}" = "503"
+busy_write_error="$(cat "${busy_write_body}")"
+rm -f "${busy_write_body}"
+assert_json "${busy_write_error}" "value.ok === false && value.error.code === 'sql_session_busy'"
 lock_session_close="$(post_json /api/mindbrain/sql/session/close "{\"session_id\":${lock_session_id},\"commit\":false}")"
 assert_json "${lock_session_close}" "value.ok === true && value.session_id === ${lock_session_id} && value.committed === false"
+inactive_write_status="$(get_json /api/mindbrain/sql/write-status)"
+assert_json "${inactive_write_status}" "value.ok === true && value.active_session_id === null"
 curl -fsS "${BASE_URL}/health" >/dev/null
 
 constraint_error="$(

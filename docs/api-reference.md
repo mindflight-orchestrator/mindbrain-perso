@@ -59,10 +59,17 @@ the server bound to loopback or place it behind an external auth/proxy layer.
 | `POST` | `/api/mindbrain/sql/session/open` | empty body | `{ ok, session_id }` and starts `BEGIN IMMEDIATE` |
 | `POST` | `/api/mindbrain/sql/session/query` | `{ "session_id": 1, "sql": "...", "params": [...] }` | Same shape as `/sql`; session is required |
 | `POST` | `/api/mindbrain/sql/session/close` | `{ "session_id": 1, "commit": true }` | `{ ok, session_id, committed }` |
+| `GET` | `/api/mindbrain/sql/write-status` | none | `{ ok, mode, active_session_id, completed, failed }` |
 
 `params` is an array of JSON values. Unknown JSON fields are rejected. If a
 non-session SQL request has no parameters and contains multiple statements, the
 server executes it through SQLite `exec` and returns only mutation metadata.
+
+Standalone HTTP serializes writes through one writer connection using WAL,
+`busy_timeout`, and `synchronous=NORMAL`. SQL writes, SQL sessions, fact writes,
+and `/api/mindbrain/simulate` use that writer lane; read-only SQL uses separate
+read connections. `/api/mindbrain/sql/write-status` reports the current writer
+mode, active SQL session if any, and completed/failed writer operation counters.
 
 SQL execution failures return JSON with `ok:false` and an `error` object that
 contains the MindBrain operation name, SQLite primary and extended result codes,
