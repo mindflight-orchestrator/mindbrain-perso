@@ -3,6 +3,7 @@ const std = @import("std");
 pub const default_listen_addr = "127.0.0.1:8091";
 pub const default_max_body_bytes: usize = 1024 * 1024;
 pub const default_max_connections: u32 = 128;
+pub const default_sqlite_busy_timeout_ms: u32 = 30_000;
 
 pub const StartupOptions = struct {
     addr_text: []const u8,
@@ -11,6 +12,7 @@ pub const StartupOptions = struct {
     init_only: bool,
     max_body_bytes: usize,
     max_connections: u32,
+    sqlite_busy_timeout_ms: u32,
 };
 
 pub fn resolveStartupOptions(
@@ -20,6 +22,7 @@ pub fn resolveStartupOptions(
     env_static_dir: ?[]const u8,
     env_max_body: ?[]const u8,
     env_max_conns: ?[]const u8,
+    env_sqlite_busy_timeout_ms: ?[]const u8,
     printUsageFn: *const fn () anyerror!void,
 ) !StartupOptions {
     var options = StartupOptions{
@@ -29,6 +32,7 @@ pub fn resolveStartupOptions(
         .init_only = false,
         .max_body_bytes = if (env_max_body) |value| try parsePositiveUsize(value) else default_max_body_bytes,
         .max_connections = if (env_max_conns) |value| try parsePositiveU32(value) else default_max_connections,
+        .sqlite_busy_timeout_ms = if (env_sqlite_busy_timeout_ms) |value| try parsePositiveU32(value) else default_sqlite_busy_timeout_ms,
     };
 
     var index: usize = 1;
@@ -56,6 +60,12 @@ pub fn resolveStartupOptions(
             options.static_dir = arg["--static-dir=".len..];
         } else if (std.mem.eql(u8, arg, "--init-only")) {
             options.init_only = true;
+        } else if (std.mem.eql(u8, arg, "--sqlite-busy-timeout-ms")) {
+            index += 1;
+            if (index >= args.len) return error.InvalidArguments;
+            options.sqlite_busy_timeout_ms = try parsePositiveU32(args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--sqlite-busy-timeout-ms=")) {
+            options.sqlite_busy_timeout_ms = try parsePositiveU32(arg["--sqlite-busy-timeout-ms=".len..]);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsageFn();
             return error.InvalidArguments;
@@ -118,6 +128,7 @@ test "startup options default to loopback and env limits" {
         null,
         "4096",
         "7",
+        "1234",
         noopUsage,
     );
 
@@ -126,12 +137,14 @@ test "startup options default to loopback and env limits" {
     try std.testing.expectEqualStrings("dashboard/dist", options.static_dir);
     try std.testing.expectEqual(@as(usize, 4096), options.max_body_bytes);
     try std.testing.expectEqual(@as(u32, 7), options.max_connections);
+    try std.testing.expectEqual(@as(u32, 1234), options.sqlite_busy_timeout_ms);
 }
 
 test "startup options prefer env listen addr when cli is absent" {
     const options = try resolveStartupOptions(
         &.{"mindbrain-http"},
         "0.0.0.0:9000",
+        null,
         null,
         null,
         null,
@@ -146,6 +159,7 @@ test "startup options let cli override env listen addr" {
     const options = try resolveStartupOptions(
         &.{ "mindbrain-http", "--addr", "127.0.0.1:7001" },
         "0.0.0.0:9000",
+        null,
         null,
         null,
         null,

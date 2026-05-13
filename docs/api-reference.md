@@ -32,6 +32,7 @@ Environment and CLI options:
 | `--init-only` | Initialize the database schema and exit without listening. | off |
 | `MINDBRAIN_HTTP_MAX_BODY_BYTES` | Maximum JSON body size for SQL requests. | `1048576` |
 | `MINDBRAIN_HTTP_MAX_CONNS` | Maximum concurrent accepted connections. | `128` |
+| `--sqlite-busy-timeout-ms <n>` / `MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS` | SQLite busy timeout for backend connections. | `30000` |
 
 ### Security
 
@@ -59,7 +60,7 @@ the server bound to loopback or place it behind an external auth/proxy layer.
 | `POST` | `/api/mindbrain/sql/session/open` | empty body | `{ ok, session_id }` and starts `BEGIN IMMEDIATE` |
 | `POST` | `/api/mindbrain/sql/session/query` | `{ "session_id": 1, "sql": "...", "params": [...] }` | Same shape as `/sql`; session is required |
 | `POST` | `/api/mindbrain/sql/session/close` | `{ "session_id": 1, "commit": true }` | `{ ok, session_id, committed }` |
-| `GET` | `/api/mindbrain/sql/write-status` | none | `{ ok, mode, active_session_id, completed, failed }` |
+| `GET` | `/api/mindbrain/sql/write-status` | none | `{ ok, mode, active_session_id, completed, failed, busy_timeout_ms, last_error }` |
 
 `params` is an array of JSON values. Unknown JSON fields are rejected. If a
 non-session SQL request has no parameters and contains multiple statements, the

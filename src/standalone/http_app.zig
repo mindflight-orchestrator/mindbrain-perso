@@ -23,14 +23,20 @@ fn milliTimestamp() i64 {
     return std.Io.Timestamp.now(zig16_compat.io(), .real).toMilliseconds();
 }
 
-fn applyReadConnectionPragmas(db: facet_sqlite.Database) !void {
-    try db.exec("PRAGMA busy_timeout=30000");
+fn applyReadConnectionPragmas(db: facet_sqlite.Database, busy_timeout_ms: u32) !void {
+    try setBusyTimeout(db, busy_timeout_ms);
 }
 
-fn applyWriterConnectionPragmas(db: facet_sqlite.Database) !void {
-    try applyReadConnectionPragmas(db);
+fn applyWriterConnectionPragmas(db: facet_sqlite.Database, busy_timeout_ms: u32) !void {
+    try applyReadConnectionPragmas(db, busy_timeout_ms);
     try db.exec("PRAGMA journal_mode=WAL");
     try db.exec("PRAGMA synchronous=NORMAL");
+}
+
+fn setBusyTimeout(db: facet_sqlite.Database, busy_timeout_ms: u32) !void {
+    if (facet_sqlite.c.sqlite3_busy_timeout(db.handle, @intCast(busy_timeout_ms)) != facet_sqlite.c.SQLITE_OK) {
+        return error.ExecFailed;
+    }
 }
 
 const SqlSession = struct {
@@ -71,6 +77,7 @@ pub const MindbrainHttpOptions = struct {
     init_only: bool = false,
     max_body_bytes: usize = http_config.default_max_body_bytes,
     max_connections: u32 = http_config.default_max_connections,
+    sqlite_busy_timeout_ms: u32 = http_config.default_sqlite_busy_timeout_ms,
     service_name: []const u8 = "mindbrain-http",
     warn_on_empty_graph: bool = true,
     default_workspace: DefaultWorkspaceOptions = .{},
@@ -104,6 +111,10 @@ pub const MindbrainHttpApp = struct {
     writer_active_session_id: ?u64,
     writer_completed: u64,
     writer_failed: u64,
+    writer_last_error_operation: ?[]u8,
+    writer_last_error_kind: ?[]u8,
+    writer_last_error_message: ?[]u8,
+    sqlite_busy_timeout_ms: u32,
     connection_slots_mutex: std.Io.Mutex,
     active_connections: u32,
 
@@ -118,6 +129,7 @@ pub const MindbrainHttpApp = struct {
         const env_static_dir = environ_map.get("MINDBRAIN_STATIC_DIR");
         const env_max_body = environ_map.get("MINDBRAIN_HTTP_MAX_BODY_BYTES");
         const env_max_conns = environ_map.get("MINDBRAIN_HTTP_MAX_CONNS");
+        const env_sqlite_busy_timeout_ms = environ_map.get("MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS");
 
         const options = try http_config.resolveStartupOptions(
             args,
@@ -126,6 +138,7 @@ pub const MindbrainHttpApp = struct {
             env_static_dir,
             env_max_body,
             env_max_conns,
+            env_sqlite_busy_timeout_ms,
             printUsage,
         );
 
@@ -136,6 +149,7 @@ pub const MindbrainHttpApp = struct {
             .init_only = options.init_only,
             .max_body_bytes = options.max_body_bytes,
             .max_connections = options.max_connections,
+            .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
         });
     }
 
@@ -175,7 +189,7 @@ pub const MindbrainHttpApp = struct {
         }
         var writer_db = try facet_sqlite.Database.open(db_path_owned);
         errdefer writer_db.close();
-        try applyWriterConnectionPragmas(writer_db);
+        try applyWriterConnectionPragmas(writer_db, options.sqlite_busy_timeout_ms);
 
         var app = MindbrainHttpApp{
             .allocator = allocator,
@@ -205,6 +219,10 @@ pub const MindbrainHttpApp = struct {
             .writer_active_session_id = null,
             .writer_completed = 0,
             .writer_failed = 0,
+            .writer_last_error_operation = null,
+            .writer_last_error_kind = null,
+            .writer_last_error_message = null,
+            .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
             .connection_slots_mutex = .init,
             .active_connections = 0,
         };
@@ -217,6 +235,7 @@ pub const MindbrainHttpApp = struct {
         self.closeAllSqlSessions();
         self.sql_sessions.deinit();
         self.writer_db.close();
+        self.clearWriterLastError();
         self.allocator.free(self.db_path_owned);
         self.allocator.free(self.static_dir_owned);
         self.allocator.free(self.listen_addr_text_owned);
@@ -312,7 +331,7 @@ pub const MindbrainHttpApp = struct {
 
         var db = try facet_sqlite.Database.open(self.db_path);
         defer db.close();
-        try applyWriterConnectionPragmas(db);
+        try applyWriterConnectionPragmas(db, self.sqlite_busy_timeout_ms);
         try db.applyStandaloneSchema();
         try workspace_sqlite.upsertWorkspace(
             db,
@@ -385,6 +404,29 @@ pub const MindbrainHttpApp = struct {
         self.sql_sessions.clearRetainingCapacity();
     }
 
+    fn clearWriterLastError(self: *MindbrainHttpApp) void {
+        if (self.writer_last_error_operation) |value| self.allocator.free(value);
+        if (self.writer_last_error_kind) |value| self.allocator.free(value);
+        if (self.writer_last_error_message) |value| self.allocator.free(value);
+        self.writer_last_error_operation = null;
+        self.writer_last_error_kind = null;
+        self.writer_last_error_message = null;
+    }
+
+    fn recordWriterError(self: *MindbrainHttpApp, db: facet_sqlite.Database, operation: []const u8, err: anyerror) void {
+        self.clearWriterLastError();
+        self.writer_last_error_operation = self.allocator.dupe(u8, operation) catch null;
+        self.writer_last_error_kind = self.allocator.dupe(u8, @errorName(err)) catch null;
+        const message = std.mem.span(facet_sqlite.c.sqlite3_errmsg(db.handle));
+        self.writer_last_error_message = self.allocator.dupe(u8, message) catch null;
+    }
+
+    fn recordWriterSqliteResponseError(self: *MindbrainHttpApp, db: facet_sqlite.Database, operation: []const u8, err: anyerror) void {
+        if (db.handle != self.writer_db.handle) return;
+        self.writer_failed += 1;
+        self.recordWriterError(db, operation, err);
+    }
+
     fn handleSqlSessionOpen(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -407,6 +449,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_db.exec("BEGIN IMMEDIATE") catch |err| {
             self.writer_failed += 1;
+            self.recordWriterError(self.writer_db, "BEGIN IMMEDIATE", err);
             const response = try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "BEGIN IMMEDIATE", err, null);
             return response;
         };
@@ -457,11 +500,13 @@ pub const MindbrainHttpApp = struct {
                     rollback_err = err;
                 };
                 self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "COMMIT", commit_err);
                 return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "COMMIT", commit_err, rollback_err);
             };
         } else {
             self.writer_db.exec("ROLLBACK") catch |rollback_err| {
                 self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "ROLLBACK", rollback_err);
                 return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "ROLLBACK", rollback_err, null);
             };
         }
@@ -502,6 +547,7 @@ pub const MindbrainHttpApp = struct {
 
             const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
                 self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "sql.session.query", err);
                 return err;
             };
             self.writer_completed += 1;
@@ -517,6 +563,7 @@ pub const MindbrainHttpApp = struct {
             }
             const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
                 self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "sql", err);
                 return err;
             };
             self.writer_completed += 1;
@@ -579,6 +626,7 @@ pub const MindbrainHttpApp = struct {
 
         if (has_multiple_statements) {
             db.exec(sql) catch |err| {
+                self.recordWriterSqliteResponseError(db, "exec", err);
                 return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "exec", err, null);
             };
             return toResponse(
@@ -594,12 +642,16 @@ pub const MindbrainHttpApp = struct {
 
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK or stmt == null) {
+            self.recordWriterSqliteResponseError(db, "prepare", error.PrepareFailed);
             return try self.sqliteErrorResponse(allocator, db, .bad_request, "prepare", error.PrepareFailed, null);
         }
         defer _ = c.sqlite3_finalize(stmt.?);
 
         bindSqlParams(stmt.?, params) catch |err| switch (err) {
-            error.BindFailed => return try self.sqliteErrorResponse(allocator, db, .bad_request, "bind", err, null),
+            error.BindFailed => {
+                self.recordWriterSqliteResponseError(db, "bind", err);
+                return try self.sqliteErrorResponse(allocator, db, .bad_request, "bind", err, null);
+            },
             else => return err,
         };
 
@@ -624,6 +676,7 @@ pub const MindbrainHttpApp = struct {
             const rc = c.sqlite3_step(stmt.?);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) {
+                self.recordWriterSqliteResponseError(db, "step", error.StepFailed);
                 return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "step", error.StepFailed, null);
             }
 
@@ -873,6 +926,7 @@ pub const MindbrainHttpApp = struct {
             error.InvalidFactWrite, error.InvalidFacetsJson => return error.BadRequest,
             error.PrepareFailed, error.StepFailed, error.BindFailed, error.ExecFailed => {
                 self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "facts.write", err);
                 return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "facts.write", err, null);
             },
             else => return err,
@@ -1512,7 +1566,6 @@ pub const MindbrainHttpApp = struct {
 
     fn isReadOnlySql(sql: []const u8) bool {
         if (startsWithSqlKeyword(sql, "SELECT")) return true;
-        if (startsWithSqlKeyword(sql, "WITH")) return true;
         if (startsWithSqlKeyword(sql, "EXPLAIN")) return true;
         if (!startsWithSqlKeyword(sql, "PRAGMA")) return false;
 
@@ -1568,7 +1621,7 @@ pub const MindbrainHttpApp = struct {
     fn openDb(self: *MindbrainHttpApp) !facet_sqlite.Database {
         var db = try facet_sqlite.Database.open(self.db_path);
         errdefer db.close();
-        try applyReadConnectionPragmas(db);
+        try applyReadConnectionPragmas(db, self.sqlite_busy_timeout_ms);
         return db;
     }
 
@@ -1583,6 +1636,12 @@ pub const MindbrainHttpApp = struct {
                 .active_session_id = self.writer_active_session_id,
                 .completed = self.writer_completed,
                 .failed = self.writer_failed,
+                .busy_timeout_ms = self.sqlite_busy_timeout_ms,
+                .last_error = if (self.writer_last_error_kind) |kind| .{
+                    .operation = self.writer_last_error_operation,
+                    .kind = kind,
+                    .message = self.writer_last_error_message,
+                } else null,
             }),
         );
     }
@@ -2092,12 +2151,13 @@ fn mimeTypeForPath(path: []const u8) []const u8 {
 fn printUsage() !void {
     std.debug.print(
         \\usage:
-        \\  mindbrain-http [--addr <ip:port>] [--db <sqlite_path>] [--static-dir <dir>] [--init-only]
+        \\  mindbrain-http [--addr <ip:port>] [--db <sqlite_path>] [--static-dir <dir>] [--sqlite-busy-timeout-ms <n>] [--init-only]
         \\
         \\env:
         \\  MINDBRAIN_HTTP_ADDR=127.0.0.1:8091   bind IP + port (default loopback only)
         \\  MINDBRAIN_HTTP_MAX_BODY_BYTES=1048576  cap SQL JSON request bodies
         \\  MINDBRAIN_HTTP_MAX_CONNS=128           cap concurrent connections
+        \\  MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS=30000 SQLite busy timeout
         \\  MINDBRAIN_DB_PATH=data/mindbrain.sqlite
         \\  MINDBRAIN_STATIC_DIR=dashboard/dist
         \\
@@ -2278,7 +2338,8 @@ test "http sql writer lane classifier separates reads from writes" {
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("SELECT 1", &.{}));
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane(" -- inspect\nPRAGMA table_info(workspaces)", &.{}));
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("/* inspect */\nselect 1", &.{}));
-    try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("WITH rows AS (SELECT 1) SELECT * FROM rows", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("WITH rows AS (SELECT 1) SELECT * FROM rows", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("WITH row AS (SELECT 1) INSERT INTO facets(schema_id, content, facets, workspace_id) SELECT 's', 'c', '{}', 'default' FROM row", &.{}));
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("PRAGMA main.table_xinfo(workspaces)", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA busy_timeout=1", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA journal_mode", &.{}));

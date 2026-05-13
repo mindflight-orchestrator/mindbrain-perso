@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIG_BIN="${ZIG:-/opt/zig/zig-x86_64-linux-0.16.0/zig}"
 PORT="${MINDBRAIN_HTTP_CONTRACT_PORT:-8097}"
+BUSY_TIMEOUT_MS="${MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS:-1000}"
 ADDR="127.0.0.1:${PORT}"
 BASE_URL="http://${ADDR}"
 DB_PATH="$(mktemp "/tmp/mindbrain-http-contract.XXXXXX.sqlite")"
@@ -24,7 +25,7 @@ ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-/tmp/zig-cache}" \
 ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zig-global-cache}" \
   "${ZIG_BIN}" build standalone-http --summary all --error-style minimal
 
-MINDBRAIN_DB_PATH="${DB_PATH}" ./zig-out/bin/mindbrain-http --addr "${ADDR}" >"${LOG_PATH}" 2>&1 &
+MINDBRAIN_DB_PATH="${DB_PATH}" MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS="${BUSY_TIMEOUT_MS}" ./zig-out/bin/mindbrain-http --addr "${ADDR}" >"${LOG_PATH}" 2>&1 &
 server_pid="$!"
 
 for _ in {1..80}; do
@@ -77,7 +78,7 @@ get_json() {
 }
 
 initial_write_status="$(get_json /api/mindbrain/sql/write-status)"
-assert_json "${initial_write_status}" "value.ok === true && value.mode === 'serialized-writer' && value.active_session_id === null && typeof value.completed === 'number' && typeof value.failed === 'number'"
+assert_json "${initial_write_status}" "value.ok === true && value.mode === 'serialized-writer' && value.active_session_id === null && typeof value.completed === 'number' && typeof value.failed === 'number' && value.busy_timeout_ms === ${BUSY_TIMEOUT_MS}"
 
 append="$(post_json /api/mindbrain/facts/write '{"schema_id":"ghostcrab.fact","content":"append smoke","facets_json":"{\"kind\":\"note\"}"}')"
 assert_json "${append}" "value.ok === true && value.created === true && value.updated === false && value.doc_id === 1"
@@ -115,27 +116,44 @@ lock_session_id="$(json_field "${lock_session_open}" "value.session_id")"
 active_write_status="$(get_json /api/mindbrain/sql/write-status)"
 assert_json "${active_write_status}" "value.ok === true && value.active_session_id === ${lock_session_id}"
 second_open_body="$(mktemp "/tmp/mindbrain-http-contract-second-open.XXXXXX.json")"
+second_open_start_ms="$(date +%s%3N)"
 second_open_status="$(
   curl -sS --max-time 10 -o "${second_open_body}" -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST "${BASE_URL}/api/mindbrain/sql/session/open" \
     --data '{}'
 )"
+second_open_elapsed_ms="$(( $(date +%s%3N) - second_open_start_ms ))"
 test "${second_open_status}" = "503"
+test "${second_open_elapsed_ms}" -lt 500
 second_open_error="$(cat "${second_open_body}")"
 rm -f "${second_open_body}"
 assert_json "${second_open_error}" "value.ok === false && value.error.code === 'sql_session_busy'"
 busy_write_body="$(mktemp "/tmp/mindbrain-http-contract-busy-write.XXXXXX.json")"
+busy_write_start_ms="$(date +%s%3N)"
 busy_write_status="$(
   curl -sS --max-time 10 -o "${busy_write_body}" -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST "${BASE_URL}/api/mindbrain/sql" \
     --data '{"sql":"INSERT INTO facets (schema_id, content, facets, workspace_id) VALUES (\"busy:http\", \"busy raw\", \"{}\", \"default\")","params":[]}'
 )"
+busy_write_elapsed_ms="$(( $(date +%s%3N) - busy_write_start_ms ))"
 test "${busy_write_status}" = "503"
+test "${busy_write_elapsed_ms}" -lt 500
 busy_write_error="$(cat "${busy_write_body}")"
 rm -f "${busy_write_body}"
 assert_json "${busy_write_error}" "value.ok === false && value.error.code === 'sql_session_busy'"
+with_write_body="$(mktemp "/tmp/mindbrain-http-contract-with-write.XXXXXX.json")"
+with_write_status="$(
+  curl -sS --max-time 10 -o "${with_write_body}" -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X POST "${BASE_URL}/api/mindbrain/sql" \
+    --data '{"sql":"WITH row AS (SELECT 1) INSERT INTO facets (schema_id, content, facets, workspace_id) SELECT \"busy:with\", \"busy with\", \"{}\", \"default\" FROM row","params":[]}'
+)"
+test "${with_write_status}" = "503"
+with_write_error="$(cat "${with_write_body}")"
+rm -f "${with_write_body}"
+assert_json "${with_write_error}" "value.ok === false && value.error.code === 'sql_session_busy'"
 lock_session_close="$(post_json /api/mindbrain/sql/session/close "{\"session_id\":${lock_session_id},\"commit\":false}")"
 assert_json "${lock_session_close}" "value.ok === true && value.session_id === ${lock_session_id} && value.committed === false"
 inactive_write_status="$(get_json /api/mindbrain/sql/write-status)"
@@ -155,6 +173,8 @@ session_error="$(
     --data "{\"session_id\":${session_id},\"sql\":\"INSERT INTO facets (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES ('dup-in-session', 'ghostcrab.fact', 'dup', '{}', '{}', 'default', 1)\",\"params\":[]}"
 )"
 assert_json "${session_error}" "value.ok === false && value.error.kind === 'StepFailed'"
+failed_status="$(get_json /api/mindbrain/sql/write-status)"
+assert_json "${failed_status}" "value.ok === true && value.last_error && value.last_error.kind === 'StepFailed' && typeof value.last_error.message === 'string'"
 session_close="$(post_json /api/mindbrain/sql/session/close "{\"session_id\":${session_id},\"commit\":false}")"
 assert_json "${session_close}" "value.ok === true && value.session_id === ${session_id} && value.committed === false"
 

@@ -33,6 +33,7 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 ### Bind configuration
 
 - `MINDBRAIN_HTTP_ADDR` sets the listen address from the environment, including both IP and port, for example `127.0.0.1:8091`, `0.0.0.0:8091`, or `[::1]:8091`.
+- `MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS` or `--sqlite-busy-timeout-ms` sets the SQLite busy timeout. Production defaults to `30000`; integration harnesses can lower it to fail fast on lock contention.
 - `--addr` overrides `MINDBRAIN_HTTP_ADDR` when you need a one-off CLI override.
 - `MINDBRAIN_HTTP_MAX_BODY_BYTES` caps SQL JSON request bodies.
 - `MINDBRAIN_HTTP_MAX_CONNS` caps concurrent client connections.
