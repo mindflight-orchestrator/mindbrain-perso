@@ -8,6 +8,7 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 |----------|-------------|
 | [overview.md](overview.md) | What the system contains and how the pieces fit together |
 | [installation.md](installation.md) | Dependencies, build, and installing the runtime |
+| [api-reference.md](api-reference.md) | Current HTTP routes, CLI commands, and native/SQL surface boundaries |
 | [facets.md](facets.md) | `facets` schema: faceting, search, BM25 |
 | [graph.md](graph.md) | `graph` schema: entities, relations, native traversal |
 | [pragma.md](pragma.md) | Memory projection helpers and `pragma_*` SQL functions |
@@ -25,8 +26,8 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 
 ## Source of truth
 
-- SQL objects: SQL install script
+- SQL objects: [../sql/sqlite_mindbrain--1.0.0.sql](../sql/sqlite_mindbrain--1.0.0.sql)
 - Zig sources: [src/](../src/) (`mb_facets`, `mb_graph`, `mb_pragma`, `standalone`)
-- Control file: control file
+- Runtime entrypoints: [../src/standalone/tool.zig](../src/standalone/tool.zig), [../src/standalone/http_server.zig](../src/standalone/http_server.zig), [../build.zig](../build.zig)
 
 This project is **not** the GhostCrab MCP server; it is the SQLite runtime and supporting library those applications may call into.

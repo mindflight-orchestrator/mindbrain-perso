@@ -1,13 +1,14 @@
-# MindBrain (`pg_mindbrain`)
+# MindBrain
 
-PostgreSQL extension and standalone SQLite engine for **faceted search** (Roaring Bitmaps + **BM25**), **graph traversal**, **memory projection** helpers, and **workspace** metadata — implemented primarily in **Zig**, with the SQL surface in a single install script.
+SQLite-first knowledge runtime and native library for **faceted search** (Roaring Bitmaps + **BM25**), **graph traversal**, **memory projection** helpers, workspace metadata, document collections, and a small local HTTP/CLI API. The implementation is primarily **Zig**.
 
 ## Documentation
 
 All user-facing documentation lives under **[docs/](docs/README.md)**:
 
 - [docs/overview.md](docs/overview.md) — architecture and scope  
-- [docs/installation.md](docs/installation.md) — build and `CREATE EXTENSION`  
+- [docs/installation.md](docs/installation.md) — build, native install notes, and standalone runtime prerequisites
+- [docs/api-reference.md](docs/api-reference.md) — current HTTP routes and CLI commands
 - [docs/facets.md](docs/facets.md) · [docs/graph.md](docs/graph.md) · [docs/pragma.md](docs/pragma.md)  
 - [docs/workspace.md](docs/workspace.md) · [docs/standalone.md](docs/standalone.md) · [docs/demo-benchmark.md](docs/demo-benchmark.md)  
 - [docs/native-reference.md](docs/native-reference.md) · [docs/third-party.md](docs/third-party.md)
@@ -21,12 +22,14 @@ zig build
 zig build standalone-tool   # optional: SQLite CLI
 ```
 
-Requires PostgreSQL server headers for the extension, **`roaringbitmap`** in the target database, and **SQLite** for standalone targets.
+Requires PostgreSQL server headers for the native shared library and **SQLite** for standalone targets. Use Zig **0.16.0** explicitly if `zig` on `PATH` points to an older toolchain.
 
-## Extension metadata
+## Runtime metadata
 
-- Control file: [pg_mindbrain.control](pg_mindbrain.control)  
-- SQL install script: [sql/sqlite_mindbrain--1.0.0.sql](sql/sqlite_mindbrain--1.0.0.sql)
+- Standalone CLI: [src/standalone/tool.zig](src/standalone/tool.zig)
+- Standalone HTTP server: [src/standalone/http_server.zig](src/standalone/http_server.zig)
+- SQLite SQL install script: [sql/sqlite_mindbrain--1.0.0.sql](sql/sqlite_mindbrain--1.0.0.sql)
+- Native shared library build target: `pg_mindbrain` in [build.zig](build.zig)
 
 ## Public GitHub mirror
 

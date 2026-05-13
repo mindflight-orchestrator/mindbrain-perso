@@ -23,7 +23,7 @@ Cross-compiling the standalone binaries also requires target-compatible SQLite d
 
 ## HTTP server: `mindbrain-http`
 
-`mindbrain-http` serves the SQLite-backed API and static dashboard assets from the standalone layer.
+`mindbrain-http` serves the SQLite-backed API and static dashboard assets from the standalone layer. The route-by-route contract is maintained in [api-reference.md](api-reference.md).
 
 ### Security model
 
@@ -42,8 +42,8 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 |-------------|-------------|-------|
 | `POST /api/mindbrain/sql*` | High | Arbitrary SQL and transaction/session control. Trusted operators only. |
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
-| `GET /api/mindbrain/pack` | High | Retrieval output can expose packed context for a user/query pair. |
-| `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
+| `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get` | High | Retrieval/projection output can expose packed context, evidence, or operational projection rows. |
+| `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
 | `GET /health`, static assets | Low | Basic liveness/static serving only. |
 
 ## CLI: `mindbrain-standalone-tool`
@@ -51,20 +51,28 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 Usage strings from the tool:
 
 ```text
-mindbrain-standalone-tool workspace-create --db <sqlite_path> --workspace-id <id> [--label <text>] [--description <text>] [--profile <name>]
-mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
-mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
-mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> ... (--content <text> | --content-file <path>)
-mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] ...
-mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] ...
-mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] ...
-mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--archive-failures] ...
-mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
 mindbrain-standalone-tool traverse --db <sqlite_path> --start <node_id> [--direction outbound|inbound] [--depth <n>] [--target <node_id>] [--edge-label <label> ...]
 mindbrain-standalone-tool workspace-export --db <sqlite_path> --workspace-id <id>
+mindbrain-standalone-tool workspace-create --db <sqlite_path> --workspace-id <id> [--label <text>] [--description <text>] [--profile <name>]
+mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
+mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
+mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
+mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
+mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
+mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
+mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
+mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
+mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
+mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
+mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
+mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> --base-url <url> --embedding-model <name> [--api-key <key>] [--limit <n>] [--vector-weight <0..1>]
+mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
+mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
 mindbrain-standalone-tool search-compact-info --db <sqlite_path>
 mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
+mindbrain-standalone-tool seed-demo --db <sqlite_path>
+mindbrain-standalone-tool bootstrap-from-sql --db <sqlite_path> --sql-file <path>
 mindbrain-standalone-tool workspace-export-by-domain --db <sqlite_path> --domain-or-workspace <id>
 mindbrain-standalone-tool coverage --db <sqlite_path> --workspace-id <id> [--entity-type <type> ...]
 mindbrain-standalone-tool coverage-by-domain --db <sqlite_path> --domain-or-workspace <id> [--entity-type <type> ...]
@@ -80,13 +88,18 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 
 - **`traverse`** — Graph walk from a start node; prints JSON (`target_found`, `rows`).
 - **`workspace-export`** — Emits **TOON** workspace model export to stdout.
+- **`workspace-create` / `collection-create` / `collection-export` / `collection-import`** — Workspace and collection lifecycle plus portable JSON bundle export/import.
+- **`ontology-register` / `ontology-attach`** — Register workspace-scoped ontologies and attach them to collections.
 - **`graph-path`** — Path finding between named nodes.
 - **`benchmark-db`** — Runs facet and graph query/mutation benchmarks against a SQLite database and returns JSON with embedded TOON payloads for the facet and graph query results.
 - **`graph/subgraph`** — SSE graph stream for browser clients (`seed_node`, `node`, `edge`, `done`).
 - **`coverage` / `coverage-by-domain`** — Emits a TOON `coverage_report` with a summary and per-gap rows for ontology or taxonomy nodes that are not currently covered by the graph.
 - **`pack`** — Context packing-style retrieval for a user/query (SQLite implementation).
+- **`document-ingest` / `document-by-nanoid` / `external-link-add`** — Raw document/chunk ingestion, public document-id lookup, and cross-document link insertion.
 - **`document-normalize`** — Orchestrates external PDF/HTML extraction tools (`pdftotext`, `ocrmypdf`, `pandoc`, or a DeepSeek command template) and writes normalized `.txt` / `.md` plus sidecar metadata.
 - **`document-profile` / `document-profile-enqueue` / `document-profile-worker`** — LLM document “semantic id card” JSON, optional SQLite queue, optional persist to `documents_raw` and `chunks_raw` (see [document-profile.md](document-profile.md)).
+- **`contextual-search`** — Embedding-backed contextual retrieval over a search table.
+- **`seed-demo` / `bootstrap-from-sql`** — Seed the built-in demo dataset or execute a SQL bootstrap file against a SQLite database.
 - **`corpus-eval`** — Deterministic checks against [fixtures/](../fixtures/corpus_eval/) (no network).
 - **`queue-*`** — Lightweight message queue operations on the SQLite runtime (`queue_messages` and helpers in [`queue_sqlite.zig`](../src/standalone/queue_sqlite.zig)).
 - **`simulate`** — Internal simulation entrypoint (see source for behavior).
