@@ -17,6 +17,7 @@ pub const db_benchmark = @import("db_benchmark.zig");
 pub const document_normalize = @import("document_normalize.zig");
 pub const interfaces = @import("interfaces.zig");
 pub const helper_api = @import("helper_api.zig");
+pub const http_app = @import("http_app.zig");
 pub const legal_chunker = @import("legal_chunker.zig");
 pub const llm = @import("llm/lib.zig");
 pub const llm_client = @import("llm_client.zig");

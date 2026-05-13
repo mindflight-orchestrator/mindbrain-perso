@@ -26,6 +26,7 @@ comptime {
     _ = @import("graph_sqlite.zig");
     _ = @import("graph_store.zig");
     _ = @import("helper_api.zig");
+    _ = @import("http_app.zig");
     _ = @import("http_server_config.zig");
     _ = @import("hybrid_search.zig");
     _ = @import("import_pipeline.zig");
