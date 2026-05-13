@@ -9,6 +9,7 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 | [overview.md](overview.md) | What the system contains and how the pieces fit together |
 | [installation.md](installation.md) | Dependencies, build, and installing the runtime |
 | [api-reference.md](api-reference.md) | Current HTTP routes, CLI commands, and native/SQL surface boundaries |
+| [comparison/README.md](comparison/README.md) | API and SQL migration comparison with the sibling `pg_mindbrain` PostgreSQL extension |
 | [facets.md](facets.md) | `facets` schema: faceting, search, BM25 |
 | [graph.md](graph.md) | `graph` schema: entities, relations, native traversal |
 | [pragma.md](pragma.md) | Memory projection helpers and `pragma_*` SQL functions |

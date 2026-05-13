@@ -19,6 +19,7 @@ comptime {
     _ = @import("facet_parity_test.zig");
     _ = @import("bm25_stopwords_sqlite.zig");
     _ = @import("facet_sqlite.zig");
+    _ = @import("facts_sqlite.zig");
     _ = @import("facet_store.zig");
     _ = @import("fixture_loader.zig");
     _ = @import("fixture_repositories.zig");

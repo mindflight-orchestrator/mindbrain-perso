@@ -1,6 +1,7 @@
 const std = @import("std");
 const mindbrain = @import("mindbrain");
 const facet_sqlite = mindbrain.facet_sqlite;
+const facts_sqlite = mindbrain.facts_sqlite;
 const graph_sqlite = mindbrain.graph_sqlite;
 const helper_api = mindbrain.helper_api;
 const ontology_sqlite = mindbrain.ontology_sqlite;
@@ -32,6 +33,19 @@ const SqlRequest = struct {
     params: []const std.json.Value = &.{},
     session_id: ?u64 = null,
     commit: ?bool = null,
+};
+
+const FactWriteRequest = struct {
+    id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
+    schema_id: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    facets_json: ?[]const u8 = null,
+    embedding_blob: ?[]const u8 = null,
+    created_by: ?[]const u8 = null,
+    valid_from_unix: ?i64 = null,
+    valid_until_unix: ?i64 = null,
+    source_ref: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -309,13 +323,21 @@ const MindbrainHttpApp = struct {
 
         session.mutex.lockUncancelable(self.io);
         defer session.mutex.unlock(self.io);
+        defer session.db.close();
 
         if (commit) {
-            try session.db.exec("COMMIT");
+            session.db.exec("COMMIT") catch |commit_err| {
+                var rollback_err: ?anyerror = null;
+                session.db.exec("ROLLBACK") catch |err| {
+                    rollback_err = err;
+                };
+                return try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "COMMIT", commit_err, rollback_err);
+            };
         } else {
-            try session.db.exec("ROLLBACK");
+            session.db.exec("ROLLBACK") catch |rollback_err| {
+                return try self.sqliteErrorResponse(allocator, session.db, .internal_server_error, "ROLLBACK", rollback_err, null);
+            };
         }
-        session.db.close();
 
         return toResponse(
             try helper_api.jsonResponse(allocator, .{
@@ -399,12 +421,13 @@ const MindbrainHttpApp = struct {
         sql: []const u8,
         params: []const std.json.Value,
     ) !Response {
-        _ = self;
         const c = facet_sqlite.c;
         const has_multiple_statements = params.len == 0 and countSqlStatements(sql) > 1;
 
         if (has_multiple_statements) {
-            try db.exec(sql);
+            db.exec(sql) catch |err| {
+                return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "exec", err, null);
+            };
             return toResponse(
                 try helper_api.jsonResponse(allocator, .{
                     .ok = true,
@@ -418,11 +441,14 @@ const MindbrainHttpApp = struct {
 
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK or stmt == null) {
-            return error.PrepareFailed;
+            return try self.sqliteErrorResponse(allocator, db, .bad_request, "prepare", error.PrepareFailed, null);
         }
         defer _ = c.sqlite3_finalize(stmt.?);
 
-        try bindSqlParams(stmt.?, params);
+        bindSqlParams(stmt.?, params) catch |err| switch (err) {
+            error.BindFailed => return try self.sqliteErrorResponse(allocator, db, .bad_request, "bind", err, null),
+            else => return err,
+        };
 
         const column_count: usize = @intCast(c.sqlite3_column_count(stmt.?));
         var columns = std.ArrayList([]const u8).empty;
@@ -444,7 +470,9 @@ const MindbrainHttpApp = struct {
         while (true) {
             const rc = c.sqlite3_step(stmt.?);
             if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            if (rc != c.SQLITE_ROW) {
+                return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "step", error.StepFailed, null);
+            }
 
             const row = try allocator.alloc(std.json.Value, column_count);
             errdefer allocator.free(row);
@@ -570,6 +598,11 @@ const MindbrainHttpApp = struct {
         query: []const u8,
         body_buffer: []u8,
     ) !Response {
+        if (std.mem.eql(u8, path, "/api/mindbrain/facts/write")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleFactWrite(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleSqlRequest(allocator, request, body_buffer, false);
@@ -641,6 +674,81 @@ const MindbrainHttpApp = struct {
         }
 
         return self.handleStatic(allocator, path);
+    }
+
+    fn handleFactWrite(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseFactWriteRequest(allocator, request, body_buffer);
+        const schema_id = write_request.schema_id orelse return error.BadRequest;
+        const content = write_request.content orelse return error.BadRequest;
+        if (schema_id.len == 0 or content.len == 0) return error.BadRequest;
+
+        const workspace_id = write_request.workspace_id orelse "default";
+        if (workspace_id.len == 0) return error.BadRequest;
+
+        const facets_json = write_request.facets_json orelse "{}";
+        facts_sqlite.validateFacetsJsonObject(allocator, facets_json) catch return error.BadRequest;
+
+        const source_ref = normalizeOptionalText(write_request.source_ref);
+        var db = try self.openDb();
+        defer db.close();
+
+        const result = facts_sqlite.writeFact(db, allocator, .{
+            .id = write_request.id,
+            .workspace_id = workspace_id,
+            .schema_id = schema_id,
+            .content = content,
+            .facets_json = facets_json,
+            .embedding_blob = write_request.embedding_blob,
+            .created_by = write_request.created_by,
+            .valid_from_unix = write_request.valid_from_unix,
+            .valid_until_unix = write_request.valid_until_unix,
+            .source_ref = source_ref,
+        }) catch |err| switch (err) {
+            error.InvalidFactWrite, error.InvalidFacetsJson => return error.BadRequest,
+            error.PrepareFailed, error.StepFailed, error.BindFailed, error.ExecFailed => {
+                return try self.sqliteErrorResponse(allocator, db, .internal_server_error, "facts.write", err, null);
+            },
+            else => return err,
+        };
+        defer facts_sqlite.deinitFactWriteResult(allocator, result);
+
+        return toResponse(
+            try helper_api.jsonResponse(allocator, .{
+                .ok = true,
+                .id = result.id,
+                .doc_id = result.doc_id,
+                .created = result.created,
+                .updated = result.updated,
+            }),
+        );
+    }
+
+    fn parseFactWriteRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !FactWriteRequest {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        return try std.json.parseFromSliceLeaky(
+            FactWriteRequest,
+            allocator,
+            body,
+            .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = false,
+            },
+        );
     }
 
     fn handleSimulate(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
@@ -1275,6 +1383,42 @@ const MindbrainHttpApp = struct {
             },
         );
     }
+
+    fn sqliteErrorResponse(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        db: facet_sqlite.Database,
+        status: http.Status,
+        operation: []const u8,
+        err: anyerror,
+        rollback_err: ?anyerror,
+    ) !Response {
+        _ = self;
+        const rc = facet_sqlite.c.sqlite3_errcode(db.handle);
+        const extended_rc = facet_sqlite.c.sqlite3_extended_errcode(db.handle);
+        const message = std.mem.span(facet_sqlite.c.sqlite3_errmsg(db.handle));
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print(
+            "{{\"ok\":false,\"error\":{{\"kind\":{f},\"operation\":{f},\"sqlite_code\":{},\"sqlite_extended_code\":{},\"sqlite_message\":{f}",
+            .{
+                std.json.fmt(@errorName(err), .{}),
+                std.json.fmt(operation, .{}),
+                rc,
+                extended_rc,
+                std.json.fmt(message, .{}),
+            },
+        );
+        if (rollback_err) |rollback| {
+            try out.writer.print(",\"rollback_error\":{f}", .{std.json.fmt(@errorName(rollback), .{})});
+        }
+        try out.writer.writeAll("}}");
+        return .{
+            .status = status,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
 };
 
 const Response = struct {
@@ -1329,6 +1473,12 @@ fn normalizeOptionalQueryValue(value: ?[]const u8) ?[]const u8 {
     if (text.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(text, "null")) return null;
     if (std.ascii.eqlIgnoreCase(text, "nil")) return null;
+    return text;
+}
+
+fn normalizeOptionalText(value: ?[]const u8) ?[]const u8 {
+    const text = value orelse return null;
+    if (text.len == 0) return null;
     return text;
 }
 
@@ -1670,6 +1820,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/sql/session/open
         \\  POST /api/mindbrain/sql/session/query
         \\  POST /api/mindbrain/sql/session/close
+        \\  POST /api/mindbrain/facts/write
         \\  GET /health
         \\  GET /api/events  (SSE demo_firehose, long-lived)
         \\  GET /api/mindbrain/simulate

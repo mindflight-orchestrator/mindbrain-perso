@@ -6,6 +6,7 @@ pub const corpus_profile = @import("corpus_profile.zig");
 pub const corpus_profile_prompt = @import("corpus_profile_prompt.zig");
 pub const bm25_stopwords_sqlite = @import("bm25_stopwords_sqlite.zig");
 pub const facet_sqlite = @import("facet_sqlite.zig");
+pub const facts_sqlite = @import("facts_sqlite.zig");
 pub const fixture_loader = @import("fixture_loader.zig");
 pub const fixture_repositories = @import("fixture_repositories.zig");
 pub const graph_sqlite = @import("graph_sqlite.zig");

@@ -298,7 +298,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS facets_source_ref_workspace_uniq
     ON facets(source_ref, workspace_id)
     WHERE source_ref IS NOT NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_facets_source_ref_workspace
+CREATE INDEX IF NOT EXISTS idx_facets_source_ref_workspace
     ON facets(source_ref, workspace_id)
     WHERE source_ref IS NOT NULL;
 
@@ -331,8 +331,9 @@ BEGIN
     SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
         facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
         embedding = COALESCE(NEW.embedding, embedding),
+        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM facets WHERE rowid <> NEW.rowid)),
         updated_at = CURRENT_TIMESTAMP
-    WHERE id = NEW.id;
+    WHERE rowid = NEW.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sync_facets_compat_after_update

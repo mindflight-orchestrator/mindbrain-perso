@@ -42,7 +42,7 @@ the server bound to loopback or place it behind an external auth/proxy layer.
 ### Response rules
 
 - `GET` and `HEAD` are accepted for read routes and static assets.
-- SQL routes accept `POST` only.
+- SQL and fact-write routes accept `POST` only.
 - Unsupported methods return `405`.
 - Missing or invalid required parameters return `400`.
 - Missing sessions or unknown domain/workspace lookups return `404` where the
@@ -63,6 +63,57 @@ the server bound to loopback or place it behind an external auth/proxy layer.
 `params` is an array of JSON values. Unknown JSON fields are rejected. If a
 non-session SQL request has no parameters and contains multiple statements, the
 server executes it through SQLite `exec` and returns only mutation metadata.
+
+SQL execution failures return JSON with `ok:false` and an `error` object that
+contains the MindBrain operation name, SQLite primary and extended result codes,
+and the raw SQLite error message:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "kind": "StepFailed",
+    "operation": "step",
+    "sqlite_code": 19,
+    "sqlite_extended_code": 2067,
+    "sqlite_message": "UNIQUE constraint failed: facets.doc_id"
+  }
+}
+```
+
+Session close always closes the SQLite handle after attempting the requested
+`COMMIT` or `ROLLBACK`; if `COMMIT` fails, the server attempts a rollback before
+returning the error payload.
+
+### Fact write endpoint
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/api/mindbrain/facts/write` | `{ "workspace_id": "default", "schema_id": "...", "content": "...", "facets_json": "{}", "source_ref": "...", "created_by": "...", "valid_from_unix": 0, "valid_until_unix": 0 }` | `{ ok, id, doc_id, created, updated }` |
+
+Required fields are `schema_id` and `content`; both must be non-empty.
+`workspace_id` defaults to `default`. `facets_json` defaults to `{}` and must
+parse as a JSON object text. `source_ref` is optional; an empty string is
+normalized to null by the HTTP layer.
+
+The endpoint is the standalone durable fact-store write API. It writes to the
+`facets` table and keeps the legacy `facets` text column and `facets_json`
+column in sync. `doc_id` is allocated by MindBrain inside the same SQLite write
+transaction as the insert, using the next integer above the current maximum
+`facets.doc_id`.
+
+Write behavior:
+
+- When `source_ref` is absent, each request appends a new fact row and returns a
+  new `id` and `doc_id`.
+- When `source_ref` is present, rows are upserted by `(workspace_id,
+  source_ref)`. Existing rows keep their original `id` and `doc_id` and return
+  `updated:true`; new rows return `created:true`.
+- Fresh schemas keep `facets.doc_id` unique and use a compatibility trigger to
+  allocate it for legacy raw SQL inserts that omit the value. Downstream
+  search/pack clients should still treat non-null `doc_id` as the durable
+  integer document key, and new clients should prefer this endpoint instead of
+  writing `facets` directly.
 
 ### Read endpoints
 

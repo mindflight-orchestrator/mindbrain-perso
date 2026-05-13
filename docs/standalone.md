@@ -16,6 +16,7 @@ For **LLM-assisted document profiling**, durable queue jobs, and offline corpus 
 | `zig build standalone-http` | Installs **`mindbrain-http`** |
 | `zig build benchmark-tool` | Installs **`mindbrain-benchmark-tool`** |
 | `zig build bench-standalone` | Runs **`standalone-bench`** (linked with SQLite) |
+| `scripts/test-standalone-http-contract.sh` | Builds `mindbrain-http`, starts it on a temporary SQLite DB, and verifies the fact-write and SQL-session HTTP contract |
 | `./scripts/prebuilds-all.sh` | Cross-compiles standalone binaries into **`prebuilds/{platform-arch}/bin/`** with **Zig 0.16.x** |
 
 Linking requires **libsqlite3** on the system for standalone binaries and tests.
@@ -27,7 +28,7 @@ Cross-compiling the standalone binaries also requires target-compatible SQLite d
 
 ### Security model
 
-Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. The SQL routes (`POST /api/mindbrain/sql`, `POST /api/mindbrain/sql/session/open`, `POST /api/mindbrain/sql/session/query`, `POST /api/mindbrain/sql/session/close`) are **unauthenticated** and can execute arbitrary SQLite statements. By default the server should stay on **loopback** (`127.0.0.1:8091`). Only bind to `0.0.0.0` or another non-loopback IP when the deployment is on a trusted network segment or behind your own auth/reverse-proxy layer.
+Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. The SQL routes (`POST /api/mindbrain/sql`, `POST /api/mindbrain/sql/session/open`, `POST /api/mindbrain/sql/session/query`, `POST /api/mindbrain/sql/session/close`) are **unauthenticated** and can execute arbitrary SQLite statements. The fact-write route (`POST /api/mindbrain/facts/write`) can persist durable rows into the standalone fact store. By default the server should stay on **loopback** (`127.0.0.1:8091`). Only bind to `0.0.0.0` or another non-loopback IP when the deployment is on a trusted network segment or behind your own auth/reverse-proxy layer.
 
 ### Bind configuration
 
@@ -41,6 +42,7 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 | Route group | Sensitivity | Notes |
 |-------------|-------------|-------|
 | `POST /api/mindbrain/sql*` | High | Arbitrary SQL and transaction/session control. Trusted operators only. |
+| `POST /api/mindbrain/facts/write` | High | Durable fact-store mutation. Allocates `doc_id` and writes `facets` rows for downstream retrieval/packing clients. |
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
 | `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get` | High | Retrieval/projection output can expose packed context, evidence, or operational projection rows. |
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
@@ -135,6 +137,14 @@ const db = try mindbrain.facet_sqlite.Database.open("data/mindbrain.sqlite");
 ## Schema
 
 SQLite DDL and migrations are maintained in Zig modules such as [src/standalone/sqlite_schema.zig](../src/standalone/sqlite_schema.zig) and applied via helpers like `applyStandaloneSchema()` where used.
+
+The standalone fact-store contract uses the `facets` table as the durable fact
+row table. MindBrain allocates `facets.doc_id` transactionally in
+`POST /api/mindbrain/facts/write`, appends rows when `source_ref` is absent, and
+upserts synchronized rows by `(workspace_id, source_ref)` when `source_ref` is
+present. Fresh schemas also keep a compatibility trigger that assigns `doc_id`
+for legacy raw SQL inserts that omit it, but new clients should use the HTTP
+write API instead of allocating or omitting `doc_id` themselves.
 
 ## Relationship to the source tree
 
