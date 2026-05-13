@@ -3,7 +3,7 @@ const std = @import("std");
 pub const default_listen_addr = "127.0.0.1:8091";
 pub const default_max_body_bytes: usize = 1024 * 1024;
 pub const default_max_connections: u32 = 128;
-pub const default_sqlite_busy_timeout_ms: u32 = 30_000;
+pub const default_sqlite_busy_timeout_ms: u32 = 1_000;
 
 pub const StartupOptions = struct {
     addr_text: []const u8,

@@ -2157,7 +2157,7 @@ fn printUsage() !void {
         \\  MINDBRAIN_HTTP_ADDR=127.0.0.1:8091   bind IP + port (default loopback only)
         \\  MINDBRAIN_HTTP_MAX_BODY_BYTES=1048576  cap SQL JSON request bodies
         \\  MINDBRAIN_HTTP_MAX_CONNS=128           cap concurrent connections
-        \\  MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS=30000 SQLite busy timeout
+        \\  MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS=1000  SQLite busy timeout
         \\  MINDBRAIN_DB_PATH=data/mindbrain.sqlite
         \\  MINDBRAIN_STATIC_DIR=dashboard/dist
         \\

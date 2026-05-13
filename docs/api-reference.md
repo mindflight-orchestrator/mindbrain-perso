@@ -32,7 +32,7 @@ Environment and CLI options:
 | `--init-only` | Initialize the database schema and exit without listening. | off |
 | `MINDBRAIN_HTTP_MAX_BODY_BYTES` | Maximum JSON body size for SQL requests. | `1048576` |
 | `MINDBRAIN_HTTP_MAX_CONNS` | Maximum concurrent accepted connections. | `128` |
-| `--sqlite-busy-timeout-ms <n>` / `MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS` | SQLite busy timeout for backend connections. | `30000` |
+| `--sqlite-busy-timeout-ms <n>` / `MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS` | SQLite busy timeout for backend connections. | `1000` |
 
 ### Security
 
