@@ -363,14 +363,17 @@ fn detectSimdReport() SimdReport {
 }
 
 fn detectRoaringSupportX86() RoaringSupport {
-    const support = croaring_hardware_support();
+    if (comptime builtin.cpu.arch != .x86_64) {
+        return .{ .avx2 = false, .avx512 = false };
+    }
+    const support = (struct {
+        extern fn croaring_hardware_support() c_int;
+    }).croaring_hardware_support();
     return .{
         .avx2 = (support & 1) != 0,
         .avx512 = (support & 2) != 0,
     };
 }
-
-extern fn croaring_hardware_support() c_int;
 
 fn runSavepointScoped(db: facet_sqlite.Database, comptime savepoint_name: []const u8, comptime func: anytype, ctx: anytype) !void {
     try db.exec("SAVEPOINT " ++ savepoint_name);

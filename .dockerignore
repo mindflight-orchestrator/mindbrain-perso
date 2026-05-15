@@ -1,0 +1,41 @@
+# Build artefacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Zig package fetch cache
+zig-pkg/
+
+# Data (exclude large databases/prebuilts; keep small test fixtures)
+db/
+data/
+!data/sources/
+!data/sources/**
+datasets/
+prebuilds/
+fixtures/
+
+# Documentation (exclude plans; keep JSON fixtures needed by tests)
+docs/
+!docs/fixtures/hybrid_search_baseline_fixture.json
+examples/
+
+# Scripts (not needed for the image)
+scripts/
+
+# Tests (Zig tests run from src/)
+test/
+
+# SQL migration scripts (embedded or applied externally)
+sql/
+sqlite_mindbrain--1.0.0.sql
+
+# Git and editor
+.git/
+.cursor/
+.vscode/
+
+# Misc
+*.md
+Licence.md
+META.json

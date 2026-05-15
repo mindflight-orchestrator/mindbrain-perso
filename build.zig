@@ -18,21 +18,17 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const root_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    configureCroaring(root_mod, .{});
+    const neon = b.option(
+        NeonMode,
+        "neon",
+        "ARM NEON support: auto (off on aarch64 until 4.7.0 verified on M1), on, off",
+    ) orelse .auto;
 
     const ztoon_mod = b.createModule(.{
         .root_source_file = b.path("deps/ztoon/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root_mod.addImport("ztoon", ztoon_mod);
 
     const standalone_http_lib_mod = b.createModule(.{
         .root_source_file = b.path("src/standalone/lib.zig"),
@@ -40,7 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureCroaring(standalone_http_lib_mod, .{ .disable_neon = true });
+    configureCroaring(b, standalone_http_lib_mod, target, neon);
     standalone_http_lib_mod.addImport("ztoon", ztoon_mod);
 
     const benchmark_mod = b.createModule(.{
@@ -49,36 +45,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     benchmark_mod.addImport("mindbrain", standalone_http_lib_mod);
-
-    const lib = b.addLibrary(.{
-        .name = "pg_mindbrain",
-        .root_module = root_mod,
-        .linkage = .dynamic,
-    });
-
-    var pg_server_include: []const u8 = "/usr/include/postgresql/server";
-    var pg_config_code: u8 = 0;
-    if (b.runAllowFail(&.{ "pg_config", "--includedir-server" }, &pg_config_code, .ignore)) |stdout| {
-        pg_server_include = std.mem.trim(u8, stdout, " \n\r\t");
-    } else |_| {
-        // Keep the historical fallback paths when pg_config is unavailable.
-    }
-
-    root_mod.addSystemIncludePath(.{ .cwd_relative = pg_server_include });
-    root_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql/16/server" });
-    root_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql/17/server" });
-    root_mod.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/postgresql@17/include/server" });
-    root_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/postgresql@17/include/server" });
-    root_mod.addSystemIncludePath(.{ .cwd_relative = "../../.pg_install/include/server" });
-
-    root_mod.addCSourceFile(.{
-        .file = b.path("src/common/helper.c"),
-        .flags = &.{},
-    });
-
-    lib.linker_allow_shlib_undefined = true;
-
-    b.installArtifact(lib);
 
     // Test root must live in the same module as the source files we want
     // discovered, otherwise their `test ""` blocks are invisible to the test
@@ -90,7 +56,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureCroaring(standalone_test_mod, .{ .disable_neon = true });
+    configureCroaring(b, standalone_test_mod, target, neon);
     standalone_test_mod.addImport("ztoon", ztoon_mod);
 
     const standalone_tests = b.addTest(.{
@@ -133,7 +99,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureCroaring(standalone_bench_mod, .{ .disable_neon = true });
+    configureCroaring(b, standalone_bench_mod, target, neon);
     standalone_bench_mod.addImport("ztoon", ztoon_mod);
 
     const standalone_bench = b.addExecutable(.{
@@ -201,43 +167,25 @@ pub fn build(b: *std.Build) void {
     const install_standalone_http = b.addInstallArtifact(standalone_http, .{});
     const standalone_http_step = b.step("standalone-http", "Build standalone HTTP server (dashboard API)");
     standalone_http_step.dependOn(&install_standalone_http.step);
-
-    var extension_dir: []const u8 = "/usr/share/postgresql/16/extension";
-    pg_config_code = 0;
-    if (b.runAllowFail(&.{ "pg_config", "--sharedir" }, &pg_config_code, .ignore)) |stdout| {
-        const sharedir = std.mem.trim(u8, stdout, " \n\r\t");
-        extension_dir = std.fmt.allocPrint(b.allocator, "{s}/extension", .{sharedir}) catch extension_dir;
-    } else |_| {
-        // Keep the historical fallback path when pg_config is unavailable.
-    }
-
-    _ = b.addInstallFileWithDir(
-        b.path("pg_mindbrain.control"),
-        .{ .custom = extension_dir },
-        "pg_mindbrain.control",
-    );
-
-    _ = b.addInstallFileWithDir(
-        b.path("sql/sqlite_mindbrain--1.0.0.sql"),
-        .{ .custom = extension_dir },
-        "sqlite_mindbrain--1.0.0.sql",
-    );
 }
 
-const CroaringOptions = struct {
-    disable_neon: bool = false,
-};
+const NeonMode = enum { auto, on, off };
 
-fn configureCroaring(module: *std.Build.Module, options: CroaringOptions) void {
-    module.addIncludePath(.{ .cwd_relative = "deps/pg_roaringbitmap" });
-    if (options.disable_neon) {
-        // Keep the standalone Zig header import and the compiled CRoaring object
-        // on the same code path for ARM targets.
-        module.addCMacro("DISABLENEON", "1");
-    }
+fn configureCroaring(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    neon: NeonMode,
+) void {
+    const disable_neon = switch (neon) {
+        .off => true,
+        .on => false,
+        .auto => target.result.cpu.arch == .aarch64,
+    };
+
     module.addCSourceFile(.{
-        .file = .{ .cwd_relative = "deps/pg_roaringbitmap/roaring.c" },
-        .flags = if (options.disable_neon)
+        .file = b.path("deps/croaring/roaring.c"),
+        .flags = if (disable_neon)
             &.{ "-DCROARING_COMPILER_SUPPORTS_AVX512=0", "-DDISABLENEON=1" }
         else
             &.{"-DCROARING_COMPILER_SUPPORTS_AVX512=0"},

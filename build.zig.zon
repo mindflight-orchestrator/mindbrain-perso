@@ -1,0 +1,8 @@
+.{
+    .name = .mindbrain,
+    .version = "0.1.0",
+    .fingerprint = 0xb989c2a572a8a643,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "deps", "sql" },
+}
