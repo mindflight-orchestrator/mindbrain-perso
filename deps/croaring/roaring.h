@@ -430,7 +430,7 @@ static inline int roaring_hamming(uint64_t x) {
 #define CROARING_TARGET_AVX512                                         \
     CROARING_TARGET_REGION(                                            \
         "avx2,bmi,bmi2,pclmul,lzcnt,popcnt,avx512f,avx512dq,avx512bw," \
-        "avx512vbmi2,avx512bitalg,avx512vpopcntdq")
+        "avx512vbmi2,avx512bitalg,avx512vpopcntdq,evex512")
 #define CROARING_UNTARGET_AVX2 CROARING_UNTARGET_REGION
 #define CROARING_UNTARGET_AVX512 CROARING_UNTARGET_REGION
 

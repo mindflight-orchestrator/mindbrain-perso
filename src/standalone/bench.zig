@@ -322,7 +322,7 @@ pub fn main(init: std.process.Init) !void {
 fn detectSimdReport() SimdReport {
     const os = @tagName(builtin.os.tag);
     const arch = @tagName(builtin.cpu.arch);
-    const avx512_compile_disabled = true;
+    const avx512_compile_disabled = (builtin.cpu.arch != .x86_64);
 
     switch (builtin.cpu.arch) {
         .x86_64 => {

@@ -186,8 +186,8 @@ fn configureCroaring(
     module.addCSourceFile(.{
         .file = b.path("deps/croaring/roaring.c"),
         .flags = if (disable_neon)
-            &.{ "-DCROARING_COMPILER_SUPPORTS_AVX512=0", "-DDISABLENEON=1" }
+            &.{"-DDISABLENEON=1"}
         else
-            &.{"-DCROARING_COMPILER_SUPPORTS_AVX512=0"},
+            &.{},
     });
 }
