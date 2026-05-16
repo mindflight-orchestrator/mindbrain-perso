@@ -188,6 +188,41 @@ The CLI also exposes that runtime path:
   --vector-weight 0.65
 ```
 
+`contextual-search` is BM25-only unless embedding provider flags are supplied.
+Even with those flags, it only embeds the live query when `search_embeddings`
+already contains indexed rows for the table. It does not create document or
+chunk embeddings during search.
+
+To backfill `search_embeddings` for existing `search_documents` rows outside
+the live request path:
+
+```bash
+./zig-out/bin/mindbrain-standalone-tool search-embedding-batch \
+  --db "$MINDBRAIN_DB" \
+  --table-id 77 \
+  --embedding-base-url "$MINDBRAIN_EMBED_BASE_URL" \
+  --embedding-api-key "$MINDBRAIN_EMBED_API_KEY" \
+  --embedding-model "$MINDBRAIN_EMBED_MODEL" \
+  --missing-only
+```
+
+Optional real LLM reranking is separate from vector fusion and is never the
+default:
+
+```bash
+./zig-out/bin/mindbrain-standalone-tool contextual-search \
+  --db "$MINDBRAIN_DB" \
+  --table-id 77 \
+  --query "How can the contract end?" \
+  --base-url "$MINDBRAIN_EMBED_BASE_URL" \
+  --api-key "$MINDBRAIN_EMBED_API_KEY" \
+  --embedding-model "$MINDBRAIN_EMBED_MODEL" \
+  --rerank \
+  --rerank-base-url "$MINDBRAIN_PROFILE_BASE_URL" \
+  --rerank-api-key "$MINDBRAIN_PROFILE_API_KEY" \
+  --rerank-model "$MINDBRAIN_PROFILE_MODEL"
+```
+
 ## Minimal Zig Smoke Shape
 
 A provider-backed smoke harness should follow this shape:

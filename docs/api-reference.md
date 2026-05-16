@@ -179,7 +179,8 @@ mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [
 mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
 mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
 mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
-mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> --base-url <url> --embedding-model <name> [--api-key <key>] [--limit <n>] [--vector-weight <0..1>]
+mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> [--base-url <url> --embedding-model <name> [--api-key <key>]] [--limit <n>] [--vector-weight <0..1>] [--rerank --rerank-base-url <url> --rerank-model <name> [--rerank-api-key <key>] [--rerank-candidates <n>] [--rerank-max-doc-chars <n>]]
+mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <n> --embedding-base-url <url> --embedding-model <name> [--embedding-api-key <key>] [--limit <n>] [--missing-only]
 mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
 mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
@@ -205,11 +206,25 @@ Command families:
 | Workspace and collections | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import` |
 | Ontology | `ontology-register`, `ontology-attach`, `coverage`, `coverage-by-domain` |
 | Documents and chunks | `document-ingest`, `document-by-nanoid`, `document-normalize`, `external-link-add` |
-| LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search` |
+| LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search`, `search-embedding-batch` |
 | Graph | `traverse`, `graph-path` |
 | Search and context | `search-compact-info`, `pack` |
 | Queue | `queue-send`, `queue-read`, `queue-archive`, `queue-delete` |
 | Demo and maintenance | `seed-demo`, `bootstrap-from-sql`, `benchmark-db`, `corpus-eval`, `simulate` |
+
+HTTP clients can write indexed search vectors with:
+
+```http
+POST /api/mindbrain/search-embedding-upsert
+```
+
+```json
+{ "table_id": 77, "doc_id": 123, "embedding": [0.1, 0.2, 0.3] }
+```
+
+The endpoint accepts JSON number arrays and stores `search_embeddings.embedding_blob`
+as packed little-endian `f32` bytes. Do not use the generic SQL JSON passthrough
+to bind vector blobs; it intentionally binds JSON strings/arrays as text.
 
 ## Native and SQL surfaces
 

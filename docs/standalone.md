@@ -69,7 +69,8 @@ mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [
 mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
 mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
 mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
-mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> --base-url <url> --embedding-model <name> [--api-key <key>] [--limit <n>] [--vector-weight <0..1>]
+mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> [--base-url <url> --embedding-model <name> [--api-key <key>]] [--limit <n>] [--vector-weight <0..1>] [--rerank --rerank-base-url <url> --rerank-model <name> [--rerank-api-key <key>] [--rerank-candidates <n>] [--rerank-max-doc-chars <n>]]
+mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <n> --embedding-base-url <url> --embedding-model <name> [--embedding-api-key <key>] [--limit <n>] [--missing-only]
 mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
 mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
@@ -102,7 +103,9 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`document-ingest` / `document-by-nanoid` / `external-link-add`** — Raw document/chunk ingestion, public document-id lookup, and cross-document link insertion.
 - **`document-normalize`** — Orchestrates external PDF/HTML extraction tools (`pdftotext`, `ocrmypdf`, `pandoc`, or a DeepSeek command template) and writes normalized `.txt` / `.md` plus sidecar metadata.
 - **`document-profile` / `document-profile-enqueue` / `document-profile-worker`** — LLM document “semantic id card” JSON, optional SQLite queue, optional persist to `documents_raw` and `chunks_raw` (see [document-profile.md](document-profile.md)).
-- **`contextual-search`** — Embedding-backed contextual retrieval over a search table.
+- **`contextual-search`** — BM25 search by default. When embedding provider flags are present and `search_embeddings` has rows for the table, it embeds the live query and adds vector fusion. If embedding flags are omitted, or indexed embeddings are absent, it stays BM25-only and reports `semantic_status` in JSON. Optional `--rerank` performs non-default LLM score reranking over retrieved candidates.
+- **`search-embedding-batch`** — Populates `search_embeddings` for existing `search_documents` rows outside the live search request path.
+- **`POST /api/mindbrain/search-embedding-upsert`** — HTTP JSON write path for clients that already have embedding arrays; stores them as packed `f32` blobs in `search_embeddings`.
 - **`seed-demo` / `bootstrap-from-sql`** — Seed the built-in demo dataset or execute a SQL bootstrap file against a SQLite database.
 - **`corpus-eval`** — Deterministic checks against [fixtures/](../fixtures/corpus_eval/) (no network).
 - **`queue-*`** — Lightweight message queue operations on the SQLite runtime (`queue_messages` and helpers in [`queue_sqlite.zig`](../src/standalone/queue_sqlite.zig)).

@@ -4,6 +4,10 @@ The standalone **`facets`** schema provides Roaring Bitmap–backed faceting on 
 
 Definitive definitions live in the SQLite standalone schema and Zig entrypoints under `src/standalone/`.
 
+For the process-level view that connects facets with FTS5 BM25, indexed
+embeddings, hybrid search, and optional LLM reranking, see
+[faceted-hybrid-search.md](faceted-hybrid-search.md).
+
 > **Where the data comes from.** Facet definitions and per-document
 > facet picks are sourced from the raw layer described in
 > [collections.md](./collections.md) (`ontology_*` and

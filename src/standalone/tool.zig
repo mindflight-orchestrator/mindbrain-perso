@@ -115,6 +115,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "search-embedding-batch")) {
+        try runSearchEmbeddingBatchCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "corpus-eval")) {
         try runCorpusEvalCommand(allocator, args[2..]);
         return;
@@ -293,7 +298,8 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
         \\  mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
         \\  mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
-        \\  mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> --base-url <url> --embedding-model <name> [--api-key <key>] [--limit <n>] [--vector-weight <0..1>]
+        \\  mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> [--base-url <url> --embedding-model <name> [--api-key <key>]] [--limit <n>] [--vector-weight <0..1>] [--rerank --rerank-base-url <url> --rerank-model <name> [--rerank-api-key <key>] [--rerank-candidates <n>] [--rerank-max-doc-chars <n>]]
+        \\  mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <n> --embedding-base-url <url> --embedding-model <name> [--embedding-api-key <key>] [--limit <n>] [--missing-only]
         \\  mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
         \\  mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
         \\  mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
@@ -2366,6 +2372,7 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
     var embedding_model: ?[]const u8 = null;
     var limit: usize = 20;
     var vector_weight: f64 = 0.5;
+    var rerank_options = RerankOptions{};
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -2379,54 +2386,210 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
         } else if (std.mem.eql(u8, arg, "--vector-weight")) {
             const v = try requireArg(args, &index);
             vector_weight = std.fmt.parseFloat(f64, v) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--rerank")) {
+            rerank_options.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--rerank-base-url")) {
+            rerank_options.base_url = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--rerank-api-key")) {
+            rerank_options.api_key = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--rerank-model")) {
+            rerank_options.model = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--rerank-provider-kind")) {
+            rerank_options.provider_kind = parseProviderKind(try requireArg(args, &index)) orelse return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--rerank-candidates")) {
+            const v = try requireArg(args, &index);
+            rerank_options.candidate_limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--rerank-max-doc-chars")) {
+            const v = try requireArg(args, &index);
+            rerank_options.max_doc_chars = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
     }
 
-    if (db_path == null or table_id == null or query == null or base_url == null or embedding_model == null) return CliError.InvalidArguments;
+    if (db_path == null or table_id == null or query == null) return CliError.InvalidArguments;
     if (limit == 0 or vector_weight < 0.0 or vector_weight > 1.0) return CliError.InvalidArguments;
+    const embedding_requested = base_url != null or api_key != null or embedding_model != null;
+    if (embedding_requested and (base_url == null or embedding_model == null)) return CliError.InvalidArguments;
+    if (rerank_options.enabled and (rerank_options.base_url == null or rerank_options.model == null)) return CliError.InvalidArguments;
+    if (rerank_options.enabled and (rerank_options.candidate_limit == 0 or rerank_options.max_doc_chars == 0)) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
     try db.applyStandaloneSchema();
 
-    var store = try search_sqlite.loadSearchStore(db, allocator);
-    defer store.deinit();
+    const indexed_embeddings = try search_sqlite.countSearchEmbeddings(db, table_id.?);
+    const semantic_enabled = embedding_requested and indexed_embeddings > 0;
+    const retrieval_limit = if (rerank_options.enabled)
+        @max(limit, rerank_options.candidate_limit)
+    else
+        limit;
 
-    const query_embedding = try embedContextualText(allocator, query.?, .{
-        .enabled = true,
-        .embedding_base_url = base_url,
-        .embedding_api_key = api_key,
-        .embedding_model = embedding_model,
-    });
-    defer allocator.free(query_embedding);
-
-    const bm25_matches = try search_sqlite.searchFts5Bm25(db, allocator, table_id.?, query.?, limit);
+    const bm25_matches = try search_sqlite.searchFts5Bm25(db, allocator, table_id.?, query.?, retrieval_limit);
     defer allocator.free(bm25_matches);
 
-    const vector_repo = store.vectorRepository();
-    const vector_matches = try vector_repo.searchNearestFn(vector_repo.ctx, allocator, .{
-        .table_name = "search_embeddings",
-        .key_column = "doc_id",
-        .vector_column = "embedding_blob",
-        .query_vector = query_embedding,
-        .limit = limit,
-    });
-    defer allocator.free(vector_matches);
+    const empty_vector_matches: []interfaces.VectorSearchMatch = &.{};
+    var owned_vector_matches: ?[]interfaces.VectorSearchMatch = null;
+    defer if (owned_vector_matches) |matches| allocator.free(matches);
 
-    const matches = try fuseBm25AndVectorMatches(allocator, bm25_matches, vector_matches, vector_weight, limit);
+    if (semantic_enabled) {
+        var store = try search_sqlite.loadSearchStore(db, allocator);
+        defer store.deinit();
+
+        const query_embedding = try embedContextualText(allocator, query.?, .{
+            .enabled = true,
+            .embedding_base_url = base_url,
+            .embedding_api_key = api_key,
+            .embedding_model = embedding_model,
+        });
+        defer allocator.free(query_embedding);
+
+        const vector_repo = store.vectorRepository();
+        owned_vector_matches = try vector_repo.searchNearestFn(vector_repo.ctx, allocator, .{
+            .table_name = "search_embeddings",
+            .key_column = "doc_id",
+            .vector_column = "embedding_blob",
+            .query_vector = query_embedding,
+            .limit = retrieval_limit,
+        });
+    }
+
+    const vector_matches = owned_vector_matches orelse empty_vector_matches;
+
+    const fused_matches = try fuseBm25AndVectorMatches(allocator, bm25_matches, vector_matches, vector_weight, retrieval_limit);
+    defer allocator.free(fused_matches);
+
+    var matches = try contextualMatchesFromHybrid(allocator, fused_matches);
     defer allocator.free(matches);
+
+    if (rerank_options.enabled) {
+        try applyLlmRerank(allocator, db, table_id.?, query.?, &matches, rerank_options);
+    }
+
+    if (matches.len > limit) matches.len = limit;
 
     try writeStdout("{f}\n", .{std.json.fmt(.{
         .table_id = table_id.?,
         .query = query.?,
+        .retrieval_mode = if (semantic_enabled) "hybrid_bm25_vector" else "bm25",
+        .semantic_status = if (!embedding_requested) "not_requested" else if (indexed_embeddings == 0) "no_indexed_embeddings" else "ok",
+        .indexed_embeddings = indexed_embeddings,
         .vector_weight = vector_weight,
+        .rerank_enabled = rerank_options.enabled,
         .matches = matches,
+    }, .{})});
+}
+
+fn runSearchEmbeddingBatchCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var table_id: ?u64 = null;
+    var embedding_base_url: ?[]const u8 = null;
+    var embedding_api_key: ?[]const u8 = null;
+    var embedding_model: ?[]const u8 = null;
+    var limit: usize = 100;
+    var missing_only = false;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            db_path = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--table-id")) {
+            table_id = std.fmt.parseInt(u64, try requireArg(args, &index), 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--embedding-base-url") or std.mem.eql(u8, arg, "--base-url")) {
+            embedding_base_url = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--embedding-api-key") or std.mem.eql(u8, arg, "--api-key")) {
+            embedding_api_key = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--embedding-model")) {
+            embedding_model = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            limit = std.fmt.parseInt(usize, try requireArg(args, &index), 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--missing-only")) {
+            missing_only = true;
+        } else return CliError.InvalidArguments;
+    }
+
+    if (db_path == null or table_id == null or embedding_base_url == null or embedding_model == null or limit == 0) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const rows = try search_sqlite.loadSearchDocumentsForEmbeddingBatch(db, allocator, table_id.?, limit, missing_only);
+    defer {
+        for (rows) |row| row.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    if (rows.len == 0) {
+        try writeStdout("{f}\n", .{std.json.fmt(.{
+            .table_id = table_id.?,
+            .processed = 0,
+            .missing_only = missing_only,
+        }, .{})});
+        return;
+    }
+
+    const inputs = try allocator.alloc([]const u8, rows.len);
+    defer allocator.free(inputs);
+    for (rows, 0..) |row, i| inputs[i] = row.content;
+
+    const provider = llm.ProviderConfig{
+        .name = "search-embedding-batch",
+        .kind = .openai_compatible,
+        .base_url = embedding_base_url.?,
+        .api_key = embedding_api_key,
+        .model = embedding_model.?,
+        .capabilities = &.{.embeddings},
+    };
+    const manager = llm.Manager.init(.{
+        .providers = &.{provider},
+        .default_provider = "search-embedding-batch",
+    });
+
+    var response = try manager.embedTexts(allocator, mindbrain.zig16_compat.io(), null, inputs);
+    defer response.deinit(allocator);
+    if (response.vectors.len != rows.len) return error.InvalidResponse;
+
+    for (rows, response.vectors) |row, vector| {
+        try search_sqlite.upsertSearchEmbedding(db, allocator, row.table_id, row.doc_id, vector.values);
+    }
+
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .table_id = table_id.?,
+        .processed = rows.len,
+        .missing_only = missing_only,
     }, .{})});
 }
 
 const FusionScore = struct {
     bm25_score: f64 = 0.0,
     vector_score: f64 = 0.0,
+};
+
+const ContextualSearchMatch = struct {
+    doc_id: interfaces.DocId,
+    bm25_score: f64,
+    vector_score: f64,
+    combined_score: f64,
+    rerank_score: ?f64 = null,
+};
+
+const RerankOptions = struct {
+    enabled: bool = false,
+    provider_kind: llm.ProviderKind = .openai_compatible,
+    base_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    candidate_limit: usize = 50,
+    max_doc_chars: usize = 1200,
+};
+
+const RerankScoreRow = struct {
+    doc_id: u64,
+    score: f64,
+};
+
+const RerankResponse = struct {
+    scores: []RerankScoreRow,
 };
 
 fn fuseBm25AndVectorMatches(
@@ -2476,6 +2639,135 @@ fn fuseBm25AndVectorMatches(
     return results.toOwnedSlice(allocator);
 }
 
+fn contextualMatchesFromHybrid(
+    allocator: Allocator,
+    matches: []const interfaces.HybridSearchMatch,
+) ![]ContextualSearchMatch {
+    const out = try allocator.alloc(ContextualSearchMatch, matches.len);
+    for (matches, 0..) |match, i| {
+        out[i] = .{
+            .doc_id = match.doc_id,
+            .bm25_score = match.bm25_score,
+            .vector_score = match.vector_score,
+            .combined_score = match.combined_score,
+        };
+    }
+    return out;
+}
+
+fn applyLlmRerank(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    table_id: u64,
+    query: []const u8,
+    matches: *[]ContextualSearchMatch,
+    options: RerankOptions,
+) !void {
+    if (matches.len == 0) return;
+    const prompt = try buildRerankPrompt(allocator, db, table_id, query, matches.*, options.max_doc_chars);
+    defer allocator.free(prompt);
+
+    const provider = llm.ProviderConfig{
+        .name = "search-reranker",
+        .kind = options.provider_kind,
+        .base_url = options.base_url.?,
+        .api_key = options.api_key,
+        .model = options.model.?,
+        .capabilities = &.{ .chat, .json_output },
+    };
+    const manager = llm.Manager.init(.{
+        .providers = &.{provider},
+        .default_provider = "search-reranker",
+    });
+    const messages = [_]llm.Message{
+        .{
+            .role = "system",
+            .content = "You rerank search candidates. Return only JSON with a scores array. Each score must use an input doc_id and a relevance score from 0 to 1.",
+        },
+        .{ .role = "user", .content = prompt },
+    };
+
+    var response = try manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+        .json_mode = true,
+        .temperature = 0.0,
+        .max_tokens = 1200,
+    });
+    defer response.deinit(allocator);
+
+    var parsed = try std.json.parseFromSlice(RerankResponse, allocator, response.content, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const valid_scores = applyRerankScores(matches.*, parsed.value.scores);
+    if (valid_scores == 0) return error.InvalidResponse;
+
+    sortContextualMatchesByRerank(matches.*);
+}
+
+fn applyRerankScores(matches: []ContextualSearchMatch, scores: []const RerankScoreRow) usize {
+    var valid_scores: usize = 0;
+    for (scores) |score| {
+        if (!std.math.isFinite(score.score)) continue;
+        for (matches) |*match| {
+            if (match.doc_id == score.doc_id) {
+                match.rerank_score = @max(0.0, @min(1.0, score.score));
+                valid_scores += 1;
+                break;
+            }
+        }
+    }
+    return valid_scores;
+}
+
+fn sortContextualMatchesByRerank(matches: []ContextualSearchMatch) void {
+    std.mem.sort(ContextualSearchMatch, matches, {}, struct {
+        fn lessThan(_: void, a: ContextualSearchMatch, b: ContextualSearchMatch) bool {
+            const ar = a.rerank_score orelse 0.0;
+            const br = b.rerank_score orelse 0.0;
+            if (ar == br) return a.combined_score > b.combined_score;
+            return ar > br;
+        }
+    }.lessThan);
+}
+
+fn buildRerankPrompt(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    table_id: u64,
+    query: []const u8,
+    matches: []const ContextualSearchMatch,
+    max_doc_chars: usize,
+) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("Query: ");
+    try writer.print("{f}", .{std.json.fmt(query, .{})});
+    try writer.writeAll("\nCandidates JSON lines:\n");
+
+    for (matches) |match| {
+        const content = search_sqlite.loadSearchDocumentContent(db, allocator, table_id, match.doc_id) catch |err| switch (err) {
+            error.MissingRow => continue,
+            else => return err,
+        };
+        defer allocator.free(content);
+        const clipped = content[0..@min(content.len, max_doc_chars)];
+        try writer.print("{f}\n", .{std.json.fmt(.{
+            .doc_id = match.doc_id,
+            .bm25_score = match.bm25_score,
+            .vector_score = match.vector_score,
+            .combined_score = match.combined_score,
+            .content = clipped,
+        }, .{})});
+    }
+
+    try writer.writeAll("Return JSON: {\"scores\":[{\"doc_id\":<number>,\"score\":<0..1>}]}");
+    return try out.toOwnedSlice();
+}
+
 fn getOrPutFusionScore(
     scores: *std.AutoHashMap(interfaces.DocId, FusionScore),
     doc_id: interfaces.DocId,
@@ -2483,6 +2775,42 @@ fn getOrPutFusionScore(
     const gop = try scores.getOrPut(doc_id);
     if (!gop.found_existing) gop.value_ptr.* = .{};
     return gop.value_ptr;
+}
+
+fn parseProviderKind(value: []const u8) ?llm.ProviderKind {
+    if (std.mem.eql(u8, value, "openai_compatible")) return .openai_compatible;
+    if (std.mem.eql(u8, value, "openai")) return .openai;
+    if (std.mem.eql(u8, value, "openrouter")) return .openrouter;
+    if (std.mem.eql(u8, value, "ollama")) return .ollama;
+    if (std.mem.eql(u8, value, "vllm")) return .vllm;
+    if (std.mem.eql(u8, value, "llama_cpp")) return .llama_cpp;
+    if (std.mem.eql(u8, value, "deepseek")) return .deepseek;
+    if (std.mem.eql(u8, value, "gemini")) return .gemini;
+    if (std.mem.eql(u8, value, "anthropic")) return .anthropic;
+    return null;
+}
+
+test "rerank scores clamp and reorder contextual matches" {
+    var matches = [_]ContextualSearchMatch{
+        .{ .doc_id = 1, .bm25_score = 2.0, .vector_score = 0.2, .combined_score = 1.1 },
+        .{ .doc_id = 2, .bm25_score = 1.0, .vector_score = 0.9, .combined_score = 1.0 },
+        .{ .doc_id = 3, .bm25_score = 0.8, .vector_score = 0.1, .combined_score = 0.6 },
+    };
+    const scores = [_]RerankScoreRow{
+        .{ .doc_id = 2, .score = 1.5 },
+        .{ .doc_id = 3, .score = -0.5 },
+        .{ .doc_id = 99, .score = 0.9 },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), applyRerankScores(&matches, &scores));
+    sortContextualMatchesByRerank(&matches);
+
+    try std.testing.expectEqual(@as(u64, 2), matches[0].doc_id);
+    try std.testing.expectEqual(@as(f64, 1.0), matches[0].rerank_score.?);
+    try std.testing.expectEqual(@as(u64, 1), matches[1].doc_id);
+    try std.testing.expect(matches[1].rerank_score == null);
+    try std.testing.expectEqual(@as(u64, 3), matches[2].doc_id);
+    try std.testing.expectEqual(@as(f64, 0.0), matches[2].rerank_score.?);
 }
 
 fn profileMetadataJson(

@@ -11,6 +11,7 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 | [api-reference.md](api-reference.md) | Current HTTP routes, CLI commands, and native/SQL surface boundaries |
 | [comparison/README.md](comparison/README.md) | API and SQL migration comparison with the sibling `pg_mindbrain` PostgreSQL extension |
 | [facets.md](facets.md) | `facets` schema: faceting, search, BM25 |
+| [faceted-hybrid-search.md](faceted-hybrid-search.md) | Process view for facets, FTS5 BM25, indexed embeddings, hybrid search, and optional reranking |
 | [graph.md](graph.md) | `graph` schema: entities, relations, native traversal |
 | [pragma.md](pragma.md) | Memory projection helpers and `pragma_*` SQL functions |
 | [dsl-rules.md](dsl-rules.md) | Proposition DSL line format (for `projection_type = 'proposition'`) |

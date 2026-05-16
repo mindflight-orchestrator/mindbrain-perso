@@ -27,6 +27,18 @@ pub const Bm25Match = struct {
     score: f64,
 };
 
+pub const SearchDocumentRow = struct {
+    table_id: u64,
+    doc_id: interfaces.DocId,
+    content: []u8,
+    language: []u8,
+
+    pub fn deinit(self: SearchDocumentRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        allocator.free(self.language);
+    }
+};
+
 pub const SearchTableSetupSpec = struct {
     table_id: u64,
     workspace_id: []const u8 = "default",
@@ -254,6 +266,70 @@ pub fn searchFts5Bm25(
     }
 
     return matches.toOwnedSlice(allocator);
+}
+
+pub fn countSearchEmbeddings(db: Database, table_id: u64) !u64 {
+    const stmt = try prepare(db, "SELECT COUNT(*) FROM search_embeddings WHERE table_id = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
+}
+
+pub fn loadSearchDocumentsForEmbeddingBatch(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    limit: usize,
+    missing_only: bool,
+) ![]SearchDocumentRow {
+    if (limit == 0) return allocator.alloc(SearchDocumentRow, 0);
+
+    const sql =
+        \\SELECT d.table_id, d.doc_id, d.content, d.language
+        \\FROM search_documents d
+        \\WHERE d.table_id = ?1
+        \\  AND (?2 = 0 OR NOT EXISTS (
+        \\      SELECT 1 FROM search_embeddings e
+        \\      WHERE e.table_id = d.table_id AND e.doc_id = d.doc_id
+        \\  ))
+        \\ORDER BY d.doc_id
+        \\LIMIT ?3
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, @as(i64, if (missing_only) 1 else 0));
+    try bindInt64(stmt, 3, limit);
+
+    var rows = std.ArrayList(SearchDocumentRow).empty;
+    errdefer {
+        for (rows.items) |row| row.deinit(allocator);
+        rows.deinit(allocator);
+    }
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        {
+            const row_table_id = try columnU64(stmt, 0);
+            const row_doc_id = try columnDocId(stmt, 1);
+            const row_content = try columnTextOwned(allocator, stmt, 2);
+            errdefer allocator.free(row_content);
+            const row_language = try columnTextOwned(allocator, stmt, 3);
+            var row = SearchDocumentRow{
+                .table_id = row_table_id,
+                .doc_id = row_doc_id,
+                .content = row_content,
+                .language = row_language,
+            };
+            errdefer row.deinit(allocator);
+            try rows.append(allocator, row);
+        }
+    }
+
+    return rows.toOwnedSlice(allocator);
 }
 
 pub fn deleteSearchDocument(db: Database, table_id: u64, doc_id: u64) !void {
@@ -944,7 +1020,7 @@ fn loadTermFrequencyMapForDoc(
     return counts;
 }
 
-fn loadSearchDocumentContent(
+pub fn loadSearchDocumentContent(
     db: Database,
     allocator: std.mem.Allocator,
     table_id: u64,
@@ -1156,6 +1232,53 @@ test "search sqlite persists and reloads standalone search state" {
     });
     defer std.testing.allocator.free(nearest);
     try std.testing.expectEqual(@as(u64, 7), nearest[0].doc_id);
+}
+
+test "search sqlite counts embeddings and selects missing embedding batch rows" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertSearchDocument(db, 1, 7, "zig sqlite roaring", "english");
+    try upsertSearchDocument(db, 1, 9, "graph traversal", "english");
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 0.8, 0.2 });
+
+    try std.testing.expectEqual(@as(u64, 1), try countSearchEmbeddings(db, 1));
+
+    const missing_rows = try loadSearchDocumentsForEmbeddingBatch(db, std.testing.allocator, 1, 10, true);
+    defer {
+        for (missing_rows) |row| row.deinit(std.testing.allocator);
+        std.testing.allocator.free(missing_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_rows.len);
+    try std.testing.expectEqual(@as(u64, 9), missing_rows[0].doc_id);
+
+    const all_rows = try loadSearchDocumentsForEmbeddingBatch(db, std.testing.allocator, 1, 10, false);
+    defer {
+        for (all_rows) |row| row.deinit(std.testing.allocator);
+        std.testing.allocator.free(all_rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), all_rows.len);
+}
+
+test "search sqlite stores search embeddings as packed f32 blobs" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 0.25, -0.5, 1.0 });
+
+    const stmt = try prepare(db, "SELECT dimensions, length(embedding_blob), typeof(embedding_blob) FROM search_embeddings WHERE table_id = ?1 AND doc_id = ?2");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, 1);
+    try bindInt64(stmt, 2, 7);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+
+    try std.testing.expectEqual(@as(u64, 3), try columnU64(stmt, 0));
+    try std.testing.expectEqual(@as(u64, 12), try columnU64(stmt, 1));
+    const storage_type = try columnTextOwned(std.testing.allocator, stmt, 2);
+    defer std.testing.allocator.free(storage_type);
+    try std.testing.expectEqualStrings("blob", storage_type);
 }
 
 test "search sqlite rebuilds compact artifacts and reloads compact store" {

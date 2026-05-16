@@ -63,6 +63,12 @@ const FactWriteRequest = struct {
     source_ref: ?[]const u8 = null,
 };
 
+const SearchEmbeddingUpsertRequest = struct {
+    table_id: ?u64 = null,
+    doc_id: ?u64 = null,
+    embedding: []const f64 = &.{},
+};
+
 pub const DefaultWorkspaceOptions = struct {
     id: []const u8 = "default",
     domain_profile_json: []const u8 = "{\"domain\":\"ghostcrab\"}",
@@ -809,6 +815,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleFactWrite(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/search-embedding-upsert")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleSearchEmbeddingUpsert(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleSqlRequest(allocator, request, body_buffer, false);
@@ -943,6 +954,60 @@ pub const MindbrainHttpApp = struct {
                 .updated = result.updated,
             }),
         );
+    }
+
+    fn handleSearchEmbeddingUpsert(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseSearchEmbeddingUpsertRequest(allocator, request, body_buffer);
+        const table_id = write_request.table_id orelse return error.BadRequest;
+        const doc_id = write_request.doc_id orelse return error.BadRequest;
+        const values = try copyFiniteEmbeddingF32(allocator, write_request.embedding);
+        defer allocator.free(values);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        search_sqlite.upsertSearchEmbedding(self.writer_db, allocator, table_id, doc_id, values) catch |err| switch (err) {
+            error.PrepareFailed, error.StepFailed, error.BindFailed => {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "search_embedding.upsert", err);
+                return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "search_embedding.upsert", err, null);
+            },
+            else => return err,
+        };
+        self.writer_completed += 1;
+
+        return toResponse(
+            try helper_api.jsonResponse(allocator, .{
+                .ok = true,
+                .table_id = table_id,
+                .doc_id = doc_id,
+                .dimensions = values.len,
+                .bytes = values.len * @sizeOf(f32),
+            }),
+        );
+    }
+
+    fn parseSearchEmbeddingUpsertRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !SearchEmbeddingUpsertRequest {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        return try parseSearchEmbeddingUpsertBody(allocator, body);
     }
 
     fn parseFactWriteRequest(
@@ -2171,6 +2236,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/sql/session/query
         \\  POST /api/mindbrain/sql/session/close
         \\  POST /api/mindbrain/facts/write
+        \\  POST /api/mindbrain/search-embedding-upsert
         \\  GET /health
         \\  GET /api/events  (SSE demo_firehose, long-lived)
         \\  GET /api/mindbrain/simulate
@@ -2305,6 +2371,33 @@ fn parseDirection(text: []const u8) ?graph_sqlite.TraverseDirection {
     return null;
 }
 
+fn copyFiniteEmbeddingF32(allocator: std.mem.Allocator, embedding: []const f64) ![]f32 {
+    if (embedding.len == 0) return error.BadRequest;
+    const values = try allocator.alloc(f32, embedding.len);
+    errdefer allocator.free(values);
+    for (embedding, 0..) |value, index| {
+        if (!std.math.isFinite(value)) return error.BadRequest;
+        values[index] = @floatCast(value);
+        if (!std.math.isFinite(values[index])) return error.BadRequest;
+    }
+    return values;
+}
+
+fn parseSearchEmbeddingUpsertBody(allocator: std.mem.Allocator, body: []const u8) !SearchEmbeddingUpsertRequest {
+    return std.json.parseFromSliceLeaky(
+        SearchEmbeddingUpsertRequest,
+        allocator,
+        body,
+        .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.BadRequest,
+    };
+}
+
 test "graph subgraph sse encoder emits expected frames" {
     var events = try std.testing.allocator.alloc(graph_sqlite.GraphStreamEvent, 2);
     defer {
@@ -2347,4 +2440,24 @@ test "http sql writer lane classifier separates reads from writes" {
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("CREATE TABLE t(id INTEGER)", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("INSERT INTO t(id) VALUES (?)", &.{std.json.Value{ .integer = 1 }}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("SELECT 1; SELECT 2", &.{}));
+}
+
+test "http search embedding request converts finite JSON numbers to f32" {
+    const values = try copyFiniteEmbeddingF32(std.testing.allocator, &.{ 0.25, -0.5, 1.0 });
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, -0.5, 1.0 }, values);
+}
+
+test "http search embedding request rejects empty and non-finite vectors" {
+    try std.testing.expectError(error.BadRequest, copyFiniteEmbeddingF32(std.testing.allocator, &.{}));
+    try std.testing.expectError(error.BadRequest, copyFiniteEmbeddingF32(std.testing.allocator, &.{std.math.inf(f64)}));
+    try std.testing.expectError(error.BadRequest, copyFiniteEmbeddingF32(std.testing.allocator, &.{1.0e100}));
+}
+
+test "http search embedding request rejects malformed JSON bodies" {
+    try std.testing.expectError(error.BadRequest, parseSearchEmbeddingUpsertBody(std.testing.allocator, "{"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadRequest, parseSearchEmbeddingUpsertBody(arena.allocator(), "{\"table_id\":1,\"doc_id\":2,\"embedding\":[0.1],\"extra\":true}"));
 }
