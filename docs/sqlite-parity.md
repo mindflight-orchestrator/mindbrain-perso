@@ -11,9 +11,10 @@ Zig helper, or is intentionally skipped) see
 
 ## Contract summary
 
-- **Source of truth**: `../pg_mindbrain/sql/sqlite_mindbrain--1.0.0.sql` and
-  the Zig modules under `../pg_mindbrain/src/mb_*` define the canonical
-  API names, argument lists, default values, and result shapes.
+- **Source of truth**: `sql/sqlite_mindbrain--1.0.0.sql` defines the
+  canonical SQLite storage schema. The Zig modules under `src/mb_*` and
+  `src/standalone/*_sqlite.zig` define the public API names, argument lists,
+  default values, and result shapes.
 - **Implementation**: every API family is exposed under the same names in
   `mindbrain`. SQLite is the default backend. PostgreSQL-only logic is
   replaced by SQLite SQL, FTS5, JSON1, or Zig helpers.
@@ -37,8 +38,10 @@ Zig helper, or is intentionally skipped) see
 
 ## Storage contract
 
-The SQLite schema lives in `src/standalone/sqlite_schema.zig` and
-mirrors the durable PostgreSQL data contract:
+The SQLite schema lives in
+[`sql/sqlite_mindbrain--1.0.0.sql`](../sql/sqlite_mindbrain--1.0.0.sql), which
+`src/standalone/sqlite_schema.zig` embeds for runtime bootstrap. That single
+canonical file mirrors the durable PostgreSQL data contract:
 
 - `facets`, `projections`, `projection_types` are the
   primary persistence layer. The `projection_types` seeds for

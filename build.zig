@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addSqliteSchemaImport(standalone_http_lib_mod, b);
     configureCroaring(b, standalone_http_lib_mod, target, neon);
     standalone_http_lib_mod.addImport("ztoon", ztoon_mod);
 
@@ -56,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addSqliteSchemaImport(standalone_test_mod, b);
     configureCroaring(b, standalone_test_mod, target, neon);
     standalone_test_mod.addImport("ztoon", ztoon_mod);
 
@@ -99,6 +101,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addSqliteSchemaImport(standalone_bench_mod, b);
     configureCroaring(b, standalone_bench_mod, target, neon);
     standalone_bench_mod.addImport("ztoon", ztoon_mod);
 
@@ -118,6 +121,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addSqliteSchemaImport(standalone_tool_mod, b);
     standalone_tool_mod.addImport("mindbrain", standalone_http_lib_mod);
     standalone_tool_mod.addImport("benchmark", benchmark_mod);
 
@@ -156,6 +160,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addSqliteSchemaImport(standalone_http_mod, b);
     standalone_http_mod.addImport("mindbrain", standalone_http_lib_mod);
 
     const standalone_http = b.addExecutable(.{
@@ -167,6 +172,12 @@ pub fn build(b: *std.Build) void {
     const install_standalone_http = b.addInstallArtifact(standalone_http, .{});
     const standalone_http_step = b.step("standalone-http", "Build standalone HTTP server (dashboard API)");
     standalone_http_step.dependOn(&install_standalone_http.step);
+}
+
+fn addSqliteSchemaImport(module: *std.Build.Module, b: *std.Build) void {
+    module.addAnonymousImport("sqlite_mindbrain_schema", .{
+        .root_source_file = b.path("sql/sqlite_mindbrain--1.0.0.sql"),
+    });
 }
 
 const NeonMode = enum { auto, on, off };

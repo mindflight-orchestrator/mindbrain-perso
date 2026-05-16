@@ -1,9 +1,10 @@
 -- MindBrain SQLite install schema.
--- this file is equivalent to  src/standalone/sqlite_schema.zig
+-- This is the canonical current-state SQLite schema used by both the
+-- standalone runtime and installed SQL artifact.
 -- This file is intentionally SQLite-only. It does not use PostgreSQL
 -- extensions, namespaces, procedural functions, server catalog types,
--- specialized index methods, custom data types, or migration-style table
--- alterations.
+-- specialized index methods, custom data types, or table-mutation migration
+-- fragments.
 --
 -- Design notes:
 -- - Logical PostgreSQL schemas are represented as unprefixed / prefixed table
@@ -11,10 +12,8 @@
 -- - JSON values are stored as TEXT.
 -- - Embeddings and bitmap/posting payloads are stored as BLOB/TEXT payloads and
 --   interpreted by the application/native layer.
--- - This is a fresh-install schema. Future migrations should live in separate
---   migration files rather than being folded into this base definition.
-
-PRAGMA foreign_keys = ON;
+-- - Keep SQLite DDL changes folded into this file and avoid separate
+--   table-mutation migration files.
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -217,6 +216,25 @@ CREATE TABLE IF NOT EXISTS graph_entity_document (
     PRIMARY KEY(entity_id, doc_id, table_id),
     FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
 );
+
+CREATE TABLE IF NOT EXISTS graph_entity_chunk (
+    entity_id INTEGER NOT NULL,
+    workspace_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    doc_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    role TEXT,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(entity_id, workspace_id, collection_id, doc_id, chunk_index),
+    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS graph_entity_chunk_entity_idx
+    ON graph_entity_chunk(entity_id);
+
+CREATE INDEX IF NOT EXISTS graph_entity_chunk_source_idx
+    ON graph_entity_chunk(workspace_id, collection_id, doc_id, chunk_index);
 
 CREATE TABLE IF NOT EXISTS graph_lj_out (
     entity_id INTEGER PRIMARY KEY,

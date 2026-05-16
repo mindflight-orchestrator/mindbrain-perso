@@ -20,9 +20,10 @@ PostgreSQL extension install body plus versioned upgrade deltas.
 
 ## MindBrain SQLite Schema Shape
 
-`sql/sqlite_mindbrain--1.0.0.sql` is a single bootstrap file that creates the
-runtime tables with `CREATE TABLE IF NOT EXISTS`, indexes, compatibility
-triggers, and seed rows.
+`sql/sqlite_mindbrain--1.0.0.sql` is the single canonical current-state schema
+file that creates the runtime tables with `CREATE TABLE IF NOT EXISTS`,
+indexes, compatibility triggers, and seed rows. The standalone Zig runtime
+embeds this file rather than maintaining a second DDL copy.
 
 Major table groups:
 

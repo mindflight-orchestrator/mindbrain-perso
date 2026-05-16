@@ -141,7 +141,13 @@ const db = try mindbrain.facet_sqlite.Database.open("data/mindbrain.sqlite");
 
 ## Schema
 
-SQLite DDL and migrations are maintained in Zig modules such as [src/standalone/sqlite_schema.zig](../src/standalone/sqlite_schema.zig) and applied via helpers like `applyStandaloneSchema()` where used.
+SQLite DDL is maintained in the single canonical schema file
+[`sql/sqlite_mindbrain--1.0.0.sql`](../sql/sqlite_mindbrain--1.0.0.sql).
+The standalone runtime embeds that file through
+[`src/standalone/sqlite_schema.zig`](../src/standalone/sqlite_schema.zig) and
+applies it via helpers like `applyStandaloneSchema()` where used. SQLite schema
+changes should be folded into the canonical file, not added as separate
+table-mutation migration files.
 
 The standalone fact-store contract uses the `facets` table as the durable fact
 row table. MindBrain allocates `facets.doc_id` transactionally in
