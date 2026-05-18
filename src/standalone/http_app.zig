@@ -3,10 +3,13 @@ const facet_sqlite = @import("facet_sqlite.zig");
 const facts_sqlite = @import("facts_sqlite.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
 const helper_api = @import("helper_api.zig");
+const hybrid_search = @import("hybrid_search.zig");
+const interfaces = @import("interfaces.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
+const tokenization_sqlite = @import("tokenization_sqlite.zig");
 const toon_exports = @import("toon_exports.zig");
 const workspace_sqlite = @import("workspace_sqlite.zig");
 const zig16_compat = @import("zig16_compat.zig");
@@ -57,6 +60,10 @@ const FactWriteRequest = struct {
     content: ?[]const u8 = null,
     facets_json: ?[]const u8 = null,
     embedding_blob: ?[]const u8 = null,
+    /// Numeric embedding vector (f64 JSON array). When non-empty, automatically
+    /// synced to search_embeddings so the MindBrain hybrid search engine can
+    /// find this fact without a separate search-embedding-upsert call.
+    embedding: []const f64 = &.{},
     created_by: ?[]const u8 = null,
     valid_from_unix: ?i64 = null,
     valid_until_unix: ?i64 = null,
@@ -67,6 +74,14 @@ const SearchEmbeddingUpsertRequest = struct {
     table_id: ?u64 = null,
     doc_id: ?u64 = null,
     embedding: []const f64 = &.{},
+};
+
+const GhostcrabSearchRequest = struct {
+    workspace_id: []const u8,
+    query: []const u8 = "",
+    embedding: []const f64 = &.{},
+    vector_weight: f64 = 0.5,
+    limit: usize = 50,
 };
 
 pub const DefaultWorkspaceOptions = struct {
@@ -840,6 +855,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleSqlRequest(allocator, request, body_buffer, true);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/search")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGhostcrabSearch(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -915,6 +935,13 @@ pub const MindbrainHttpApp = struct {
         const facets_json = write_request.facets_json orelse "{}";
         facts_sqlite.validateFacetsJsonObject(allocator, facets_json) catch return error.BadRequest;
 
+        // Validate embedding before acquiring the writer lock so bad input fails fast.
+        const embedding_values: ?[]f32 = if (write_request.embedding.len > 0)
+            copyFiniteEmbeddingF32(allocator, write_request.embedding) catch return error.BadRequest
+        else
+            null;
+        defer if (embedding_values) |v| allocator.free(v);
+
         const source_ref = normalizeOptionalText(write_request.source_ref);
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
@@ -944,6 +971,19 @@ pub const MindbrainHttpApp = struct {
         };
         self.writer_completed += 1;
         defer facts_sqlite.deinitFactWriteResult(allocator, result);
+
+        // Mirror the embedding into search_embeddings (already holding the writer mutex).
+        // The fact write is already committed; SQL errors here are logged but do not
+        // fail the response — the fact is durable regardless.
+        if (embedding_values) |values| {
+            search_sqlite.upsertSearchEmbedding(self.writer_db, allocator, 1, result.doc_id, values) catch |err| switch (err) {
+                error.PrepareFailed, error.StepFailed, error.BindFailed => {
+                    self.writer_failed += 1;
+                    self.recordWriterError(self.writer_db, "facts.write.embedding_sync", err);
+                },
+                else => return err,
+            };
+        }
 
         return toResponse(
             try helper_api.jsonResponse(allocator, .{
@@ -1119,6 +1159,89 @@ pub const MindbrainHttpApp = struct {
             .linked_evidence = linked_evidence,
             .deltas = deltas,
             .report = report,
+        };
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
+    fn handleGhostcrabSearch(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        const search_request = try std.json.parseFromSliceLeaky(
+            GhostcrabSearchRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+        );
+
+        if (search_request.workspace_id.len == 0) return error.BadRequest;
+        if (search_request.limit == 0 or search_request.limit > 1000) return error.BadRequest;
+
+        // Tokenise the query text into BM25 term hashes using the same
+        // tokeniser that the BM25 index was built with.
+        const term_hashes = try tokenization_sqlite.tokenizeSearchHashes(allocator, search_request.query, null);
+        defer allocator.free(term_hashes);
+
+        // Convert the query embedding from f64 (JSON) to f32 (store format).
+        var query_vector_f32 = try allocator.alloc(f32, search_request.embedding.len);
+        defer allocator.free(query_vector_f32);
+        for (search_request.embedding, 0..) |v, i| {
+            query_vector_f32[i] = @floatCast(v);
+        }
+
+        var db = try self.openDb();
+        defer db.close();
+
+        var store = try search_sqlite.loadSearchStore(db, allocator);
+        defer store.deinit();
+
+        const bm25_repo = store.bm25Repository();
+        const vector_repo = store.vectorRepository();
+
+        const maybe_vector_request: ?interfaces.VectorSearchRequest = if (query_vector_f32.len > 0) .{
+            .table_name = "facets",
+            .key_column = "doc_id",
+            .vector_column = "embedding_blob",
+            .query_vector = query_vector_f32,
+            .limit = search_request.limit,
+            .table_id = 1,
+        } else null;
+
+        const matches = try hybrid_search.search(
+            allocator,
+            bm25_repo,
+            if (maybe_vector_request != null) &vector_repo else null,
+            .{
+                .bm25_table_id = 1,
+                .bm25_term_hashes = term_hashes,
+                .vector = maybe_vector_request,
+                .vector_weight = search_request.vector_weight,
+                .limit = search_request.limit,
+            },
+        );
+        defer allocator.free(matches);
+
+        const payload = .{
+            .workspace_id = search_request.workspace_id,
+            .query = search_request.query,
+            .returned = matches.len,
+            .matches = matches,
         };
 
         var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1359,6 +1482,10 @@ pub const MindbrainHttpApp = struct {
             edge_types_owned = try parseCsvStringList(allocator, value);
         }
 
+        const format_text = try queryValue(allocator, query, "format");
+        defer if (format_text) |value| allocator.free(value);
+        const json_format = format_text != null and std.mem.eql(u8, format_text.?, "json");
+
         const events = try graph_sqlite.streamSubgraph(
             db,
             allocator,
@@ -1375,12 +1502,21 @@ pub const MindbrainHttpApp = struct {
             allocator.free(events);
         }
 
-        const body = try encodeGraphSubgraphSseBody(allocator, events);
-        return .{
-            .status = .ok,
-            .content_type = "text/event-stream; charset=utf-8",
-            .body = body,
-        };
+        if (json_format) {
+            const body = try encodeGraphSubgraphJsonBody(allocator, events);
+            return .{
+                .status = .ok,
+                .content_type = "application/json; charset=utf-8",
+                .body = body,
+            };
+        } else {
+            const body = try encodeGraphSubgraphSseBody(allocator, events);
+            return .{
+                .status = .ok,
+                .content_type = "text/event-stream; charset=utf-8",
+                .body = body,
+            };
+        }
     }
 
     fn handleTraverse(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
@@ -2237,6 +2373,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/sql/session/close
         \\  POST /api/mindbrain/facts/write
         \\  POST /api/mindbrain/search-embedding-upsert
+        \\  POST /api/mindbrain/ghostcrab/search
         \\  GET /health
         \\  GET /api/events  (SSE demo_firehose, long-lived)
         \\  GET /api/mindbrain/simulate
@@ -2325,6 +2462,26 @@ fn encodeGraphSubgraphSseBody(allocator: std.mem.Allocator, events: []const grap
         try out.writer.print("event: {s}\n", .{event.kind});
         try out.writer.print("data: {s}\n\n", .{event.payload});
     }
+    return try out.toOwnedSlice();
+}
+
+/// Encode subgraph events as a JSON array: [{seq, kind, payload}, ...].
+/// Each `payload` is already a valid JSON value and is embedded verbatim.
+fn encodeGraphSubgraphJsonBody(allocator: std.mem.Allocator, events: []const graph_sqlite.GraphStreamEvent) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.writeAll("[");
+    for (events, 0..) |event, i| {
+        if (i > 0) try out.writer.writeAll(",");
+        try out.writer.print("{{\"seq\":{d},\"kind\":{},\"payload\":", .{
+            event.seq,
+            std.json.fmt(event.kind, .{}),
+        });
+        try out.writer.writeAll(event.payload);
+        try out.writer.writeAll("}");
+    }
+    try out.writer.writeAll("]");
     return try out.toOwnedSlice();
 }
 
