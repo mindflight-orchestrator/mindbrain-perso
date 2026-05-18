@@ -87,6 +87,14 @@ pub const Store = struct {
         try upsertAdjacency(self.allocator, &self.incoming, &self.incoming_index, entity_id, relation_ids);
     }
 
+    pub fn appendOutgoing(self: *Store, entity_id: u32, relation_id: u32) !void {
+        try appendAdjacencyRelation(self.allocator, &self.outgoing, &self.outgoing_index, entity_id, relation_id);
+    }
+
+    pub fn appendIncoming(self: *Store, entity_id: u32, relation_id: u32) !void {
+        try appendAdjacencyRelation(self.allocator, &self.incoming, &self.incoming_index, entity_id, relation_id);
+    }
+
     pub fn shortestPathHopsFast(
         self: *const Store,
         allocator: std.mem.Allocator,
@@ -302,6 +310,34 @@ fn upsertAdjacency(
     try entries.append(allocator, .{
         .entity_id = entity_id,
         .relation_ids = try allocator.dupe(u32, relation_ids),
+        .bitmap = try roaring.Bitmap.fromSlice(relation_ids),
+    });
+    try index.put(entity_id, entries.items.len - 1);
+}
+
+fn appendAdjacencyRelation(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(AdjacencyEntry),
+    index: *std.AutoHashMap(u32, usize),
+    entity_id: u32,
+    relation_id: u32,
+) !void {
+    if (index.get(entity_id)) |entry_index| {
+        const old_ids = entries.items[entry_index].relation_ids;
+        const relation_ids = try allocator.alloc(u32, old_ids.len + 1);
+        @memcpy(relation_ids[0..old_ids.len], old_ids);
+        relation_ids[old_ids.len] = relation_id;
+        allocator.free(old_ids);
+        entries.items[entry_index].bitmap.deinit();
+        entries.items[entry_index].relation_ids = relation_ids;
+        entries.items[entry_index].bitmap = try roaring.Bitmap.fromSlice(relation_ids);
+        return;
+    }
+
+    const relation_ids = try allocator.dupe(u32, &.{relation_id});
+    try entries.append(allocator, .{
+        .entity_id = entity_id,
+        .relation_ids = relation_ids,
         .bitmap = try roaring.Bitmap.fromSlice(relation_ids),
     });
     try index.put(entity_id, entries.items.len - 1);

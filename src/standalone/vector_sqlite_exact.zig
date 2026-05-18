@@ -129,6 +129,7 @@ pub const Repository = struct {
             }, request.limit);
         }
 
+        sortChunkMatches(matches.items);
         return matches.toOwnedSlice(allocator);
     }
 
@@ -166,6 +167,7 @@ pub const Repository = struct {
             }, request.limit);
         }
 
+        sortDocumentMatches(matches.items);
         return matches.toOwnedSlice(allocator);
     }
 
@@ -186,6 +188,7 @@ pub const Repository = struct {
                 .similarity = match.similarity,
             }, request.limit);
         }
+        sortDocumentMatches(matches.items);
         return matches.toOwnedSlice(allocator);
     }
 };
@@ -238,20 +241,45 @@ fn insertTopDocumentMatch(
     if (limit == 0) return;
     if (matches.items.len < limit) {
         try matches.append(allocator, candidate);
-    } else if (vector_distance.lessThan({}, candidate, matches.items[matches.items.len - 1])) {
-        matches.items[matches.items.len - 1] = candidate;
+        siftUpWorstDocumentMatch(matches.items, matches.items.len - 1);
+    } else if (vector_distance.lessThan({}, candidate, matches.items[0])) {
+        matches.items[0] = candidate;
+        siftDownWorstDocumentMatch(matches.items, 0);
     } else {
         return;
     }
-    bubbleLastDocumentMatch(matches.items);
 }
 
-fn bubbleLastDocumentMatch(items: []interfaces.VectorSearchMatch) void {
-    if (items.len < 2) return;
-    var index = items.len - 1;
-    while (index > 0 and vector_distance.lessThan({}, items[index], items[index - 1])) : (index -= 1) {
-        std.mem.swap(interfaces.VectorSearchMatch, &items[index], &items[index - 1]);
+fn siftUpWorstDocumentMatch(items: []interfaces.VectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!documentWorse(items[index], items[parent])) break;
+        std.mem.swap(interfaces.VectorSearchMatch, &items[index], &items[parent]);
+        index = parent;
     }
+}
+
+fn siftDownWorstDocumentMatch(items: []interfaces.VectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        var worst = index;
+        if (left < items.len and documentWorse(items[left], items[worst])) worst = left;
+        if (right < items.len and documentWorse(items[right], items[worst])) worst = right;
+        if (worst == index) break;
+        std.mem.swap(interfaces.VectorSearchMatch, &items[index], &items[worst]);
+        index = worst;
+    }
+}
+
+fn documentWorse(lhs: interfaces.VectorSearchMatch, rhs: interfaces.VectorSearchMatch) bool {
+    return vector_distance.lessThan({}, rhs, lhs);
+}
+
+fn sortDocumentMatches(items: []interfaces.VectorSearchMatch) void {
+    std.mem.sort(interfaces.VectorSearchMatch, items, {}, vector_distance.lessThan);
 }
 
 fn insertTopChunkMatch(
@@ -263,19 +291,36 @@ fn insertTopChunkMatch(
     if (limit == 0) return;
     if (matches.items.len < limit) {
         try matches.append(allocator, candidate);
-    } else if (chunkLessThan(candidate, matches.items[matches.items.len - 1])) {
-        matches.items[matches.items.len - 1] = candidate;
+        siftUpWorstChunkMatch(matches.items, matches.items.len - 1);
+    } else if (chunkLessThan(candidate, matches.items[0])) {
+        matches.items[0] = candidate;
+        siftDownWorstChunkMatch(matches.items, 0);
     } else {
         return;
     }
-    bubbleLastChunkMatch(matches.items);
 }
 
-fn bubbleLastChunkMatch(items: []ChunkVectorSearchMatch) void {
-    if (items.len < 2) return;
-    var index = items.len - 1;
-    while (index > 0 and chunkLessThan(items[index], items[index - 1])) : (index -= 1) {
-        std.mem.swap(ChunkVectorSearchMatch, &items[index], &items[index - 1]);
+fn siftUpWorstChunkMatch(items: []ChunkVectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!chunkWorse(items[index], items[parent])) break;
+        std.mem.swap(ChunkVectorSearchMatch, &items[index], &items[parent]);
+        index = parent;
+    }
+}
+
+fn siftDownWorstChunkMatch(items: []ChunkVectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        var worst = index;
+        if (left < items.len and chunkWorse(items[left], items[worst])) worst = left;
+        if (right < items.len and chunkWorse(items[right], items[worst])) worst = right;
+        if (worst == index) break;
+        std.mem.swap(ChunkVectorSearchMatch, &items[index], &items[worst]);
+        index = worst;
     }
 }
 
@@ -283,6 +328,18 @@ fn chunkLessThan(lhs: ChunkVectorSearchMatch, rhs: ChunkVectorSearchMatch) bool 
     if (lhs.similarity != rhs.similarity) return lhs.similarity > rhs.similarity;
     if (lhs.doc_id != rhs.doc_id) return lhs.doc_id < rhs.doc_id;
     return lhs.chunk_index < rhs.chunk_index;
+}
+
+fn chunkWorse(lhs: ChunkVectorSearchMatch, rhs: ChunkVectorSearchMatch) bool {
+    return chunkLessThan(rhs, lhs);
+}
+
+fn sortChunkMatches(items: []ChunkVectorSearchMatch) void {
+    std.mem.sort(ChunkVectorSearchMatch, items, {}, struct {
+        fn lessThan(_: void, lhs: ChunkVectorSearchMatch, rhs: ChunkVectorSearchMatch) bool {
+            return chunkLessThan(lhs, rhs);
+        }
+    }.lessThan);
 }
 
 test "sqlite exact vector repository searches raw document vectors" {

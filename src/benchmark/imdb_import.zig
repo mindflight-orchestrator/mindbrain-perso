@@ -715,8 +715,7 @@ fn mirrorImdbRawTables(db: facet_sqlite.Database, options: ImportOptions) !void 
     const relations_sql = try std.fmt.allocPrint(std.heap.page_allocator,
         \\INSERT OR REPLACE INTO relations_raw(workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, confidence, metadata_json)
         \\SELECT '{s}', '{s}', relation_id, relation_type, source_id, target_id, confidence, metadata_json
-        \\FROM temp_imdb_relation_stage
-        \\ORDER BY relation_id;
+        \\FROM temp_imdb_relation_stage;
     , .{ ws_lit, onto_lit });
     defer std.heap.page_allocator.free(relations_sql);
     try db.exec(relations_sql);
@@ -782,7 +781,7 @@ test "imdb importer handles a small TSV fixture" {
     try std.testing.expectEqual(@as(usize, 1), summary.title_episode_rows);
     try std.testing.expectEqual(@as(usize, 1), summary.title_crew_rows);
     try std.testing.expectEqual(@as(usize, 1), summary.title_principals_rows);
-    try std.testing.expect(summary.entity_rows >= 3);
+    try std.testing.expectEqual(@as(usize, 3), summary.entity_rows);
     try std.testing.expect(summary.relation_rows >= 5);
     try std.testing.expect(summary.alias_rows >= 2);
 

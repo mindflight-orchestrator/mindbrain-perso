@@ -18,8 +18,10 @@ pub const Adapter = struct {
             .ctx = @ptrCast(&adapter_ctx),
             .getCollectionStatsFn = getCollectionStatsViaInterface,
             .getDocumentStatsFn = getDocumentStatsViaInterface,
+            .getDocumentStatsBatchFn = getDocumentStatsBatchViaInterface,
             .getTermStatsFn = getTermStatsViaInterface,
             .getTermFrequenciesFn = getTermFrequenciesViaInterface,
+            .getTermFrequenciesBatchFn = getTermFrequenciesBatchViaInterface,
             .getPostingBitmapFn = getPostingBitmapViaInterface,
             .upsertDocumentFn = upsertDocumentViaInterface,
             .deleteDocumentFn = deleteDocumentViaInterface,
@@ -266,6 +268,34 @@ pub const Adapter = struct {
         }
 
         return freqs;
+    }
+
+    fn getDocumentStatsBatchViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
+        var rows = std.ArrayList(interfaces.DocumentStats).empty;
+        defer rows.deinit(allocator);
+        for (doc_ids) |doc_id| {
+            if (try getDocumentStatsViaInterface(ctx, allocator, table_id, doc_id)) |stats| {
+                try rows.append(allocator, stats);
+            }
+        }
+        return rows.toOwnedSlice(allocator);
+    }
+
+    fn getTermFrequenciesBatchViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
+        var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
+        defer rows.deinit(allocator);
+        for (doc_ids) |doc_id| {
+            const freqs = try getTermFrequenciesViaInterface(ctx, allocator, table_id, doc_id, term_hashes);
+            defer allocator.free(freqs);
+            for (freqs) |freq| {
+                try rows.append(allocator, .{
+                    .doc_id = doc_id,
+                    .term_hash = freq.term_hash,
+                    .frequency = freq.frequency,
+                });
+            }
+        }
+        return rows.toOwnedSlice(allocator);
     }
 
     fn getPostingBitmapViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap {

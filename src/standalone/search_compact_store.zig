@@ -69,8 +69,10 @@ pub const Store = struct {
             .ctx = @ptrCast(self),
             .getCollectionStatsFn = getCollectionStats,
             .getDocumentStatsFn = getDocumentStats,
+            .getDocumentStatsBatchFn = getDocumentStatsBatch,
             .getTermStatsFn = getTermStats,
             .getTermFrequenciesFn = getTermFrequencies,
+            .getTermFrequenciesBatchFn = getTermFrequenciesBatch,
             .getPostingBitmapFn = getPostingBitmap,
             .upsertDocumentFn = unsupportedUpsertDocument,
             .deleteDocumentFn = unsupportedDeleteDocument,
@@ -106,6 +108,24 @@ fn getDocumentStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64
     return null;
 }
 
+fn getDocumentStatsBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
+    const self: *Store = @ptrCast(@alignCast(ctx));
+    var wanted = std.AutoHashMap(interfaces.DocId, void).init(allocator);
+    defer wanted.deinit();
+    for (doc_ids) |doc_id| {
+        _ = try wanted.getOrPut(doc_id);
+    }
+
+    var rows = std.ArrayList(interfaces.DocumentStats).empty;
+    defer rows.deinit(allocator);
+    for (self.document_stats.items) |entry| {
+        if (entry.table_id == table_id and wanted.contains(entry.stats.doc_id)) {
+            try rows.append(allocator, entry.stats);
+        }
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
 fn getTermStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hashes: []const u64) anyerror![]interfaces.TermStat {
     const self: *Store = @ptrCast(@alignCast(ctx));
     const rows = try allocator.alloc(interfaces.TermStat, term_hashes.len);
@@ -131,6 +151,36 @@ fn getTermFrequencies(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u
                 try rows.append(allocator, entry.frequency);
                 break;
             }
+        }
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
+fn getTermFrequenciesBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
+    const self: *Store = @ptrCast(@alignCast(ctx));
+    var wanted_docs = std.AutoHashMap(interfaces.DocId, void).init(allocator);
+    defer wanted_docs.deinit();
+    for (doc_ids) |doc_id| {
+        _ = try wanted_docs.getOrPut(doc_id);
+    }
+    var wanted_terms = std.AutoHashMap(u64, void).init(allocator);
+    defer wanted_terms.deinit();
+    for (term_hashes) |term_hash| {
+        _ = try wanted_terms.getOrPut(term_hash);
+    }
+
+    var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
+    defer rows.deinit(allocator);
+    for (self.term_frequencies.items) |entry| {
+        if (entry.table_id == table_id and
+            wanted_docs.contains(entry.doc_id) and
+            wanted_terms.contains(entry.frequency.term_hash))
+        {
+            try rows.append(allocator, .{
+                .doc_id = entry.doc_id,
+                .term_hash = entry.frequency.term_hash,
+                .frequency = entry.frequency.frequency,
+            });
         }
     }
     return rows.toOwnedSlice(allocator);

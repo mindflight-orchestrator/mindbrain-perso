@@ -1728,6 +1728,26 @@ pub fn upsertAdjacency(db: Database, table_name: []const u8, entity_id: u32, rel
     try stepDone(stmt);
 }
 
+pub fn appendAdjacencyRelation(db: Database, table_name: []const u8, entity_id: u32, relation_id: u32, allocator: std.mem.Allocator) !void {
+    var bitmap = loadAdjacencyBitmap(db, allocator, table_name, entity_id) catch |err| switch (err) {
+        error.MissingRow => try roaring.Bitmap.empty(),
+        else => return err,
+    };
+    defer bitmap.deinit();
+    bitmap.add(relation_id);
+
+    const sql = try std.fmt.allocPrint(allocator, "INSERT OR REPLACE INTO {s}(entity_id, relation_ids_blob) VALUES (?1, ?2)", .{table_name});
+    defer allocator.free(sql);
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    const bytes = try bitmap.serializePortableStable(allocator);
+    defer allocator.free(bytes);
+    try bindInt64(stmt, 1, entity_id);
+    try bindBlob(stmt, 2, bytes);
+    try stepDone(stmt);
+}
+
 pub fn deleteAdjacency(db: Database, table_name: []const u8, entity_id: u32, allocator: std.mem.Allocator) !void {
     const sql = try std.fmt.allocPrint(allocator, "DELETE FROM {s} WHERE entity_id = ?1", .{table_name});
     defer allocator.free(sql);

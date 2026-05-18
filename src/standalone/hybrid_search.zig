@@ -19,6 +19,7 @@ pub fn search(
     if (request.vector_weight < 0.0 or request.vector_weight > 1.0) {
         return error.InvalidWeight;
     }
+    if (request.limit == 0) return allocator.alloc(interfaces.HybridSearchMatch, 0);
 
     const collection_stats = try bm25_repository.getCollectionStatsFn(
         bm25_repository.ctx,
@@ -79,30 +80,46 @@ pub fn search(
         }
     }
 
+    const candidate_doc_ids = try collectCandidateDocIds(allocator, &candidate_scores);
+    defer allocator.free(candidate_doc_ids);
+
+    const doc_stats_rows = try bm25_repository.getDocumentStatsBatchFn(
+        bm25_repository.ctx,
+        allocator,
+        request.bm25_table_id,
+        candidate_doc_ids,
+    );
+    defer allocator.free(doc_stats_rows);
+
+    const term_frequency_rows = try bm25_repository.getTermFrequenciesBatchFn(
+        bm25_repository.ctx,
+        allocator,
+        request.bm25_table_id,
+        candidate_doc_ids,
+        request.bm25_term_hashes,
+    );
+    defer allocator.free(term_frequency_rows);
+
+    var doc_stats_by_id = std.AutoHashMap(interfaces.DocId, interfaces.DocumentStats).init(allocator);
+    defer doc_stats_by_id.deinit();
+    for (doc_stats_rows) |row| {
+        try doc_stats_by_id.put(row.doc_id, row);
+    }
+
+    var frequencies_by_doc_term = std.AutoHashMap(u128, u32).init(allocator);
+    defer frequencies_by_doc_term.deinit();
+    for (term_frequency_rows) |row| {
+        try frequencies_by_doc_term.put(packDocTermKey(row.doc_id, row.term_hash), row.frequency);
+    }
+
     var candidate_iter = candidate_scores.iterator();
     while (candidate_iter.next()) |entry| {
-        const doc_id = entry.key_ptr.*;
-        const maybe_doc_stats = try bm25_repository.getDocumentStatsFn(
-            bm25_repository.ctx,
-            allocator,
-            request.bm25_table_id,
-            doc_id,
-        );
-        if (maybe_doc_stats == null) continue;
-
-        const term_freqs = try bm25_repository.getTermFrequenciesFn(
-            bm25_repository.ctx,
-            allocator,
-            request.bm25_table_id,
-            doc_id,
+        const doc_stats = doc_stats_by_id.get(entry.key_ptr.*) orelse continue;
+        entry.value_ptr.bm25_score = calculateBm25ScoreFromMap(
             request.bm25_term_hashes,
-        );
-        defer allocator.free(term_freqs);
-
-        entry.value_ptr.bm25_score = calculateBm25Score(
-            request.bm25_term_hashes,
-            term_freqs,
-            maybe_doc_stats.?,
+            entry.key_ptr.*,
+            &frequencies_by_doc_term,
+            doc_stats,
             collection_stats,
             &term_df,
         );
@@ -127,25 +144,27 @@ pub fn search(
             combined_score = 0.0;
         }
 
-        try results.append(allocator, .{
+        try insertTopHybridMatch(allocator, &results, .{
             .doc_id = entry.key_ptr.*,
             .bm25_score = bm25_score,
             .vector_score = vector_score,
             .combined_score = combined_score,
-        });
+        }, request.limit);
     }
 
-    std.mem.sort(interfaces.HybridSearchMatch, results.items, {}, struct {
-        fn lessThan(_: void, a: interfaces.HybridSearchMatch, b: interfaces.HybridSearchMatch) bool {
-            return a.combined_score > b.combined_score;
-        }
-    }.lessThan);
-
-    if (results.items.len > request.limit) {
-        results.shrinkRetainingCapacity(request.limit);
-    }
+    sortHybridMatches(results.items);
 
     return results.toOwnedSlice(allocator);
+}
+
+fn collectCandidateDocIds(allocator: std.mem.Allocator, candidate_scores: *std.AutoHashMap(interfaces.DocId, CandidateScore)) ![]interfaces.DocId {
+    var doc_ids = try std.ArrayList(interfaces.DocId).initCapacity(allocator, candidate_scores.count());
+    defer doc_ids.deinit(allocator);
+    var it = candidate_scores.iterator();
+    while (it.next()) |entry| {
+        try doc_ids.append(allocator, entry.key_ptr.*);
+    }
+    return doc_ids.toOwnedSlice(allocator);
 }
 
 fn calculateBm25Score(
@@ -191,6 +210,47 @@ fn calculateBm25Score(
     return score;
 }
 
+fn calculateBm25ScoreFromMap(
+    term_hashes: []const u64,
+    doc_id: interfaces.DocId,
+    frequencies_by_doc_term: *const std.AutoHashMap(u128, u32),
+    doc_stats: interfaces.DocumentStats,
+    collection_stats: interfaces.CollectionStats,
+    term_df: *const std.AutoHashMap(u64, u64),
+) f64 {
+    if (collection_stats.total_documents <= 0) return 0.0;
+
+    var avgdl: f64 = collection_stats.avg_document_length;
+    if (!(avgdl > 0.0) or std.math.isNan(avgdl) or std.math.isInf(avgdl)) avgdl = 1.0;
+
+    const k1 = 1.2;
+    const b = 0.75;
+    const doc_len = @as(f64, @floatFromInt(doc_stats.document_length));
+    const total_docs = @as(f64, @floatFromInt(collection_stats.total_documents));
+
+    var score: f64 = 0.0;
+    for (term_hashes) |term_hash| {
+        const tf = frequencies_by_doc_term.get(packDocTermKey(doc_id, term_hash)) orelse 0;
+        if (tf == 0) continue;
+
+        const df = term_df.get(term_hash) orelse 0;
+        if (df == 0) continue;
+
+        const idf = @log((total_docs + 1.0) / (@as(f64, @floatFromInt(df)) + 0.5));
+        const tf_f = @as(f64, @floatFromInt(tf));
+        const numerator = tf_f * (k1 + 1.0);
+        const denominator = tf_f + k1 * (1.0 - b + b * (doc_len / avgdl));
+        score += idf * (numerator / denominator);
+    }
+
+    if (!std.math.isFinite(score)) return 0.0;
+    return score;
+}
+
+fn packDocTermKey(doc_id: interfaces.DocId, term_hash: u64) u128 {
+    return (@as(u128, doc_id) << 64) | @as(u128, term_hash);
+}
+
 fn lookupFrequency(term_freqs: []const interfaces.TermFrequency, term_hash: u64) u32 {
     for (term_freqs) |term_freq| {
         if (term_freq.term_hash == term_hash) return term_freq.frequency;
@@ -207,6 +267,63 @@ fn getOrPutCandidate(
         gop.value_ptr.* = .{};
     }
     return gop.value_ptr;
+}
+
+fn hybridBetter(lhs: interfaces.HybridSearchMatch, rhs: interfaces.HybridSearchMatch) bool {
+    if (lhs.combined_score != rhs.combined_score) return lhs.combined_score > rhs.combined_score;
+    return lhs.doc_id < rhs.doc_id;
+}
+
+fn hybridWorse(lhs: interfaces.HybridSearchMatch, rhs: interfaces.HybridSearchMatch) bool {
+    return hybridBetter(rhs, lhs);
+}
+
+fn insertTopHybridMatch(
+    allocator: std.mem.Allocator,
+    matches: *std.ArrayList(interfaces.HybridSearchMatch),
+    candidate: interfaces.HybridSearchMatch,
+    limit: usize,
+) !void {
+    if (limit == 0) return;
+    if (matches.items.len < limit) {
+        try matches.append(allocator, candidate);
+        siftUpWorstHybrid(matches.items, matches.items.len - 1);
+    } else if (hybridBetter(candidate, matches.items[0])) {
+        matches.items[0] = candidate;
+        siftDownWorstHybrid(matches.items, 0);
+    }
+}
+
+fn siftUpWorstHybrid(items: []interfaces.HybridSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!hybridWorse(items[index], items[parent])) break;
+        std.mem.swap(interfaces.HybridSearchMatch, &items[index], &items[parent]);
+        index = parent;
+    }
+}
+
+fn siftDownWorstHybrid(items: []interfaces.HybridSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        var worst = index;
+        if (left < items.len and hybridWorse(items[left], items[worst])) worst = left;
+        if (right < items.len and hybridWorse(items[right], items[worst])) worst = right;
+        if (worst == index) break;
+        std.mem.swap(interfaces.HybridSearchMatch, &items[index], &items[worst]);
+        index = worst;
+    }
+}
+
+fn sortHybridMatches(items: []interfaces.HybridSearchMatch) void {
+    std.mem.sort(interfaces.HybridSearchMatch, items, {}, struct {
+        fn lessThan(_: void, a: interfaces.HybridSearchMatch, b: interfaces.HybridSearchMatch) bool {
+            return hybridBetter(a, b);
+        }
+    }.lessThan);
 }
 
 test "hybrid search ranks BM25-only candidates by exact BM25 score" {
@@ -353,8 +470,10 @@ const TestFixture = struct {
             .ctx = @ptrCast(self),
             .getCollectionStatsFn = bm25GetCollectionStats,
             .getDocumentStatsFn = bm25GetDocumentStats,
+            .getDocumentStatsBatchFn = bm25GetDocumentStatsBatch,
             .getTermStatsFn = bm25GetTermStats,
             .getTermFrequenciesFn = bm25GetTermFrequencies,
+            .getTermFrequenciesBatchFn = bm25GetTermFrequenciesBatch,
             .getPostingBitmapFn = bm25GetPostingBitmap,
             .upsertDocumentFn = bm25UpsertDocument,
             .deleteDocumentFn = bm25DeleteDocument,
@@ -395,6 +514,17 @@ fn bm25GetDocumentStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id:
     return null;
 }
 
+fn bm25GetDocumentStatsBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
+    var rows = std.ArrayList(interfaces.DocumentStats).empty;
+    defer rows.deinit(allocator);
+    for (doc_ids) |doc_id| {
+        if (try bm25GetDocumentStats(ctx, allocator, table_id, doc_id)) |stats| {
+            try rows.append(allocator, stats);
+        }
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
 fn bm25GetTermStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hashes: []const u64) anyerror![]interfaces.TermStat {
     _ = ctx;
     try std.testing.expectEqual(@as(u64, 42), table_id);
@@ -433,6 +563,23 @@ fn bm25GetTermFrequencies(ctx: *anyopaque, allocator: std.mem.Allocator, table_i
     }
 
     return freqs.toOwnedSlice(allocator);
+}
+
+fn bm25GetTermFrequenciesBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
+    var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
+    defer rows.deinit(allocator);
+    for (doc_ids) |doc_id| {
+        const freqs = try bm25GetTermFrequencies(ctx, allocator, table_id, doc_id, term_hashes);
+        defer allocator.free(freqs);
+        for (freqs) |freq| {
+            try rows.append(allocator, .{
+                .doc_id = doc_id,
+                .term_hash = freq.term_hash,
+                .frequency = freq.frequency,
+            });
+        }
+    }
+    return rows.toOwnedSlice(allocator);
 }
 
 fn bm25GetPostingBitmap(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap {

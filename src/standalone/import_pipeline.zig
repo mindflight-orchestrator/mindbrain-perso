@@ -161,8 +161,10 @@ pub const Pipeline = struct {
             .valid_to_unix = relation.valid_to_unix,
         });
 
-        try syncAdjacencyForNode(self, relation.source_id, true);
-        try syncAdjacencyForNode(self, relation.target_id, false);
+        try self.graph.appendOutgoing(relation.source_id, relation.relation_id);
+        try self.graph.appendIncoming(relation.target_id, relation.relation_id);
+        try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_out", relation.source_id, relation.relation_id, self.allocator);
+        try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_in", relation.target_id, relation.relation_id, self.allocator);
     }
 
     pub fn linkEntityDocument(self: *Pipeline, link: EntityDocumentImport) !void {

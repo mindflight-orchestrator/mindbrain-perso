@@ -167,8 +167,8 @@ pub fn syncDeleteSearchDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
+    try deleteSearchArtifactsForDocument(db, allocator, table_id, doc_id);
     try deleteSearchDocument(db, table_id, doc_id);
-    try rebuildSearchArtifacts(db, allocator);
 }
 
 pub fn syncDeleteSearchDocumentIfTriggered(
@@ -557,7 +557,36 @@ pub fn upsertSearchArtifactsForDocument(
     defer allocator.free(row.content);
     defer allocator.free(row.language);
     try upsertSearchFtsDocument(db, table_id, doc_id, row.content);
-    try rebuildSearchArtifacts(db, allocator);
+
+    const old_doc_stats = try loadDocumentStat(db, table_id, doc_id);
+    var old_counts = try loadTermFrequencyMapForDoc(db, allocator, table_id, doc_id);
+    defer old_counts.deinit();
+
+    var stop_cache = bm25_stopwords_sqlite.StopwordCache.init(allocator);
+    defer stop_cache.deinit();
+    const sw = try stop_cache.sliceFor(db, row.language);
+    const tokens = try tokenization_sqlite.tokenizeSearchHashes(allocator, row.content, sw);
+    defer allocator.free(tokens);
+
+    var new_counts = std.AutoHashMap(u64, u32).init(allocator);
+    defer new_counts.deinit();
+    for (tokens) |token| {
+        const entry = try new_counts.getOrPut(token);
+        if (entry.found_existing) {
+            entry.value_ptr.* += 1;
+        } else {
+            entry.value_ptr.* = 1;
+        }
+    }
+
+    try upsertDocumentStat(db, table_id, doc_id, tokens.len, new_counts.count());
+    try reconcileCollectionArtifact(
+        db,
+        table_id,
+        if (old_doc_stats) |stats| @as(u64, stats.document_length) else null,
+        tokens.len,
+    );
+    try reconcileDocumentTermArtifacts(db, allocator, table_id, doc_id, &old_counts, &new_counts);
 }
 
 pub fn deleteSearchArtifactsForDocument(
@@ -567,7 +596,18 @@ pub fn deleteSearchArtifactsForDocument(
     doc_id: u64,
 ) !void {
     try deleteSearchFtsDocument(db, table_id, doc_id);
-    try rebuildSearchArtifacts(db, allocator);
+    const old_doc_stats = try loadDocumentStat(db, table_id, doc_id);
+    var old_counts = try loadTermFrequencyMapForDoc(db, allocator, table_id, doc_id);
+    defer old_counts.deinit();
+
+    var old_it = old_counts.iterator();
+    while (old_it.next()) |entry| {
+        try reconcileTermArtifact(db, allocator, table_id, doc_id, entry.key_ptr.*, entry.value_ptr.*, 0);
+    }
+    try deleteDocumentStat(db, table_id, doc_id);
+    if (old_doc_stats) |stats| {
+        try reconcileCollectionArtifact(db, table_id, @as(u64, stats.document_length), null);
+    }
 }
 
 pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !search_compact_store.Store {
@@ -938,10 +978,57 @@ fn reconcileTermArtifact(
     }
 }
 
+fn reconcileDocumentTermArtifacts(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    doc_id: u64,
+    old_counts: *const std.AutoHashMap(u64, u32),
+    new_counts: *const std.AutoHashMap(u64, u32),
+) !void {
+    var old_it = old_counts.iterator();
+    while (old_it.next()) |entry| {
+        const term_hash = entry.key_ptr.*;
+        const new_frequency = new_counts.get(term_hash) orelse 0;
+        try reconcileTermArtifact(db, allocator, table_id, doc_id, term_hash, entry.value_ptr.*, new_frequency);
+    }
+
+    var new_it = new_counts.iterator();
+    while (new_it.next()) |entry| {
+        const term_hash = entry.key_ptr.*;
+        if (old_counts.contains(term_hash)) continue;
+        try reconcileTermArtifact(db, allocator, table_id, doc_id, term_hash, 0, entry.value_ptr.*);
+    }
+}
+
 const CollectionStatRecord = struct {
     total_documents: u64,
     total_length: u64,
 };
+
+fn reconcileCollectionArtifact(
+    db: Database,
+    table_id: u64,
+    old_document_length: ?u64,
+    new_document_length: ?u64,
+) !void {
+    var stat = try loadCollectionStat(db, table_id);
+    if (old_document_length) |old_len| {
+        if (stat.total_documents > 0) stat.total_documents -= 1;
+        stat.total_length = if (stat.total_length > old_len) stat.total_length - old_len else 0;
+    }
+    if (new_document_length) |new_len| {
+        stat.total_documents += 1;
+        stat.total_length += new_len;
+    }
+
+    if (stat.total_documents == 0) {
+        try deleteCollectionStat(db, table_id);
+    } else {
+        const avg = @as(f64, @floatFromInt(stat.total_length)) / @as(f64, @floatFromInt(stat.total_documents));
+        try upsertCollectionStat(db, table_id, stat.total_documents, stat.total_length, avg);
+    }
+}
 
 fn loadCollectionStat(db: Database, table_id: u64) !CollectionStatRecord {
     const stmt = try prepare(db, "SELECT total_documents, total_document_length, avg_document_length FROM search_collection_stats WHERE table_id = ?1");

@@ -116,6 +116,12 @@ pub const TermFrequency = struct {
     frequency: u32,
 };
 
+pub const DocumentTermFrequency = struct {
+    doc_id: DocId,
+    term_hash: u64,
+    frequency: u32,
+};
+
 pub const UpsertDocumentRequest = struct {
     table_id: u64,
     doc_id: DocId,
@@ -148,8 +154,10 @@ pub const Bm25Repository = struct {
     ctx: *anyopaque,
     getCollectionStatsFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64) anyerror!CollectionStats,
     getDocumentStatsFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_id: DocId) anyerror!?DocumentStats,
+    getDocumentStatsBatchFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const DocId) anyerror![]DocumentStats,
     getTermStatsFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hashes: []const u64) anyerror![]TermStat,
     getTermFrequenciesFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_id: DocId, term_hashes: []const u64) anyerror![]TermFrequency,
+    getTermFrequenciesBatchFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const DocId, term_hashes: []const u64) anyerror![]DocumentTermFrequency,
     getPostingBitmapFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap,
     upsertDocumentFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, request: UpsertDocumentRequest) anyerror!void,
     deleteDocumentFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_id: DocId) anyerror!void,

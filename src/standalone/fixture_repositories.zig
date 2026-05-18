@@ -20,8 +20,10 @@ pub const Store = struct {
             .ctx = @ptrCast(self),
             .getCollectionStatsFn = bm25GetCollectionStats,
             .getDocumentStatsFn = bm25GetDocumentStats,
+            .getDocumentStatsBatchFn = bm25GetDocumentStatsBatch,
             .getTermStatsFn = bm25GetTermStats,
             .getTermFrequenciesFn = bm25GetTermFrequencies,
+            .getTermFrequenciesBatchFn = bm25GetTermFrequenciesBatch,
             .getPostingBitmapFn = bm25GetPostingBitmap,
             .upsertDocumentFn = bm25UpsertDocument,
             .deleteDocumentFn = bm25DeleteDocument,
@@ -89,6 +91,17 @@ fn bm25GetDocumentStats(ctx: *anyopaque, allocator: std.mem.Allocator, requested
     return null;
 }
 
+fn bm25GetDocumentStatsBatch(ctx: *anyopaque, allocator: std.mem.Allocator, requested_table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
+    var rows = std.ArrayList(interfaces.DocumentStats).empty;
+    defer rows.deinit(allocator);
+    for (doc_ids) |doc_id| {
+        if (try bm25GetDocumentStats(ctx, allocator, requested_table_id, doc_id)) |stats| {
+            try rows.append(allocator, stats);
+        }
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
 fn bm25GetTermStats(ctx: *anyopaque, allocator: std.mem.Allocator, requested_table_id: u64, term_hashes: []const u64) anyerror![]interfaces.TermStat {
     if (requested_table_id != table_id) return allocator.alloc(interfaces.TermStat, 0);
 
@@ -138,6 +151,23 @@ fn bm25GetTermFrequencies(ctx: *anyopaque, allocator: std.mem.Allocator, request
     }
 
     return allocator.alloc(interfaces.TermFrequency, 0);
+}
+
+fn bm25GetTermFrequenciesBatch(ctx: *anyopaque, allocator: std.mem.Allocator, requested_table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
+    var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
+    defer rows.deinit(allocator);
+    for (doc_ids) |doc_id| {
+        const freqs = try bm25GetTermFrequencies(ctx, allocator, requested_table_id, doc_id, term_hashes);
+        defer allocator.free(freqs);
+        for (freqs) |freq| {
+            try rows.append(allocator, .{
+                .doc_id = doc_id,
+                .term_hash = freq.term_hash,
+                .frequency = freq.frequency,
+            });
+        }
+    }
+    return rows.toOwnedSlice(allocator);
 }
 
 fn bm25GetPostingBitmap(ctx: *anyopaque, allocator: std.mem.Allocator, requested_table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap {
