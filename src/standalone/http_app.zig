@@ -1226,7 +1226,7 @@ pub const MindbrainHttpApp = struct {
         const matches = try hybrid_search.search(
             allocator,
             bm25_repo,
-            if (maybe_vector_request != null) &vector_repo else null,
+            if (maybe_vector_request != null) vector_repo else null,
             .{
                 .bm25_table_id = 1,
                 .bm25_term_hashes = term_hashes,
