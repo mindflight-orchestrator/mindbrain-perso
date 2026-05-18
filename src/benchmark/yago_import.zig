@@ -93,12 +93,14 @@ const Importer = struct {
             \\    entity_type TEXT NOT NULL,
             \\    name TEXT NOT NULL,
             \\    confidence REAL NOT NULL,
-            \\    metadata_json TEXT NOT NULL
+            \\    metadata_json TEXT NOT NULL,
+            \\    PRIMARY KEY(entity_id)
             \\);
             \\CREATE TEMP TABLE temp_yago_alias_stage (
             \\    term TEXT NOT NULL,
             \\    entity_id INTEGER NOT NULL,
-            \\    confidence REAL NOT NULL
+            \\    confidence REAL NOT NULL,
+            \\    PRIMARY KEY(term, entity_id)
             \\);
             \\CREATE TEMP TABLE temp_yago_relation_stage (
             \\    relation_id INTEGER NOT NULL,
@@ -107,7 +109,8 @@ const Importer = struct {
             \\    source_id INTEGER NOT NULL,
             \\    target_id INTEGER NOT NULL,
             \\    confidence REAL NOT NULL,
-            \\    metadata_json TEXT NOT NULL
+            \\    metadata_json TEXT NOT NULL,
+            \\    PRIMARY KEY(relation_id)
             \\);
         );
 
@@ -117,11 +120,11 @@ const Importer = struct {
             .workspace_id = workspace_id,
             .stage_entity_stmt = try prepare(
                 db,
-                "INSERT INTO temp_yago_entity_stage(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO temp_yago_entity_stage(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(entity_id) DO UPDATE SET workspace_id = MIN(temp_yago_entity_stage.workspace_id, excluded.workspace_id), entity_type = MIN(temp_yago_entity_stage.entity_type, excluded.entity_type), name = MIN(temp_yago_entity_stage.name, excluded.name), confidence = MAX(temp_yago_entity_stage.confidence, excluded.confidence), metadata_json = MIN(temp_yago_entity_stage.metadata_json, excluded.metadata_json)",
             ),
             .stage_alias_stmt = try prepare(
                 db,
-                "INSERT INTO temp_yago_alias_stage(term, entity_id, confidence) VALUES (?1, ?2, ?3)",
+                "INSERT INTO temp_yago_alias_stage(term, entity_id, confidence) VALUES (?1, ?2, ?3) ON CONFLICT(term, entity_id) DO UPDATE SET confidence = MAX(temp_yago_alias_stage.confidence, excluded.confidence)",
             ),
             .stage_relation_stmt = try prepare(
                 db,
@@ -628,6 +631,7 @@ test "yago importer loads a small rdf fixture" {
     defer yago_file.close();
     try yago_file.writeAll(
         "<http://yago-knowledge.org/resource/Ada_Lovelace> <http://www.w3.org/2000/01/rdf-schema#label> \"Ada Lovelace\"@en .\n" ++
+            "<http://yago-knowledge.org/resource/Ada_Lovelace> <http://www.w3.org/2000/01/rdf-schema#label> \"Ada Lovelace\"@en .\n" ++
             "<http://yago-knowledge.org/resource/Ada_Lovelace> <http://yago-knowledge.org/prop/direct/knows> <http://yago-knowledge.org/resource/Charles_Babbage> .\n",
     );
 
@@ -645,10 +649,10 @@ test "yago importer loads a small rdf fixture" {
         .yago_path = sample_path,
         .row_limit = null,
     });
-    try std.testing.expectEqual(@as(usize, 2), summary.triple_rows);
+    try std.testing.expectEqual(@as(usize, 3), summary.triple_rows);
     try std.testing.expectEqual(@as(usize, 3), summary.entity_rows);
     try std.testing.expectEqual(@as(usize, 2), summary.relation_rows);
-    try std.testing.expectEqual(@as(usize, 1), summary.alias_rows);
+    try std.testing.expectEqual(@as(usize, 2), summary.alias_rows);
 
     try expectRowCount(db, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = 'yago'", 1);
     try expectRowCount(db, "SELECT COUNT(*) FROM collections WHERE collection_id = 'yago::core_facts'", 1);

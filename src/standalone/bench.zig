@@ -4,6 +4,7 @@ const facet_sqlite = @import("facet_sqlite.zig");
 const facet_store = @import("facet_store.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
+const search_compact_store = @import("search_compact_store.zig");
 const roaring = @import("roaring.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
 const query_executor = @import("query_executor.zig");
@@ -23,6 +24,7 @@ const IterationConfig = struct {
     compact_vector_queries: usize = 1_000,
     facet_filters: usize = 1_000,
     graph_paths: usize = 250,
+    graph_streams: usize = 100,
     composite_queries: usize = 250,
     facet_single_mutations: usize = 50,
     facet_batch_mutations: usize = 20,
@@ -268,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
         .{ dataset.search_docs, dataset.facet_docs, dataset.graph_nodes },
     );
     std.debug.print(
-        "iterations bitmap_ops={d} search_upserts={d} compact_lookups={d} compact_vector_queries={d} facet_filters={d} graph_paths={d} composite_queries={d} facet_single_mutations={d} facet_batch_mutations={d} graph_mutation_nodes={d} graph_single_mutations={d} graph_batch_mutations={d}\n",
+        "iterations bitmap_ops={d} search_upserts={d} compact_lookups={d} compact_vector_queries={d} facet_filters={d} graph_paths={d} graph_streams={d} composite_queries={d} facet_single_mutations={d} facet_batch_mutations={d} graph_mutation_nodes={d} graph_single_mutations={d} graph_batch_mutations={d}\n",
         .{
             iters.bitmap_ops,
             iters.search_upserts,
@@ -276,6 +278,7 @@ pub fn main(init: std.process.Init) !void {
             iters.compact_vector_queries,
             iters.facet_filters,
             iters.graph_paths,
+            iters.graph_streams,
             iters.composite_queries,
             iters.facet_single_mutations,
             iters.facet_batch_mutations,
@@ -305,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
     (try microCompactVectorSearch(allocator, dataset.search_docs, iters.compact_vector_queries)).print();
     (try microFacetFilter(allocator, dataset.facet_docs, iters.facet_filters)).print();
     (try microGraphShortestPath(allocator, dataset.graph_nodes, iters.graph_paths)).print();
+    (try microGraphStreamSubgraph(allocator, dataset.graph_nodes, iters.graph_streams)).print();
     (try microCompositeQuery(allocator, iters.composite_queries)).print();
     (try microFacetSingleAdd(allocator, dataset.facet_docs, iters.facet_single_mutations)).print();
     (try microFacetSingleRemove(allocator, dataset.facet_docs, iters.facet_single_mutations)).print();
@@ -425,7 +429,9 @@ fn coldCompactReload(allocator: std.mem.Allocator, doc_count: usize) !ColdStat {
     defer db.close();
     try db.applyStandaloneSchema();
     _ = try bulkInsertSearchDocs(db, allocator, doc_count);
-    try search_sqlite.rebuildSearchArtifacts(db, allocator);
+    for (0..doc_count) |index| {
+        try search_sqlite.upsertSearchArtifactsForDocument(db, allocator, 1, @intCast(index + 1));
+    }
 
     var timer = try compat.Timer.start();
     var store = try search_sqlite.loadCompactSearchStore(db, allocator);
@@ -642,16 +648,21 @@ fn microSearchSingleDocUpsert(allocator: std.mem.Allocator, iterations: usize) !
 }
 
 fn microCompactPostingLookup(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
-    var db = try facet_sqlite.Database.openInMemory();
-    defer db.close();
-    try db.applyStandaloneSchema();
-    _ = try bulkInsertSearchDocs(db, allocator, doc_count);
-    try search_sqlite.rebuildSearchArtifacts(db, allocator);
-
-    var store = try search_sqlite.loadCompactSearchStore(db, allocator);
+    var store = search_compact_store.Store.init(allocator);
     defer store.deinit();
+    const term_hash = tokenization_sqlite.hashTermLexeme("benchmark");
+    const doc_ids = try allocator.alloc(u32, doc_count);
+    defer allocator.free(doc_ids);
+    for (doc_ids, 0..) |*doc_id, index| {
+        doc_id.* = @intCast(index + 1);
+    }
+    try store.postings.append(allocator, .{
+        .table_id = 1,
+        .term_hash = term_hash,
+        .bitmap = try roaring.Bitmap.fromSlice(doc_ids),
+    });
+
     const repo = store.bm25Repository();
-    const term_hash = tokenization_sqlite.hashTermLexeme("roaring");
 
     const Ctx = struct {
         allocator: std.mem.Allocator,
@@ -762,6 +773,36 @@ fn microGraphShortestPath(allocator: std.mem.Allocator, node_count: usize, itera
             std.mem.doNotOptimizeAway(hops.?);
         }
     }.run);
+}
+
+fn microGraphStreamSubgraph(allocator: std.mem.Allocator, node_count: usize, iterations: usize) !MicroStat {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try seedGraphFanout(db, allocator, @min(node_count, 512));
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        db: facet_sqlite.Database,
+    };
+    var ctx = Ctx{ .allocator = allocator, .db = db };
+    return measure("micro_graph_stream_subgraph", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            const events = try graph_sqlite.streamSubgraph(local.db, local.allocator, &.{1}, 2, null, null, null, null, null);
+            defer {
+                for (events) |*event| event.deinit(local.allocator);
+                local.allocator.free(events);
+            }
+            std.mem.doNotOptimizeAway(events.len);
+        }
+    }.run);
+}
+
+test "graph stream benchmark emits a metric" {
+    const stat = try microGraphStreamSubgraph(std.testing.allocator, 32, 1);
+    try std.testing.expectEqualStrings("micro_graph_stream_subgraph", stat.name);
+    try std.testing.expectEqual(@as(usize, 1), stat.iterations);
+    try std.testing.expect(stat.max_ns >= stat.min_ns);
 }
 
 fn microCompositeQuery(allocator: std.mem.Allocator, iterations: usize) !MicroStat {
@@ -1201,6 +1242,53 @@ fn seedGraphChain(db: facet_sqlite.Database, allocator: std.mem.Allocator, node_
         defer incoming.deinit(allocator);
         if (index > 0) try incoming.append(allocator, @intCast(index));
         try graph_sqlite.upsertAdjacency(db, "graph_lj_in", entity_id, incoming.items, allocator);
+    }
+}
+
+fn seedGraphFanout(db: facet_sqlite.Database, allocator: std.mem.Allocator, node_count: usize) !void {
+    if (node_count < 4) return error.InvalidConfig;
+
+    for (0..node_count) |index| {
+        const entity_id: u32 = @intCast(index + 1);
+        const name = try std.fmt.allocPrint(allocator, "stream-node-{d}", .{entity_id});
+        defer allocator.free(name);
+        try graph_sqlite.upsertEntity(db, entity_id, "concept", name);
+    }
+
+    var root_outgoing = std.ArrayList(u32).empty;
+    defer root_outgoing.deinit(allocator);
+
+    const branch_count = @min(node_count - 1, 128);
+    var relation_id: u32 = 1;
+    for (0..branch_count) |index| {
+        const child_id: u32 = @intCast(index + 2);
+        try graph_sqlite.upsertRelation(db, .{
+            .relation_id = relation_id,
+            .source_id = 1,
+            .target_id = child_id,
+            .relation_type = "links_to",
+            .confidence = 1.0,
+        });
+        try root_outgoing.append(allocator, relation_id);
+        try graph_sqlite.upsertAdjacency(db, "graph_lj_in", child_id, &.{relation_id}, allocator);
+        relation_id += 1;
+    }
+    try graph_sqlite.upsertAdjacency(db, "graph_lj_out", 1, root_outgoing.items, allocator);
+
+    for (0..branch_count) |index| {
+        const child_id: u32 = @intCast(index + 2);
+        const grandchild_id: u32 = @intCast(((index + branch_count) % (node_count - 1)) + 2);
+        if (child_id == grandchild_id) continue;
+        try graph_sqlite.upsertRelation(db, .{
+            .relation_id = relation_id,
+            .source_id = child_id,
+            .target_id = grandchild_id,
+            .relation_type = "links_to",
+            .confidence = 0.9,
+        });
+        try graph_sqlite.upsertAdjacency(db, "graph_lj_out", child_id, &.{relation_id}, allocator);
+        try graph_sqlite.upsertAdjacency(db, "graph_lj_in", grandchild_id, &.{relation_id}, allocator);
+        relation_id += 1;
     }
 }
 

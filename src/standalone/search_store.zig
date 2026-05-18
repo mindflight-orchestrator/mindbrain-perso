@@ -41,6 +41,17 @@ const PostingEntry = struct {
     bitmap: roaring.Bitmap,
 };
 
+const TableDocKey = struct {
+    table_id: u64,
+    doc_id: interfaces.DocId,
+};
+
+const TableDocTermKey = struct {
+    table_id: u64,
+    doc_id: interfaces.DocId,
+    term_hash: u64,
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     documents: std.ArrayList(DocumentRecord),
@@ -50,6 +61,11 @@ pub const Store = struct {
     term_stats: std.ArrayList(TermStatEntry),
     term_frequencies: std.ArrayList(TermFrequencyEntry),
     postings: std.ArrayList(PostingEntry),
+    collection_stats_by_table: std.AutoHashMap(u64, interfaces.CollectionStats),
+    document_stats_by_doc: std.AutoHashMap(TableDocKey, interfaces.DocumentStats),
+    term_stats_by_term: std.AutoHashMap(u128, interfaces.TermStat),
+    term_frequencies_by_doc_term: std.AutoHashMap(TableDocTermKey, u32),
+    posting_index_by_term: std.AutoHashMap(u128, usize),
     bm25_stopwords: bm25_stopwords_sqlite.StopwordCache,
     /// When set (e.g. by `loadSearchStore`), BM25 tokenization loads `bm25_stopwords` for each document language.
     bm25_db: ?facet_sqlite.Database = null,
@@ -64,6 +80,11 @@ pub const Store = struct {
             .term_stats = .empty,
             .term_frequencies = .empty,
             .postings = .empty,
+            .collection_stats_by_table = std.AutoHashMap(u64, interfaces.CollectionStats).init(allocator),
+            .document_stats_by_doc = std.AutoHashMap(TableDocKey, interfaces.DocumentStats).init(allocator),
+            .term_stats_by_term = std.AutoHashMap(u128, interfaces.TermStat).init(allocator),
+            .term_frequencies_by_doc_term = std.AutoHashMap(TableDocTermKey, u32).init(allocator),
+            .posting_index_by_term = std.AutoHashMap(u128, usize).init(allocator),
             .bm25_stopwords = bm25_stopwords_sqlite.StopwordCache.init(allocator),
             .bm25_db = null,
         };
@@ -76,6 +97,11 @@ pub const Store = struct {
         self.term_stats.deinit(self.allocator);
         self.term_frequencies.deinit(self.allocator);
         self.postings.deinit(self.allocator);
+        self.collection_stats_by_table.deinit();
+        self.document_stats_by_doc.deinit();
+        self.term_stats_by_term.deinit();
+        self.term_frequencies_by_doc_term.deinit();
+        self.posting_index_by_term.deinit();
         self.bm25_stopwords.deinit();
         for (self.documents.items) |doc| {
             self.allocator.free(doc.content);
@@ -95,6 +121,11 @@ pub const Store = struct {
         self.term_frequencies.clearRetainingCapacity();
         for (self.postings.items) |*entry| entry.bitmap.deinit();
         self.postings.clearRetainingCapacity();
+        self.collection_stats_by_table.clearRetainingCapacity();
+        self.document_stats_by_doc.clearRetainingCapacity();
+        self.term_stats_by_term.clearRetainingCapacity();
+        self.term_frequencies_by_doc_term.clearRetainingCapacity();
+        self.posting_index_by_term.clearRetainingCapacity();
     }
 
     pub fn bm25Repository(self: *Store) interfaces.Bm25Repository {
@@ -184,14 +215,19 @@ pub const Store = struct {
                 }
             }
 
+            const doc_stats: interfaces.DocumentStats = .{
+                .doc_id = doc.doc_id,
+                .document_length = @intCast(tokens.len),
+                .unique_terms = @intCast(local_counts.count()),
+            };
             try self.document_stats.append(self.allocator, .{
                 .table_id = doc.table_id,
-                .stats = .{
-                    .doc_id = doc.doc_id,
-                    .document_length = @intCast(tokens.len),
-                    .unique_terms = @intCast(local_counts.count()),
-                },
+                .stats = doc_stats,
             });
+            try self.document_stats_by_doc.put(.{
+                .table_id = doc.table_id,
+                .doc_id = doc.doc_id,
+            }, doc_stats);
 
             const length_entry = try doc_lengths.getOrPut(doc.table_id);
             if (!length_entry.found_existing) length_entry.value_ptr.* = .{ .total_docs = 0, .total_length = 0 };
@@ -201,14 +237,20 @@ pub const Store = struct {
             var local_it = local_counts.iterator();
             while (local_it.next()) |entry| {
                 const term_hash = entry.key_ptr.*;
+                const frequency: interfaces.TermFrequency = .{
+                    .term_hash = term_hash,
+                    .frequency = entry.value_ptr.*,
+                };
                 try self.term_frequencies.append(self.allocator, .{
                     .table_id = doc.table_id,
                     .doc_id = doc.doc_id,
-                    .frequency = .{
-                        .term_hash = term_hash,
-                        .frequency = entry.value_ptr.*,
-                    },
+                    .frequency = frequency,
                 });
+                try self.term_frequencies_by_doc_term.put(.{
+                    .table_id = doc.table_id,
+                    .doc_id = doc.doc_id,
+                    .term_hash = term_hash,
+                }, entry.value_ptr.*);
 
                 const key = packTableTermKey(doc.table_id, term_hash);
                 const df_entry = try term_doc_freq.getOrPut(key);
@@ -225,35 +267,41 @@ pub const Store = struct {
         while (length_it.next()) |entry| {
             const total_docs = entry.value_ptr.total_docs;
             const avg = if (total_docs == 0) 0.0 else @as(f64, @floatFromInt(entry.value_ptr.total_length)) / @as(f64, @floatFromInt(total_docs));
+            const stats: interfaces.CollectionStats = .{
+                .total_documents = total_docs,
+                .avg_document_length = avg,
+            };
             try self.collection_stats.append(self.allocator, .{
                 .table_id = entry.key_ptr.*,
-                .stats = .{
-                    .total_documents = total_docs,
-                    .avg_document_length = avg,
-                },
+                .stats = stats,
             });
+            try self.collection_stats_by_table.put(entry.key_ptr.*, stats);
         }
 
         var df_it = term_doc_freq.iterator();
         while (df_it.next()) |entry| {
             const unpacked = unpackTableTermKey(entry.key_ptr.*);
+            const stat: interfaces.TermStat = .{
+                .term_hash = unpacked.term_hash,
+                .document_frequency = entry.value_ptr.*,
+            };
             try self.term_stats.append(self.allocator, .{
                 .table_id = unpacked.table_id,
-                .stat = .{
-                    .term_hash = unpacked.term_hash,
-                    .document_frequency = entry.value_ptr.*,
-                },
+                .stat = stat,
             });
+            try self.term_stats_by_term.put(entry.key_ptr.*, stat);
         }
 
         var posting_it = posting_docs.iterator();
         while (posting_it.next()) |entry| {
             const unpacked = unpackTableTermKey(entry.key_ptr.*);
+            const posting_index = self.postings.items.len;
             try self.postings.append(self.allocator, .{
                 .table_id = unpacked.table_id,
                 .term_hash = unpacked.term_hash,
                 .bitmap = try roaring.Bitmap.fromSlice(entry.value_ptr.items),
             });
+            try self.posting_index_by_term.put(entry.key_ptr.*, posting_index);
         }
     }
 
@@ -287,19 +335,17 @@ pub const Store = struct {
 fn getCollectionStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64) anyerror!interfaces.CollectionStats {
     _ = allocator;
     const self: *Store = @ptrCast(@alignCast(ctx));
-    for (self.collection_stats.items) |entry| {
-        if (entry.table_id == table_id) return entry.stats;
-    }
+    if (self.collection_stats_by_table.get(table_id)) |stats| return stats;
     return .{ .total_documents = 0, .avg_document_length = 0.0 };
 }
 
 fn getDocumentStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_id: interfaces.DocId) anyerror!?interfaces.DocumentStats {
     _ = allocator;
     const self: *Store = @ptrCast(@alignCast(ctx));
-    for (self.document_stats.items) |entry| {
-        if (entry.table_id == table_id and entry.stats.doc_id == doc_id) return entry.stats;
-    }
-    return null;
+    return self.document_stats_by_doc.get(.{
+        .table_id = table_id,
+        .doc_id = doc_id,
+    });
 }
 
 fn getDocumentStatsBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
@@ -318,48 +364,52 @@ fn getTermStats(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, te
     const stats = try allocator.alloc(interfaces.TermStat, term_hashes.len);
 
     for (term_hashes, 0..) |term_hash, index| {
-        stats[index] = .{ .term_hash = term_hash, .document_frequency = 0 };
-        for (self.term_stats.items) |entry| {
-            if (entry.table_id == table_id and entry.stat.term_hash == term_hash) {
-                stats[index] = entry.stat;
-                break;
-            }
-        }
+        stats[index] = self.term_stats_by_term.get(packTableTermKey(table_id, term_hash)) orelse .{
+            .term_hash = term_hash,
+            .document_frequency = 0,
+        };
     }
 
     return stats;
 }
 
 fn getTermFrequencies(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_id: interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.TermFrequency {
-    const self: *Store = @ptrCast(@alignCast(ctx));
-    var wanted_terms = std.AutoHashMap(u64, void).init(allocator);
-    defer wanted_terms.deinit();
-    for (term_hashes) |term_hash| {
-        _ = try wanted_terms.getOrPut(term_hash);
-    }
-
-    var freqs = std.ArrayList(interfaces.TermFrequency).empty;
+    var freqs = try std.ArrayList(interfaces.TermFrequency).initCapacity(allocator, term_hashes.len);
     defer freqs.deinit(allocator);
-    for (self.term_frequencies.items) |entry| {
-        if (entry.table_id == table_id and entry.doc_id == doc_id and wanted_terms.contains(entry.frequency.term_hash)) {
-            try freqs.append(allocator, entry.frequency);
+
+    const self: *Store = @ptrCast(@alignCast(ctx));
+    for (term_hashes) |term_hash| {
+        if (self.term_frequencies_by_doc_term.get(.{
+            .table_id = table_id,
+            .doc_id = doc_id,
+            .term_hash = term_hash,
+        })) |frequency| {
+            try freqs.append(allocator, .{
+                .term_hash = term_hash,
+                .frequency = frequency,
+            });
         }
     }
     return freqs.toOwnedSlice(allocator);
 }
 
 fn getTermFrequenciesBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
+    const self: *Store = @ptrCast(@alignCast(ctx));
     var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
     defer rows.deinit(allocator);
     for (doc_ids) |doc_id| {
-        const freqs = try getTermFrequencies(ctx, allocator, table_id, doc_id, term_hashes);
-        defer allocator.free(freqs);
-        for (freqs) |freq| {
-            try rows.append(allocator, .{
+        for (term_hashes) |term_hash| {
+            if (self.term_frequencies_by_doc_term.get(.{
+                .table_id = table_id,
                 .doc_id = doc_id,
-                .term_hash = freq.term_hash,
-                .frequency = freq.frequency,
-            });
+                .term_hash = term_hash,
+            })) |frequency| {
+                try rows.append(allocator, .{
+                    .doc_id = doc_id,
+                    .term_hash = term_hash,
+                    .frequency = frequency,
+                });
+            }
         }
     }
     return rows.toOwnedSlice(allocator);
@@ -368,8 +418,8 @@ fn getTermFrequenciesBatch(ctx: *anyopaque, allocator: std.mem.Allocator, table_
 fn getPostingBitmap(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap {
     _ = allocator;
     const self: *Store = @ptrCast(@alignCast(ctx));
-    for (self.postings.items) |entry| {
-        if (entry.table_id == table_id and entry.term_hash == term_hash) return try entry.bitmap.clone();
+    if (self.posting_index_by_term.get(packTableTermKey(table_id, term_hash))) |index| {
+        if (index < self.postings.items.len) return try self.postings.items[index].bitmap.clone();
     }
     return null;
 }
@@ -461,4 +511,53 @@ fn countTokenFrequency(tokens: []const u64, target: u64) u32 {
         if (token == target) count += 1;
     }
     return count;
+}
+
+test "search store maintains indexed BM25 lookup maps across updates" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.upsertDocument(.{
+        .table_id = 1,
+        .doc_id = 10,
+        .content = "zig zig sqlite",
+        .language = "english",
+    });
+    try store.upsertDocument(.{
+        .table_id = 1,
+        .doc_id = 20,
+        .content = "sqlite graph",
+        .language = "english",
+    });
+
+    const repo = store.bm25Repository();
+    const zig_hash = tokenization_sqlite.hashTermLexeme("zig");
+    const sqlite_hash = tokenization_sqlite.hashTermLexeme("sqlite");
+
+    const collection = try repo.getCollectionStatsFn(repo.ctx, std.testing.allocator, 1);
+    try std.testing.expectEqual(@as(u64, 2), collection.total_documents);
+
+    const term_stats = try repo.getTermStatsFn(repo.ctx, std.testing.allocator, 1, &.{ zig_hash, sqlite_hash });
+    defer std.testing.allocator.free(term_stats);
+    try std.testing.expectEqual(@as(u64, 1), term_stats[0].document_frequency);
+    try std.testing.expectEqual(@as(u64, 2), term_stats[1].document_frequency);
+
+    const doc_stats = try repo.getDocumentStatsBatchFn(repo.ctx, std.testing.allocator, 1, &.{ 10, 20 });
+    defer std.testing.allocator.free(doc_stats);
+    try std.testing.expectEqual(@as(usize, 2), doc_stats.len);
+
+    const freqs = try repo.getTermFrequenciesBatchFn(repo.ctx, std.testing.allocator, 1, &.{ 10, 20 }, &.{ zig_hash, sqlite_hash });
+    defer std.testing.allocator.free(freqs);
+    try std.testing.expectEqual(@as(usize, 3), freqs.len);
+
+    var sqlite_posting = (try repo.getPostingBitmapFn(repo.ctx, std.testing.allocator, 1, sqlite_hash)).?;
+    defer sqlite_posting.deinit();
+    try std.testing.expect(sqlite_posting.contains(10));
+    try std.testing.expect(sqlite_posting.contains(20));
+
+    try store.deleteDocument(1, 10);
+    try std.testing.expect((try repo.getDocumentStatsFn(repo.ctx, std.testing.allocator, 1, 10)) == null);
+    const updated_collection = try repo.getCollectionStatsFn(repo.ctx, std.testing.allocator, 1);
+    try std.testing.expectEqual(@as(u64, 1), updated_collection.total_documents);
+    try std.testing.expect((try repo.getPostingBitmapFn(repo.ctx, std.testing.allocator, 1, zig_hash)) == null);
 }

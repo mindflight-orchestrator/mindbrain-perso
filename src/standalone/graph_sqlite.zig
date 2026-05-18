@@ -14,6 +14,8 @@ const Value = ztoon.Value;
 pub const Database = facet_sqlite.Database;
 pub const c = facet_sqlite.c;
 const Error = facet_sqlite.Error;
+const EntityFullMap = std.AutoHashMap(u32, EntityRecordFull);
+const RelationFullMap = std.AutoHashMap(u32, RelationRecordFull);
 
 pub const EntityRecord = struct {
     entity_id: u32,
@@ -1573,10 +1575,15 @@ pub fn learnFromRun(
     try bindText(insert_run, 6, metadata_value);
     if (c.sqlite3_step(insert_run) != c.SQLITE_ROW) return error.StepFailed;
     const run_id = try columnU32(insert_run, 0);
+    try resetStatement(insert_run);
+
+    var touched_entities = std.AutoHashMap(u32, void).init(allocator);
+    defer touched_entities.deinit();
 
     for (concepts) |concept| {
         const metadata = concept.metadata_json orelse "{}";
-        _ = try upsertEntityNatural(db, allocator, concept.entity_type, concept.name, concept.confidence, metadata);
+        const entity_id = try upsertEntityNatural(db, allocator, concept.entity_type, concept.name, concept.confidence, metadata);
+        _ = try touched_entities.put(entity_id, {});
     }
 
     for (relations) |relation| {
@@ -1594,10 +1601,13 @@ pub fn learnFromRun(
             relation.valid_from_unix,
             relation.valid_to_unix,
         );
+        _ = try touched_entities.put(src_id, {});
+        _ = try touched_entities.put(tgt_id, {});
     }
 
-    try refreshEntityDegree(db);
-    try rebuildAdjacency(db, allocator);
+    const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
+    defer allocator.free(touched_ids);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, allocator);
     return run_id;
 }
 
@@ -1628,12 +1638,16 @@ pub fn applyKnowledgePatch(
     try bindText(insert_patch, 5, applied_by);
     if (c.sqlite3_step(insert_patch) != c.SQLITE_ROW) return error.StepFailed;
     const patch_id = try columnU32(insert_patch, 0);
+    try resetStatement(insert_patch);
 
     var applied_count: u32 = 0;
+    var touched_entities = std.AutoHashMap(u32, void).init(allocator);
+    defer touched_entities.deinit();
+
     for (artifacts) |artifact| {
         if (std.mem.eql(u8, artifact.action, "upsert_entity")) {
             if (artifact.entity_type == null or artifact.name == null) return error.MissingRow;
-            _ = try upsertEntityNatural(
+            const entity_id = try upsertEntityNatural(
                 db,
                 allocator,
                 artifact.entity_type.?,
@@ -1641,6 +1655,7 @@ pub fn applyKnowledgePatch(
                 artifact.confidence orelse confidence,
                 artifact.metadata_json orelse "{}",
             );
+            _ = try touched_entities.put(entity_id, {});
             applied_count += 1;
             continue;
         }
@@ -1661,6 +1676,8 @@ pub fn applyKnowledgePatch(
                 null,
                 null,
             );
+            _ = try touched_entities.put(src_id, {});
+            _ = try touched_entities.put(tgt_id, {});
             applied_count += 1;
             continue;
         }
@@ -1679,6 +1696,8 @@ pub fn applyKnowledgePatch(
             try bindInt64(stmt, 3, tgt_id);
             try bindInt64(stmt, 4, patch_id);
             try stepDone(stmt);
+            _ = try touched_entities.put(src_id, {});
+            _ = try touched_entities.put(tgt_id, {});
             applied_count += 1;
             continue;
         }
@@ -1691,8 +1710,9 @@ pub fn applyKnowledgePatch(
     try bindInt64(update_patch, 1, patch_id);
     try stepDone(update_patch);
 
-    try refreshEntityDegree(db);
-    try rebuildAdjacency(db, allocator);
+    const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
+    defer allocator.free(touched_ids);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, allocator);
     return applied_count;
 }
 
@@ -1826,6 +1846,12 @@ pub fn rebuildLjForEntities(db: Database, entity_ids: []const u32, allocator: st
 
     try db.exec("BEGIN IMMEDIATE");
     errdefer _ = db.exec("ROLLBACK") catch {};
+    try rebuildLjForEntitiesNoTransaction(db, entity_ids, allocator);
+    try db.exec("COMMIT");
+}
+
+fn rebuildLjForEntitiesNoTransaction(db: Database, entity_ids: []const u32, allocator: std.mem.Allocator) !void {
+    if (entity_ids.len == 0) return;
 
     const out_stmt = try prepare(db, "DELETE FROM graph_lj_out WHERE entity_id = ?1");
     defer finalize(out_stmt);
@@ -1893,8 +1919,7 @@ pub fn rebuildLjForEntities(db: Database, entity_ids: []const u32, allocator: st
         try upsertAdjacency(db, "graph_lj_in", entry.key_ptr.*, entry.value_ptr.items, allocator);
     }
 
-    try db.exec("COMMIT");
-    try refreshEntityDegree(db);
+    try refreshEntityDegreeForEntities(db, entity_ids);
 }
 
 pub fn refreshEntityDegree(db: Database) !void {
@@ -1905,6 +1930,47 @@ pub fn refreshEntityDegree(db: Database) !void {
     );
     defer finalize(stmt);
     try stepDone(stmt);
+}
+
+fn refreshEntityDegreeForEntities(db: Database, entity_ids: []const u32) !void {
+    if (entity_ids.len == 0) return;
+
+    const delete_stmt = try prepare(db, "DELETE FROM graph_entity_degree WHERE entity_id = ?1");
+    defer finalize(delete_stmt);
+
+    const insert_stmt = try prepare(
+        db,
+        "INSERT INTO graph_entity_degree(entity_id, name, entity_type, confidence, out_degree, in_degree, total_degree) " ++
+            "SELECT e.entity_id, e.name, e.entity_type, e.confidence, " ++
+            "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.source_id = e.entity_id AND r.deprecated_at IS NULL), 0), " ++
+            "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.target_id = e.entity_id AND r.deprecated_at IS NULL), 0), " ++
+            "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.source_id = e.entity_id AND r.deprecated_at IS NULL), 0) + " ++
+            "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.target_id = e.entity_id AND r.deprecated_at IS NULL), 0) " ++
+            "FROM graph_entity e WHERE e.entity_id = ?1 AND e.deprecated_at IS NULL",
+    );
+    defer finalize(insert_stmt);
+
+    for (entity_ids) |entity_id| {
+        try resetStatement(delete_stmt);
+        try bindInt64(delete_stmt, 1, entity_id);
+        try stepDone(delete_stmt);
+
+        try resetStatement(insert_stmt);
+        try bindInt64(insert_stmt, 1, entity_id);
+        try stepDone(insert_stmt);
+    }
+}
+
+fn mapKeysToSlice(allocator: std.mem.Allocator, map: *std.AutoHashMap(u32, void)) ![]u32 {
+    var ids = try std.ArrayList(u32).initCapacity(allocator, map.count());
+    errdefer ids.deinit(allocator);
+
+    var it = map.keyIterator();
+    while (it.next()) |id| {
+        try ids.append(allocator, id.*);
+    }
+
+    return ids.toOwnedSlice(allocator);
 }
 
 pub fn buildPathResult(
@@ -2621,12 +2687,12 @@ pub fn streamEntityNeighborhood(
         for (outbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
         allocator.free(outbound);
     }
+    var outbound_maps = try loadStreamLookupMaps(db, allocator, outbound[0..@min(outbound.len, max_out)]);
+    defer outbound_maps.deinit(allocator);
     for (outbound[0..@min(outbound.len, max_out)]) |neighbor| {
         if ((try emitted_edges.getOrPut(neighbor.relation_id)).found_existing) continue;
-        var relation = (try loadRelationFull(db, allocator, neighbor.relation_id)) orelse continue;
-        defer relation.deinit(allocator);
-        var target = try loadEntityFull(db, allocator, neighbor.entity.entity_id);
-        defer target.deinit(allocator);
+        const relation = outbound_maps.relations.get(neighbor.relation_id) orelse continue;
+        const target = outbound_maps.entities.get(neighbor.entity.entity_id) orelse continue;
         try appendJsonEvent(allocator, &events, seq, "edge", .{
             .direction = "outbound",
             .relation = buildRelationPayload(relation),
@@ -2653,12 +2719,12 @@ pub fn streamEntityNeighborhood(
         for (inbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
         allocator.free(inbound);
     }
+    var inbound_maps = try loadStreamLookupMaps(db, allocator, inbound[0..@min(inbound.len, max_in)]);
+    defer inbound_maps.deinit(allocator);
     for (inbound[0..@min(inbound.len, max_in)]) |neighbor| {
         if ((try emitted_edges.getOrPut(neighbor.relation_id)).found_existing) continue;
-        var relation = (try loadRelationFull(db, allocator, neighbor.relation_id)) orelse continue;
-        defer relation.deinit(allocator);
-        var source = try loadEntityFull(db, allocator, neighbor.entity.entity_id);
-        defer source.deinit(allocator);
+        const relation = inbound_maps.relations.get(neighbor.relation_id) orelse continue;
+        const source = inbound_maps.entities.get(neighbor.entity.entity_id) orelse continue;
         try appendJsonEvent(allocator, &events, seq, "edge", .{
             .direction = "inbound",
             .relation = buildRelationPayload(relation),
@@ -2744,14 +2810,13 @@ pub fn streamSubgraph(
                 for (outbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
                 allocator.free(outbound);
             }
+            var outbound_maps = try loadStreamLookupMaps(db, allocator, outbound);
+            defer outbound_maps.deinit(allocator);
             for (outbound) |neighbor| {
                 if ((try seen_edges.getOrPut(neighbor.relation_id)).found_existing) continue;
-                var relation = (try loadRelationFull(db, allocator, neighbor.relation_id)) orelse continue;
-                defer relation.deinit(allocator);
-                var source = try loadEntityFull(db, allocator, relation.source_id);
-                defer source.deinit(allocator);
-                var target = try loadEntityFull(db, allocator, relation.target_id);
-                defer target.deinit(allocator);
+                const relation = outbound_maps.relations.get(neighbor.relation_id) orelse continue;
+                const source = outbound_maps.entities.get(relation.source_id) orelse continue;
+                const target = outbound_maps.entities.get(relation.target_id) orelse continue;
                 try appendJsonEvent(allocator, &events, @intCast(events.items.len), "edge", .{
                     .direction = "outbound",
                     .depth = depth + 1,
@@ -2784,14 +2849,13 @@ pub fn streamSubgraph(
                 for (inbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
                 allocator.free(inbound);
             }
+            var inbound_maps = try loadStreamLookupMaps(db, allocator, inbound);
+            defer inbound_maps.deinit(allocator);
             for (inbound) |neighbor| {
                 if ((try seen_edges.getOrPut(neighbor.relation_id)).found_existing) continue;
-                var relation = (try loadRelationFull(db, allocator, neighbor.relation_id)) orelse continue;
-                defer relation.deinit(allocator);
-                var source = try loadEntityFull(db, allocator, relation.source_id);
-                defer source.deinit(allocator);
-                var target = try loadEntityFull(db, allocator, relation.target_id);
-                defer target.deinit(allocator);
+                const relation = inbound_maps.relations.get(neighbor.relation_id) orelse continue;
+                const source = inbound_maps.entities.get(relation.source_id) orelse continue;
+                const target = inbound_maps.entities.get(relation.target_id) orelse continue;
                 try appendJsonEvent(allocator, &events, @intCast(events.items.len), "edge", .{
                     .direction = "inbound",
                     .depth = depth + 1,
@@ -3144,6 +3208,146 @@ fn loadRelationsWithQuery(
     }
 
     return rows.toOwnedSlice(allocator);
+}
+
+const StreamLookupMaps = struct {
+    relations: RelationFullMap,
+    entities: EntityFullMap,
+
+    fn deinit(self: *StreamLookupMaps, allocator: std.mem.Allocator) void {
+        deinitRelationFullMap(allocator, &self.relations);
+        deinitEntityFullMap(allocator, &self.entities);
+        self.* = undefined;
+    }
+};
+
+fn loadStreamLookupMaps(db: Database, allocator: std.mem.Allocator, neighbors: []const TraverseNeighbor) !StreamLookupMaps {
+    var relation_ids = try std.ArrayList(u32).initCapacity(allocator, neighbors.len);
+    defer relation_ids.deinit(allocator);
+    for (neighbors) |neighbor| {
+        try relation_ids.append(allocator, neighbor.relation_id);
+    }
+
+    var relations = try loadRelationFullMap(db, allocator, relation_ids.items);
+    errdefer deinitRelationFullMap(allocator, &relations);
+
+    var entity_ids = std.ArrayList(u32).empty;
+    defer entity_ids.deinit(allocator);
+    var relation_it = relations.valueIterator();
+    while (relation_it.next()) |relation| {
+        try entity_ids.append(allocator, relation.source_id);
+        try entity_ids.append(allocator, relation.target_id);
+    }
+
+    var entities = try loadEntityFullMap(db, allocator, entity_ids.items);
+    errdefer deinitEntityFullMap(allocator, &entities);
+
+    return .{
+        .relations = relations,
+        .entities = entities,
+    };
+}
+
+fn loadRelationFullMap(db: Database, allocator: std.mem.Allocator, relation_ids: []const u32) !RelationFullMap {
+    var rows = RelationFullMap.init(allocator);
+    errdefer deinitRelationFullMap(allocator, &rows);
+    if (relation_ids.len == 0) return rows;
+
+    var sql_buf = std.Io.Writer.Allocating.init(allocator);
+    defer sql_buf.deinit();
+    try sql_buf.writer.writeAll("SELECT relation_id, workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, deprecated_at, run_id, patch_id, metadata_json, created_at_unix FROM graph_relation WHERE relation_id IN (");
+    for (relation_ids, 0..) |relation_id, index| {
+        if (index > 0) try sql_buf.writer.writeByte(',');
+        try sql_buf.writer.print("{d}", .{relation_id});
+    }
+    try sql_buf.writer.writeByte(')');
+
+    const sql = try sql_buf.toOwnedSlice();
+    defer allocator.free(sql);
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        var relation = try loadRelationFullFromStmt(allocator, stmt);
+        errdefer relation.deinit(allocator);
+        const entry = try rows.getOrPut(relation.relation_id);
+        if (entry.found_existing) {
+            relation.deinit(allocator);
+        } else {
+            entry.value_ptr.* = relation;
+        }
+    }
+
+    return rows;
+}
+
+fn loadEntityFullMap(db: Database, allocator: std.mem.Allocator, entity_ids: []const u32) !EntityFullMap {
+    var rows = EntityFullMap.init(allocator);
+    errdefer deinitEntityFullMap(allocator, &rows);
+    if (entity_ids.len == 0) return rows;
+
+    var sql_buf = std.Io.Writer.Allocating.init(allocator);
+    defer sql_buf.deinit();
+    try sql_buf.writer.writeAll("SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE entity_id IN (");
+    for (entity_ids, 0..) |entity_id, index| {
+        if (index > 0) try sql_buf.writer.writeByte(',');
+        try sql_buf.writer.print("{d}", .{entity_id});
+    }
+    try sql_buf.writer.writeByte(')');
+
+    const sql = try sql_buf.toOwnedSlice();
+    defer allocator.free(sql);
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        var entity = try loadEntityFullFromStmt(allocator, stmt);
+        errdefer entity.deinit(allocator);
+        const entry = try rows.getOrPut(entity.entity_id);
+        if (entry.found_existing) {
+            entity.deinit(allocator);
+        } else {
+            entry.value_ptr.* = entity;
+        }
+    }
+
+    return rows;
+}
+
+fn loadEntityFullFromStmt(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !EntityRecordFull {
+    return .{
+        .entity_id = try columnU32(stmt, 0),
+        .entity_type = try dupeColumnText(allocator, stmt, 1),
+        .name = try dupeColumnText(allocator, stmt, 2),
+        .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
+        .metadata_json = try dupeColumnText(allocator, stmt, 4),
+        .deprecated_at_unix = columnOptionalI64(stmt, 5),
+        .created_at_unix = @intCast(c.sqlite3_column_int64(stmt, 6)),
+    };
+}
+
+fn deinitRelationFullMap(allocator: std.mem.Allocator, map: *RelationFullMap) void {
+    var it = map.valueIterator();
+    while (it.next()) |relation| {
+        relation.deinit(allocator);
+    }
+    map.deinit();
+}
+
+fn deinitEntityFullMap(allocator: std.mem.Allocator, map: *EntityFullMap) void {
+    var it = map.valueIterator();
+    while (it.next()) |entity| {
+        entity.deinit(allocator);
+    }
+    map.deinit();
 }
 
 fn buildEntityPayload(entity: EntityRecordFull) StreamEntityPayload {
@@ -4243,6 +4447,11 @@ test "sqlite graph migration supports knowledge patch application" {
         null,
     );
 
+    const zig_id = try loadEntityIdByName(db, "zig");
+    var before_out = try loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_out", zig_id);
+    defer before_out.deinit();
+    try std.testing.expect(before_out.contains(1));
+
     const patch_count = try applyKnowledgePatch(
         db,
         std.testing.allocator,
@@ -4256,7 +4465,24 @@ test "sqlite graph migration supports knowledge patch application" {
     );
     try std.testing.expectEqual(@as(u32, 1), patch_count);
 
-    const deps = try skillDependencies(db, std.testing.allocator, try loadEntityIdByName(db, "zig"), 5, 0.0);
+    const maybe_after_out = loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_out", zig_id) catch |err| switch (err) {
+        error.MissingRow => null,
+        else => return err,
+    };
+    if (maybe_after_out) |bitmap| {
+        var mutable_bitmap = bitmap;
+        defer mutable_bitmap.deinit();
+        try std.testing.expect(!mutable_bitmap.contains(1));
+    }
+
+    const degree_stmt = try prepare(db, "SELECT out_degree, total_degree FROM graph_entity_degree WHERE entity_id = ?1");
+    defer finalize(degree_stmt);
+    try bindInt64(degree_stmt, 1, zig_id);
+    try std.testing.expect(c.sqlite3_step(degree_stmt) == c.SQLITE_ROW);
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(degree_stmt, 0));
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(degree_stmt, 1));
+
+    const deps = try skillDependencies(db, std.testing.allocator, zig_id, 5, 0.0);
     defer {
         for (deps) |dep| {
             std.testing.allocator.free(dep.dep_name);
