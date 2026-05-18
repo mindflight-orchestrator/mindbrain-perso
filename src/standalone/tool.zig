@@ -70,6 +70,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "qualification-vocab-list")) {
+        try runQualificationVocabListCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "collection-export")) {
         try runCollectionExportCommand(allocator, args[2..]);
         return;
@@ -290,6 +295,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
         \\  mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
         \\  mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
+        \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
         \\  mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
         \\  mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
@@ -1358,6 +1364,243 @@ fn runOntologyAttachCommand(allocator: Allocator, args: []const []const u8) !voi
     try db.applyStandaloneSchema();
     try collections_sqlite.attachOntologyToCollection(db, workspace_id.?, collection_id.?, ontology_id.?, role);
     try writeStdout("ontology {s} attached to {s} ({s})\n", .{ ontology_id.?, collection_id.?, role });
+}
+
+fn runQualificationVocabListCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var collection_id: ?[]const u8 = null;
+    var taxonomy_filter: ?[]const u8 = null;
+    var facet_filter: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--taxonomies")) taxonomy_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--facets")) facet_filter = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"workspace_id\":");
+    try writer.print("{f}", .{std.json.fmt(workspace_id.?, .{})});
+    try writer.writeAll(",\"collection_id\":");
+    if (collection_id) |collection| {
+        try writer.print("{f}", .{std.json.fmt(collection, .{})});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"taxonomies\":[");
+    try writeQualificationTaxonomiesJson(writer, db, workspace_id.?, collection_id, taxonomy_filter);
+    try writer.writeAll("],\"facets\":[");
+    try writeQualificationFacetsJson(allocator, writer, db, workspace_id.?, collection_id, taxonomy_filter, facet_filter);
+    try writer.writeAll("]}\n");
+
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
+    try writeStdout("{s}", .{payload});
+}
+
+fn writeQualificationTaxonomiesJson(
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    taxonomy_filter: ?[]const u8,
+) !void {
+    const sql =
+        \\SELECT o.ontology_id, o.name, o.version, o.source_kind, co.role
+        \\FROM ontologies o
+        \\LEFT JOIN collection_ontologies co
+        \\  ON co.workspace_id = ?1
+        \\ AND co.collection_id = ?2
+        \\ AND co.ontology_id = o.ontology_id
+        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL)
+        \\  AND (?2 IS NULL OR co.collection_id = ?2)
+        \\ORDER BY o.ontology_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_id) |collection| try facet_sqlite.bindText(stmt, 2, collection) else try facet_sqlite.bindNull(stmt, 2);
+
+    const c = facet_sqlite.c;
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const ontology_id = columnText(stmt, 0);
+        if (!csvContains(taxonomy_filter, ontology_id)) continue;
+
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{\"id\":");
+        try writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+        try writer.writeAll(",\"name\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 1), .{})});
+        try writer.writeAll(",\"version\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 2), .{})});
+        try writer.writeAll(",\"source_kind\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 3), .{})});
+        try writer.writeAll(",\"role\":");
+        if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) {
+            try writer.writeAll("null");
+        } else {
+            try writer.print("{f}", .{std.json.fmt(columnText(stmt, 4), .{})});
+        }
+        try writer.writeAll("}");
+    }
+}
+
+fn writeQualificationFacetsJson(
+    allocator: Allocator,
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    taxonomy_filter: ?[]const u8,
+    facet_filter: ?[]const u8,
+) !void {
+    const sql =
+        \\SELECT d.ontology_id, d.namespace, d.dimension, d.value_type, d.is_multi, d.hierarchy_kind,
+        \\       COUNT(v.value) AS values_count
+        \\FROM ontology_dimensions d
+        \\JOIN ontologies o ON o.ontology_id = d.ontology_id
+        \\LEFT JOIN collection_ontologies co
+        \\  ON co.workspace_id = ?1
+        \\ AND co.collection_id = ?2
+        \\ AND co.ontology_id = d.ontology_id
+        \\LEFT JOIN ontology_values v
+        \\  ON v.ontology_id = d.ontology_id
+        \\ AND v.namespace = d.namespace
+        \\ AND v.dimension = d.dimension
+        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL)
+        \\  AND (?2 IS NULL OR co.collection_id = ?2)
+        \\GROUP BY d.ontology_id, d.namespace, d.dimension, d.value_type, d.is_multi, d.hierarchy_kind
+        \\ORDER BY d.ontology_id, d.namespace, d.dimension
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_id) |collection| try facet_sqlite.bindText(stmt, 2, collection) else try facet_sqlite.bindNull(stmt, 2);
+
+    const c = facet_sqlite.c;
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const ontology_id = columnText(stmt, 0);
+        const namespace = columnText(stmt, 1);
+        const dimension = columnText(stmt, 2);
+        if (!csvContains(taxonomy_filter, ontology_id)) continue;
+        if (!facetCsvContains(facet_filter, namespace, dimension)) continue;
+
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{\"id\":");
+        try writeFacetIdJson(allocator, writer, namespace, dimension);
+        try writer.writeAll(",\"taxonomy_id\":");
+        try writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+        try writer.writeAll(",\"namespace\":");
+        try writer.print("{f}", .{std.json.fmt(namespace, .{})});
+        try writer.writeAll(",\"dimension\":");
+        try writer.print("{f}", .{std.json.fmt(dimension, .{})});
+        try writer.writeAll(",\"value_type\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 3), .{})});
+        try writer.writeAll(",\"is_multi\":");
+        try writer.writeAll(if (c.sqlite3_column_int64(stmt, 4) != 0) "true" else "false");
+        try writer.writeAll(",\"hierarchy_kind\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 5), .{})});
+        try writer.writeAll(",\"values_count\":");
+        try writer.print("{}", .{c.sqlite3_column_int64(stmt, 6)});
+        try writer.writeAll(",\"values_preview\":[");
+        try writeFacetValuesPreviewJson(writer, db, ontology_id, namespace, dimension);
+        try writer.writeAll("]}");
+    }
+}
+
+fn writeFacetValuesPreviewJson(
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+    namespace: []const u8,
+    dimension: []const u8,
+) !void {
+    const sql =
+        \\SELECT value
+        \\FROM ontology_values
+        \\WHERE ontology_id = ?1 AND namespace = ?2 AND dimension = ?3
+        \\ORDER BY value_id
+        \\LIMIT 8
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    try facet_sqlite.bindText(stmt, 2, namespace);
+    try facet_sqlite.bindText(stmt, 3, dimension);
+
+    const c = facet_sqlite.c;
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 0), .{})});
+    }
+}
+
+fn writeFacetIdJson(
+    allocator: Allocator,
+    writer: *std.Io.Writer,
+    namespace: []const u8,
+    dimension: []const u8,
+) !void {
+    const id = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ namespace, dimension });
+    defer allocator.free(id);
+    try writer.print("{f}", .{std.json.fmt(id, .{})});
+}
+
+fn columnText(stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int) []const u8 {
+    const len: usize = @intCast(facet_sqlite.c.sqlite3_column_bytes(stmt, index));
+    const ptr = facet_sqlite.c.sqlite3_column_text(stmt, index) orelse return "";
+    return @as([*]const u8, @ptrCast(ptr))[0..len];
+}
+
+fn csvContains(csv: ?[]const u8, value: []const u8) bool {
+    const raw = csv orelse return true;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, value)) return true;
+    }
+    return false;
+}
+
+fn facetCsvContains(csv: ?[]const u8, namespace: []const u8, dimension: []const u8) bool {
+    const raw = csv orelse return true;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == namespace.len + 1 + dimension.len and
+            std.mem.eql(u8, trimmed[0..namespace.len], namespace) and
+            trimmed[namespace.len] == '.' and
+            std.mem.eql(u8, trimmed[namespace.len + 1 ..], dimension))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !void {
