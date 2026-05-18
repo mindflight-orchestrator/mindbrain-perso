@@ -2449,6 +2449,7 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
             .vector_column = "embedding_blob",
             .query_vector = query_embedding,
             .limit = retrieval_limit,
+            .table_id = table_id,
         });
     }
 

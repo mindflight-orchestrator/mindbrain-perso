@@ -683,7 +683,9 @@ fn searchNearest(ctx: *anyopaque, allocator: std.mem.Allocator, request: interfa
     defer matches.deinit(allocator);
 
     for (self.embeddings.items) |entry| {
-        if (entry.table_id != 1 and request.table_name.len > 0) {}
+        if (request.table_id) |tid| {
+            if (entry.table_id != tid) continue;
+        }
         const vector_score = vector_distance.score(request.metric, request.query_vector, entry.values);
         try vector_distance.insertTopMatch(allocator, &matches, .{
             .doc_id = entry.doc_id,

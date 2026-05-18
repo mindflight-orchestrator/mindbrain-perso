@@ -5,6 +5,7 @@ const facet_store = @import("facet_store.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
 const search_compact_store = @import("search_compact_store.zig");
+const search_store = @import("search_store.zig");
 const roaring = @import("roaring.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
 const query_executor = @import("query_executor.zig");
@@ -306,6 +307,8 @@ pub fn main(init: std.process.Init) !void {
     (try microSearchSingleDocUpsert(allocator, iters.search_upserts)).print();
     (try microCompactPostingLookup(allocator, dataset.search_docs, iters.compact_lookups)).print();
     (try microCompactVectorSearch(allocator, dataset.search_docs, iters.compact_vector_queries)).print();
+    (try microSearchStoreVectorSearch(allocator, 128, 10_000, 100)).print();
+    (try microSearchStoreVectorSearch(allocator, 1_536, 10_000, 50)).print();
     (try microFacetFilter(allocator, dataset.facet_docs, iters.facet_filters)).print();
     (try microGraphShortestPath(allocator, dataset.graph_nodes, iters.graph_paths)).print();
     (try microGraphStreamSubgraph(allocator, dataset.graph_nodes, iters.graph_streams)).print();
@@ -714,6 +717,66 @@ fn microCompactVectorSearch(allocator: std.mem.Allocator, doc_count: usize, iter
             if (nearest.len > 0) std.mem.doNotOptimizeAway(nearest[0].doc_id);
         }
     }.run);
+}
+
+/// Measures in-memory vector nearest-neighbour query latency at realistic embedding
+/// dimensions. Uses the search_store.Store with N=doc_count documents and D=dimensions
+/// dimensions per vector. This gives a data point closer to production OpenAI embeddings
+/// (D=1536) vs the toy D=3 used in microCompactVectorSearch.
+fn microSearchStoreVectorSearch(allocator: std.mem.Allocator, comptime dimensions: usize, doc_count: usize, iterations: usize) !MicroStat {
+    var store = search_store.Store.init(allocator);
+    defer store.deinit();
+    store.beginBulkLoad();
+
+    const primes = [_]u32{ 17, 13, 11, 7, 5, 3, 19, 23, 29, 31 };
+    const embedding_buf = try allocator.alloc(f32, dimensions);
+    defer allocator.free(embedding_buf);
+
+    for (0..doc_count) |index| {
+        for (embedding_buf, 0..) |*v, d| {
+            const p = primes[d % primes.len];
+            v.* = @as(f32, @floatFromInt((index + d) % p + 1)) / @as(f32, @floatFromInt(p));
+        }
+        try store.upsertEmbedding(.{
+            .table_id = 1,
+            .doc_id = @intCast(index + 1),
+            .values = embedding_buf,
+        });
+    }
+    try store.endBulkLoad();
+
+    // Normalised query vector pointing in the "average" direction.
+    const query_buf = try allocator.alloc(f32, dimensions);
+    defer allocator.free(query_buf);
+    const qval: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dimensions)));
+    for (query_buf) |*v| v.* = qval;
+
+    const repo = store.vectorRepository();
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        repo: @TypeOf(repo),
+        query: []const f32,
+    };
+    var ctx = Ctx{ .allocator = allocator, .repo = repo, .query = query_buf };
+    return measure(
+        std.fmt.comptimePrint("micro_store_vector_search_d{d}", .{dimensions}),
+        iterations,
+        &ctx,
+        struct {
+            fn run(local: *Ctx) !void {
+                const nearest = try local.repo.searchNearestFn(local.repo.ctx, local.allocator, .{
+                    .table_name = "search_embeddings",
+                    .key_column = "doc_id",
+                    .vector_column = "embedding_blob",
+                    .query_vector = local.query,
+                    .limit = 20,
+                    .table_id = 1,
+                });
+                defer local.allocator.free(nearest);
+                if (nearest.len > 0) std.mem.doNotOptimizeAway(nearest[0].doc_id);
+            }
+        }.run,
+    );
 }
 
 fn microFacetFilter(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {

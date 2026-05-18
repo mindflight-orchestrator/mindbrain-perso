@@ -188,6 +188,9 @@ pub const VectorSearchRequest = struct {
     query_vector: []const f32,
     limit: usize,
     metric: VectorDistanceMetric = .cosine,
+    /// When set, in-memory stores skip embeddings whose table_id differs.
+    /// SQL-backed stores already scope queries by table via the SQL statement.
+    table_id: ?u64 = null,
 };
 
 pub const OntologyRepository = struct {
