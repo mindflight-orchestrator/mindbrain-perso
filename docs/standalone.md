@@ -6,6 +6,25 @@ Sources live under [src/standalone/](../src/standalone/). The reusable library s
 
 For **LLM-assisted document profiling**, durable queue jobs, and offline corpus evaluation, see [document-profile.md](document-profile.md).
 
+## v1.4.0 Runtime Notes
+
+`v1.4.0` keeps the standalone CLI and HTTP surface stable, but changes the
+runtime cost profile of search and graph operations:
+
+- search store loads now bulk-build BM25 state once, instead of rebuilding on
+  every loaded document;
+- search document upserts/deletes maintain BM25 artifacts by delta;
+- compact BM25 stores build keyed lookup maps after load for O(1) repository
+  reads;
+- vector and hybrid search keep a bounded top-k heap, then sort only the final
+  result window;
+- in-memory vector search honors `VectorSearchRequest.table_id`, and
+  `contextual-search --table-id` forwards that scope into vector retrieval;
+- graph knowledge patches and learning runs refresh adjacency/degree data only
+  for touched entities when possible;
+- graph stream expansion batches entity/relation lookup maps to avoid repeated
+  per-edge loads.
+
 ## Build targets
 
 | Command | Output |
@@ -112,6 +131,21 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`simulate`** — Internal simulation entrypoint (see source for behavior).
 
 Dataset-specific demo and benchmark commands live in [demo-benchmark.md](demo-benchmark.md) and are built as the separate `mindbrain-benchmark-tool`.
+
+## Search Library Contract
+
+The standalone search repositories expose batch BM25 read hooks for hybrid
+retrieval:
+
+- `getDocumentStatsBatchFn(table_id, doc_ids)` returns document stats for the
+  candidate set;
+- `getTermFrequenciesBatchFn(table_id, doc_ids, term_hashes)` returns
+  `(doc_id, term_hash, frequency)` rows for the same candidate set;
+- `VectorSearchRequest.table_id` is optional, but should be set by in-memory
+  callers that need collection/table isolation.
+
+The older single-document hooks remain part of the interface. New hybrid search
+code should use the batch hooks when it already has a candidate set.
 
 ## Coverage report shape
 

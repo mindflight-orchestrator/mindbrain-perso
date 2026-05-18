@@ -51,3 +51,22 @@ From the repo root:
 ```bash
 rg '^export fn ' src/mb_facets/main.zig src/mb_graph/main.zig src/mb_pragma/main.zig
 ```
+
+## Standalone repository interfaces
+
+The standalone Zig library also exposes repository-style interfaces from
+[`src/standalone/interfaces.zig`](../src/standalone/interfaces.zig). These are
+not exported C symbols, but they are the public in-repo contract used by the
+SQLite search, vector, fixture, and PostgreSQL adapter layers.
+
+`v1.4.0` adds batch BM25 read hooks and scoped vector requests:
+
+| Interface item | Purpose |
+|----------------|---------|
+| `DocumentTermFrequency` | Batch row carrying `doc_id`, `term_hash`, and `frequency`. |
+| `Bm25Repository.getDocumentStatsBatchFn` | Load stats for a set of candidate document IDs. |
+| `Bm25Repository.getTermFrequenciesBatchFn` | Load term frequencies for a set of candidate document IDs and query terms. |
+| `VectorSearchRequest.table_id` | Optional logical search table scope for in-memory vector stores. |
+
+Hybrid search uses these hooks to avoid one BM25 lookup per candidate and to
+keep vector results isolated to the same logical table as the BM25 request.

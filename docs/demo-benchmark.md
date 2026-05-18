@@ -34,6 +34,13 @@ The benchmark tool is intentionally separate from the main standalone CLI so dat
 
 For the full SQLite corpus already present in this repository, use `mindbrain-standalone-tool benchmark-db`. That command opens the SQLite file, seeds a temporary benchmark workspace/table, runs facet and graph queries, exercises single-row and batch insert/update/remove paths, and rolls everything back before exit.
 
+The standalone micro-benchmark suite also covers the in-memory search and graph
+hot paths used by the runtime. `v1.4.0` adds coverage for graph subgraph
+streaming and production-sized vector search dimensions:
+`micro_store_vector_search_d128` and `micro_store_vector_search_d1536` run
+against 10k in-memory vectors so the reported latency is closer to real
+embedding sizes than the older toy-vector case.
+
 ## Demo Contract
 
 The demo path is meant to be a small, deterministic, end-to-end scenario.
@@ -102,6 +109,11 @@ Both IMDb and YAGO benchmark flows should follow the same structural pattern:
 4. Flush staged rows into the persistent graph tables.
 5. Rebuild derived structures that the runtime depends on.
 6. Return timing and row-count summaries as JSON.
+
+For incremental runtime paths, benchmark implementations should prefer the
+document/entity-level maintenance APIs when they are measuring steady-state
+updates. Full rebuilds remain appropriate for fresh imports and broad source
+replacement.
 
 ### IMDb Import
 

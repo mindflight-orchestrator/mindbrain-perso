@@ -240,4 +240,4 @@ Function-level SQL behavior is documented in the topic pages:
 - [workspace.md](workspace.md)
 - [collections.md](collections.md)
 - [projections.md](projections.md)
-- [sqlite-parity.md](sqlite-parity.md)
+- [dev/sqlite-parity.md](dev/sqlite-parity.md)

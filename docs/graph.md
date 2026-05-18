@@ -32,6 +32,12 @@ Additional tables (execution runs, learning pipeline, etc.) exist in the same sc
 
 Compatibility views **`lj_o`** and **`lj_i`** expose the same data under names expected by the Zig BFS engine.
 
+The standalone graph helpers also support narrower maintenance paths for common
+runtime updates. Knowledge learning and patch application track touched entity
+IDs and rebuild adjacency/degree rows for those entities instead of forcing a
+full graph refresh. Bulk import paths can still rebuild the full derived graph
+state when the source data set changes broadly.
+
 ## Native traversal (Zig)
 
 | Function | Returns | Notes |
@@ -56,6 +62,10 @@ The standalone Zig module exposes a richer direct API for application code:
 | `streamEntityNeighborhood(...)` | Emit neighborhood events as JSON payloads |
 | `streamSubgraph(...)` | Emit subgraph expansion events as JSON payloads |
 | `marketplaceSearchToon(...)` / `entityFtsSearchToon(...)` / `skillDependenciesToon(...)` | TOON exports for the graph search helpers |
+
+The stream helpers batch relation and entity loads for each expansion window.
+This keeps browser/SSE graph exploration from issuing repeated per-edge lookups
+when a node has a larger fanout.
 
 ## SQL helpers
 

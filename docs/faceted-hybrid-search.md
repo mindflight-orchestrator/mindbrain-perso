@@ -93,6 +93,25 @@ Embeddings are created before search in one of these ways:
 Live search never backfills `search_embeddings`. This avoids unpredictable
 latency, write contention, and accidental billing during reads.
 
+### Search Artifact Maintenance
+
+The SQLite search tables maintain two layers of derived state:
+
+- FTS5 rows in `search_fts_docs` / `search_fts`;
+- compact BM25 tables for collection stats, document stats, term stats, term
+  frequencies, and posting bitmaps.
+
+Current standalone writes update these artifacts by document-level delta where
+possible. `syncDeleteSearchDocument` deletes the FTS and compact BM25 artifacts
+for the target `(table_id, doc_id)` before removing the logical document row.
+`upsertSearchArtifactsForDocument` reconciles old and new token counts for the
+same document instead of rebuilding the entire search artifact set.
+
+When a complete in-memory search store is loaded, bulk-load mode builds BM25
+indexes once after all documents are present. Compact stores call
+`buildIndexes()` after load so repository reads are keyed lookups rather than
+linear scans.
+
 ## Query Flow
 
 `contextual-search` has three search modes, selected by flags and current index
@@ -143,7 +162,8 @@ The vector path requires indexed rows:
   `search_documents`.
 - `contextual-search` embeds the query only after confirming indexed embeddings
   exist for the target `table_id`.
-- Vector scores are computed against the loaded `search_embeddings` rows.
+- Vector scores are computed against the loaded `search_embeddings` rows for
+  the requested `table_id`.
 
 JSON HTTP clients should write indexed vectors through
 `POST /api/mindbrain/search-embedding-upsert` with
@@ -154,6 +174,11 @@ passthrough binds arrays and strings as text, so it is not a vector-blob writer.
 The query embedding must use the same embedding model family as the stored
 document/chunk embeddings. If models differ, vector similarity can be misleading
 even though the command succeeds.
+
+The vector repository contract includes an optional `VectorSearchRequest.table_id`
+field. In-memory stores use it to skip embeddings from other logical search
+tables; SQL-backed stores scope by table in their SQL query. CLI
+`contextual-search --table-id` forwards this scope into vector retrieval.
 
 ### Score Fusion
 
@@ -167,6 +192,11 @@ combined_score = bm25_score * (1.0 - vector_weight) + vector_score * vector_weig
 Default `vector_weight` is `0.5`. This is weighted score fusion, not a neural
 reranker. It is fast and deterministic, but BM25 scores and vector similarity
 scores are different scales, so `vector_weight` is an operational tuning knob.
+
+Hybrid retrieval uses the BM25 repository batch hooks
+`getDocumentStatsBatchFn` and `getTermFrequenciesBatchFn` to score all
+candidates without issuing one repository lookup per document. It keeps only the
+top `limit` candidates during scoring, then sorts that final window.
 
 ## Optional LLM Reranking
 
@@ -317,6 +347,7 @@ provider and returns BM25 results with:
 | BM25 works, vector score is always `0` | No indexed embeddings | Run `search-embedding-batch` or profile with contextual embedding flags |
 | Embedding provider is not called | No indexed embeddings exist for the table | This is intentional; search does not embed the query unless vector search can run |
 | Vector results look unrelated | Query and stored vectors used different models | Rebuild `search_embeddings` with the intended model |
+| Vector results contain rows from another logical table | Caller omitted `VectorSearchRequest.table_id` on an in-memory vector store | Pass the same table ID used by BM25/search documents |
 | Rerank requested but command fails | LLM returned no valid `doc_id` scores | Inspect reranker provider/model and candidate prompt size |
 | Facet counts do not match search results | Facet bitmap and search table use different logical IDs | Verify `table_id`, `doc_id` mapping, and chunk synthetic ID policy |
 

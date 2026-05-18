@@ -2,6 +2,13 @@
 
 This repository ships a **SQLite-first** knowledge engine with faceted search, BM25, graph traversal, pragma helpers, workspace registry, and a small CLI.
 
+## Current release
+
+`v1.4.0` is a performance and correctness release for the standalone runtime.
+It keeps the public CLI/HTTP shape stable while improving graph ingestion,
+graph stream expansion, BM25/hybrid search hot paths, compact-store lookup
+speed, and vector result scoping by `table_id`.
+
 ## Start here
 
 | Document | Description |
@@ -23,7 +30,7 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 | [third-party.md](third-party.md) | Bundled native dependencies (attribution) |
 | [dev/sqlite-backport-plan.md](dev/sqlite-backport-plan.md) | SQLite-first port plan for newer graph/facet behavior |
 | [dev/sqlite-vector-search-testing.md](dev/sqlite-vector-search-testing.md) | How to test SQLite embedding search, including fillable `.env` variables |
-| [sqlite-parity.md](sqlite-parity.md) | API-identical SQLite-backed contract (parity with `pg_mindbrain`) |
+| [dev/sqlite-parity.md](dev/sqlite-parity.md) | API-identical SQLite-backed contract (parity with `pg_mindbrain`) |
 | [dev/api-parity-inventory.md](dev/api-parity-inventory.md) | Per-function `pg_mindbrain` → `mindbrain` parity matrix |
 
 ## Source of truth

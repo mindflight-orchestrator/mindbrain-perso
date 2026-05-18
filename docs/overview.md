@@ -9,6 +9,10 @@
 5. **Ontology layer** — Functions in **`mb_ontology`** that join facets, graph, and projections for coverage and marketplace-style search when the optional `public.*` tables exist.
 
 The same Zig codebase also builds a **standalone SQLite** stack (see [standalone.md](standalone.md)) for portability and tooling.
+As of `v1.4.0`, the standalone search and graph stores maintain their hot
+indexes incrementally for common writes and use bounded top-k selection for
+vector and hybrid retrieval, so large candidate sets no longer require full
+artifact rebuilds or full-result sorting on every query.
 
 ## Architecture
 
@@ -35,7 +39,7 @@ flowchart LR
 | [src/mb_facets/main.zig](../src/mb_facets/main.zig) | Native facet merge, filter bitmaps, facet counts, document search, BM25 indexing and search |
 | [src/mb_graph/main.zig](../src/mb_graph/main.zig) | `k_hops_filtered_native`, `shortest_path_filtered_native` |
 | [src/mb_pragma/main.zig](../src/mb_pragma/main.zig) | `pragma_parse_proposition_line`; stubs for `pragma_rank_native`, `pragma_next_hops_native` |
-| [src/standalone/](../src/standalone/) | SQLite stores, hybrid search, CLI tool |
+| [src/standalone/](../src/standalone/) | SQLite stores, hybrid search, graph streaming, CLI and HTTP tools |
 
 ## Version
 
