@@ -664,6 +664,7 @@ fn microCompactPostingLookup(allocator: std.mem.Allocator, doc_count: usize, ite
         .term_hash = term_hash,
         .bitmap = try roaring.Bitmap.fromSlice(doc_ids),
     });
+    try store.buildIndexes();
 
     const repo = store.bm25Repository();
 
