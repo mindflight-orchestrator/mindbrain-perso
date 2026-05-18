@@ -411,6 +411,7 @@ pub fn loadSearchStore(db: Database, allocator: std.mem.Allocator) !search_store
     var store = search_store.Store.init(allocator);
     errdefer store.deinit();
     store.bm25_db = db;
+    store.beginBulkLoad();
 
     const doc_sql = "SELECT table_id, doc_id, content, language FROM search_documents ORDER BY table_id, doc_id";
     const doc_stmt = try prepare(db, doc_sql);
@@ -433,6 +434,9 @@ pub fn loadSearchStore(db: Database, allocator: std.mem.Allocator) !search_store
             .language = language,
         });
     }
+
+    // Build position maps and BM25 index exactly once after all documents are loaded.
+    try store.endBulkLoad();
 
     const embedding_sql = "SELECT table_id, doc_id, dimensions, embedding_blob FROM search_embeddings ORDER BY table_id, doc_id";
     const embedding_stmt = try prepare(db, embedding_sql);
@@ -707,6 +711,7 @@ pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !searc
         });
     }
 
+    try store.buildIndexes();
     return store;
 }
 

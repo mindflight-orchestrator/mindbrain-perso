@@ -20,6 +20,12 @@ const ValueNodeKey = struct {
     value_id: u32,
 };
 
+/// In-memory facet store intended for test fixtures and small in-process workloads.
+/// All repository methods (getTableConfig, getFacetId, getPostings, getFacetValueNode,
+/// getFacetChildren, listFacetValues) perform linear scans over the backing ArrayLists.
+/// Production query paths use facet_sqlite.Repository backed by SQLite indexes instead.
+/// Do not evolve this store into a runtime store without replacing the linear scans with
+/// keyed maps; the fixture-only boundary is intentional.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     table_configs: std.ArrayList(interfaces.FacetTableConfig),

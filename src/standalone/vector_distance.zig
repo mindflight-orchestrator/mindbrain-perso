@@ -19,6 +19,54 @@ pub fn lessThan(_: void, lhs: interfaces.VectorSearchMatch, rhs: interfaces.Vect
     return lhs.similarity > rhs.similarity;
 }
 
+/// Returns true when lhs ranks strictly below rhs (lhs is a worse match).
+pub fn matchWorse(lhs: interfaces.VectorSearchMatch, rhs: interfaces.VectorSearchMatch) bool {
+    return lessThan({}, rhs, lhs);
+}
+
+/// Insert candidate into a bounded worst-at-root heap, keeping the top `limit`
+/// best matches. O(log K) per call. After all insertions sort with `lessThan`
+/// to obtain the final best-first order.
+pub fn insertTopMatch(
+    allocator: std.mem.Allocator,
+    matches: *std.ArrayList(interfaces.VectorSearchMatch),
+    candidate: interfaces.VectorSearchMatch,
+    limit: usize,
+) !void {
+    if (limit == 0) return;
+    if (matches.items.len < limit) {
+        try matches.append(allocator, candidate);
+        siftUpWorstMatch(matches.items, matches.items.len - 1);
+    } else if (lessThan({}, candidate, matches.items[0])) {
+        matches.items[0] = candidate;
+        siftDownWorstMatch(matches.items, 0);
+    }
+}
+
+fn siftUpWorstMatch(items: []interfaces.VectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!matchWorse(items[index], items[parent])) break;
+        std.mem.swap(interfaces.VectorSearchMatch, &items[index], &items[parent]);
+        index = parent;
+    }
+}
+
+fn siftDownWorstMatch(items: []interfaces.VectorSearchMatch, start_index: usize) void {
+    var index = start_index;
+    while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        var worst = index;
+        if (left < items.len and matchWorse(items[left], items[worst])) worst = left;
+        if (right < items.len and matchWorse(items[right], items[worst])) worst = right;
+        if (worst == index) break;
+        std.mem.swap(interfaces.VectorSearchMatch, &items[index], &items[worst]);
+        index = worst;
+    }
+}
+
 fn cosineScore(a: []const f32, b: []const f32) Score {
     const similarity = cosineSimilarity(a, b);
     return .{

@@ -897,27 +897,6 @@ fn syncFacetAssignments(self: *Pipeline, table_id: u64, doc_id: u64, facets: []c
     }
 }
 
-fn syncAdjacencyForNode(self: *Pipeline, entity_id: u32, outgoing: bool) !void {
-    var relation_ids = std.ArrayList(u32).empty;
-    defer relation_ids.deinit(self.allocator);
-
-    for (self.graph.relations.items) |relation| {
-        if (outgoing and relation.source_id == entity_id) {
-            try relation_ids.append(self.allocator, relation.relation_id);
-        } else if (!outgoing and relation.target_id == entity_id) {
-            try relation_ids.append(self.allocator, relation.relation_id);
-        }
-    }
-
-    if (outgoing) {
-        try self.graph.setOutgoing(entity_id, relation_ids.items);
-        try graph_sqlite.upsertAdjacency(self.db.*, "graph_lj_out", entity_id, relation_ids.items, self.allocator);
-    } else {
-        try self.graph.setIncoming(entity_id, relation_ids.items);
-        try graph_sqlite.upsertAdjacency(self.db.*, "graph_lj_in", entity_id, relation_ids.items, self.allocator);
-    }
-}
-
 fn findFacetTable(store: *facet_store.Store, table_id: u64) ?interfaces.FacetTableConfig {
     for (store.table_configs.items) |config| {
         if (config.table_id == table_id) return config;
