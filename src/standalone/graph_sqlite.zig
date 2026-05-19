@@ -830,7 +830,9 @@ pub fn loadRelationPropertiesBatch(
 /// Projects all `relation_properties_raw` rows for `workspace_id` into
 /// `graph_relation_property`. Skips rows whose `relation_id` has no
 /// corresponding row in `graph_relation` (i.e., not yet projected).
-pub fn projectRelationProperties(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) !u64 {
+/// Cost: O(P_workspace) — scans every raw property row for the workspace.
+/// For incremental updates prefer `projectRelationPropertiesForIds`.
+pub fn projectRelationProperties(db: Database, workspace_id: []const u8) !u64 {
     const sql =
         \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency)
         \\SELECT rpr.relation_id, rpr.property_key, rpr.value_type, rpr.value_text, rpr.value_number, rpr.value_integer, rpr.ref_doc_id, rpr.currency
@@ -849,7 +851,70 @@ pub fn projectRelationProperties(db: Database, allocator: std.mem.Allocator, wor
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     try stepDone(stmt);
-    _ = allocator;
+    return @intCast(c.sqlite3_changes(db.handle));
+}
+
+/// Projects `relation_properties_raw` rows for a specific set of relation ids
+/// into `graph_relation_property`. Skips ids that have no corresponding row in
+/// `graph_relation`. Chunked at 500 to stay below SQLITE_MAX_VARIABLE_NUMBER.
+/// Cost: O(P_changed) — only touches the provided relation ids.
+pub fn projectRelationPropertiesForIds(
+    db: Database,
+    allocator: std.mem.Allocator,
+    relation_ids: []const u32,
+) !u64 {
+    if (relation_ids.len == 0) return 0;
+
+    var total: u64 = 0;
+    const chunk_size: usize = 500;
+    var offset: usize = 0;
+    while (offset < relation_ids.len) {
+        const end = @min(offset + chunk_size, relation_ids.len);
+        const chunk = relation_ids[offset..end];
+        offset = end;
+        total += try projectRelationPropertiesChunk(db, allocator, chunk);
+    }
+    return total;
+}
+
+fn projectRelationPropertiesChunk(
+    db: Database,
+    allocator: std.mem.Allocator,
+    chunk: []const u32,
+) !u64 {
+    var query = std.ArrayList(u8).empty;
+    defer query.deinit(allocator);
+
+    try query.appendSlice(allocator,
+        \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency)
+        \\SELECT rpr.relation_id, rpr.property_key, rpr.value_type, rpr.value_text, rpr.value_number, rpr.value_integer, rpr.ref_doc_id, rpr.currency
+        \\FROM relation_properties_raw rpr
+        \\INNER JOIN graph_relation gr ON gr.relation_id = rpr.relation_id
+        \\WHERE rpr.relation_id IN (
+    );
+    for (chunk, 0..) |_, i| {
+        if (i > 0) try query.appendSlice(allocator, ",");
+        var buf: [24]u8 = undefined;
+        const param = try std.fmt.bufPrint(&buf, "?{d}", .{i + 1});
+        try query.appendSlice(allocator, param);
+    }
+    try query.appendSlice(allocator,
+        \\)
+        \\ON CONFLICT(relation_id, property_key) DO UPDATE SET
+        \\    value_type    = excluded.value_type,
+        \\    value_text    = excluded.value_text,
+        \\    value_number  = excluded.value_number,
+        \\    value_integer = excluded.value_integer,
+        \\    ref_doc_id    = excluded.ref_doc_id,
+        \\    currency      = excluded.currency
+    );
+
+    const stmt = try prepare(db, query.items);
+    defer finalize(stmt);
+    for (chunk, 0..) |rid, i| {
+        try bindInt64(stmt, @intCast(i + 1), rid);
+    }
+    try stepDone(stmt);
     return @intCast(c.sqlite3_changes(db.handle));
 }
 
@@ -4879,7 +4944,7 @@ test "projectRelationProperties mirrors relation_properties_raw into graph_relat
     try insertEntity(db, 2, "bien", "Maison");
     try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "POSSEDE", .confidence = 1.0, .valid_from_unix = null, .valid_to_unix = null });
 
-    const count = try projectRelationProperties(db, std.testing.allocator, "ws_prop");
+    const count = try projectRelationProperties(db, "ws_prop");
     try std.testing.expectEqual(@as(u64, 1), count);
 
     // Verify the projection landed
@@ -4891,4 +4956,137 @@ test "projectRelationProperties mirrors relation_properties_raw into graph_relat
     try std.testing.expectEqual(@as(usize, 1), props.len);
     try std.testing.expectEqualStrings("share_bp", props[0].property_key);
     try std.testing.expectEqual(@as(i64, 10000), props[0].value_integer.?);
+}
+
+test "projectRelationPropertiesForIds roundtrip — only specified relations land in derived table" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Three relations; FK enforcement is off so no workspace/ontology setup needed.
+    try insertEntity(db, 1, "contact", "Alice");
+    try insertEntity(db, 2, "bien", "Maison");
+    try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "OWNS", .confidence = 1.0 });
+    try insertRelation(db, .{ .relation_id = 11, .source_id = 1, .target_id = 2, .relation_type = "OWNS", .confidence = 1.0 });
+    try insertRelation(db, .{ .relation_id = 12, .source_id = 1, .target_id = 2, .relation_type = "OWNS", .confidence = 1.0 });
+
+    // Two raw properties for each relation.
+    const ins =
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_integer)
+        \\VALUES ('ws_ids', ?1, ?2, 'percentage_bp', ?3)
+    ;
+    inline for ([_]struct { rid: u32, key: []const u8, val: i64 }{
+        .{ .rid = 10, .key = "share_bp", .val = 10000 },
+        .{ .rid = 10, .key = "score", .val = 90 },
+        .{ .rid = 11, .key = "share_bp", .val = 5000 },
+        .{ .rid = 11, .key = "score", .val = 80 },
+        .{ .rid = 12, .key = "share_bp", .val = 3000 },
+        .{ .rid = 12, .key = "score", .val = 70 },
+    }) |row| {
+        const s = try facet_sqlite.prepare(db, ins);
+        defer facet_sqlite.finalize(s);
+        try facet_sqlite.bindInt64(s, 1, row.rid);
+        try facet_sqlite.bindText(s, 2, row.key);
+        try facet_sqlite.bindInt64(s, 3, row.val);
+        try facet_sqlite.stepDone(s);
+    }
+
+    // Project only relations 10 and 11, not 12.
+    const count = try projectRelationPropertiesForIds(db, std.testing.allocator, &.{ 10, 11 });
+    try std.testing.expectEqual(@as(u64, 4), count);
+
+    // Derived table should have exactly 4 rows (2 per relation for 10 and 11).
+    const all = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 10, 11, 12 });
+    defer {
+        for (all) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 4), all.len);
+    // Relation 12 must not appear.
+    for (all) |p| {
+        try std.testing.expect(p.relation_id != 12);
+    }
+}
+
+test "projectRelationPropertiesForIds consistency boundary — raw write alone leaves derived table empty" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "contact", "Alice");
+    try insertEntity(db, 2, "bien", "Maison");
+    try insertRelation(db, .{ .relation_id = 20, .source_id = 1, .target_id = 2, .relation_type = "OWNS", .confidence = 1.0 });
+
+    const ins =
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_integer)
+        \\VALUES ('ws_bound', 20, 'share_bp', 'percentage_bp', 10000)
+    ;
+    const s = try facet_sqlite.prepare(db, ins);
+    defer facet_sqlite.finalize(s);
+    try facet_sqlite.stepDone(s);
+
+    // Before projection: derived table must be empty.
+    const before = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{20});
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    // After projection: derived table must have the row.
+    const count = try projectRelationPropertiesForIds(db, std.testing.allocator, &.{20});
+    try std.testing.expectEqual(@as(u64, 1), count);
+
+    const after = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{20});
+    defer {
+        for (after) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(after);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqual(@as(i64, 10000), after[0].value_integer.?);
+}
+
+test "projectRelationPropertiesForIds chunk boundary — all 501 ids projected across two chunks" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Shared source/target entities (FK enforcement is off so no raw-layer setup needed).
+    try insertEntity(db, 1, "node", "A");
+    try insertEntity(db, 2, "node", "B");
+
+    const ins_rel =
+        \\INSERT INTO graph_relation(relation_id, relation_type, source_id, target_id, confidence)
+        \\VALUES (?1, 'LINK', 1, 2, 1.0)
+    ;
+    const ins_rpr =
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_integer)
+        \\VALUES ('ws_chunk', ?1, 'seq', 'percentage_bp', ?1)
+    ;
+
+    // Insert 501 relations + raw properties (ids 100..600 to avoid entity id collisions).
+    var i: u32 = 100;
+    while (i < 601) : (i += 1) {
+        const sr = try facet_sqlite.prepare(db, ins_rel);
+        defer facet_sqlite.finalize(sr);
+        try facet_sqlite.bindInt64(sr, 1, i);
+        try facet_sqlite.stepDone(sr);
+
+        const sp = try facet_sqlite.prepare(db, ins_rpr);
+        defer facet_sqlite.finalize(sp);
+        try facet_sqlite.bindInt64(sp, 1, i);
+        try facet_sqlite.stepDone(sp);
+    }
+
+    // Build ids slice 100..600.
+    var ids: [501]u32 = undefined;
+    for (&ids, 0..) |*slot, idx| slot.* = @intCast(100 + idx);
+
+    const count = try projectRelationPropertiesForIds(db, std.testing.allocator, &ids);
+    try std.testing.expectEqual(@as(u64, 501), count);
+
+    // Spot-check first, last, and the 501st id.
+    const spot = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 100, 600 });
+    defer {
+        for (spot) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(spot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), spot.len);
 }

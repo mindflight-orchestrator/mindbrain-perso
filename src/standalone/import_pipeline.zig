@@ -308,6 +308,18 @@ pub const Pipeline = struct {
         try self.db.exec("RELEASE SAVEPOINT add_relation_property");
     }
 
+    /// Bulk-stages typed edge properties into `relation_properties_raw` without
+    /// per-property SAVEPOINTs. All relations must already exist in `graph_relation`.
+    /// The derived `graph_relation_property` table is NOT updated by this call;
+    /// the caller must follow up with `graph_sqlite.projectRelationPropertiesForIds`
+    /// (or the full `graph_sqlite.projectRelationProperties`) inside the same
+    /// transaction to keep raw and derived tables consistent.
+    pub fn addRelationPropertiesBatch(self: *Pipeline, specs: []const collections_sqlite.RelationPropertyRawSpec) !void {
+        for (specs) |spec| {
+            try collections_sqlite.upsertRelationPropertyRaw(self.db.*, spec);
+        }
+    }
+
     pub fn linkEntityToDocument(self: *Pipeline, spec: collections_sqlite.EntityDocumentRawSpec, table_id: ?u64) !void {
         try collections_sqlite.linkEntityDocumentRaw(self.db.*, spec);
         if (table_id) |tid| {
@@ -768,7 +780,7 @@ pub const Pipeline = struct {
             projected_count += 1;
         }
 
-        const prop_count = try graph_sqlite.projectRelationProperties(self.db.*, self.allocator, workspace_id);
+        const prop_count = try graph_sqlite.projectRelationProperties(self.db.*, workspace_id);
         projected_count += prop_count;
 
         if (document_table_id) |tid| {
@@ -1713,4 +1725,96 @@ test "co-ownership: two contacts POSSEDE same bien with share_bp summing to 1000
         try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
         try std.testing.expectEqual(@as(i64, 2), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
     }
+}
+
+test "addRelationPropertiesBatch stages raw rows then projectRelationPropertiesForIds populates derived table" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var search = search_store.Store.init(std.testing.allocator);
+    defer search.deinit();
+    var facets = facet_store.Store.init(std.testing.allocator);
+    defer facets.deinit();
+    var graph = graph_store.Store.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var pipeline = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph,
+    };
+
+    try pipeline.createWorkspace(.{ .workspace_id = "ws_batch", .label = "Batch test" });
+    try pipeline.registerOntology(.{
+        .header = .{ .ontology_id = "ws_batch::core", .workspace_id = "ws_batch", .name = "core" },
+        .entity_types = &.{
+            .{ .ontology_id = "ws_batch::core", .entity_type = "contact" },
+            .{ .ontology_id = "ws_batch::core", .entity_type = "bien" },
+        },
+        .edge_types = &.{
+            .{ .ontology_id = "ws_batch::core", .edge_type = "POSSEDE" },
+        },
+    });
+
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_batch", .ontology_id = "ws_batch::core", .entity_id = 1, .entity_type = "contact", .name = "Alice" });
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_batch", .ontology_id = "ws_batch::core", .entity_id = 2, .entity_type = "bien", .name = "Maison" });
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_batch", .ontology_id = "ws_batch::core", .entity_id = 3, .entity_type = "bien", .name = "Chalet" });
+
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_batch",
+        .ontology_id = "ws_batch::core",
+        .relation_id = 10,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 1,
+        .target_entity_id = 2,
+        .confidence = 1.0,
+    });
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_batch",
+        .ontology_id = "ws_batch::core",
+        .relation_id = 11,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 1,
+        .target_entity_id = 3,
+        .confidence = 1.0,
+    });
+
+    // Stage raw properties via the batch method — derived table must still be empty.
+    const specs: []const collections_sqlite.RelationPropertyRawSpec = &.{
+        .{ .workspace_id = "ws_batch", .relation_id = 10, .property_key = "ownership_kind", .value_type = .text, .value_text = "pleine_propriete" },
+        .{ .workspace_id = "ws_batch", .relation_id = 10, .property_key = "share_bp", .value_type = .percentage_bp, .value_integer = 10000 },
+        .{ .workspace_id = "ws_batch", .relation_id = 11, .property_key = "ownership_kind", .value_type = .text, .value_text = "nue_propriete" },
+        .{ .workspace_id = "ws_batch", .relation_id = 11, .property_key = "share_bp", .value_type = .percentage_bp, .value_integer = 10000 },
+    };
+    try pipeline.addRelationPropertiesBatch(specs);
+
+    // Derived table still empty — no projection called yet.
+    const before = try graph_sqlite.loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 10, 11 });
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    // Project the two relations explicitly.
+    const projected = try graph_sqlite.projectRelationPropertiesForIds(db, std.testing.allocator, &.{ 10, 11 });
+    try std.testing.expectEqual(@as(u64, 4), projected);
+
+    // Derived table now contains all 4 properties.
+    const after = try graph_sqlite.loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 10, 11 });
+    defer {
+        for (after) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(after);
+    }
+    try std.testing.expectEqual(@as(usize, 4), after.len);
+
+    // Verify relation 10 has ownership_kind = pleine_propriete.
+    var found_pleine = false;
+    for (after) |p| {
+        if (p.relation_id == 10 and std.mem.eql(u8, p.property_key, "ownership_kind")) {
+            try std.testing.expectEqualStrings("pleine_propriete", p.value_text.?);
+            found_pleine = true;
+        }
+    }
+    try std.testing.expect(found_pleine);
 }
