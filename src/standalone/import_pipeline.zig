@@ -281,6 +281,33 @@ pub const Pipeline = struct {
         try graph_sqlite.upsertRelationFull(self.db.*, rid, spec.workspace_id, spec.edge_type, src, tgt, valid_from_unix, valid_to_unix, @floatCast(spec.confidence), spec.metadata_json);
     }
 
+    /// Persists a single typed edge property into the raw staging table and
+    /// immediately projects it into `graph_relation_property`. The relation
+    /// must already exist in `graph_relation` (i.e., `addRelationFull` or
+    /// `addRelation` must have been called first for the same relation_id).
+    /// Both writes are wrapped in a savepoint so raw and derived tables
+    /// stay consistent even if the process crashes between the two writes.
+    pub fn addRelationProperty(self: *Pipeline, spec: collections_sqlite.RelationPropertyRawSpec) !void {
+        try self.db.exec("SAVEPOINT add_relation_property");
+        errdefer {
+            _ = self.db.exec("ROLLBACK TO SAVEPOINT add_relation_property") catch {};
+            _ = self.db.exec("RELEASE SAVEPOINT add_relation_property") catch {};
+        }
+        try collections_sqlite.upsertRelationPropertyRaw(self.db.*, spec);
+        const rid: u32 = std.math.cast(u32, spec.relation_id) orelse return error.ValueOutOfRange;
+        try graph_sqlite.upsertRelationProperty(self.db.*, .{
+            .relation_id = rid,
+            .property_key = spec.property_key,
+            .value_type = spec.value_type.label(),
+            .value_text = spec.value_text,
+            .value_number = spec.value_number,
+            .value_integer = spec.value_integer,
+            .ref_doc_id = spec.ref_doc_id,
+            .currency = spec.currency,
+        });
+        try self.db.exec("RELEASE SAVEPOINT add_relation_property");
+    }
+
     pub fn linkEntityToDocument(self: *Pipeline, spec: collections_sqlite.EntityDocumentRawSpec, table_id: ?u64) !void {
         try collections_sqlite.linkEntityDocumentRaw(self.db.*, spec);
         if (table_id) |tid| {
@@ -740,6 +767,9 @@ pub const Pipeline = struct {
             try graph_sqlite.upsertRelationFull(self.db.*, rid, workspace_id, edge, src, tgt, valid_from_unix, valid_to_unix, confidence, metadata_json);
             projected_count += 1;
         }
+
+        const prop_count = try graph_sqlite.projectRelationProperties(self.db.*, self.allocator, workspace_id);
+        projected_count += prop_count;
 
         if (document_table_id) |tid| {
             {
@@ -1331,4 +1361,356 @@ test "ingestDocumentChunked end-to-end persists nanoid, chunks, and source.* fac
         .edge_type = "cites",
     });
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(db, "SELECT COUNT(*) FROM external_links_raw WHERE link_id = 7 AND target_uri = 'https://example.com/policy'"));
+}
+
+test "ownership scenario: Contact POSSEDE Bien with typed properties, sale transfer, current and historical owners" {
+    //
+    // Domain model:
+    //   Contact --[POSSEDE]--> Bien
+    //   Edge properties: ownership_kind (text), share_bp (percentage_bp),
+    //                    purchase_price (money_minor), contract_signed_at (date_unix)
+    //
+    // Scenario:
+    //   2020-01-01: Alice acquires Maison (pleine_propriete, 100%, 300 000 EUR)
+    //   2024-06-01: Alice sells to Bob    (Alice: valid_to set, Bob: new edge)
+    //   At 2025-01-01: current owner = Bob; historical owner = Alice
+    //
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var search = search_store.Store.init(std.testing.allocator);
+    defer search.deinit();
+    var facets = facet_store.Store.init(std.testing.allocator);
+    defer facets.deinit();
+    var graph = graph_store.Store.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var pipeline = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph,
+    };
+
+    try pipeline.createWorkspace(.{ .workspace_id = "ws_own", .label = "Ownership test" });
+    try pipeline.registerOntology(.{
+        .header = .{
+            .ontology_id = "ws_own::core",
+            .workspace_id = "ws_own",
+            .name = "core",
+        },
+        .entity_types = &.{
+            .{ .ontology_id = "ws_own::core", .entity_type = "contact" },
+            .{ .ontology_id = "ws_own::core", .entity_type = "bien" },
+        },
+        .edge_types = &.{
+            .{ .ontology_id = "ws_own::core", .edge_type = "POSSEDE" },
+        },
+    });
+
+    // unix epochs: 2020-01-01=1577836800, 2025-01-01=1735689600
+    const acq_date: i64 = 1577836800;
+    const query_date: i64 = 1735689600;
+
+    // --- Entities ---
+    try pipeline.upsertEntityFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .entity_id = 1,
+        .entity_type = "contact",
+        .name = "Alice",
+    });
+    try pipeline.upsertEntityFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .entity_id = 2,
+        .entity_type = "contact",
+        .name = "Bob",
+    });
+    try pipeline.upsertEntityFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .entity_id = 3,
+        .entity_type = "bien",
+        .name = "Maison",
+    });
+
+    // --- Alice acquires Maison (relation 10) ---
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .relation_id = 10,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 1, // Alice
+        .target_entity_id = 3, // Maison
+        .valid_from = "2020-01-01",
+        .valid_to = null, // open — current owner at ingest time
+        .confidence = 1.0,
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 10,
+        .property_key = "ownership_kind",
+        .value_type = .text,
+        .value_text = "pleine_propriete",
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 10,
+        .property_key = "share_bp",
+        .value_type = .percentage_bp,
+        .value_integer = 10000,
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 10,
+        .property_key = "purchase_price",
+        .value_type = .money_minor,
+        .value_integer = 30_000_000, // 300 000 EUR
+        .currency = "EUR",
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 10,
+        .property_key = "contract_signed_at",
+        .value_type = .date_unix,
+        .value_integer = acq_date,
+    });
+
+    // --- Alice sells to Bob on 2024-06-01 ---
+    // Close Alice's edge
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .relation_id = 10,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 1,
+        .target_entity_id = 3,
+        .valid_from = "2020-01-01",
+        .valid_to = "2024-06-01", // closed interval — past owner
+        .confidence = 1.0,
+    });
+    // Bob's new edge (relation 11)
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_own",
+        .ontology_id = "ws_own::core",
+        .relation_id = 11,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 2, // Bob
+        .target_entity_id = 3, // Maison
+        .valid_from = "2024-06-01",
+        .valid_to = null, // open — current owner
+        .confidence = 1.0,
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 11,
+        .property_key = "ownership_kind",
+        .value_type = .text,
+        .value_text = "pleine_propriete",
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 11,
+        .property_key = "share_bp",
+        .value_type = .percentage_bp,
+        .value_integer = 10000,
+    });
+    try pipeline.addRelationProperty(.{
+        .workspace_id = "ws_own",
+        .relation_id = 11,
+        .property_key = "purchase_price",
+        .value_type = .money_minor,
+        .value_integer = 35_000_000, // 350 000 EUR
+        .currency = "EUR",
+    });
+
+    // ---- Query: current owner at query_date (2025-01-01) ----
+    {
+        const sql =
+            \\SELECT gr.source_id
+            \\FROM graph_relation gr
+            \\WHERE gr.relation_type = 'POSSEDE'
+            \\  AND gr.target_id = 3
+            \\  AND gr.valid_from_unix <= ?1
+            \\  AND (gr.valid_to_unix IS NULL OR gr.valid_to_unix > ?1)
+            \\  AND gr.deprecated_at IS NULL
+        ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindInt64(stmt, 1, query_date);
+        try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
+        const current_owner_id = facet_sqlite.c.sqlite3_column_int64(stmt, 0);
+        try std.testing.expectEqual(@as(i64, 2), current_owner_id); // Bob
+        try std.testing.expectEqual(facet_sqlite.c.SQLITE_DONE, facet_sqlite.c.sqlite3_step(stmt)); // only one current owner
+    }
+
+    // ---- Query: historical owners (closed valid_to) ----
+    {
+        const sql =
+            \\SELECT gr.source_id
+            \\FROM graph_relation gr
+            \\WHERE gr.relation_type = 'POSSEDE'
+            \\  AND gr.target_id = 3
+            \\  AND gr.valid_to_unix IS NOT NULL
+            \\  AND gr.deprecated_at IS NULL
+        ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
+        const past_owner_id = facet_sqlite.c.sqlite3_column_int64(stmt, 0);
+        try std.testing.expectEqual(@as(i64, 1), past_owner_id); // Alice
+    }
+
+    // ---- Verify edge properties on current owner's relation (Bob, id=11) ----
+    {
+        const props = try graph_sqlite.loadRelationPropertiesBatch(db, std.testing.allocator, &.{11});
+        defer {
+            for (props) |p| p.deinit(std.testing.allocator);
+            std.testing.allocator.free(props);
+        }
+        var found_kind = false;
+        var found_price = false;
+        for (props) |p| {
+            if (std.mem.eql(u8, p.property_key, "ownership_kind")) {
+                try std.testing.expectEqualStrings("pleine_propriete", p.value_text.?);
+                found_kind = true;
+            } else if (std.mem.eql(u8, p.property_key, "purchase_price")) {
+                try std.testing.expectEqual(@as(i64, 35_000_000), p.value_integer.?);
+                try std.testing.expectEqualStrings("EUR", p.currency.?);
+                found_price = true;
+            }
+        }
+        try std.testing.expect(found_kind);
+        try std.testing.expect(found_price);
+    }
+
+    // ---- Reindex round-trip: raw → derived preserves properties ----
+    var graph2 = graph_store.Store.init(std.testing.allocator);
+    defer graph2.deinit();
+    var rebuild = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph2,
+    };
+    const count = try rebuild.reindexGraphWithDocumentTable("ws_own", null);
+    // 3 entities + 2 relations + 2 property projections from relation_properties_raw
+    try std.testing.expect(count >= 5);
+
+    const props_after = try graph_sqlite.loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 10, 11 });
+    defer {
+        for (props_after) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(props_after);
+    }
+    // 4 props on rel 10 + 3 props on rel 11 = 7 total
+    try std.testing.expectEqual(@as(usize, 7), props_after.len);
+}
+
+test "co-ownership: two contacts POSSEDE same bien with share_bp summing to 10000" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var search = search_store.Store.init(std.testing.allocator);
+    defer search.deinit();
+    var facets = facet_store.Store.init(std.testing.allocator);
+    defer facets.deinit();
+    var graph = graph_store.Store.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var pipeline = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph,
+    };
+
+    try pipeline.createWorkspace(.{ .workspace_id = "ws_co", .label = "Co-ownership" });
+    try pipeline.registerOntology(.{
+        .header = .{ .ontology_id = "ws_co::core", .workspace_id = "ws_co", .name = "core" },
+        .entity_types = &.{
+            .{ .ontology_id = "ws_co::core", .entity_type = "contact" },
+            .{ .ontology_id = "ws_co::core", .entity_type = "bien" },
+        },
+        .edge_types = &.{
+            .{ .ontology_id = "ws_co::core", .edge_type = "POSSEDE" },
+        },
+    });
+
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_co", .ontology_id = "ws_co::core", .entity_id = 1, .entity_type = "contact", .name = "Alice" });
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_co", .ontology_id = "ws_co::core", .entity_id = 2, .entity_type = "contact", .name = "Bob" });
+    try pipeline.upsertEntityFull(.{ .workspace_id = "ws_co", .ontology_id = "ws_co::core", .entity_id = 3, .entity_type = "bien", .name = "Chalet" });
+
+    // Alice: usufruit 50%
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_co",
+        .ontology_id = "ws_co::core",
+        .relation_id = 20,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 1,
+        .target_entity_id = 3,
+        .valid_from = "2022-01-01",
+        .confidence = 1.0,
+    });
+    try pipeline.addRelationProperty(.{ .workspace_id = "ws_co", .relation_id = 20, .property_key = "ownership_kind", .value_type = .text, .value_text = "usufruit" });
+    try pipeline.addRelationProperty(.{ .workspace_id = "ws_co", .relation_id = 20, .property_key = "share_bp", .value_type = .percentage_bp, .value_integer = 5000 });
+
+    // Bob: nue_propriete 50%
+    try pipeline.addRelationFull(.{
+        .workspace_id = "ws_co",
+        .ontology_id = "ws_co::core",
+        .relation_id = 21,
+        .edge_type = "POSSEDE",
+        .source_entity_id = 2,
+        .target_entity_id = 3,
+        .valid_from = "2022-01-01",
+        .confidence = 1.0,
+    });
+    try pipeline.addRelationProperty(.{ .workspace_id = "ws_co", .relation_id = 21, .property_key = "ownership_kind", .value_type = .text, .value_text = "nue_propriete" });
+    try pipeline.addRelationProperty(.{ .workspace_id = "ws_co", .relation_id = 21, .property_key = "share_bp", .value_type = .percentage_bp, .value_integer = 5000 });
+
+    const at: i64 = 1735689600; // 2025-01-01
+
+    // Both Alice and Bob are current owners
+    {
+        const sql =
+            \\SELECT COUNT(*), SUM(grp.value_integer) as total_bp
+            \\FROM graph_relation gr
+            \\INNER JOIN graph_relation_property grp
+            \\        ON grp.relation_id = gr.relation_id AND grp.property_key = 'share_bp'
+            \\WHERE gr.relation_type = 'POSSEDE'
+            \\  AND gr.target_id = 3
+            \\  AND gr.valid_from_unix <= ?1
+            \\  AND (gr.valid_to_unix IS NULL OR gr.valid_to_unix > ?1)
+            \\  AND gr.deprecated_at IS NULL
+        ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindInt64(stmt, 1, at);
+        try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
+        const co_owner_count = facet_sqlite.c.sqlite3_column_int64(stmt, 0);
+        const total_bp = facet_sqlite.c.sqlite3_column_int64(stmt, 1);
+        try std.testing.expectEqual(@as(i64, 2), co_owner_count);
+        try std.testing.expectEqual(@as(i64, 10000), total_bp); // 50% + 50% = 100%
+    }
+
+    // Ownership kinds are distinct (usufruit vs nue_propriete)
+    {
+        const sql =
+            \\SELECT COUNT(DISTINCT grp.value_text)
+            \\FROM graph_relation gr
+            \\INNER JOIN graph_relation_property grp
+            \\        ON grp.relation_id = gr.relation_id AND grp.property_key = 'ownership_kind'
+            \\WHERE gr.relation_type = 'POSSEDE' AND gr.target_id = 3 AND gr.deprecated_at IS NULL
+        ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
+        try std.testing.expectEqual(@as(i64, 2), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
+    }
 }

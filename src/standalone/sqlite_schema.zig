@@ -75,6 +75,34 @@ fn renderImportSchema(allocator: std.mem.Allocator) ![]u8 {
     ,
         \\
     );
+    try replaceSchemaFragment(allocator, &schema,
+        \\CREATE INDEX IF NOT EXISTS grp_key_text_idx
+        \\    ON graph_relation_property(property_key, value_text)
+        \\    WHERE value_text IS NOT NULL;
+    ,
+        \\
+    );
+    try replaceSchemaFragment(allocator, &schema,
+        \\CREATE INDEX IF NOT EXISTS grp_key_int_idx
+        \\    ON graph_relation_property(property_key, value_integer)
+        \\    WHERE value_integer IS NOT NULL;
+    ,
+        \\
+    );
+    try replaceSchemaFragment(allocator, &schema,
+        \\CREATE INDEX IF NOT EXISTS grp_key_num_idx
+        \\    ON graph_relation_property(property_key, value_number)
+        \\    WHERE value_number IS NOT NULL;
+    ,
+        \\
+    );
+    try replaceSchemaFragment(allocator, &schema,
+        \\CREATE INDEX IF NOT EXISTS grp_doc_ref_idx
+        \\    ON graph_relation_property(ref_doc_id)
+        \\    WHERE ref_doc_id IS NOT NULL;
+    ,
+        \\
+    );
 
     return schema;
 }
@@ -132,6 +160,11 @@ test "sqlite schema is loaded from the canonical install file" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_relation") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_source_id_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_target_id_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_relation_property") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_text_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_int_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_num_idx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_doc_ref_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_entity_chunk") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_entity_chunk_source_idx") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_lj_out") != null);
@@ -184,6 +217,7 @@ test "sqlite schema includes the collection raw tables" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS entities_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS entity_aliases_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS relations_raw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS relation_properties_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS entity_documents_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS entity_chunks_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS document_links_raw") != null);
@@ -207,6 +241,10 @@ test "sqlite import schema skips graph indexes and hot import constraints" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_source_id_idx") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_target_id_idx") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS graph_relation_workspace_id_idx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_text_idx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_int_idx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_key_num_idx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE INDEX IF NOT EXISTS grp_doc_ref_idx") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "UNIQUE(entity_type, name)") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "PRIMARY KEY(term, entity_id)") == null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "FOREIGN KEY(source_id) REFERENCES graph_entity(entity_id)") == null);

@@ -38,6 +38,7 @@ psql_cmd -c 'CREATE EXTENSION IF NOT EXISTS pg_mindbrain'
 run_sql_file /tests/sql/facets/minimal_facets_test.sql
 run_sql_file /tests/sql/facets/minimal_bm25_test.sql
 run_sql_file /tests/sql/graph/minimal_graph_test.sql
+run_sql_file /tests/sql/graph/relation_property_test.sql
 run_sql_file /tests/sql/pragma/test_pg_pragma.sql
 run_sql_file /tests/sql/ontology/minimal_ontology_test.sql
 run_sql_file /tests/sql/ontology/phase2_registry_test.sql

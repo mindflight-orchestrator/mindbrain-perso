@@ -216,6 +216,40 @@ pub const RelationRawSpec = struct {
     metadata_json: []const u8 = "{}",
 };
 
+pub const RelationPropertyValueType = enum {
+    text,
+    number,
+    percentage_bp,
+    money_minor,
+    date_unix,
+    doc_ref,
+    uri,
+
+    pub fn label(self: RelationPropertyValueType) []const u8 {
+        return switch (self) {
+            .text => "text",
+            .number => "number",
+            .percentage_bp => "percentage_bp",
+            .money_minor => "money_minor",
+            .date_unix => "date_unix",
+            .doc_ref => "doc_ref",
+            .uri => "uri",
+        };
+    }
+};
+
+pub const RelationPropertyRawSpec = struct {
+    workspace_id: []const u8,
+    relation_id: u64,
+    property_key: []const u8,
+    value_type: RelationPropertyValueType,
+    value_text: ?[]const u8 = null,
+    value_number: ?f64 = null,
+    value_integer: ?i64 = null,
+    ref_doc_id: ?u64 = null,
+    currency: ?[]const u8 = null,
+};
+
 pub const EntityDocumentRawSpec = struct {
     workspace_id: []const u8,
     entity_id: u64,
@@ -754,6 +788,34 @@ pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
     if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 8, v) else try facet_sqlite.bindNull(stmt, 8);
     if (c.sqlite3_bind_double(stmt, 9, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 10, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub fn upsertRelationPropertyRaw(db: Database, spec: RelationPropertyRawSpec) !void {
+    const sql =
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        \\ON CONFLICT(workspace_id, relation_id, property_key) DO UPDATE SET
+        \\    value_type    = excluded.value_type,
+        \\    value_text    = excluded.value_text,
+        \\    value_number  = excluded.value_number,
+        \\    value_integer = excluded.value_integer,
+        \\    ref_doc_id    = excluded.ref_doc_id,
+        \\    currency      = excluded.currency
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindInt64(stmt, 2, spec.relation_id);
+    try facet_sqlite.bindText(stmt, 3, spec.property_key);
+    try facet_sqlite.bindText(stmt, 4, spec.value_type.label());
+    if (spec.value_text) |v| try facet_sqlite.bindText(stmt, 5, v) else try facet_sqlite.bindNull(stmt, 5);
+    if (spec.value_number) |v| {
+        if (c.sqlite3_bind_double(stmt, 6, v) != c.SQLITE_OK) return error.BindFailed;
+    } else try facet_sqlite.bindNull(stmt, 6);
+    if (spec.value_integer) |v| try facet_sqlite.bindInt64(stmt, 7, v) else try facet_sqlite.bindNull(stmt, 7);
+    if (spec.ref_doc_id) |v| try facet_sqlite.bindInt64(stmt, 8, v) else try facet_sqlite.bindNull(stmt, 8);
+    if (spec.currency) |v| try facet_sqlite.bindText(stmt, 9, v) else try facet_sqlite.bindNull(stmt, 9);
     try facet_sqlite.stepDone(stmt);
 }
 

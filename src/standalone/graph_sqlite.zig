@@ -349,6 +349,14 @@ pub const DurableRepository = struct {
         edges: roaring.Bitmap,
         filter: interfaces.GraphEdgeFilter,
     ) anyerror!roaring.Bitmap {
+        // property_predicates and sort_by_property require JOIN-level SQL
+        // support that is not yet implemented in filterEdges. Callers that set
+        // either field will receive an explicit error rather than silently
+        // incorrect results. Wire-up is tracked in graph_sqlite TODO.
+        if (filter.property_predicates != null or filter.sort_by_property != null) {
+            return error.PropertyPredicatesNotImplemented;
+        }
+
         const self: *const DurableRepository = @ptrCast(@alignCast(ctx));
         const edge_ids = try edges.toArray(allocator);
         defer allocator.free(edge_ids);
@@ -696,6 +704,153 @@ pub fn upsertRelationNatural(
     if (valid_to_unix) |value| try bindInt64(insert_stmt, 9, value) else try bindNull(insert_stmt, 9);
     if (c.sqlite3_step(insert_stmt) != c.SQLITE_ROW) return error.StepFailed;
     return try columnU32(insert_stmt, 0);
+}
+
+pub fn upsertRelationProperty(db: Database, prop: interfaces.RelationProperty) !void {
+    const sql =
+        \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\ON CONFLICT(relation_id, property_key) DO UPDATE SET
+        \\    value_type    = excluded.value_type,
+        \\    value_text    = excluded.value_text,
+        \\    value_number  = excluded.value_number,
+        \\    value_integer = excluded.value_integer,
+        \\    ref_doc_id    = excluded.ref_doc_id,
+        \\    currency      = excluded.currency
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, prop.relation_id);
+    try bindText(stmt, 2, prop.property_key);
+    try bindText(stmt, 3, prop.value_type);
+    if (prop.value_text) |v| try bindText(stmt, 4, v) else try bindNull(stmt, 4);
+    if (prop.value_number) |v| {
+        if (c.sqlite3_bind_double(stmt, 5, v) != c.SQLITE_OK) return error.BindFailed;
+    } else try bindNull(stmt, 5);
+    if (prop.value_integer) |v| try bindInt64(stmt, 6, v) else try bindNull(stmt, 6);
+    if (prop.ref_doc_id) |v| try bindInt64(stmt, 7, v) else try bindNull(stmt, 7);
+    if (prop.currency) |v| try bindText(stmt, 8, v) else try bindNull(stmt, 8);
+    try stepDone(stmt);
+}
+
+/// Loads all properties for a batch of relation ids in a single SQL statement.
+/// Caller owns the returned slice and each `RelationProperty` (call `.deinit(allocator)`).
+pub fn loadRelationPropertiesBatch(
+    db: Database,
+    allocator: std.mem.Allocator,
+    relation_ids: []const u32,
+) ![]interfaces.RelationProperty {
+    if (relation_ids.len == 0) return try allocator.alloc(interfaces.RelationProperty, 0);
+
+    var result = std.ArrayList(interfaces.RelationProperty).empty;
+    errdefer {
+        for (result.items) |p| p.deinit(allocator);
+        result.deinit(allocator);
+    }
+
+    // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999. Chunk at 500 to
+    // stay safely below that limit while keeping round-trips low.
+    const chunk_size: usize = 500;
+    var offset: usize = 0;
+    while (offset < relation_ids.len) {
+        const end = @min(offset + chunk_size, relation_ids.len);
+        const chunk = relation_ids[offset..end];
+        offset = end;
+
+        var query = std.ArrayList(u8).empty;
+        defer query.deinit(allocator);
+        try query.appendSlice(allocator,
+            \\SELECT relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
+            \\FROM graph_relation_property
+            \\WHERE relation_id IN (
+        );
+        for (chunk, 0..) |_, i| {
+            if (i > 0) try query.appendSlice(allocator, ",");
+            var buf: [24]u8 = undefined;
+            const param = try std.fmt.bufPrint(&buf, "?{d}", .{i + 1});
+            try query.appendSlice(allocator, param);
+        }
+        try query.appendSlice(allocator, ") ORDER BY relation_id, property_key");
+
+        const stmt = try prepare(db, query.items);
+        defer finalize(stmt);
+        for (chunk, 0..) |rid, i| {
+            try bindInt64(stmt, @intCast(i + 1), rid);
+        }
+
+        while (true) {
+            const status = c.sqlite3_step(stmt);
+            if (status == c.SQLITE_DONE) break;
+            if (status != c.SQLITE_ROW) return error.StepFailed;
+
+            const rid: u32 = @intCast(c.sqlite3_column_int64(stmt, 0));
+            const key = try dupeColumnText(allocator, stmt, 1);
+            errdefer allocator.free(key);
+            const vtype = try dupeColumnText(allocator, stmt, 2);
+            errdefer allocator.free(vtype);
+            const value_text = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL)
+                null
+            else
+                try dupeColumnText(allocator, stmt, 3);
+            errdefer if (value_text) |v| allocator.free(v);
+            const value_number: ?f64 = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL)
+                null
+            else
+                c.sqlite3_column_double(stmt, 4);
+            const value_integer: ?i64 = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL)
+                null
+            else
+                c.sqlite3_column_int64(stmt, 5);
+            const ref_doc_id: ?u64 = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL)
+                null
+            else
+                @intCast(c.sqlite3_column_int64(stmt, 6));
+            const currency = if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL)
+                null
+            else
+                try dupeColumnText(allocator, stmt, 7);
+            errdefer if (currency) |v| allocator.free(v);
+
+            try result.append(allocator, .{
+                .relation_id = rid,
+                .property_key = key,
+                .value_type = vtype,
+                .value_text = value_text,
+                .value_number = value_number,
+                .value_integer = value_integer,
+                .ref_doc_id = ref_doc_id,
+                .currency = currency,
+            });
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Projects all `relation_properties_raw` rows for `workspace_id` into
+/// `graph_relation_property`. Skips rows whose `relation_id` has no
+/// corresponding row in `graph_relation` (i.e., not yet projected).
+pub fn projectRelationProperties(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) !u64 {
+    const sql =
+        \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency)
+        \\SELECT rpr.relation_id, rpr.property_key, rpr.value_type, rpr.value_text, rpr.value_number, rpr.value_integer, rpr.ref_doc_id, rpr.currency
+        \\FROM relation_properties_raw rpr
+        \\INNER JOIN graph_relation gr ON gr.relation_id = rpr.relation_id
+        \\WHERE rpr.workspace_id = ?1
+        \\ON CONFLICT(relation_id, property_key) DO UPDATE SET
+        \\    value_type    = excluded.value_type,
+        \\    value_text    = excluded.value_text,
+        \\    value_number  = excluded.value_number,
+        \\    value_integer = excluded.value_integer,
+        \\    ref_doc_id    = excluded.ref_doc_id,
+        \\    currency      = excluded.currency
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    try stepDone(stmt);
+    _ = allocator;
+    return @intCast(c.sqlite3_changes(db.handle));
 }
 
 pub fn insertEntityAlias(db: Database, term: []const u8, entity_id: u32, confidence: f32) !void {
@@ -4559,4 +4714,181 @@ test "graph parity helpers cover bulk-name and metadata lookups, deprecation, de
 
     const after = try findRelationByIds(db, std.testing.allocator, zig_id, safety_id, "requires");
     try std.testing.expect(after == null);
+}
+
+test "upsertRelationProperty stores and retrieves all 7 value types" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "contact", "Alice");
+    try insertEntity(db, 2, "bien", "Maison");
+    try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "POSSEDE", .confidence = 1.0, .valid_from_unix = 1577836800, .valid_to_unix = null });
+
+    // text: ownership kind
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "ownership_kind", .value_type = "text", .value_text = "pleine_propriete", .value_number = null, .value_integer = null, .ref_doc_id = null, .currency = null });
+    // percentage_bp: 100% share = 10000 bp
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "share_bp", .value_type = "percentage_bp", .value_text = null, .value_number = null, .value_integer = 10000, .ref_doc_id = null, .currency = null });
+    // money_minor: 300 000 EUR = 30_000_000 cents
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "purchase_price", .value_type = "money_minor", .value_text = null, .value_number = null, .value_integer = 30_000_000, .ref_doc_id = null, .currency = "EUR" });
+    // date_unix: contract signed 2020-01-01
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "contract_signed_at", .value_type = "date_unix", .value_text = null, .value_number = null, .value_integer = 1577836800, .ref_doc_id = null, .currency = null });
+    // number: weight/score
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "score", .value_type = "number", .value_text = null, .value_number = 0.95, .value_integer = null, .ref_doc_id = null, .currency = null });
+    // doc_ref: purchase contract document
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "contract_doc", .value_type = "doc_ref", .value_text = null, .value_number = null, .value_integer = null, .ref_doc_id = 42, .currency = null });
+    // uri: external link
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "registry_url", .value_type = "uri", .value_text = "https://cadastre.fr/bien/12345", .value_number = null, .value_integer = null, .ref_doc_id = null, .currency = null });
+
+    const props = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{10});
+    defer {
+        for (props) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(props);
+    }
+
+    try std.testing.expectEqual(@as(usize, 7), props.len);
+
+    // Find each property by key (batch returns ordered by property_key).
+    var found_ownership_kind = false;
+    var found_share_bp = false;
+    var found_purchase_price = false;
+    var found_date = false;
+    var found_score = false;
+    var found_doc_ref = false;
+    var found_uri = false;
+    for (props) |p| {
+        if (std.mem.eql(u8, p.property_key, "ownership_kind")) {
+            try std.testing.expectEqualStrings("text", p.value_type);
+            try std.testing.expectEqualStrings("pleine_propriete", p.value_text.?);
+            found_ownership_kind = true;
+        } else if (std.mem.eql(u8, p.property_key, "share_bp")) {
+            try std.testing.expectEqualStrings("percentage_bp", p.value_type);
+            try std.testing.expectEqual(@as(i64, 10000), p.value_integer.?);
+            found_share_bp = true;
+        } else if (std.mem.eql(u8, p.property_key, "purchase_price")) {
+            try std.testing.expectEqualStrings("money_minor", p.value_type);
+            try std.testing.expectEqual(@as(i64, 30_000_000), p.value_integer.?);
+            try std.testing.expectEqualStrings("EUR", p.currency.?);
+            found_purchase_price = true;
+        } else if (std.mem.eql(u8, p.property_key, "contract_signed_at")) {
+            try std.testing.expectEqualStrings("date_unix", p.value_type);
+            try std.testing.expectEqual(@as(i64, 1577836800), p.value_integer.?);
+            found_date = true;
+        } else if (std.mem.eql(u8, p.property_key, "score")) {
+            try std.testing.expectEqualStrings("number", p.value_type);
+            try std.testing.expect(p.value_number.? > 0.9);
+            found_score = true;
+        } else if (std.mem.eql(u8, p.property_key, "contract_doc")) {
+            try std.testing.expectEqualStrings("doc_ref", p.value_type);
+            try std.testing.expectEqual(@as(u64, 42), p.ref_doc_id.?);
+            found_doc_ref = true;
+        } else if (std.mem.eql(u8, p.property_key, "registry_url")) {
+            try std.testing.expectEqualStrings("uri", p.value_type);
+            try std.testing.expectEqualStrings("https://cadastre.fr/bien/12345", p.value_text.?);
+            found_uri = true;
+        }
+    }
+    try std.testing.expect(found_ownership_kind);
+    try std.testing.expect(found_share_bp);
+    try std.testing.expect(found_purchase_price);
+    try std.testing.expect(found_date);
+    try std.testing.expect(found_score);
+    try std.testing.expect(found_doc_ref);
+    try std.testing.expect(found_uri);
+}
+
+test "loadRelationPropertiesBatch fetches properties for multiple relations in one query" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "contact", "Alice");
+    try insertEntity(db, 2, "contact", "Bob");
+    try insertEntity(db, 3, "bien", "Maison");
+
+    try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 3, .relation_type = "POSSEDE", .confidence = 1.0, .valid_from_unix = 1577836800, .valid_to_unix = 1717200000 });
+    try insertRelation(db, .{ .relation_id = 11, .source_id = 2, .target_id = 3, .relation_type = "POSSEDE", .confidence = 1.0, .valid_from_unix = 1717200000, .valid_to_unix = null });
+
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "ownership_kind", .value_type = "text", .value_text = "pleine_propriete", .value_number = null, .value_integer = null, .ref_doc_id = null, .currency = null });
+    try upsertRelationProperty(db, .{ .relation_id = 10, .property_key = "share_bp", .value_type = "percentage_bp", .value_text = null, .value_number = null, .value_integer = 10000, .ref_doc_id = null, .currency = null });
+    try upsertRelationProperty(db, .{ .relation_id = 11, .property_key = "ownership_kind", .value_type = "text", .value_text = "nue_propriete", .value_number = null, .value_integer = null, .ref_doc_id = null, .currency = null });
+    try upsertRelationProperty(db, .{ .relation_id = 11, .property_key = "share_bp", .value_type = "percentage_bp", .value_text = null, .value_number = null, .value_integer = 10000, .ref_doc_id = null, .currency = null });
+
+    const props = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{ 10, 11 });
+    defer {
+        for (props) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(props);
+    }
+
+    // 2 properties per relation = 4 total
+    try std.testing.expectEqual(@as(usize, 4), props.len);
+
+    // Properties for relation 10 come first (ordered by relation_id, property_key)
+    try std.testing.expectEqual(@as(u32, 10), props[0].relation_id);
+    try std.testing.expectEqual(@as(u32, 10), props[1].relation_id);
+    try std.testing.expectEqual(@as(u32, 11), props[2].relation_id);
+    try std.testing.expectEqual(@as(u32, 11), props[3].relation_id);
+
+    // Empty batch returns empty slice
+    const empty = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "projectRelationProperties mirrors relation_properties_raw into graph_relation_property" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Setup raw layer
+    const sql_ws = "INSERT INTO workspaces(id, workspace_id) VALUES ('ws_prop', 'ws_prop')";
+    const ws_stmt = try facet_sqlite.prepare(db, sql_ws);
+    defer facet_sqlite.finalize(ws_stmt);
+    try facet_sqlite.stepDone(ws_stmt);
+
+    const sql_ont = "INSERT INTO ontologies(ontology_id, workspace_id, name, version) VALUES ('ws_prop::core', 'ws_prop', 'core', '1')";
+    const ont_stmt = try facet_sqlite.prepare(db, sql_ont);
+    defer facet_sqlite.finalize(ont_stmt);
+    try facet_sqlite.stepDone(ont_stmt);
+
+    const sql_e1 = "INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, entity_type, name) VALUES ('ws_prop', 'ws_prop::core', 1, 'contact', 'Alice')";
+    const e1_stmt = try facet_sqlite.prepare(db, sql_e1);
+    defer facet_sqlite.finalize(e1_stmt);
+    try facet_sqlite.stepDone(e1_stmt);
+
+    const sql_e2 = "INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, entity_type, name) VALUES ('ws_prop', 'ws_prop::core', 2, 'bien', 'Maison')";
+    const e2_stmt = try facet_sqlite.prepare(db, sql_e2);
+    defer facet_sqlite.finalize(e2_stmt);
+    try facet_sqlite.stepDone(e2_stmt);
+
+    const sql_rel = "INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id) VALUES ('ws_prop', 'ws_prop::core', 10, 'POSSEDE', 1, 2)";
+    const rel_stmt = try facet_sqlite.prepare(db, sql_rel);
+    defer facet_sqlite.finalize(rel_stmt);
+    try facet_sqlite.stepDone(rel_stmt);
+
+    const sql_rp =
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_integer)
+        \\VALUES ('ws_prop', 10, 'share_bp', 'percentage_bp', 10000)
+    ;
+    const rp_stmt = try facet_sqlite.prepare(db, sql_rp);
+    defer facet_sqlite.finalize(rp_stmt);
+    try facet_sqlite.stepDone(rp_stmt);
+
+    // Mirror into derived graph (relation must exist in graph_relation first)
+    try insertEntity(db, 1, "contact", "Alice");
+    try insertEntity(db, 2, "bien", "Maison");
+    try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "POSSEDE", .confidence = 1.0, .valid_from_unix = null, .valid_to_unix = null });
+
+    const count = try projectRelationProperties(db, std.testing.allocator, "ws_prop");
+    try std.testing.expectEqual(@as(u64, 1), count);
+
+    // Verify the projection landed
+    const props = try loadRelationPropertiesBatch(db, std.testing.allocator, &.{10});
+    defer {
+        for (props) |p| p.deinit(std.testing.allocator);
+        std.testing.allocator.free(props);
+    }
+    try std.testing.expectEqual(@as(usize, 1), props.len);
+    try std.testing.expectEqualStrings("share_bp", props[0].property_key);
+    try std.testing.expectEqual(@as(i64, 10000), props[0].value_integer.?);
 }

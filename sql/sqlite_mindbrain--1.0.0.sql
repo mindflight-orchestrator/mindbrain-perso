@@ -207,6 +207,37 @@ CREATE INDEX IF NOT EXISTS graph_relation_source_id_idx
 CREATE INDEX IF NOT EXISTS graph_relation_target_id_idx
     ON graph_relation(target_id, relation_id);
 
+CREATE TABLE IF NOT EXISTS graph_relation_property (
+    relation_id   INTEGER NOT NULL REFERENCES graph_relation(relation_id),
+    property_key  TEXT    NOT NULL,
+    value_type    TEXT    NOT NULL CHECK(value_type IN (
+                      'text', 'number', 'percentage_bp', 'money_minor',
+                      'date_unix', 'doc_ref', 'uri')),
+    value_text    TEXT,
+    value_number  REAL,
+    value_integer INTEGER,
+    ref_doc_id    INTEGER,
+    currency      TEXT,
+    CHECK (currency IS NULL OR value_type = 'money_minor'),
+    PRIMARY KEY (relation_id, property_key)
+);
+
+CREATE INDEX IF NOT EXISTS grp_key_text_idx
+    ON graph_relation_property(property_key, value_text)
+    WHERE value_text IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS grp_key_int_idx
+    ON graph_relation_property(property_key, value_integer)
+    WHERE value_integer IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS grp_key_num_idx
+    ON graph_relation_property(property_key, value_number)
+    WHERE value_number IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS grp_doc_ref_idx
+    ON graph_relation_property(ref_doc_id)
+    WHERE ref_doc_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS graph_entity_document (
     entity_id INTEGER NOT NULL,
     doc_id INTEGER NOT NULL,
@@ -933,6 +964,28 @@ CREATE INDEX IF NOT EXISTS relations_raw_target_idx
 
 CREATE INDEX IF NOT EXISTS relations_raw_edge_type_idx
     ON relations_raw(workspace_id, edge_type);
+
+CREATE TABLE IF NOT EXISTS relation_properties_raw (
+    workspace_id  TEXT    NOT NULL,
+    relation_id   INTEGER NOT NULL,
+    property_key  TEXT    NOT NULL,
+    value_type    TEXT    NOT NULL CHECK(value_type IN (
+                      'text', 'number', 'percentage_bp', 'money_minor',
+                      'date_unix', 'doc_ref', 'uri')),
+    value_text    TEXT,
+    value_number  REAL,
+    value_integer INTEGER,
+    ref_doc_id    INTEGER,
+    currency      TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (currency IS NULL OR value_type = 'money_minor'),
+    PRIMARY KEY (workspace_id, relation_id, property_key),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
+    FOREIGN KEY (workspace_id, relation_id) REFERENCES relations_raw(workspace_id, relation_id)
+);
+
+CREATE INDEX IF NOT EXISTS relation_properties_raw_relation_idx
+    ON relation_properties_raw(workspace_id, relation_id);
 
 CREATE TABLE IF NOT EXISTS entity_documents_raw (
     workspace_id TEXT NOT NULL,

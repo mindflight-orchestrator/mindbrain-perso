@@ -43,6 +43,48 @@ pub const EmbeddingRecord = struct {
     values: []const f32,
 };
 
+pub const RelationProperty = struct {
+    relation_id: u32,
+    property_key: []const u8,
+    value_type: []const u8,
+    value_text: ?[]const u8,
+    value_number: ?f64,
+    value_integer: ?i64,
+    ref_doc_id: ?u64,
+    currency: ?[]const u8,
+
+    pub fn deinit(self: RelationProperty, allocator: std.mem.Allocator) void {
+        allocator.free(self.property_key);
+        allocator.free(self.value_type);
+        if (self.value_text) |v| allocator.free(v);
+        if (self.currency) |v| allocator.free(v);
+    }
+};
+
+pub const RelationPropertyPredicate = struct {
+    property_key: []const u8,
+    op: Op,
+    /// Compared against value_text for text/uri, value_integer for integer
+    /// types (percentage_bp, money_minor, date_unix), value_number for number.
+    value_text: ?[]const u8 = null,
+    value_integer: ?i64 = null,
+    value_number: ?f64 = null,
+    /// Upper bound for `between` (inclusive).
+    value_integer_hi: ?i64 = null,
+    value_number_hi: ?f64 = null,
+
+    pub const Op = enum {
+        eq,
+        exists,
+        lt,
+        lte,
+        gt,
+        gte,
+        between,
+        in_text,
+    };
+};
+
 pub const GraphEdgeFilter = struct {
     edge_types: ?[]const []const u8 = null,
     doc_types: ?[]const []const u8 = null,
@@ -51,6 +93,12 @@ pub const GraphEdgeFilter = struct {
     before_unix_seconds: ?i64 = null,
     confidence_min: ?f32 = null,
     confidence_max: ?f32 = null,
+    /// Optional property-level predicates. All predicates are ANDed together.
+    property_predicates: ?[]const RelationPropertyPredicate = null,
+    /// When set to e.g. "property:share_bp", relations are sorted by the
+    /// named property's integer value ascending. Falls back to relation_id
+    /// order when the property is absent on a relation.
+    sort_by_property: ?[]const u8 = null,
 };
 
 pub const GraphNeighborStep = struct {
