@@ -1647,10 +1647,13 @@ fn runOntologyImportCommand(allocator: Allocator, args: []const []const u8) !voi
     defer db.close();
     try db.applyStandaloneSchema();
 
-    const content = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), input_path.?, allocator, .unlimited);
-    defer allocator.free(content);
+    const io = mindbrain.zig16_compat.io();
+    var in_file = try std.Io.Dir.cwd().openFile(io, input_path.?, .{});
+    defer in_file.close(io);
+    var read_buf: [65536]u8 = undefined;
+    var fr = in_file.reader(io, &read_buf);
 
-    const summary = try owl2_import.importNTriples(db, allocator, workspace_id.?, ontology_id.?, content, .{
+    const summary = try owl2_import.importNTriplesReader(db, allocator, workspace_id.?, ontology_id.?, &fr.interface, .{
         .ontology_name = name,
         .materialize_graph = materialize_graph,
     });
@@ -1678,23 +1681,41 @@ fn runOntologyExportCommand(allocator: Allocator, args: []const []const u8) !voi
     defer db.close();
     try db.applyStandaloneSchema();
 
-    const payload = if (std.mem.eql(u8, format, "ntriples"))
-        try owl2_import.exportNTriples(db, allocator, ontology_id.?)
-    else if (std.mem.eql(u8, format, "bundle")) blk: {
-        if (workspace_id == null) return CliError.InvalidArguments;
-        break :blk try collections_io.exportToJson(allocator, db, .{ .taxonomies = workspace_id.? });
-    } else return CliError.InvalidArguments;
-    defer allocator.free(payload);
+    const io = mindbrain.zig16_compat.io();
 
-    if (output_path) |path| {
-        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
-            .sub_path = path,
-            .data = payload,
-            .flags = .{ .truncate = true },
-        });
-    } else {
-        try writeStdout("{s}", .{payload});
+    if (std.mem.eql(u8, format, "ntriples")) {
+        var write_buf: [65536]u8 = undefined;
+        if (output_path) |path| {
+            var out_file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer out_file.close(io);
+            var fw = out_file.writer(io, &write_buf);
+            try owl2_import.exportNTriplesWriter(db, ontology_id.?, &fw.interface);
+            try fw.interface.flush();
+        } else {
+            var sfw = std.Io.File.stdout().writer(io, &write_buf);
+            try owl2_import.exportNTriplesWriter(db, ontology_id.?, &sfw.interface);
+            try sfw.interface.flush();
+        }
+        return;
     }
+
+    if (std.mem.eql(u8, format, "bundle")) {
+        if (workspace_id == null) return CliError.InvalidArguments;
+        const payload = try collections_io.exportToJson(allocator, db, .{ .taxonomies = workspace_id.? });
+        defer allocator.free(payload);
+        if (output_path) |path| {
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = path,
+                .data = payload,
+                .flags = .{ .truncate = true },
+            });
+        } else {
+            try writeStdout("{s}", .{payload});
+        }
+        return;
+    }
+
+    return CliError.InvalidArguments;
 }
 
 fn runBackupExportCommand(allocator: Allocator, args: []const []const u8) !void {

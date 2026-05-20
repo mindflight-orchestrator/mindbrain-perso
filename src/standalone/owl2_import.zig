@@ -61,12 +61,270 @@ pub const ImportSummary = struct {
     graph_relations: usize = 0,
 };
 
-pub fn importNTriples(
+// ImportSession holds pre-prepared statements and per-import dedup sets to
+// reduce SQLite prepare/finalize overhead from O(T × stmts) to O(1) per import.
+const ImportSession = struct {
+    db: Database,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    materialize_graph: bool,
+    scratch: Allocator,
+
+    stmt_triple: *c.sqlite3_stmt,
+    stmt_entity_type: *c.sqlite3_stmt,
+    stmt_edge_type: *c.sqlite3_stmt,
+    stmt_ont_entity: *c.sqlite3_stmt,
+    stmt_ont_relation: *c.sqlite3_stmt,
+    stmt_entity_raw: ?*c.sqlite3_stmt,
+    stmt_relation_raw: ?*c.sqlite3_stmt,
+
+    // Dedup sets: skip re-sending identical ensure calls for the same
+    // entity_type/edge_type within one import.  Keys live in the scratch arena.
+    seen_entity_types: std.StringHashMapUnmanaged(void),
+    seen_edge_types: std.StringHashMapUnmanaged(void),
+
+    fn init(
+        db: Database,
+        scratch: Allocator,
+        workspace_id: []const u8,
+        ontology_id: []const u8,
+        materialize_graph: bool,
+    ) !ImportSession {
+        const stmt_triple = try facet_sqlite.prepare(db,
+            \\INSERT INTO ontology_triples_raw(ontology_id, triple_index, subject_kind, subject, predicate, object_kind, object_value, object_datatype, object_language, source_line, metadata_json)
+            \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            \\ON CONFLICT(ontology_id, triple_index) DO UPDATE SET
+            \\    subject_kind = excluded.subject_kind,
+            \\    subject = excluded.subject,
+            \\    predicate = excluded.predicate,
+            \\    object_kind = excluded.object_kind,
+            \\    object_value = excluded.object_value,
+            \\    object_datatype = excluded.object_datatype,
+            \\    object_language = excluded.object_language,
+            \\    source_line = excluded.source_line,
+            \\    metadata_json = excluded.metadata_json
+        );
+        errdefer facet_sqlite.finalize(stmt_triple);
+
+        const stmt_entity_type = try facet_sqlite.prepare(db,
+            \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json)
+            \\VALUES(?1, ?2, ?3, ?4)
+            \\ON CONFLICT(ontology_id, entity_type) DO UPDATE SET
+            \\    label = COALESCE(excluded.label, ontology_entity_types.label),
+            \\    metadata_json = excluded.metadata_json
+        );
+        errdefer facet_sqlite.finalize(stmt_entity_type);
+
+        const stmt_edge_type = try facet_sqlite.prepare(db,
+            \\INSERT INTO ontology_edge_types(ontology_id, edge_type, directed, source_entity_type, target_entity_type, metadata_json)
+            \\VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            \\ON CONFLICT(ontology_id, edge_type) DO UPDATE SET
+            \\    directed = excluded.directed,
+            \\    source_entity_type = excluded.source_entity_type,
+            \\    target_entity_type = excluded.target_entity_type,
+            \\    metadata_json = excluded.metadata_json
+        );
+        errdefer facet_sqlite.finalize(stmt_edge_type);
+
+        const stmt_ont_entity = try facet_sqlite.prepare(db,
+            \\INSERT INTO ontology_entities_raw(ontology_id, entity_id, entity_type, name, metadata_json)
+            \\VALUES(?1, ?2, ?3, ?4, ?5)
+            \\ON CONFLICT(ontology_id, entity_id) DO UPDATE SET
+            \\    entity_type = excluded.entity_type,
+            \\    name = excluded.name,
+            \\    metadata_json = excluded.metadata_json
+        );
+        errdefer facet_sqlite.finalize(stmt_ont_entity);
+
+        const stmt_ont_relation = try facet_sqlite.prepare(db,
+            \\INSERT INTO ontology_relations_raw(ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, metadata_json)
+            \\VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            \\ON CONFLICT(ontology_id, relation_id) DO UPDATE SET
+            \\    edge_type = excluded.edge_type,
+            \\    source_entity_id = excluded.source_entity_id,
+            \\    target_entity_id = excluded.target_entity_id,
+            \\    metadata_json = excluded.metadata_json
+        );
+        errdefer facet_sqlite.finalize(stmt_ont_relation);
+
+        var stmt_entity_raw: ?*c.sqlite3_stmt = null;
+        var stmt_relation_raw: ?*c.sqlite3_stmt = null;
+        if (materialize_graph) {
+            const er = try facet_sqlite.prepare(db,
+                \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, entity_type, name, confidence, metadata_json)
+                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                \\ON CONFLICT(workspace_id, entity_id) DO UPDATE SET
+                \\    ontology_id = excluded.ontology_id,
+                \\    entity_type = excluded.entity_type,
+                \\    name = excluded.name,
+                \\    confidence = excluded.confidence,
+                \\    metadata_json = excluded.metadata_json
+            );
+            errdefer facet_sqlite.finalize(er);
+            stmt_entity_raw = er;
+
+            stmt_relation_raw = try facet_sqlite.prepare(db,
+                \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
+                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                \\ON CONFLICT(workspace_id, relation_id) DO UPDATE SET
+                \\    ontology_id = excluded.ontology_id,
+                \\    edge_type = excluded.edge_type,
+                \\    source_entity_id = excluded.source_entity_id,
+                \\    target_entity_id = excluded.target_entity_id,
+                \\    valid_from = excluded.valid_from,
+                \\    valid_to = excluded.valid_to,
+                \\    confidence = excluded.confidence,
+                \\    metadata_json = excluded.metadata_json
+            );
+            errdefer if (stmt_relation_raw) |stmt| facet_sqlite.finalize(stmt);
+        }
+
+        // Pre-seed entity types written by seedOwlNamespaces so we skip them.
+        var seen_entity_types = std.StringHashMapUnmanaged(void){};
+        try seen_entity_types.put(scratch, "owl_class", {});
+        try seen_entity_types.put(scratch, "owl_resource", {});
+        try seen_entity_types.put(scratch, "owl_blank_node", {});
+
+        return .{
+            .db = db,
+            .workspace_id = workspace_id,
+            .ontology_id = ontology_id,
+            .materialize_graph = materialize_graph,
+            .scratch = scratch,
+            .stmt_triple = stmt_triple,
+            .stmt_entity_type = stmt_entity_type,
+            .stmt_edge_type = stmt_edge_type,
+            .stmt_ont_entity = stmt_ont_entity,
+            .stmt_ont_relation = stmt_ont_relation,
+            .stmt_entity_raw = stmt_entity_raw,
+            .stmt_relation_raw = stmt_relation_raw,
+            .seen_entity_types = seen_entity_types,
+            .seen_edge_types = .{},
+        };
+    }
+
+    fn deinit(s: *ImportSession) void {
+        facet_sqlite.finalize(s.stmt_triple);
+        facet_sqlite.finalize(s.stmt_entity_type);
+        facet_sqlite.finalize(s.stmt_edge_type);
+        facet_sqlite.finalize(s.stmt_ont_entity);
+        facet_sqlite.finalize(s.stmt_ont_relation);
+        if (s.stmt_entity_raw) |stmt| facet_sqlite.finalize(stmt);
+        if (s.stmt_relation_raw) |stmt| facet_sqlite.finalize(stmt);
+    }
+
+    fn upsertTriple(
+        s: *ImportSession,
+        triple_index: usize,
+        subject_kind: []const u8,
+        subject: []const u8,
+        predicate: []const u8,
+        object_kind: []const u8,
+        object_value: []const u8,
+        object_datatype: ?[]const u8,
+        object_language: ?[]const u8,
+        source_line: []const u8,
+        metadata_json: []const u8,
+    ) !void {
+        try facet_sqlite.resetStatement(s.stmt_triple);
+        try facet_sqlite.bindText(s.stmt_triple, 1, s.ontology_id);
+        try facet_sqlite.bindInt64(s.stmt_triple, 2, @as(i64, @intCast(triple_index)));
+        try facet_sqlite.bindText(s.stmt_triple, 3, subject_kind);
+        try facet_sqlite.bindText(s.stmt_triple, 4, subject);
+        try facet_sqlite.bindText(s.stmt_triple, 5, predicate);
+        try facet_sqlite.bindText(s.stmt_triple, 6, object_kind);
+        try facet_sqlite.bindText(s.stmt_triple, 7, object_value);
+        if (object_datatype) |dt| try facet_sqlite.bindText(s.stmt_triple, 8, dt) else try facet_sqlite.bindNull(s.stmt_triple, 8);
+        if (object_language) |lang| try facet_sqlite.bindText(s.stmt_triple, 9, lang) else try facet_sqlite.bindNull(s.stmt_triple, 9);
+        try facet_sqlite.bindText(s.stmt_triple, 10, source_line);
+        try facet_sqlite.bindText(s.stmt_triple, 11, metadata_json);
+        try facet_sqlite.stepDone(s.stmt_triple);
+    }
+
+    fn ensureEntityType(s: *ImportSession, entity_type: []const u8, label: ?[]const u8, metadata_json: []const u8) !void {
+        const gop = try s.seen_entity_types.getOrPut(s.scratch, entity_type);
+        if (gop.found_existing) return;
+        try facet_sqlite.resetStatement(s.stmt_entity_type);
+        try facet_sqlite.bindText(s.stmt_entity_type, 1, s.ontology_id);
+        try facet_sqlite.bindText(s.stmt_entity_type, 2, entity_type);
+        if (label) |l| try facet_sqlite.bindText(s.stmt_entity_type, 3, l) else try facet_sqlite.bindNull(s.stmt_entity_type, 3);
+        try facet_sqlite.bindText(s.stmt_entity_type, 4, metadata_json);
+        try facet_sqlite.stepDone(s.stmt_entity_type);
+    }
+
+    fn ensureEdgeType(s: *ImportSession, edge_type: []const u8, metadata_json: []const u8) !void {
+        const gop = try s.seen_edge_types.getOrPut(s.scratch, edge_type);
+        if (gop.found_existing) return;
+        try facet_sqlite.resetStatement(s.stmt_edge_type);
+        try facet_sqlite.bindText(s.stmt_edge_type, 1, s.ontology_id);
+        try facet_sqlite.bindText(s.stmt_edge_type, 2, edge_type);
+        try facet_sqlite.bindInt64(s.stmt_edge_type, 3, 1);
+        try facet_sqlite.bindNull(s.stmt_edge_type, 4);
+        try facet_sqlite.bindNull(s.stmt_edge_type, 5);
+        try facet_sqlite.bindText(s.stmt_edge_type, 6, metadata_json);
+        try facet_sqlite.stepDone(s.stmt_edge_type);
+    }
+
+    fn upsertOntologyEntity(s: *ImportSession, entity_id: u64, entity_type: []const u8, name: []const u8, metadata_json: []const u8) !void {
+        try facet_sqlite.resetStatement(s.stmt_ont_entity);
+        try facet_sqlite.bindText(s.stmt_ont_entity, 1, s.ontology_id);
+        try facet_sqlite.bindInt64(s.stmt_ont_entity, 2, entity_id);
+        try facet_sqlite.bindText(s.stmt_ont_entity, 3, entity_type);
+        try facet_sqlite.bindText(s.stmt_ont_entity, 4, name);
+        try facet_sqlite.bindText(s.stmt_ont_entity, 5, metadata_json);
+        try facet_sqlite.stepDone(s.stmt_ont_entity);
+    }
+
+    fn upsertOntologyRelation(s: *ImportSession, relation_id: u64, edge_type: []const u8, source_entity_id: u64, target_entity_id: u64, metadata_json: []const u8) !void {
+        try facet_sqlite.resetStatement(s.stmt_ont_relation);
+        try facet_sqlite.bindText(s.stmt_ont_relation, 1, s.ontology_id);
+        try facet_sqlite.bindInt64(s.stmt_ont_relation, 2, relation_id);
+        try facet_sqlite.bindText(s.stmt_ont_relation, 3, edge_type);
+        try facet_sqlite.bindInt64(s.stmt_ont_relation, 4, source_entity_id);
+        try facet_sqlite.bindInt64(s.stmt_ont_relation, 5, target_entity_id);
+        try facet_sqlite.bindText(s.stmt_ont_relation, 6, metadata_json);
+        try facet_sqlite.stepDone(s.stmt_ont_relation);
+    }
+
+    fn upsertEntityRaw(s: *ImportSession, entity_id: u64, entity_type: []const u8, name: []const u8, metadata_json: []const u8) !void {
+        const stmt = s.stmt_entity_raw.?;
+        try facet_sqlite.resetStatement(stmt);
+        try facet_sqlite.bindText(stmt, 1, s.workspace_id);
+        try facet_sqlite.bindText(stmt, 2, s.ontology_id);
+        try facet_sqlite.bindInt64(stmt, 3, entity_id);
+        try facet_sqlite.bindText(stmt, 4, entity_type);
+        try facet_sqlite.bindText(stmt, 5, name);
+        if (c.sqlite3_bind_double(stmt, 6, 1.0) != c.SQLITE_OK) return error.BindFailed;
+        try facet_sqlite.bindText(stmt, 7, metadata_json);
+        try facet_sqlite.stepDone(stmt);
+    }
+
+    fn upsertRelationRaw(s: *ImportSession, relation_id: u64, edge_type: []const u8, source_entity_id: u64, target_entity_id: u64, metadata_json: []const u8) !void {
+        const stmt = s.stmt_relation_raw.?;
+        try facet_sqlite.resetStatement(stmt);
+        try facet_sqlite.bindText(stmt, 1, s.workspace_id);
+        try facet_sqlite.bindText(stmt, 2, s.ontology_id);
+        try facet_sqlite.bindInt64(stmt, 3, relation_id);
+        try facet_sqlite.bindText(stmt, 4, edge_type);
+        try facet_sqlite.bindInt64(stmt, 5, source_entity_id);
+        try facet_sqlite.bindInt64(stmt, 6, target_entity_id);
+        try facet_sqlite.bindNull(stmt, 7);
+        try facet_sqlite.bindNull(stmt, 8);
+        if (c.sqlite3_bind_double(stmt, 9, 1.0) != c.SQLITE_OK) return error.BindFailed;
+        try facet_sqlite.bindText(stmt, 10, metadata_json);
+        try facet_sqlite.stepDone(stmt);
+    }
+};
+
+// importNTriplesReader is the streaming implementation.  It reads N-Triples
+// line-by-line from reader without buffering the entire file.  The reader's
+// buffer must be large enough to hold the longest individual line.
+pub fn importNTriplesReader(
     db: Database,
     allocator: Allocator,
     workspace_id: []const u8,
     ontology_id: []const u8,
-    content: []const u8,
+    reader: *std.Io.Reader,
     options: ImportOptions,
 ) !ImportSummary {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -86,38 +344,56 @@ pub fn importNTriples(
     });
     try seedOwlNamespaces(db, ontology_id);
 
+    var session = try ImportSession.init(db, scratch, workspace_id, ontology_id, options.materialize_graph);
+    defer session.deinit();
+
     var summary = ImportSummary{ .ontology_id = ontology_id };
-    var line_it = std.mem.splitScalar(u8, content, '\n');
     var line_no: usize = 0;
-    while (line_it.next()) |raw_line| {
+
+    // takeDelimiter tosses the delimiter itself (unlike takeDelimiterExclusive)
+    // so seek advances past each '\n', preventing an infinite loop on empty lines.
+    while (try reader.takeDelimiter('\n')) |raw_line| {
         line_no += 1;
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
 
         const triple = try parseNTripleLine(scratch, line);
         summary.triples += 1;
-        try collections_sqlite.upsertOntologyTriple(db, .{
-            .ontology_id = ontology_id,
-            .triple_index = @intCast(summary.triples),
-            .subject_kind = triple.subject.kind.label(),
-            .subject = triple.subject.value,
-            .predicate = triple.predicate,
-            .object_kind = triple.object.kind.label(),
-            .object_value = triple.object.value,
-            .object_datatype = triple.object.datatype,
-            .object_language = triple.object.language,
-            .source_line = triple.source_line,
-            .metadata_json = try lineMetadata(scratch, line_no),
-        });
+        try session.upsertTriple(
+            summary.triples,
+            triple.subject.kind.label(),
+            triple.subject.value,
+            triple.predicate,
+            triple.object.kind.label(),
+            triple.object.value,
+            triple.object.datatype,
+            triple.object.language,
+            triple.source_line,
+            try lineMetadata(scratch, line_no),
+        );
 
-        try projectTriple(db, scratch, workspace_id, ontology_id, triple, options.materialize_graph, &summary);
+        try projectTriple(&session, scratch, triple, &summary);
     }
 
     try db.exec("COMMIT");
     return summary;
 }
 
-pub fn exportNTriples(db: Database, allocator: Allocator, ontology_id: []const u8) ![]const u8 {
+pub fn importNTriples(
+    db: Database,
+    allocator: Allocator,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    content: []const u8,
+    options: ImportOptions,
+) !ImportSummary {
+    var reader = std.Io.Reader.fixed(content);
+    return importNTriplesReader(db, allocator, workspace_id, ontology_id, &reader, options);
+}
+
+// exportNTriplesWriter writes N-Triples rows directly to writer, one per line,
+// without buffering the full result set in memory.
+pub fn exportNTriplesWriter(db: Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
     const sql =
         \\SELECT source_line
         \\FROM ontology_triples_raw
@@ -128,15 +404,19 @@ pub fn exportNTriples(db: Database, allocator: Allocator, ontology_id: []const u
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, ontology_id);
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
     while (true) {
         const status = c.sqlite3_step(stmt);
         if (status == c.SQLITE_DONE) break;
         if (status != c.SQLITE_ROW) return error.StepFailed;
-        try out.writer.writeAll(columnText(stmt, 0));
-        try out.writer.writeByte('\n');
+        try writer.writeAll(columnText(stmt, 0));
+        try writer.writeByte('\n');
     }
+}
+
+pub fn exportNTriples(db: Database, allocator: Allocator, ontology_id: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try exportNTriplesWriter(db, ontology_id, &out.writer);
     return out.toOwnedSlice();
 }
 
@@ -163,37 +443,34 @@ pub fn parseNTripleLine(allocator: Allocator, line: []const u8) !Triple {
 }
 
 fn projectTriple(
-    db: Database,
+    session: *ImportSession,
     allocator: Allocator,
-    workspace_id: []const u8,
-    ontology_id: []const u8,
     triple: Triple,
-    materialize_graph: bool,
     summary: *ImportSummary,
 ) !void {
     if (triple.subject.kind == .iri and std.mem.eql(u8, triple.predicate, rdf_type) and triple.object.kind == .iri) {
         if (std.mem.eql(u8, triple.object.value, owl_class) or std.mem.eql(u8, triple.object.value, rdfs_class)) {
-            try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, "owl_class");
+            try upsertOntologyNode(session, allocator, triple.subject.value, "owl_class");
             summary.classes += 1;
             return;
         }
         if (std.mem.eql(u8, triple.object.value, owl_object_property)) {
-            try ensureEdgeTypeForIri(db, allocator, ontology_id, triple.subject.value);
-            try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, "owl_object_property");
+            try ensureEdgeTypeForIri(session, allocator, triple.subject.value);
+            try upsertOntologyNode(session, allocator, triple.subject.value, "owl_object_property");
             summary.object_properties += 1;
             return;
         }
         if (std.mem.eql(u8, triple.object.value, owl_datatype_property)) {
-            try ensureDatatypeProperty(db, allocator, ontology_id, triple.subject.value);
-            try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, "owl_datatype_property");
+            try ensureDatatypeProperty(session, allocator, triple.subject.value);
+            try upsertOntologyNode(session, allocator, triple.subject.value, "owl_datatype_property");
             summary.datatype_properties += 1;
             return;
         }
         if (!std.mem.eql(u8, triple.object.value, owl_ontology)) {
             const entity_type = try localNameAlloc(allocator, triple.object.value);
-            try collections_sqlite.ensureEntityType(db, .{ .ontology_id = ontology_id, .entity_type = entity_type, .label = entity_type, .metadata_json = try iriMetadata(allocator, triple.object.value) });
-            try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, entity_type);
-            if (materialize_graph) try upsertGraphNode(db, allocator, workspace_id, ontology_id, triple.subject.value, entity_type);
+            try session.ensureEntityType(entity_type, entity_type, try iriMetadata(allocator, triple.object.value));
+            try upsertOntologyNode(session, allocator, triple.subject.value, entity_type);
+            if (session.materialize_graph) try upsertGraphNode(session, allocator, triple.subject.value, entity_type);
         }
         return;
     }
@@ -201,31 +478,28 @@ fn projectTriple(
     if (triple.object.kind == .literal) return;
 
     const edge_type = if (knownPredicateName(triple.predicate)) |name| name else try localNameAlloc(allocator, triple.predicate);
-    try collections_sqlite.ensureEdgeType(db, .{ .ontology_id = ontology_id, .edge_type = edge_type, .directed = true, .metadata_json = try iriMetadata(allocator, triple.predicate) });
-    try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, termNodeType(triple.subject));
-    try upsertOntologyNode(db, allocator, ontology_id, triple.object.value, termNodeType(triple.object));
-    try collections_sqlite.upsertOntologyRelation(db, .{
-        .ontology_id = ontology_id,
-        .relation_id = stableId(&.{ "ontology-relation", triple.subject.value, triple.predicate, triple.object.value }),
-        .edge_type = edge_type,
-        .source_entity_id = stableId(&.{ "ontology-entity", triple.subject.value }),
-        .target_entity_id = stableId(&.{ "ontology-entity", triple.object.value }),
-        .metadata_json = try iriMetadata(allocator, triple.predicate),
-    });
+    try session.ensureEdgeType(edge_type, try iriMetadata(allocator, triple.predicate));
+    try upsertOntologyNode(session, allocator, triple.subject.value, termNodeType(triple.subject));
+    try upsertOntologyNode(session, allocator, triple.object.value, termNodeType(triple.object));
+    try session.upsertOntologyRelation(
+        stableId(&.{ "ontology-relation", triple.subject.value, triple.predicate, triple.object.value }),
+        edge_type,
+        stableId(&.{ "ontology-entity", triple.subject.value }),
+        stableId(&.{ "ontology-entity", triple.object.value }),
+        try iriMetadata(allocator, triple.predicate),
+    );
     summary.ontology_relations += 1;
 
-    if (materialize_graph and triple.subject.kind == .iri and triple.object.kind == .iri) {
-        try upsertGraphNode(db, allocator, workspace_id, ontology_id, triple.subject.value, "owl_resource");
-        try upsertGraphNode(db, allocator, workspace_id, ontology_id, triple.object.value, "owl_resource");
-        try collections_sqlite.upsertRelationRaw(db, .{
-            .workspace_id = workspace_id,
-            .ontology_id = ontology_id,
-            .relation_id = stableId(&.{ "graph-relation", triple.subject.value, triple.predicate, triple.object.value }),
-            .edge_type = edge_type,
-            .source_entity_id = stableId(&.{ "graph-entity", triple.subject.value }),
-            .target_entity_id = stableId(&.{ "graph-entity", triple.object.value }),
-            .metadata_json = try iriMetadata(allocator, triple.predicate),
-        });
+    if (session.materialize_graph and triple.subject.kind == .iri and triple.object.kind == .iri) {
+        try upsertGraphNode(session, allocator, triple.subject.value, "owl_resource");
+        try upsertGraphNode(session, allocator, triple.object.value, "owl_resource");
+        try session.upsertRelationRaw(
+            stableId(&.{ "graph-relation", triple.subject.value, triple.predicate, triple.object.value }),
+            edge_type,
+            stableId(&.{ "graph-entity", triple.subject.value }),
+            stableId(&.{ "graph-entity", triple.object.value }),
+            try iriMetadata(allocator, triple.predicate),
+        );
         summary.graph_relations += 1;
     }
 }
@@ -248,37 +522,34 @@ fn termNodeType(term: Term) []const u8 {
     };
 }
 
-fn upsertOntologyNode(db: Database, allocator: Allocator, ontology_id: []const u8, iri: []const u8, entity_type: []const u8) !void {
-    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = ontology_id, .entity_type = entity_type, .label = entity_type });
-    try collections_sqlite.upsertOntologyEntity(db, .{
-        .ontology_id = ontology_id,
-        .entity_id = stableId(&.{ "ontology-entity", iri }),
-        .entity_type = entity_type,
-        .name = try localNameAlloc(allocator, iri),
-        .metadata_json = try iriMetadata(allocator, iri),
-    });
+fn upsertOntologyNode(session: *ImportSession, allocator: Allocator, iri: []const u8, entity_type: []const u8) !void {
+    try session.ensureEntityType(entity_type, entity_type, "{}");
+    try session.upsertOntologyEntity(
+        stableId(&.{ "ontology-entity", iri }),
+        entity_type,
+        try localNameAlloc(allocator, iri),
+        try iriMetadata(allocator, iri),
+    );
 }
 
-fn upsertGraphNode(db: Database, allocator: Allocator, workspace_id: []const u8, ontology_id: []const u8, iri: []const u8, entity_type: []const u8) !void {
-    try collections_sqlite.upsertEntityRaw(db, .{
-        .workspace_id = workspace_id,
-        .ontology_id = ontology_id,
-        .entity_id = stableId(&.{ "graph-entity", iri }),
-        .entity_type = entity_type,
-        .name = try localNameAlloc(allocator, iri),
-        .metadata_json = try iriMetadata(allocator, iri),
-    });
+fn upsertGraphNode(session: *ImportSession, allocator: Allocator, iri: []const u8, entity_type: []const u8) !void {
+    try session.upsertEntityRaw(
+        stableId(&.{ "graph-entity", iri }),
+        entity_type,
+        try localNameAlloc(allocator, iri),
+        try iriMetadata(allocator, iri),
+    );
 }
 
-fn ensureEdgeTypeForIri(db: Database, allocator: Allocator, ontology_id: []const u8, iri: []const u8) !void {
+fn ensureEdgeTypeForIri(session: *ImportSession, allocator: Allocator, iri: []const u8) !void {
     const edge_type = try localNameAlloc(allocator, iri);
-    try collections_sqlite.ensureEdgeType(db, .{ .ontology_id = ontology_id, .edge_type = edge_type, .directed = true, .metadata_json = try iriMetadata(allocator, iri) });
+    try session.ensureEdgeType(edge_type, try iriMetadata(allocator, iri));
 }
 
-fn ensureDatatypeProperty(db: Database, allocator: Allocator, ontology_id: []const u8, iri: []const u8) !void {
-    try collections_sqlite.ensureNamespace(db, .{ .ontology_id = ontology_id, .namespace = "owl_datatype", .label = "OWL Datatype Properties" });
-    try collections_sqlite.ensureDimension(db, .{
-        .ontology_id = ontology_id,
+fn ensureDatatypeProperty(session: *ImportSession, allocator: Allocator, iri: []const u8) !void {
+    try collections_sqlite.ensureNamespace(session.db, .{ .ontology_id = session.ontology_id, .namespace = "owl_datatype", .label = "OWL Datatype Properties" });
+    try collections_sqlite.ensureDimension(session.db, .{
+        .ontology_id = session.ontology_id,
         .namespace = "owl_datatype",
         .dimension = try localNameAlloc(allocator, iri),
         .value_type = "text",
@@ -630,5 +901,110 @@ test "ontology triples survive taxonomies bundle roundtrip" {
         const exported = try exportNTriples(dest_db, allocator, ontology_id);
         defer allocator.free(exported);
         try std.testing.expectEqualStrings(expected_export, exported);
+    }
+}
+
+test "duplicate-heavy import produces stable projected table counts" {
+    // Exercises the seen_entity_types / seen_edge_types dedup in ImportSession.
+    // The same rdf:type and structural declarations appear multiple times.
+    // The projected schema tables (entity_types, edge_types, entities) must have
+    // the same row counts whether each triple is imported once or many times.
+    const allocator = std.testing.allocator;
+
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "docs/source/owl2-core.nt", allocator, .limited(1024 * 1024));
+    defer allocator.free(fixture);
+
+    // Build a fixture that repeats every data line 4 times.
+    var repeated = std.Io.Writer.Allocating.init(allocator);
+    errdefer repeated.deinit();
+    {
+        var it = std.mem.splitScalar(u8, fixture, '\n');
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r\n");
+            if (line.len == 0 or line[0] == '#') continue;
+            for (0..4) |_| {
+                try repeated.writer.writeAll(line);
+                try repeated.writer.writeByte('\n');
+            }
+        }
+    }
+    const repeated_content = try repeated.toOwnedSlice();
+    defer allocator.free(repeated_content);
+
+    // Import the original fixture.
+    var db_single = try Database.open(":memory:");
+    defer db_single.close();
+    try db_single.applyStandaloneSchema();
+    _ = try importNTriples(db_single, allocator, "ws", "onto", fixture, .{ .materialize_graph = true });
+
+    // Import the 4x-repeated fixture into a fresh DB.
+    var db_repeat = try Database.open(":memory:");
+    defer db_repeat.close();
+    try db_repeat.applyStandaloneSchema();
+    _ = try importNTriples(db_repeat, allocator, "ws", "onto", repeated_content, .{ .materialize_graph = true });
+
+    // Projected schema tables must have identical row counts in both DBs.
+    const et_single = try countRowsBound(db_single, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "onto");
+    const et_repeat = try countRowsBound(db_repeat, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "onto");
+    try std.testing.expectEqual(et_single, et_repeat);
+
+    const edge_single = try countRowsBound(db_single, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = ?1", "onto");
+    const edge_repeat = try countRowsBound(db_repeat, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = ?1", "onto");
+    try std.testing.expectEqual(edge_single, edge_repeat);
+
+    const ent_single = try countRowsBound(db_single, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = ?1", "onto");
+    const ent_repeat = try countRowsBound(db_repeat, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = ?1", "onto");
+    try std.testing.expectEqual(ent_single, ent_repeat);
+
+    try std.testing.expect(et_single > 0);
+    try std.testing.expect(edge_single > 0);
+    try std.testing.expect(ent_single > 0);
+}
+
+test "importNTriplesReader produces identical results to importNTriples" {
+    // Smoke-tests the streaming reader path against the slice-based wrapper for
+    // a fixture large enough to exercise multi-line buffering.
+    const allocator = std.testing.allocator;
+
+    const fixture_paths = [_]struct {
+        path: []const u8,
+        ontology_id: []const u8,
+    }{
+        .{ .path = "docs/source/owl2-core.nt", .ontology_id = "onto-reader-core" },
+        .{ .path = "docs/source/owl2-rl-relations.nt", .ontology_id = "onto-reader-rl" },
+        .{ .path = "docs/source/owl2-restrictions.nt", .ontology_id = "onto-reader-restr" },
+    };
+
+    for (fixture_paths) |spec| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, spec.path, allocator, .limited(1024 * 1024));
+        defer allocator.free(content);
+
+        // Slice-based import (reference).
+        var db_ref = try Database.open(":memory:");
+        defer db_ref.close();
+        try db_ref.applyStandaloneSchema();
+        const ref_summary = try importNTriples(db_ref, allocator, "ws-reader", spec.ontology_id, content, .{
+            .materialize_graph = true,
+        });
+        const ref_export = try exportNTriples(db_ref, allocator, spec.ontology_id);
+        defer allocator.free(ref_export);
+
+        // Reader-based import.
+        var db_rdr = try Database.open(":memory:");
+        defer db_rdr.close();
+        try db_rdr.applyStandaloneSchema();
+        var reader = std.Io.Reader.fixed(content);
+        const rdr_summary = try importNTriplesReader(db_rdr, allocator, "ws-reader", spec.ontology_id, &reader, .{
+            .materialize_graph = true,
+        });
+        const rdr_export = try exportNTriples(db_rdr, allocator, spec.ontology_id);
+        defer allocator.free(rdr_export);
+
+        try std.testing.expectEqual(ref_summary.triples, rdr_summary.triples);
+        try std.testing.expectEqual(ref_summary.classes, rdr_summary.classes);
+        try std.testing.expectEqual(ref_summary.object_properties, rdr_summary.object_properties);
+        try std.testing.expectEqual(ref_summary.datatype_properties, rdr_summary.datatype_properties);
+        try std.testing.expectEqual(ref_summary.ontology_relations, rdr_summary.ontology_relations);
+        try std.testing.expectEqualStrings(ref_export, rdr_export);
     }
 }
