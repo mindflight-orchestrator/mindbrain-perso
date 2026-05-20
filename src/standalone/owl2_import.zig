@@ -1,4 +1,5 @@
 const std = @import("std");
+const collections_io = @import("collections_io.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
 
@@ -197,12 +198,12 @@ fn projectTriple(
         return;
     }
 
-    if (triple.subject.kind != .iri or triple.object.kind == .literal) return;
+    if (triple.object.kind == .literal) return;
 
     const edge_type = if (knownPredicateName(triple.predicate)) |name| name else try localNameAlloc(allocator, triple.predicate);
     try collections_sqlite.ensureEdgeType(db, .{ .ontology_id = ontology_id, .edge_type = edge_type, .directed = true, .metadata_json = try iriMetadata(allocator, triple.predicate) });
-    try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, "owl_resource");
-    try upsertOntologyNode(db, allocator, ontology_id, triple.object.value, "owl_resource");
+    try upsertOntologyNode(db, allocator, ontology_id, triple.subject.value, termNodeType(triple.subject));
+    try upsertOntologyNode(db, allocator, ontology_id, triple.object.value, termNodeType(triple.object));
     try collections_sqlite.upsertOntologyRelation(db, .{
         .ontology_id = ontology_id,
         .relation_id = stableId(&.{ "ontology-relation", triple.subject.value, triple.predicate, triple.object.value }),
@@ -213,7 +214,7 @@ fn projectTriple(
     });
     summary.ontology_relations += 1;
 
-    if (materialize_graph) {
+    if (materialize_graph and triple.subject.kind == .iri and triple.object.kind == .iri) {
         try upsertGraphNode(db, allocator, workspace_id, ontology_id, triple.subject.value, "owl_resource");
         try upsertGraphNode(db, allocator, workspace_id, ontology_id, triple.object.value, "owl_resource");
         try collections_sqlite.upsertRelationRaw(db, .{
@@ -236,6 +237,15 @@ fn seedOwlNamespaces(db: Database, ontology_id: []const u8) !void {
     try collections_sqlite.ensureNamespace(db, .{ .ontology_id = ontology_id, .namespace = "xsd", .label = "XSD" });
     try collections_sqlite.ensureEntityType(db, .{ .ontology_id = ontology_id, .entity_type = "owl_class", .label = "OWL Class" });
     try collections_sqlite.ensureEntityType(db, .{ .ontology_id = ontology_id, .entity_type = "owl_resource", .label = "OWL Resource" });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = ontology_id, .entity_type = "owl_blank_node", .label = "OWL Blank Node" });
+}
+
+fn termNodeType(term: Term) []const u8 {
+    return switch (term.kind) {
+        .blank => "owl_blank_node",
+        .iri => "owl_resource",
+        .literal => "owl_literal",
+    };
 }
 
 fn upsertOntologyNode(db: Database, allocator: Allocator, ontology_id: []const u8, iri: []const u8, entity_type: []const u8) !void {
@@ -410,6 +420,38 @@ fn countRows(db: Database, sql: []const u8) !i64 {
     return c.sqlite3_column_int64(stmt, 0);
 }
 
+fn countRowsBound(db: Database, sql: []const u8, value: []const u8) !i64 {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, value);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn countFixtureTriples(content: []const u8) usize {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+        count += 1;
+    }
+    return count;
+}
+
+fn normalizedFixtureNTriples(allocator: Allocator, content: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+        try out.writer.writeAll(line);
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
+}
+
 test "parse official docs source ntriples fixtures" {
     const allocator = std.testing.allocator;
     const fixture_paths = [_][]const u8{
@@ -434,7 +476,60 @@ test "parse official docs source ntriples fixtures" {
     }
 }
 
-test "import ntriples preserves triples and can materialize graph" {
+test "import every docs source fixture into sqlite" {
+    const allocator = std.testing.allocator;
+    const fixtures = [_]struct {
+        path: []const u8,
+        ontology_id: []const u8,
+        expected_fragment: []const u8,
+    }{
+        .{
+            .path = "docs/source/owl2-core.nt",
+            .ontology_id = "onto-core",
+            .expected_fragment = "http://www.w3.org/2002/07/owl#Class",
+        },
+        .{
+            .path = "docs/source/owl2-rl-relations.nt",
+            .ontology_id = "onto-rl",
+            .expected_fragment = "http://www.w3.org/2002/07/owl#sameAs",
+        },
+        .{
+            .path = "docs/source/owl2-restrictions.nt",
+            .ontology_id = "onto-restrictions",
+            .expected_fragment = "_:managedEmployeeRestriction",
+        },
+    };
+
+    for (fixtures) |fixture_spec| {
+        var db = try Database.open(":memory:");
+        defer db.close();
+        try db.applyStandaloneSchema();
+
+        const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_spec.path, allocator, .limited(1024 * 1024));
+        defer allocator.free(fixture);
+        const expected_triples = countFixtureTriples(fixture);
+        const expected_export = try normalizedFixtureNTriples(allocator, fixture);
+        defer allocator.free(expected_export);
+
+        const summary = try importNTriples(db, allocator, "ws-owl", fixture_spec.ontology_id, fixture, .{
+            .ontology_name = fixture_spec.ontology_id,
+            .materialize_graph = true,
+        });
+        try std.testing.expectEqual(expected_triples, summary.triples);
+        try std.testing.expectEqual(
+            @as(i64, @intCast(expected_triples)),
+            try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", fixture_spec.ontology_id),
+        );
+        try std.testing.expect(try countRowsBound(db, "SELECT COUNT(*) FROM ontology_namespaces WHERE ontology_id = ?1", fixture_spec.ontology_id) >= 4);
+
+        const exported = try exportNTriples(db, allocator, fixture_spec.ontology_id);
+        defer allocator.free(exported);
+        try std.testing.expectEqualStrings(expected_export, exported);
+        try std.testing.expect(std.mem.indexOf(u8, exported, fixture_spec.expected_fragment) != null);
+    }
+}
+
+test "core fixture projects ontology and graph rows" {
     const allocator = std.testing.allocator;
     var db = try Database.open(":memory:");
     defer db.close();
@@ -442,19 +537,98 @@ test "import ntriples preserves triples and can materialize graph" {
 
     const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "docs/source/owl2-core.nt", allocator, .limited(1024 * 1024));
     defer allocator.free(fixture);
-    const summary = try importNTriples(db, allocator, "ws-owl", "onto-owl", fixture, .{
-        .ontology_name = "OWL fixture",
+    const summary = try importNTriples(db, allocator, "ws-core", "onto-core", fixture, .{
+        .ontology_name = "OWL core fixture",
         .materialize_graph = true,
     });
-    try std.testing.expect(summary.triples > 0);
-    try std.testing.expect(summary.classes > 0);
-    try std.testing.expect(summary.object_properties > 0);
-    try std.testing.expect(summary.datatype_properties > 0);
-    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_triples_raw") == @as(i64, @intCast(summary.triples)));
-    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-owl'") > 0);
-    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws-owl'") > 0);
+    try std.testing.expectEqual(@as(usize, 17), summary.triples);
+    try std.testing.expectEqual(@as(usize, 3), summary.classes);
+    try std.testing.expectEqual(@as(usize, 1), summary.object_properties);
+    try std.testing.expectEqual(@as(usize, 1), summary.datatype_properties);
+    try std.testing.expect(try countRowsBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "onto-core") > 0);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-core' AND edge_type = 'worksFor'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_dimensions WHERE ontology_id = 'onto-core' AND namespace = 'owl_datatype' AND dimension = 'employeeNumber'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws-core'") > 0);
+}
 
-    const exported = try exportNTriples(db, allocator, "onto-owl");
-    defer allocator.free(exported);
-    try std.testing.expect(std.mem.indexOf(u8, exported, "http://www.w3.org/2002/07/owl#Class") != null);
+test "owl rl fixture imports relation axioms into ontology graph" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "docs/source/owl2-rl-relations.nt", allocator, .limited(1024 * 1024));
+    defer allocator.free(fixture);
+    const summary = try importNTriples(db, allocator, "ws-rl", "onto-rl", fixture, .{
+        .ontology_name = "OWL RL fixture",
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(@as(usize, 15), summary.triples);
+    try std.testing.expect(summary.ontology_relations >= 9);
+    try std.testing.expect(summary.graph_relations >= 9);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-rl' AND edge_type = 'subClassOf'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-rl' AND edge_type = 'subPropertyOf'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-rl' AND edge_type = 'inverseOf'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-rl' AND edge_type = 'sameAs'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-rl' AND edge_type = 'disjointWith'") == 1);
+}
+
+test "restriction fixture preserves blank nodes and typed literals" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "docs/source/owl2-restrictions.nt", allocator, .limited(1024 * 1024));
+    defer allocator.free(fixture);
+    const summary = try importNTriples(db, allocator, "ws-restrictions", "onto-restrictions", fixture, .{
+        .ontology_name = "OWL restrictions fixture",
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(@as(usize, 14), summary.triples);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = 'onto-restrictions' AND subject_kind = 'blank'") >= 6);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = 'onto-restrictions' AND object_kind = 'blank'") >= 3);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = 'onto-restrictions' AND object_kind = 'literal' AND object_datatype = 'http://www.w3.org/2001/XMLSchema#nonNegativeInteger' AND object_value = '1'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-restrictions' AND edge_type = 'onProperty'") == 1);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = 'onto-restrictions' AND edge_type = 'someValuesFrom'") == 1);
+}
+
+test "ontology triples survive taxonomies bundle roundtrip" {
+    const allocator = std.testing.allocator;
+    var source_db = try Database.open(":memory:");
+    defer source_db.close();
+    try source_db.applyStandaloneSchema();
+
+    const fixture_paths = [_][]const u8{
+        "docs/source/owl2-core.nt",
+        "docs/source/owl2-rl-relations.nt",
+        "docs/source/owl2-restrictions.nt",
+    };
+    const ontology_ids = [_][]const u8{ "onto-core", "onto-rl", "onto-restrictions" };
+    for (fixture_paths, ontology_ids) |path, ontology_id| {
+        const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
+        defer allocator.free(fixture);
+        _ = try importNTriples(source_db, allocator, "ws-bundle", ontology_id, fixture, .{
+            .ontology_name = ontology_id,
+            .materialize_graph = true,
+        });
+    }
+
+    const bundle = try collections_io.exportToJson(allocator, source_db, .{ .taxonomies = "ws-bundle" });
+    defer allocator.free(bundle);
+
+    var dest_db = try Database.open(":memory:");
+    defer dest_db.close();
+    try dest_db.applyStandaloneSchema();
+    try collections_io.importBundleJson(dest_db, allocator, bundle);
+
+    for (fixture_paths, ontology_ids) |path, ontology_id| {
+        const fixture = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
+        defer allocator.free(fixture);
+        const expected_export = try normalizedFixtureNTriples(allocator, fixture);
+        defer allocator.free(expected_export);
+        const exported = try exportNTriples(dest_db, allocator, ontology_id);
+        defer allocator.free(exported);
+        try std.testing.expectEqualStrings(expected_export, exported);
+    }
 }

@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-05-20",
+  "purpose": "Official OWL2 source references for future MindBrain ontology import tests.",
+  "format_policy": {
+    "first_import_format": "N-Triples",
+    "turtle_policy": "Normalize Turtle to N-Triples before importing.",
+    "unsupported_construct_policy": "Preserve unsupported OWL constructs as raw triples and metadata."
+  },
+  "official_sources": [
+    {
+      "id": "w3c-owl2-overview",
+      "title": "OWL 2 Web Ontology Language Document Overview",
+      "url": "https://www.w3.org/TR/owl-overview/",
+      "role": "Roadmap and terminology."
+    },
+    {
+      "id": "w3c-owl2-syntax",
+      "title": "OWL 2 Web Ontology Language Structural Specification and Functional-Style Syntax",
+      "url": "https://www.w3.org/TR/owl2-syntax/",
+      "role": "Structural ontology model and entity/axiom definitions."
+    },
+    {
+      "id": "w3c-owl2-mapping-to-rdf",
+      "title": "OWL 2 Web Ontology Language Mapping to RDF Graphs",
+      "url": "https://www.w3.org/TR/owl2-mapping-to-rdf/",
+      "role": "Mapping between OWL2 ontologies and RDF graphs."
+    },
+    {
+      "id": "w3c-owl2-profiles",
+      "title": "OWL 2 Web Ontology Language Profiles",
+      "url": "https://www.w3.org/TR/owl2-profiles/",
+      "role": "OWL2 EL, QL, and RL profile definitions."
+    },
+    {
+      "id": "w3c-owl2-conformance",
+      "title": "OWL 2 Web Ontology Language Conformance",
+      "url": "https://www.w3.org/TR/owl2-test/",
+      "role": "Conformance model and test-case reference."
+    },
+    {
+      "id": "w3c-owl2-test-cases",
+      "title": "OWL 2 Test Case Repository",
+      "url": "https://www.w3.org/2009/owl-test-cases",
+      "role": "Archived OWL2 test-case repository entrypoint."
+    }
+  ],
+  "local_fixtures": [
+    {
+      "path": "owl2-core.nt",
+      "covers": ["ontology", "class", "subClassOf", "objectProperty", "datatypeProperty", "individual", "label", "domain", "range"]
+    },
+    {
+      "path": "owl2-rl-relations.nt",
+      "covers": ["subClassOf", "subPropertyOf", "inverseOf", "SymmetricProperty", "TransitiveProperty", "equivalentClass", "sameAs", "disjointWith"]
+    },
+    {
+      "path": "owl2-restrictions.nt",
+      "covers": ["Restriction", "someValuesFrom", "maxCardinality", "unionOf", "rdfList", "blankNode"]
+    }
+  ]
+}

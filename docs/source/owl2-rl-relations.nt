@@ -1,0 +1,16 @@
+<http://example.org/mindbrain/owl2/rl> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Ontology> .
+<http://example.org/mindbrain/owl2/Agent> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+<http://example.org/mindbrain/owl2/Person> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.org/mindbrain/owl2/Agent> .
+<http://example.org/mindbrain/owl2/Employee> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.org/mindbrain/owl2/Person> .
+<http://example.org/mindbrain/owl2/memberOf> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <http://example.org/mindbrain/owl2/relatedTo> .
+<http://example.org/mindbrain/owl2/worksFor> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <http://example.org/mindbrain/owl2/memberOf> .
+<http://example.org/mindbrain/owl2/employs> <http://www.w3.org/2002/07/owl#inverseOf> <http://example.org/mindbrain/owl2/worksFor> .
+<http://example.org/mindbrain/owl2/colleagueOf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#SymmetricProperty> .
+<http://example.org/mindbrain/owl2/partOf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#TransitiveProperty> .
+<http://example.org/mindbrain/owl2/StaffMember> <http://www.w3.org/2002/07/owl#equivalentClass> <http://example.org/mindbrain/owl2/Employee> .
+<http://example.org/mindbrain/owl2/AdaLovelace> <http://www.w3.org/2002/07/owl#sameAs> <http://example.org/mindbrain/owl2/Ada> .
+<http://example.org/mindbrain/owl2/Organization> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.org/mindbrain/owl2/Person> .
+<http://example.org/mindbrain/owl2/Ada> <http://example.org/mindbrain/owl2/worksFor> <http://example.org/mindbrain/owl2/ResearchLab> .
+<http://example.org/mindbrain/owl2/ResearchLab> <http://example.org/mindbrain/owl2/partOf> <http://example.org/mindbrain/owl2/Acme> .
+<http://example.org/mindbrain/owl2/Acme> <http://example.org/mindbrain/owl2/partOf> <http://example.org/mindbrain/owl2/GlobalGroup> .
+
