@@ -13,25 +13,65 @@ const c = facet_sqlite.c;
 
 pub const Scope = union(enum) {
     workspace: []const u8,
+    taxonomies: []const u8,
     collection: struct { workspace_id: []const u8, collection_id: []const u8 },
+};
+
+pub const ExportOptions = struct {
+    include_vectors: bool = true,
+};
+
+pub const BundleSummary = struct {
+    kind: []const u8,
+    schema_version: []const u8,
+    scope_kind: []const u8,
+    workspace_id: []const u8,
+    collection_id: ?[]const u8,
+    workspace_count: usize,
+    collection_count: usize,
+    ontology_count: usize,
+    ontology_value_count: usize,
+    document_count: usize,
+    chunk_count: usize,
+    relation_property_count: usize,
+
+    pub fn deinit(self: BundleSummary, allocator: Allocator) void {
+        allocator.free(self.kind);
+        allocator.free(self.schema_version);
+        allocator.free(self.scope_kind);
+        allocator.free(self.workspace_id);
+        if (self.collection_id) |value| allocator.free(value);
+    }
 };
 
 const json_writer_capacity: usize = 8 * 1024;
 
 const Bundle = struct {
-    schema_version: []const u8 = "1",
+    kind: []const u8 = "ghostcrab_backup_bundle",
+    schema_version: []const u8 = "2",
     scope: ScopeJson,
     workspaces: []WorkspaceRow,
     collections: []CollectionRow,
     ontologies: []OntologyRow,
+    ontology_namespaces: []OntologyNamespaceRow = &.{},
+    ontology_dimensions: []OntologyDimensionRow = &.{},
+    ontology_values: []OntologyValueRow = &.{},
+    ontology_entity_types: []OntologyEntityTypeRow = &.{},
+    ontology_edge_types: []OntologyEdgeTypeRow = &.{},
+    ontology_entities: []OntologyEntityRow = &.{},
+    ontology_relations: []OntologyRelationRow = &.{},
+    ontology_triples: []OntologyTripleRow = &.{},
     collection_ontologies: []CollectionOntologyRow,
     workspace_settings: []WorkspaceSettingsRow,
     documents_raw: []DocumentRow,
     chunks_raw: []ChunkRow,
+    documents_raw_vector: []VectorRow = &.{},
+    chunks_raw_vector: []VectorRow = &.{},
     facet_assignments_raw: []FacetAssignmentRow,
     entities_raw: []EntityRow,
     entity_aliases_raw: []EntityAliasRow,
     relations_raw: []RelationRow,
+    relation_properties_raw: []RelationPropertyRow = &.{},
     entity_documents_raw: []EntityDocumentRow,
     entity_chunks_raw: []EntityChunkRow,
     document_links_raw: []DocumentLinkRow,
@@ -68,6 +108,82 @@ const OntologyRow = struct {
     version: []const u8,
     frozen: bool,
     source_kind: []const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyNamespaceRow = struct {
+    ontology_id: []const u8,
+    namespace: []const u8,
+    label: ?[]const u8,
+    parent_namespace: ?[]const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyDimensionRow = struct {
+    ontology_id: []const u8,
+    namespace: []const u8,
+    dimension: []const u8,
+    value_type: []const u8,
+    is_multi: bool,
+    hierarchy_kind: []const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyValueRow = struct {
+    ontology_id: []const u8,
+    namespace: []const u8,
+    dimension: []const u8,
+    value_id: i64,
+    value: []const u8,
+    parent_value_id: ?i64,
+    label: ?[]const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyEntityTypeRow = struct {
+    ontology_id: []const u8,
+    entity_type: []const u8,
+    label: ?[]const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyEdgeTypeRow = struct {
+    ontology_id: []const u8,
+    edge_type: []const u8,
+    directed: bool,
+    source_entity_type: ?[]const u8,
+    target_entity_type: ?[]const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyEntityRow = struct {
+    ontology_id: []const u8,
+    entity_id: i64,
+    entity_type: []const u8,
+    label: []const u8,
+    metadata_json: []const u8,
+};
+
+const OntologyRelationRow = struct {
+    ontology_id: []const u8,
+    relation_id: i64,
+    edge_type: []const u8,
+    source_entity_id: i64,
+    target_entity_id: i64,
+    metadata_json: []const u8,
+};
+
+const OntologyTripleRow = struct {
+    ontology_id: []const u8,
+    triple_index: i64,
+    subject_kind: []const u8,
+    subject: []const u8,
+    predicate: []const u8,
+    object_kind: []const u8,
+    object_value: []const u8,
+    object_datatype: ?[]const u8,
+    object_language: ?[]const u8,
+    source_line: []const u8,
     metadata_json: []const u8,
 };
 
@@ -108,6 +224,15 @@ const ChunkRow = struct {
     token_count: ?i64 = null,
     parent_chunk_index: ?i64 = null,
     metadata_json: []const u8,
+};
+
+const VectorRow = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    doc_id: i64,
+    chunk_index: ?i64 = null,
+    dim: i64,
+    embedding_blob: []const u8,
 };
 
 const FacetAssignmentRow = struct {
@@ -153,6 +278,18 @@ const RelationRow = struct {
     valid_to: ?[]const u8,
     confidence: f64,
     metadata_json: []const u8,
+};
+
+const RelationPropertyRow = struct {
+    workspace_id: []const u8,
+    relation_id: i64,
+    property_key: []const u8,
+    value_type: []const u8,
+    value_text: ?[]const u8,
+    value_number: ?f64,
+    value_integer: ?i64,
+    ref_doc_id: ?i64,
+    currency: ?[]const u8,
 };
 
 const EntityDocumentRow = struct {
@@ -205,40 +342,65 @@ const DocumentLinkRow = struct {
 // ---- Export ---------------------------------------------------------------
 
 pub fn exportToJson(allocator: Allocator, db: Database, scope: Scope) ![]const u8 {
+    return exportToJsonWithOptions(allocator, db, scope, .{});
+}
+
+pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope, options: ExportOptions) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
     const workspace_id = switch (scope) {
         .workspace => |ws| ws,
+        .taxonomies => |ws| ws,
         .collection => |coll| coll.workspace_id,
     };
     const collection_filter: ?[]const u8 = switch (scope) {
         .workspace => null,
+        .taxonomies => null,
         .collection => |coll| coll.collection_id,
+    };
+    const taxonomies_only = switch (scope) {
+        .taxonomies => true,
+        else => false,
     };
 
     const bundle = Bundle{
         .scope = .{
-            .kind = if (collection_filter == null) "workspace" else "collection",
+            .kind = switch (scope) {
+                .workspace => "workspace",
+                .taxonomies => "taxonomies",
+                .collection => "collection",
+            },
             .workspace_id = workspace_id,
             .collection_id = collection_filter,
         },
         .workspaces = try selectWorkspaces(arena_allocator, db, workspace_id),
-        .collections = try selectCollections(arena_allocator, db, workspace_id, collection_filter),
+        .collections = if (taxonomies_only) &.{} else try selectCollections(arena_allocator, db, workspace_id, collection_filter),
         .ontologies = try selectOntologies(arena_allocator, db, workspace_id, collection_filter),
-        .collection_ontologies = try selectCollectionOntologies(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_namespaces = try selectOntologyNamespaces(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_dimensions = try selectOntologyDimensions(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_values = try selectOntologyValues(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_entity_types = try selectOntologyEntityTypes(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_edge_types = try selectOntologyEdgeTypes(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_entities = try selectOntologyEntities(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_relations = try selectOntologyRelations(arena_allocator, db, workspace_id, collection_filter),
+        .ontology_triples = try selectOntologyTriples(arena_allocator, db, workspace_id, collection_filter),
+        .collection_ontologies = if (taxonomies_only) &.{} else try selectCollectionOntologies(arena_allocator, db, workspace_id, collection_filter),
         .workspace_settings = try selectWorkspaceSettings(arena_allocator, db, workspace_id),
-        .documents_raw = try selectDocuments(arena_allocator, db, workspace_id, collection_filter),
-        .chunks_raw = try selectChunks(arena_allocator, db, workspace_id, collection_filter),
-        .facet_assignments_raw = try selectFacetAssignments(arena_allocator, db, workspace_id, collection_filter),
-        .entities_raw = try selectEntities(arena_allocator, db, workspace_id),
-        .entity_aliases_raw = try selectEntityAliases(arena_allocator, db, workspace_id),
-        .relations_raw = try selectRelations(arena_allocator, db, workspace_id),
-        .entity_documents_raw = try selectEntityDocuments(arena_allocator, db, workspace_id, collection_filter),
-        .entity_chunks_raw = try selectEntityChunks(arena_allocator, db, workspace_id, collection_filter),
-        .document_links_raw = try selectDocumentLinks(arena_allocator, db, workspace_id, collection_filter),
-        .external_links_raw = try selectExternalLinks(arena_allocator, db, workspace_id, collection_filter),
+        .documents_raw = if (taxonomies_only) &.{} else try selectDocuments(arena_allocator, db, workspace_id, collection_filter),
+        .chunks_raw = if (taxonomies_only) &.{} else try selectChunks(arena_allocator, db, workspace_id, collection_filter),
+        .documents_raw_vector = if (taxonomies_only or !options.include_vectors) &.{} else try selectDocumentVectors(arena_allocator, db, workspace_id, collection_filter),
+        .chunks_raw_vector = if (taxonomies_only or !options.include_vectors) &.{} else try selectChunkVectors(arena_allocator, db, workspace_id, collection_filter),
+        .facet_assignments_raw = if (taxonomies_only) &.{} else try selectFacetAssignments(arena_allocator, db, workspace_id, collection_filter),
+        .entities_raw = if (taxonomies_only) &.{} else try selectEntities(arena_allocator, db, workspace_id),
+        .entity_aliases_raw = if (taxonomies_only) &.{} else try selectEntityAliases(arena_allocator, db, workspace_id),
+        .relations_raw = if (taxonomies_only) &.{} else try selectRelations(arena_allocator, db, workspace_id),
+        .relation_properties_raw = if (taxonomies_only) &.{} else try selectRelationProperties(arena_allocator, db, workspace_id),
+        .entity_documents_raw = if (taxonomies_only) &.{} else try selectEntityDocuments(arena_allocator, db, workspace_id, collection_filter),
+        .entity_chunks_raw = if (taxonomies_only) &.{} else try selectEntityChunks(arena_allocator, db, workspace_id, collection_filter),
+        .document_links_raw = if (taxonomies_only) &.{} else try selectDocumentLinks(arena_allocator, db, workspace_id, collection_filter),
+        .external_links_raw = if (taxonomies_only) &.{} else try selectExternalLinks(arena_allocator, db, workspace_id, collection_filter),
     };
 
     return try std.json.Stringify.valueAlloc(allocator, bundle, .{ .whitespace = .indent_2 });
@@ -266,12 +428,6 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         });
     }
 
-    for (bundle.workspace_settings) |row| {
-        if (row.default_ontology_id) |oid| {
-            try collections_sqlite.setDefaultOntology(db, row.workspace_id, oid);
-        }
-    }
-
     for (bundle.collections) |row| {
         try collections_sqlite.ensureCollection(db, .{
             .workspace_id = row.workspace_id,
@@ -294,6 +450,104 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
             .source_kind = row.source_kind,
             .metadata_json = row.metadata_json,
         });
+    }
+
+    for (bundle.ontology_namespaces) |row| {
+        try collections_sqlite.ensureNamespace(db, .{
+            .ontology_id = row.ontology_id,
+            .namespace = row.namespace,
+            .label = row.label,
+            .parent_namespace = row.parent_namespace,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_dimensions) |row| {
+        try collections_sqlite.ensureDimension(db, .{
+            .ontology_id = row.ontology_id,
+            .namespace = row.namespace,
+            .dimension = row.dimension,
+            .value_type = row.value_type,
+            .is_multi = row.is_multi,
+            .hierarchy_kind = row.hierarchy_kind,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_values) |row| {
+        try collections_sqlite.ensureValue(db, .{
+            .ontology_id = row.ontology_id,
+            .namespace = row.namespace,
+            .dimension = row.dimension,
+            .value_id = std.math.cast(u32, row.value_id) orelse return error.ValueOutOfRange,
+            .value = row.value,
+            .parent_value_id = if (row.parent_value_id) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else null,
+            .label = row.label,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_entity_types) |row| {
+        try collections_sqlite.ensureEntityType(db, .{
+            .ontology_id = row.ontology_id,
+            .entity_type = row.entity_type,
+            .label = row.label,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_edge_types) |row| {
+        try collections_sqlite.ensureEdgeType(db, .{
+            .ontology_id = row.ontology_id,
+            .edge_type = row.edge_type,
+            .directed = row.directed,
+            .source_entity_type = row.source_entity_type,
+            .target_entity_type = row.target_entity_type,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_entities) |row| {
+        try collections_sqlite.upsertOntologyEntity(db, .{
+            .ontology_id = row.ontology_id,
+            .entity_id = @intCast(row.entity_id),
+            .entity_type = row.entity_type,
+            .name = row.label,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_relations) |row| {
+        try collections_sqlite.upsertOntologyRelation(db, .{
+            .ontology_id = row.ontology_id,
+            .relation_id = @intCast(row.relation_id),
+            .edge_type = row.edge_type,
+            .source_entity_id = @intCast(row.source_entity_id),
+            .target_entity_id = @intCast(row.target_entity_id),
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.ontology_triples) |row| {
+        try collections_sqlite.upsertOntologyTriple(db, .{
+            .ontology_id = row.ontology_id,
+            .triple_index = @intCast(row.triple_index),
+            .subject_kind = row.subject_kind,
+            .subject = row.subject,
+            .predicate = row.predicate,
+            .object_kind = row.object_kind,
+            .object_value = row.object_value,
+            .object_datatype = row.object_datatype,
+            .object_language = row.object_language,
+            .source_line = row.source_line,
+            .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.workspace_settings) |row| {
+        if (row.default_ontology_id) |oid| {
+            try collections_sqlite.setDefaultOntology(db, row.workspace_id, oid);
+        }
     }
 
     for (bundle.collection_ontologies) |row| {
@@ -328,6 +582,27 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
             .token_count = if (row.token_count) |tc| @intCast(tc) else null,
             .parent_chunk_index = if (row.parent_chunk_index) |pi| std.math.cast(u32, pi) orelse return error.ValueOutOfRange else null,
             .metadata_json = row.metadata_json,
+        });
+    }
+
+    for (bundle.documents_raw_vector) |row| {
+        try collections_sqlite.upsertDocumentVector(db, .{
+            .workspace_id = row.workspace_id,
+            .collection_id = row.collection_id,
+            .doc_id = @intCast(row.doc_id),
+            .dim = std.math.cast(u32, row.dim) orelse return error.ValueOutOfRange,
+            .embedding_blob = row.embedding_blob,
+        });
+    }
+
+    for (bundle.chunks_raw_vector) |row| {
+        try collections_sqlite.upsertChunkVector(db, .{
+            .workspace_id = row.workspace_id,
+            .collection_id = row.collection_id,
+            .doc_id = @intCast(row.doc_id),
+            .chunk_index = if (row.chunk_index) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else return error.ValueOutOfRange,
+            .dim = std.math.cast(u32, row.dim) orelse return error.ValueOutOfRange,
+            .embedding_blob = row.embedding_blob,
         });
     }
 
@@ -389,6 +664,20 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         });
     }
 
+    for (bundle.relation_properties_raw) |row| {
+        try collections_sqlite.upsertRelationPropertyRaw(db, .{
+            .workspace_id = row.workspace_id,
+            .relation_id = @intCast(row.relation_id),
+            .property_key = row.property_key,
+            .value_type = parseRelationPropertyValueType(row.value_type) orelse return error.ValueOutOfRange,
+            .value_text = row.value_text,
+            .value_number = row.value_number,
+            .value_integer = row.value_integer,
+            .ref_doc_id = if (row.ref_doc_id) |v| @intCast(v) else null,
+            .currency = row.currency,
+        });
+    }
+
     for (bundle.entity_documents_raw) |row| {
         try collections_sqlite.linkEntityDocumentRaw(db, .{
             .workspace_id = row.workspace_id,
@@ -445,6 +734,30 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     }
 
     try db.exec("COMMIT");
+}
+
+pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !BundleSummary {
+    const parsed = try std.json.parseFromSlice(Bundle, allocator, json_bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const bundle = parsed.value;
+
+    return .{
+        .kind = try allocator.dupe(u8, bundle.kind),
+        .schema_version = try allocator.dupe(u8, bundle.schema_version),
+        .scope_kind = try allocator.dupe(u8, bundle.scope.kind),
+        .workspace_id = try allocator.dupe(u8, bundle.scope.workspace_id),
+        .collection_id = if (bundle.scope.collection_id) |value| try allocator.dupe(u8, value) else null,
+        .workspace_count = bundle.workspaces.len,
+        .collection_count = bundle.collections.len,
+        .ontology_count = bundle.ontologies.len,
+        .ontology_value_count = bundle.ontology_values.len,
+        .document_count = bundle.documents_raw.len,
+        .chunk_count = bundle.chunks_raw.len,
+        .relation_property_count = bundle.relation_properties_raw.len,
+    };
 }
 
 // ---- Internal selectors ---------------------------------------------------
@@ -531,6 +844,298 @@ fn selectOntologies(arena: Allocator, db: Database, workspace_id: []const u8, co
             .frozen = c.sqlite3_column_int64(stmt, 4) != 0,
             .source_kind = try facet_sqlite.dupeColumnText(arena, stmt, 5),
             .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyNamespaces(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyNamespaceRow {
+    const sql_all =
+        \\SELECT n.ontology_id, n.namespace, n.label, n.parent_namespace, n.metadata_json
+        \\FROM ontology_namespaces n
+        \\JOIN ontologies o ON o.ontology_id = n.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY n.ontology_id, n.namespace
+    ;
+    const sql_attached =
+        \\SELECT n.ontology_id, n.namespace, n.label, n.parent_namespace, n.metadata_json
+        \\FROM ontology_namespaces n
+        \\JOIN collection_ontologies co ON co.ontology_id = n.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY n.ontology_id, n.namespace
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyNamespaceRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .namespace = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .label = try maybeColText(arena, stmt, 2),
+            .parent_namespace = try maybeColText(arena, stmt, 3),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyDimensions(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyDimensionRow {
+    const sql_all =
+        \\SELECT d.ontology_id, d.namespace, d.dimension, d.value_type, d.is_multi, d.hierarchy_kind, d.metadata_json
+        \\FROM ontology_dimensions d
+        \\JOIN ontologies o ON o.ontology_id = d.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY d.ontology_id, d.namespace, d.dimension
+    ;
+    const sql_attached =
+        \\SELECT d.ontology_id, d.namespace, d.dimension, d.value_type, d.is_multi, d.hierarchy_kind, d.metadata_json
+        \\FROM ontology_dimensions d
+        \\JOIN collection_ontologies co ON co.ontology_id = d.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY d.ontology_id, d.namespace, d.dimension
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyDimensionRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .namespace = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .dimension = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_type = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .is_multi = c.sqlite3_column_int64(stmt, 4) != 0,
+            .hierarchy_kind = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyValues(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyValueRow {
+    const sql_all =
+        \\SELECT v.ontology_id, v.namespace, v.dimension, v.value_id, v.value, v.parent_value_id, v.label, v.metadata_json
+        \\FROM ontology_values v
+        \\JOIN ontologies o ON o.ontology_id = v.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY v.ontology_id, v.namespace, v.dimension, v.value_id
+    ;
+    const sql_attached =
+        \\SELECT v.ontology_id, v.namespace, v.dimension, v.value_id, v.value, v.parent_value_id, v.label, v.metadata_json
+        \\FROM ontology_values v
+        \\JOIN collection_ontologies co ON co.ontology_id = v.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY v.ontology_id, v.namespace, v.dimension, v.value_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyValueRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .namespace = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .dimension = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_id = c.sqlite3_column_int64(stmt, 3),
+            .value = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .parent_value_id = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 5),
+            .label = try maybeColText(arena, stmt, 6),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyEntityTypes(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyEntityTypeRow {
+    const sql_all =
+        \\SELECT et.ontology_id, et.entity_type, et.label, et.metadata_json
+        \\FROM ontology_entity_types et
+        \\JOIN ontologies o ON o.ontology_id = et.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY et.ontology_id, et.entity_type
+    ;
+    const sql_attached =
+        \\SELECT et.ontology_id, et.entity_type, et.label, et.metadata_json
+        \\FROM ontology_entity_types et
+        \\JOIN collection_ontologies co ON co.ontology_id = et.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY et.ontology_id, et.entity_type
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyEntityTypeRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .entity_type = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .label = try maybeColText(arena, stmt, 2),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyEdgeTypes(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyEdgeTypeRow {
+    const sql_all =
+        \\SELECT et.ontology_id, et.edge_type, et.directed, et.source_entity_type, et.target_entity_type, et.metadata_json
+        \\FROM ontology_edge_types et
+        \\JOIN ontologies o ON o.ontology_id = et.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY et.ontology_id, et.edge_type
+    ;
+    const sql_attached =
+        \\SELECT et.ontology_id, et.edge_type, et.directed, et.source_entity_type, et.target_entity_type, et.metadata_json
+        \\FROM ontology_edge_types et
+        \\JOIN collection_ontologies co ON co.ontology_id = et.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY et.ontology_id, et.edge_type
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyEdgeTypeRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .edge_type = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .directed = c.sqlite3_column_int64(stmt, 2) != 0,
+            .source_entity_type = try maybeColText(arena, stmt, 3),
+            .target_entity_type = try maybeColText(arena, stmt, 4),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyEntities(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyEntityRow {
+    const sql_all =
+        \\SELECT e.ontology_id, e.entity_id, e.entity_type, e.name, e.metadata_json
+        \\FROM ontology_entities_raw e
+        \\JOIN ontologies o ON o.ontology_id = e.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY e.ontology_id, e.entity_id
+    ;
+    const sql_attached =
+        \\SELECT e.ontology_id, e.entity_id, e.entity_type, e.name, e.metadata_json
+        \\FROM ontology_entities_raw e
+        \\JOIN collection_ontologies co ON co.ontology_id = e.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY e.ontology_id, e.entity_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyEntityRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .entity_id = c.sqlite3_column_int64(stmt, 1),
+            .entity_type = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .label = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyRelations(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyRelationRow {
+    const sql_all =
+        \\SELECT r.ontology_id, r.relation_id, r.edge_type, r.source_entity_id, r.target_entity_id, r.metadata_json
+        \\FROM ontology_relations_raw r
+        \\JOIN ontologies o ON o.ontology_id = r.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY r.ontology_id, r.relation_id
+    ;
+    const sql_attached =
+        \\SELECT r.ontology_id, r.relation_id, r.edge_type, r.source_entity_id, r.target_entity_id, r.metadata_json
+        \\FROM ontology_relations_raw r
+        \\JOIN collection_ontologies co ON co.ontology_id = r.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY r.ontology_id, r.relation_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyRelationRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .relation_id = c.sqlite3_column_int64(stmt, 1),
+            .edge_type = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .source_entity_id = c.sqlite3_column_int64(stmt, 3),
+            .target_entity_id = c.sqlite3_column_int64(stmt, 4),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectOntologyTriples(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]OntologyTripleRow {
+    const sql_all =
+        \\SELECT t.ontology_id, t.triple_index, t.subject_kind, t.subject, t.predicate, t.object_kind, t.object_value, t.object_datatype, t.object_language, t.source_line, t.metadata_json
+        \\FROM ontology_triples_raw t
+        \\JOIN ontologies o ON o.ontology_id = t.ontology_id
+        \\WHERE o.workspace_id = ?1 OR o.workspace_id IS NULL
+        \\ORDER BY t.ontology_id, t.triple_index
+    ;
+    const sql_attached =
+        \\SELECT t.ontology_id, t.triple_index, t.subject_kind, t.subject, t.predicate, t.object_kind, t.object_value, t.object_datatype, t.object_language, t.source_line, t.metadata_json
+        \\FROM ontology_triples_raw t
+        \\JOIN collection_ontologies co ON co.ontology_id = t.ontology_id
+        \\WHERE co.workspace_id = ?1 AND co.collection_id = ?2
+        \\ORDER BY t.ontology_id, t.triple_index
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_attached);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyTripleRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .triple_index = c.sqlite3_column_int64(stmt, 1),
+            .subject_kind = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .subject = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .predicate = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .object_kind = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .object_value = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+            .object_datatype = try maybeColText(arena, stmt, 7),
+            .object_language = try maybeColText(arena, stmt, 8),
+            .source_line = try facet_sqlite.dupeColumnText(arena, stmt, 9),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 10),
         });
     }
     return rows.toOwnedSlice(arena);
@@ -646,6 +1251,66 @@ fn selectChunks(arena: Allocator, db: Database, workspace_id: []const u8, collec
             .token_count = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 9),
             .parent_chunk_index = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 10),
             .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 11),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectDocumentVectors(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]VectorRow {
+    const sql_all =
+        \\SELECT workspace_id, collection_id, doc_id, dim, embedding_blob
+        \\FROM documents_raw_vector WHERE workspace_id = ?1
+    ;
+    const sql_one =
+        \\SELECT workspace_id, collection_id, doc_id, dim, embedding_blob
+        \\FROM documents_raw_vector WHERE workspace_id = ?1 AND collection_id = ?2
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_one);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(VectorRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .collection_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .doc_id = c.sqlite3_column_int64(stmt, 2),
+            .chunk_index = null,
+            .dim = c.sqlite3_column_int64(stmt, 3),
+            .embedding_blob = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectChunkVectors(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]VectorRow {
+    const sql_all =
+        \\SELECT workspace_id, collection_id, doc_id, chunk_index, dim, embedding_blob
+        \\FROM chunks_raw_vector WHERE workspace_id = ?1
+    ;
+    const sql_one =
+        \\SELECT workspace_id, collection_id, doc_id, chunk_index, dim, embedding_blob
+        \\FROM chunks_raw_vector WHERE workspace_id = ?1 AND collection_id = ?2
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_one);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(VectorRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .collection_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .doc_id = c.sqlite3_column_int64(stmt, 2),
+            .chunk_index = c.sqlite3_column_int64(stmt, 3),
+            .dim = c.sqlite3_column_int64(stmt, 4),
+            .embedding_blob = try facet_sqlite.dupeColumnText(arena, stmt, 5),
         });
     }
     return rows.toOwnedSlice(arena);
@@ -798,6 +1463,35 @@ fn selectRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]
     return rows.toOwnedSlice(arena);
 }
 
+fn selectRelationProperties(arena: Allocator, db: Database, workspace_id: []const u8) ![]RelationPropertyRow {
+    const sql =
+        \\SELECT workspace_id, relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
+        \\FROM relation_properties_raw WHERE workspace_id = ?1
+        \\ORDER BY relation_id, property_key
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(RelationPropertyRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .relation_id = c.sqlite3_column_int64(stmt, 1),
+            .property_key = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_type = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .value_text = try maybeColText(arena, stmt, 4),
+            .value_number = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_double(stmt, 5),
+            .value_integer = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 6),
+            .ref_doc_id = if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 7),
+            .currency = try maybeColText(arena, stmt, 8),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
 fn selectEntityDocuments(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]EntityDocumentRow {
     const sql_all =
         \\SELECT workspace_id, entity_id, collection_id, doc_id, role, confidence
@@ -902,6 +1596,17 @@ fn maybeColText(arena: Allocator, stmt: *c.sqlite3_stmt, index: c_int) !?[]const
     return try facet_sqlite.dupeColumnText(arena, stmt, index);
 }
 
+fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
+    if (std.mem.eql(u8, value, "text")) return .text;
+    if (std.mem.eql(u8, value, "number")) return .number;
+    if (std.mem.eql(u8, value, "percentage_bp")) return .percentage_bp;
+    if (std.mem.eql(u8, value, "money_minor")) return .money_minor;
+    if (std.mem.eql(u8, value, "date_unix")) return .date_unix;
+    if (std.mem.eql(u8, value, "doc_ref")) return .doc_ref;
+    if (std.mem.eql(u8, value, "uri")) return .uri;
+    return null;
+}
+
 // ---- Tests ---------------------------------------------------------------
 
 test "export+import bundle round-trips workspace, collection, raw rows" {
@@ -936,6 +1641,43 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     });
     try collections_sqlite.ensureNamespace(db, .{ .ontology_id = "ws_round::core", .namespace = "topic" });
     try collections_sqlite.ensureDimension(db, .{ .ontology_id = "ws_round::core", .namespace = "topic", .dimension = "category" });
+    try collections_sqlite.ensureValue(db, .{
+        .ontology_id = "ws_round::core",
+        .namespace = "topic",
+        .dimension = "category",
+        .value_id = 1,
+        .value = "alpha",
+    });
+    try collections_sqlite.ensureEntityType(db, .{
+        .ontology_id = "ws_round::core",
+        .entity_type = "concept",
+        .label = "Concept",
+    });
+    try collections_sqlite.ensureEdgeType(db, .{
+        .ontology_id = "ws_round::core",
+        .edge_type = "depends_on",
+        .source_entity_type = "concept",
+        .target_entity_type = "concept",
+    });
+    try collections_sqlite.upsertOntologyEntity(db, .{
+        .ontology_id = "ws_round::core",
+        .entity_id = 10,
+        .entity_type = "concept",
+        .name = "alpha",
+    });
+    try collections_sqlite.upsertOntologyEntity(db, .{
+        .ontology_id = "ws_round::core",
+        .entity_id = 11,
+        .entity_type = "concept",
+        .name = "beta",
+    });
+    try collections_sqlite.upsertOntologyRelation(db, .{
+        .ontology_id = "ws_round::core",
+        .relation_id = 12,
+        .edge_type = "depends_on",
+        .source_entity_id = 10,
+        .target_entity_id = 11,
+    });
     try collections_sqlite.upsertFacetAssignmentRaw(db, .{
         .workspace_id = "ws_round",
         .collection_id = "ws_round::docs",
@@ -946,10 +1688,58 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
         .dimension = "category",
         .value = "alpha",
     });
+    try collections_sqlite.upsertDocumentVector(db, .{
+        .workspace_id = "ws_round",
+        .collection_id = "ws_round::docs",
+        .doc_id = 1,
+        .dim = 3,
+        .embedding_blob = "docvec",
+    });
+    try collections_sqlite.upsertChunkVector(db, .{
+        .workspace_id = "ws_round",
+        .collection_id = "ws_round::docs",
+        .doc_id = 1,
+        .chunk_index = 0,
+        .dim = 3,
+        .embedding_blob = "chunkvec",
+    });
+    try collections_sqlite.upsertEntityRaw(db, .{
+        .workspace_id = "ws_round",
+        .ontology_id = "ws_round::core",
+        .entity_id = 20,
+        .entity_type = "concept",
+        .name = "runtime_alpha",
+    });
+    try collections_sqlite.upsertEntityRaw(db, .{
+        .workspace_id = "ws_round",
+        .ontology_id = "ws_round::core",
+        .entity_id = 21,
+        .entity_type = "concept",
+        .name = "runtime_beta",
+    });
+    try collections_sqlite.upsertRelationRaw(db, .{
+        .workspace_id = "ws_round",
+        .ontology_id = "ws_round::core",
+        .relation_id = 30,
+        .edge_type = "depends_on",
+        .source_entity_id = 20,
+        .target_entity_id = 21,
+    });
+    try collections_sqlite.upsertRelationPropertyRaw(db, .{
+        .workspace_id = "ws_round",
+        .relation_id = 30,
+        .property_key = "confidence_note",
+        .value_type = .text,
+        .value_text = "learned",
+    });
 
     const bundle = try exportToJson(std.testing.allocator, db, .{ .workspace = "ws_round" });
     defer std.testing.allocator.free(bundle);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "ws_round::docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"kind\": \"ghostcrab_backup_bundle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"schema_version\": \"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"ontology_values\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "confidence_note") != null);
 
     var dest = try Database.openInMemory();
     defer dest.close();
@@ -962,6 +1752,109 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     defer facet_sqlite.finalize(stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const count_stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(count_stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+            return c.sqlite3_column_int64(count_stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = 'ws_round::core'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = 'ws_round::core' AND entity_id = 10"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM ontology_relations_raw WHERE ontology_id = 'ws_round::core'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM relation_properties_raw WHERE workspace_id = 'ws_round' AND property_key = 'confidence_note'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw_vector WHERE workspace_id = 'ws_round'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM chunks_raw_vector WHERE workspace_id = 'ws_round'"));
+}
+
+test "taxonomies-only bundle round-trips ontology body without documents" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws_taxo", .label = "Taxonomies" });
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = "ws_taxo::core",
+        .workspace_id = "ws_taxo",
+        .name = "core",
+    });
+    try collections_sqlite.ensureNamespace(db, .{ .ontology_id = "ws_taxo::core", .namespace = "topic" });
+    try collections_sqlite.ensureDimension(db, .{
+        .ontology_id = "ws_taxo::core",
+        .namespace = "topic",
+        .dimension = "category",
+        .is_multi = true,
+    });
+    try collections_sqlite.ensureValue(db, .{
+        .ontology_id = "ws_taxo::core",
+        .namespace = "topic",
+        .dimension = "category",
+        .value_id = 1,
+        .value = "alpha",
+        .label = "Alpha",
+    });
+    try collections_sqlite.ensureValue(db, .{
+        .ontology_id = "ws_taxo::core",
+        .namespace = "topic",
+        .dimension = "category",
+        .value_id = 2,
+        .value = "beta",
+        .label = "Beta",
+    });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws_taxo::core", .entity_type = "concept" });
+    try collections_sqlite.ensureEdgeType(db, .{
+        .ontology_id = "ws_taxo::core",
+        .edge_type = "related_to",
+        .source_entity_type = "concept",
+        .target_entity_type = "concept",
+    });
+    try collections_sqlite.upsertOntologyEntity(db, .{
+        .ontology_id = "ws_taxo::core",
+        .entity_id = 1,
+        .entity_type = "concept",
+        .name = "alpha",
+    });
+    try collections_sqlite.upsertOntologyRelation(db, .{
+        .ontology_id = "ws_taxo::core",
+        .relation_id = 1,
+        .edge_type = "related_to",
+        .source_entity_id = 1,
+        .target_entity_id = 1,
+    });
+
+    const bundle = try exportToJsonWithOptions(std.testing.allocator, db, .{ .taxonomies = "ws_taxo" }, .{});
+    defer std.testing.allocator.free(bundle);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"kind\": \"ghostcrab_backup_bundle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"kind\": \"taxonomies\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"documents_raw\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"ontology_values\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"value\": \"alpha\"") != null);
+
+    const summary = try summarizeBundleJson(std.testing.allocator, bundle);
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ghostcrab_backup_bundle", summary.kind);
+    try std.testing.expectEqualStrings("taxonomies", summary.scope_kind);
+    try std.testing.expectEqual(@as(usize, 2), summary.ontology_value_count);
+    try std.testing.expectEqual(@as(usize, 0), summary.document_count);
+
+    var dest = try Database.openInMemory();
+    defer dest.close();
+    try dest.applyStandaloneSchema();
+    try importBundleJson(dest, std.testing.allocator, bundle);
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM ontology_dimensions WHERE ontology_id = 'ws_taxo::core'"));
+    try std.testing.expectEqual(@as(i64, 2), try Counts.one(dest, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = 'ws_taxo::core'"));
+    try std.testing.expectEqual(@as(i64, 0), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw WHERE workspace_id = 'ws_taxo'"));
 }
 
 test "export+import bundle round-trips chunks, cross-collection links and entity bindings" {

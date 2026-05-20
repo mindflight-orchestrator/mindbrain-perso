@@ -209,6 +209,7 @@ test "sqlite schema includes the collection raw tables" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS ontology_edge_types") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS ontology_entities_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS ontology_relations_raw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS ontology_triples_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS documents_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS chunks_raw") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS documents_raw_vector") != null);

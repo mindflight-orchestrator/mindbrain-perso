@@ -819,6 +819,28 @@ CREATE INDEX IF NOT EXISTS ontology_relations_raw_source_idx
 CREATE INDEX IF NOT EXISTS ontology_relations_raw_target_idx
     ON ontology_relations_raw(ontology_id, target_entity_id);
 
+CREATE TABLE IF NOT EXISTS ontology_triples_raw (
+    ontology_id TEXT NOT NULL,
+    triple_index INTEGER NOT NULL,
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('iri', 'blank')),
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object_kind TEXT NOT NULL CHECK(object_kind IN ('iri', 'blank', 'literal')),
+    object_value TEXT NOT NULL,
+    object_datatype TEXT,
+    object_language TEXT,
+    source_line TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(ontology_id, triple_index),
+    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id)
+);
+
+CREATE INDEX IF NOT EXISTS ontology_triples_raw_subject_idx
+    ON ontology_triples_raw(ontology_id, subject);
+
+CREATE INDEX IF NOT EXISTS ontology_triples_raw_predicate_idx
+    ON ontology_triples_raw(ontology_id, predicate);
+
 CREATE TABLE IF NOT EXISTS documents_raw (
     workspace_id TEXT NOT NULL,
     collection_id TEXT NOT NULL,

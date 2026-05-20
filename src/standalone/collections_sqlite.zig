@@ -111,6 +111,20 @@ pub const OntologyRelationSpec = struct {
     metadata_json: []const u8 = "{}",
 };
 
+pub const OntologyTripleSpec = struct {
+    ontology_id: []const u8,
+    triple_index: u64,
+    subject_kind: []const u8,
+    subject: []const u8,
+    predicate: []const u8,
+    object_kind: []const u8,
+    object_value: []const u8,
+    object_datatype: ?[]const u8 = null,
+    object_language: ?[]const u8 = null,
+    source_line: []const u8,
+    metadata_json: []const u8 = "{}",
+};
+
 pub const DocumentRawSpec = struct {
     workspace_id: []const u8,
     collection_id: []const u8,
@@ -568,6 +582,37 @@ pub fn upsertOntologyRelation(db: Database, spec: OntologyRelationSpec) !void {
     try facet_sqlite.bindInt64(stmt, 4, spec.source_entity_id);
     try facet_sqlite.bindInt64(stmt, 5, spec.target_entity_id);
     try facet_sqlite.bindText(stmt, 6, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub fn upsertOntologyTriple(db: Database, spec: OntologyTripleSpec) !void {
+    const sql =
+        \\INSERT INTO ontology_triples_raw(ontology_id, triple_index, subject_kind, subject, predicate, object_kind, object_value, object_datatype, object_language, source_line, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        \\ON CONFLICT(ontology_id, triple_index) DO UPDATE SET
+        \\    subject_kind = excluded.subject_kind,
+        \\    subject = excluded.subject,
+        \\    predicate = excluded.predicate,
+        \\    object_kind = excluded.object_kind,
+        \\    object_value = excluded.object_value,
+        \\    object_datatype = excluded.object_datatype,
+        \\    object_language = excluded.object_language,
+        \\    source_line = excluded.source_line,
+        \\    metadata_json = excluded.metadata_json
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.ontology_id);
+    try facet_sqlite.bindInt64(stmt, 2, @as(i64, @intCast(spec.triple_index)));
+    try facet_sqlite.bindText(stmt, 3, spec.subject_kind);
+    try facet_sqlite.bindText(stmt, 4, spec.subject);
+    try facet_sqlite.bindText(stmt, 5, spec.predicate);
+    try facet_sqlite.bindText(stmt, 6, spec.object_kind);
+    try facet_sqlite.bindText(stmt, 7, spec.object_value);
+    if (spec.object_datatype) |dt| try facet_sqlite.bindText(stmt, 8, dt) else try facet_sqlite.bindNull(stmt, 8);
+    if (spec.object_language) |lang| try facet_sqlite.bindText(stmt, 9, lang) else try facet_sqlite.bindNull(stmt, 9);
+    try facet_sqlite.bindText(stmt, 10, spec.source_line);
+    try facet_sqlite.bindText(stmt, 11, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
 }
 

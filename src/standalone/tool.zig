@@ -18,6 +18,7 @@ const pragma_sqlite = mindbrain.pragma_sqlite;
 const queue_sqlite = mindbrain.queue_sqlite;
 const query_executor = mindbrain.query_executor;
 const ontology_sqlite = mindbrain.ontology_sqlite;
+const owl2_import = mindbrain.owl2_import;
 const search_sqlite = mindbrain.search_sqlite;
 const toon_exports = mindbrain.toon_exports;
 const db_benchmark = mindbrain.db_benchmark;
@@ -70,8 +71,28 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "ontology-import")) {
+        try runOntologyImportCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "ontology-export")) {
+        try runOntologyExportCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "qualification-vocab-list")) {
         try runQualificationVocabListCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "backup-export")) {
+        try runBackupExportCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "backup-load")) {
+        try runBackupLoadCommand(allocator, args[2..]);
         return;
     }
 
@@ -295,7 +316,11 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
         \\  mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
         \\  mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
+        \\  mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
+        \\  mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
+        \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
+        \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run]
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
         \\  mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
         \\  mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
@@ -1603,28 +1628,103 @@ fn facetCsvContains(csv: ?[]const u8, namespace: []const u8, dimension: []const 
     return false;
 }
 
-fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !void {
+fn runOntologyImportCommand(allocator: Allocator, args: []const []const u8) !void {
     var db_path: ?[]const u8 = null;
     var workspace_id: ?[]const u8 = null;
-    var collection_id: ?[]const u8 = null;
-    var output_path: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var materialize_graph = false;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--materialize-graph")) materialize_graph = true else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null or ontology_id == null or input_path == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), input_path.?, allocator, .unlimited);
+    defer allocator.free(content);
+
+    const summary = try owl2_import.importNTriples(db, allocator, workspace_id.?, ontology_id.?, content, .{
+        .ontology_name = name,
+        .materialize_graph = materialize_graph,
+    });
+    try writeStdout(
+        "{{\"ontology_id\":{f},\"triples\":{},\"classes\":{},\"object_properties\":{},\"datatype_properties\":{},\"ontology_relations\":{},\"graph_relations\":{}}}\n",
+        .{ std.json.fmt(summary.ontology_id, .{}), summary.triples, summary.classes, summary.object_properties, summary.datatype_properties, summary.ontology_relations, summary.graph_relations },
+    );
+}
+
+fn runOntologyExportCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var format: []const u8 = "ntriples";
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--format")) format = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or ontology_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const payload = if (std.mem.eql(u8, format, "ntriples"))
+        try owl2_import.exportNTriples(db, allocator, ontology_id.?)
+    else if (std.mem.eql(u8, format, "bundle")) blk: {
+        if (workspace_id == null) return CliError.InvalidArguments;
+        break :blk try collections_io.exportToJson(allocator, db, .{ .taxonomies = workspace_id.? });
+    } else return CliError.InvalidArguments;
+    defer allocator.free(payload);
+
+    if (output_path) |path| {
+        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+            .sub_path = path,
+            .data = payload,
+            .flags = .{ .truncate = true },
+        });
+    } else {
+        try writeStdout("{s}", .{payload});
+    }
+}
+
+fn runBackupExportCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var collection_id: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var scope_name: []const u8 = "workspace";
+    var include_vectors = true;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--scope")) scope_name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--no-vectors")) include_vectors = false else return CliError.InvalidArguments;
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    const scope: collections_io.Scope = if (std.mem.eql(u8, scope_name, "workspace"))
+        .{ .workspace = workspace_id.? }
+    else if (std.mem.eql(u8, scope_name, "taxonomies"))
+        .{ .taxonomies = workspace_id.? }
+    else if (std.mem.eql(u8, scope_name, "collection"))
+        .{ .collection = .{ .workspace_id = workspace_id.?, .collection_id = collection_id orelse return CliError.InvalidArguments } }
+    else
+        return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
 
-    const scope: collections_io.Scope = if (collection_id) |coll|
-        .{ .collection = .{ .workspace_id = workspace_id.?, .collection_id = coll } }
-    else
-        .{ .workspace = workspace_id.? };
-
-    const bundle = try collections_io.exportToJson(allocator, db, scope);
+    const bundle = try collections_io.exportToJsonWithOptions(allocator, db, scope, .{ .include_vectors = include_vectors });
     defer allocator.free(bundle);
 
     if (output_path) |path| {
@@ -1638,6 +1738,74 @@ fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !v
     }
 }
 
+fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var bundle_path: ?[]const u8 = null;
+    var dry_run = false;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else return CliError.InvalidArguments;
+    }
+    if (db_path == null or bundle_path == null) return CliError.InvalidArguments;
+
+    const buf = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), bundle_path.?, allocator, .unlimited);
+    defer allocator.free(buf);
+
+    if (dry_run) {
+        const summary = try collections_io.summarizeBundleJson(allocator, buf);
+        defer summary.deinit(allocator);
+        try writeStdout("{f}\n", .{std.json.fmt(.{
+            .kind = summary.kind,
+            .schema_version = summary.schema_version,
+            .scope = .{
+                .kind = summary.scope_kind,
+                .workspace_id = summary.workspace_id,
+                .collection_id = summary.collection_id,
+            },
+            .counts = .{
+                .workspaces = summary.workspace_count,
+                .collections = summary.collection_count,
+                .ontologies = summary.ontology_count,
+                .ontology_values = summary.ontology_value_count,
+                .documents = summary.document_count,
+                .chunks = summary.chunk_count,
+                .relation_properties = summary.relation_property_count,
+            },
+        }, .{})});
+        return;
+    }
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try collections_io.importBundleJson(db, allocator, buf);
+    try writeStdout("loaded backup bundle from {s}\n", .{bundle_path.?});
+}
+
+fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var collection_id: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var forwarded = std.ArrayList([]const u8).empty;
+    defer forwarded.deinit(allocator);
+    try forwarded.appendSlice(allocator, &.{ "--db", db_path.?, "--workspace-id", workspace_id.? });
+    if (collection_id) |coll| try forwarded.appendSlice(allocator, &.{ "--scope", "collection", "--collection-id", coll });
+    if (output_path) |path| try forwarded.appendSlice(allocator, &.{ "--output", path });
+    try runBackupExportCommand(allocator, forwarded.items);
+}
+
 fn runCollectionImportCommand(allocator: Allocator, args: []const []const u8) !void {
     var db_path: ?[]const u8 = null;
     var bundle_path: ?[]const u8 = null;
@@ -1649,15 +1817,7 @@ fn runCollectionImportCommand(allocator: Allocator, args: []const []const u8) !v
     }
     if (db_path == null or bundle_path == null) return CliError.InvalidArguments;
 
-    var db = try facet_sqlite.Database.open(db_path.?);
-    defer db.close();
-    try db.applyStandaloneSchema();
-
-    const buf = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), bundle_path.?, allocator, .unlimited);
-    defer allocator.free(buf);
-
-    try collections_io.importBundleJson(db, allocator, buf);
-    try writeStdout("imported bundle from {s}\n", .{bundle_path.?});
+    try runBackupLoadCommand(allocator, &.{ "--db", db_path.?, "--bundle", bundle_path.? });
 }
 
 fn parseChunkerStrategy(value: []const u8) ?chunker.Strategy {

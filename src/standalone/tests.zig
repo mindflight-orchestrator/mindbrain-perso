@@ -41,6 +41,7 @@ comptime {
     _ = @import("chunking_policy.zig");
     _ = @import("native_compat_test.zig");
     _ = @import("ontology_sqlite.zig");
+    _ = @import("owl2_import.zig");
     _ = @import("pragma_dsl.zig");
     _ = @import("pragma_sqlite.zig");
     _ = @import("query_executor.zig");

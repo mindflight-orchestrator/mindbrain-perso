@@ -25,6 +25,7 @@ pub const nanoid = @import("nanoid.zig");
 pub const chunker = @import("chunker.zig");
 pub const chunking_policy = @import("chunking_policy.zig");
 pub const ontology_sqlite = @import("ontology_sqlite.zig");
+pub const owl2_import = @import("owl2_import.zig");
 pub const pragma_dsl = @import("pragma_dsl.zig");
 pub const pragma_projection_types = @import("pragma_projection_types.zig");
 pub const pragma_sqlite = @import("pragma_sqlite.zig");
