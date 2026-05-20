@@ -13,6 +13,12 @@ The graph stores a typed knowledge graph alongside facet-indexed documents. Nati
 > `Pipeline.reindexGraph(...)` and can be rebuilt at any time from the
 > raw rows.
 
+OWL2 imports should follow the same rule. Class/property/individual triples
+belong in the raw ontology and graph tables first; the serving graph should be
+rebuilt from those raw rows instead of importing directly into derived graph
+tables. See [collections.md](collections.md) and
+[plan/2026-05-20-owl.md](plan/2026-05-20-owl.md).
+
 ## Core tables
 
 | Table | Role |
@@ -77,6 +83,19 @@ Commented examples in the SQL file (search for `Example usage`) show insert → 
 ## Workspace isolation
 
 `graph.entity` and `graph.relation` include **`workspace_id`** (default `'default'`) aligned with **`mindbrain.workspaces`**. Filter by workspace in application queries when serving multiple tenants.
+
+## OWL2 graph projection
+
+The OWL2 importer projects queryable facts into the graph only when
+`--materialize-graph` is passed:
+
+- classes and properties are preserved as ontology nodes for taxonomy/schema
+  traversal;
+- individual assertions become normal entity/relation rows;
+- OWL axioms such as `subClassOf`, `subPropertyOf`, `inverseOf`, `sameAs`, and
+  `equivalentClass` use reserved edge labels in ontology relations;
+- restrictions, RDF lists, and unsupported constructs remain preserved in raw
+  triples/metadata unless a specific graph projection is implemented.
 
 ## Client examples
 

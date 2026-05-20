@@ -114,6 +114,10 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`workspace-export`** — Emits **TOON** workspace model export to stdout.
 - **`workspace-create` / `collection-create` / `collection-export` / `collection-import`** — Workspace and collection lifecycle plus portable JSON bundle export/import.
 - **`ontology-register` / `ontology-attach`** — Register workspace-scoped ontologies and attach them to collections.
+- **`ontology-import` / `ontology-export`** — Import normalized OWL2/RDF
+  N-Triples into `ontology_triples_raw`, project simple ontology facts, optional
+  graph materialization with `--materialize-graph`, and export preserved
+  N-Triples or a workspace taxonomies bundle.
 - **`graph-path`** — Path finding between named nodes.
 - **`benchmark-db`** — Runs facet and graph query/mutation benchmarks against a SQLite database and returns JSON with embedded TOON payloads for the facet and graph query results.
 - **`graph/subgraph`** — SSE graph stream for browser clients (`seed_node`, `node`, `edge`, `done`).

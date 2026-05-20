@@ -9,6 +9,17 @@ It keeps the public CLI/HTTP shape stable while improving graph ingestion,
 graph stream expansion, BM25/hybrid search hot paths, compact-store lookup
 speed, and vector result scoping by `table_id`.
 
+## Current ontology work
+
+OWL2 import/export has a first standalone implementation for normalized
+RDF/N-Triples input. `mindbrain-standalone-tool ontology-import` preserves raw
+triples in `ontology_triples_raw`, projects simple classes/properties/relations
+into ontology tables, and can optionally materialize object triples into
+`entities_raw` / `relations_raw`. `ontology-export` can emit preserved
+N-Triples or a taxonomies bundle. Full OWL2 reasoning is still out of scope for
+the SQLite MVP; follow-up work is tracked in
+[plan/2026-05-20-owl.md](plan/2026-05-20-owl.md).
+
 ## Start here
 
 | Document | Description |
@@ -26,6 +37,7 @@ speed, and vector result scoping by `table_id`.
 | [standalone.md](standalone.md) | SQLite engine, tests, benchmarks, `mindbrain-standalone-tool` |
 | [document-profile.md](document-profile.md) | PDF/HTML normalization, LLM document profiling, chunking policy, queue worker, `corpus-eval` |
 | [demo-benchmark.md](demo-benchmark.md) | Demo seeding and IMDb/YAGO benchmark contract, including PostgreSQL-side implementation guidance |
+| [source/README.md](source/README.md) | Official OWL2 source references and local N-Triples fixtures used by ontology import tests |
 | [native-reference.md](native-reference.md) | Native Zig symbol reference |
 | [third-party.md](third-party.md) | Bundled native dependencies (attribution) |
 | [dev/sqlite-backport-plan.md](dev/sqlite-backport-plan.md) | SQLite-first port plan for newer graph/facet behavior |

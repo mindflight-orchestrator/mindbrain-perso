@@ -15,6 +15,11 @@ The repository now separates three concerns:
 2. **Demo code**: small deterministic data used to exercise the product end-to-end.
 3. **Benchmark code**: dataset-specific importers for IMDb and YAGO plus full-DB facet/graph workload benchmarks.
 
+OWL2 source fixtures under [source/](source/) are not benchmark datasets. They
+are small conformance-oriented inputs for the standalone ontology importer tests.
+Keep them in documentation/test-source space rather than merging them into the
+demo or large dataset benchmark flows.
+
 The demo and benchmark entrypoints should remain thin wrappers around reusable library operations. They should not define core schema logic beyond what is required to seed or import their own data.
 
 ## Current Command Surface
@@ -148,6 +153,10 @@ Required behaviors:
 5. Treat label predicates as aliases in addition to normal relations.
 6. Stage data in temporary tables before flushing into persistent graph tables.
 7. Rebuild adjacency and entity degree after import.
+
+YAGO parsing remains dataset-specific. It should not become the general OWL2
+importer; the OWL2 plan requires a separate normalized RDF/N-Triples import
+path that preserves triples and handles ontology vocabulary explicitly.
 
 ### Benchmark Output
 

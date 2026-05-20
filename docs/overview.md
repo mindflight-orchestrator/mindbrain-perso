@@ -14,6 +14,24 @@ indexes incrementally for common writes and use bounded top-k selection for
 vector and hybrid retrieval, so large candidate sets no longer require full
 artifact rebuilds or full-result sorting on every query.
 
+## Ontology Import
+
+The standalone runtime now includes a first OWL2 import/export path for
+normalized RDF/N-Triples:
+
+1. `ontology-import` stores every parsed triple in `ontology_triples_raw`.
+2. Simple OWL/RDFS declarations are projected into ontology entity, edge, and
+   dimension tables.
+3. With `--materialize-graph`, object triples are also mirrored into
+   `entities_raw` / `relations_raw`.
+4. `ontology-export --format ntriples` emits the preserved triples, and
+   `--format bundle` emits the taxonomies bundle for a workspace.
+5. Full OWL2 reasoning remains out of scope for the SQLite MVP.
+
+The follow-up plan is [plan/2026-05-20-owl.md](plan/2026-05-20-owl.md).
+The test-source directory is [source/](source/), which links to W3C OWL2
+references and contains small N-Triples fixtures.
+
 ## Architecture
 
 ```mermaid
@@ -27,9 +45,11 @@ flowchart LR
   SQL --> mindbrainSch[mindbrain schema]
   SQL --> pragmaFn[pragma SQL functions]
   SQL --> ontoSch[mb_ontology functions]
+  SQL --> rawOnt[collections raw ontology tables]
   Zig --> facetsSch
   Zig --> graphSch
   Zig --> pragmaFn
+  Zig --> rawOnt
 ```
 
 ## Zig modules

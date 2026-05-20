@@ -53,6 +53,24 @@ workspace-scoped and can be attached to any collection in the workspace
 via `collection_ontologies`. If a collection has no ontology attached,
 the workspace `default_ontology_id` is used.
 
+## OWL2 import
+
+The collections raw layer is the landing zone for the standalone OWL2 MVP. The
+implemented format is normalized RDF/N-Triples; fixtures and W3C references live
+in [source/](source/).
+
+The current mapping is:
+
+- ontology headers map to `ontologies`;
+- every source triple maps to `ontology_triples_raw`;
+- classes map to `ontology_entity_types`;
+- object properties map to `ontology_edge_types`;
+- datatype properties map to ontology dimensions or typed properties;
+- individuals and object-property assertions map to `entities_raw` and
+  `relations_raw` when graph materialization is requested;
+- restrictions, blank nodes, RDF lists, and unsupported OWL expressions remain
+  preserved as raw triples even when no reasoner projection exists yet.
+
 ## SQLite tables
 
 All tables live in the standalone schema (`src/standalone/sqlite_schema.zig`):
