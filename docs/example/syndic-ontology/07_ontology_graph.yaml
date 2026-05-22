@@ -1,0 +1,346 @@
+# ============================================================
+# ONTOLOGIE MINDBRAIN — Syndic Immeuble 5 Appartements
+# ============================================================
+# Ce fichier consolide :
+#   1. Les types de noeuds du domaine syndic
+#   2. Les relations et leurs proprietes
+#   3. Le graphe de scenarios
+#   4. Les user stories et requetes agent
+# ============================================================
+
+ontology:
+  id: syndic_building_ontology
+  version: "1.0.0"
+  description: "Ontologie syndic pour immeuble, menages, propriete, occupation, facturation et historique"
+
+  node_types:
+    - id: Immeuble
+      description: "Batiment gere par le syndic"
+      properties:
+        - label: string
+        - lot_count: integer
+        - status: enum[actif, archive]
+
+    - id: Lot
+      description: "Unite privative ou commune"
+      properties:
+        - label: string
+        - lot_kind: enum[appartement, garage, cave, hall, ascenseur, espace_machine_laver]
+        - floor: integer (optional)
+        - status: enum[actif, archive]
+
+    - id: Personne
+      description: "Personne physique"
+      properties:
+        - label: string
+        - profile: string
+
+    - id: Menage
+      description: "Unite de vie occupant un lot"
+      properties:
+        - label: string
+        - household_profile: enum[celibataire, vieux_couple_sans_enfants_dans_le_lot, couple_avec_2_enfants]
+        - members: list[Personne]
+
+    - id: GroupeConceptuel
+      description: "Identite stable d'un groupe metier"
+      properties:
+        - group_kind: enum[patrimonial, facturation]
+        - label: string
+
+    - id: GroupeVersion
+      description: "Version datee d'un groupe conceptuel"
+      properties:
+        - version_of: GroupeConceptuel
+        - validFrom: date
+        - validTo: date (optional)
+        - status: enum[brouillon, actif, cloture, conteste, archive]
+
+    - id: Membership
+      description: "Appartenance qualifiee a un menage ou a un groupe versionne"
+      properties:
+        - member: Personne
+        - group: Menage | GroupeVersion
+        - role: enum[occupant, conjoint, enfant, co_titulaire, co_redevable, payeur_principal]
+        - share_bp: integer (optional)
+        - validFrom: date
+        - validTo: date (optional)
+
+    - id: RelationPropriete
+      description: "Relation reifiee de propriete"
+      properties:
+        - ownership_kind: enum[pleine_propriete, nue_propriete, usufruit, indivision, succession_en_cours]
+        - share_bp: integer
+        - legalEffectiveFrom: date
+        - legalEffectiveTo: date (optional)
+        - status: enum[confirme, a_verifier, succession_en_cours, cloture]
+
+    - id: RelationOccupation
+      description: "Relation reifiee d'occupation"
+      properties:
+        - household: Menage
+        - target: Lot
+        - validFrom: date
+        - validTo: date (optional)
+        - status: enum[actif, cloture, conteste]
+
+    - id: GroupeFacturable
+      description: "Groupe operationnel de facturation"
+      properties:
+        - group_version: GroupeVersion
+        - billed_household: Menage
+        - rule: RegleFacturation
+
+    - id: RegleFacturation
+      description: "Regle d'imputation ou de repartition"
+      properties:
+        - basis: enum[occupant_household, ownership_share, custom_share]
+
+    - id: Evenement
+      description: "Evenement qui cree, cloture ou impacte un etat"
+      properties:
+        - eventDate: date
+        - knownDate: date (optional)
+        - evidenceDate: date (optional)
+        - recordedDate: date (optional)
+        - billingEffectiveDate: date (optional)
+
+    - id: DocumentPreuve
+      description: "Document justificatif"
+      properties:
+        - document_kind: enum[titre_propriete, fiche_syndic, acte_deces, acte_succession, courrier, decision_ag]
+        - label: string
+
+    - id: UserStory
+      description: "Projection requetable par un agent"
+      properties:
+        - goal: string
+        - actor: string
+        - story_type: enum[how_to, locate, scenario, branch_explore]
+        - steps: list
+
+  relation_types:
+    - id: CONTIENT
+      source: Immeuble
+      target: Lot
+    - id: ANNEXE_A
+      source: Lot
+      target: Lot
+    - id: MEMBRE_DE
+      source: Personne
+      target: Menage | GroupeVersion
+    - id: CONJOINT_DE
+      source: Personne
+      target: Personne
+    - id: PARENT_DE
+      source: Personne
+      target: Personne
+    - id: A_VERSION
+      source: GroupeConceptuel
+      target: GroupeVersion
+    - id: VERSION_DE
+      source: GroupeVersion
+      target: GroupeConceptuel
+    - id: POSSEDE
+      source: GroupeVersion | Personne | Menage
+      target: Immeuble | Lot
+      property_profile: ownership_relation
+    - id: OCCUPE
+      source: Menage
+      target: Lot
+      property_profile: occupation_relation
+    - id: FACTURABLE_POUR
+      source: GroupeVersion
+      target: Lot
+      property_profile: billing_relation
+    - id: PROUVE
+      source: DocumentPreuve
+      target: RelationPropriete | RelationOccupation | GroupeVersion | Evenement
+    - id: CREE
+      source: Evenement
+      target: GroupeVersion | Membership | RelationPropriete | RelationOccupation
+    - id: CLOTURE
+      source: Evenement
+      target: GroupeVersion | Membership | RelationPropriete | RelationOccupation
+    - id: REMPLACE
+      source: GroupeVersion
+      target: GroupeVersion
+
+  property_profiles:
+    temporal_relation:
+      fields:
+        - validFrom: date
+        - validTo: date (optional)
+        - legalEffectiveFrom: date (optional)
+        - legalEffectiveTo: date (optional)
+        - operationalEffectiveFrom: date (optional)
+        - operationalEffectiveTo: date (optional)
+        - billingEffectiveFrom: date (optional)
+        - billingEffectiveTo: date (optional)
+        - recordedAt: datetime (optional)
+
+    qualified_end:
+      fields:
+        - endReasonCode: enum[DEATH, DIVORCE, SALE, DONATION, SUCCESSION_TRANSFER, LEASE_END, OWNER_CHANGE, PAYER_CHANGE, DATA_CORRECTION]
+        - endEvent: Evenement (optional)
+        - endDocument: DocumentPreuve (optional)
+        - endNote: string (optional)
+        - replacedBy: reference (optional)
+
+    ownership_relation:
+      extends: [temporal_relation, qualified_end]
+      fields:
+        - ownership_kind: string
+        - share_bp: integer
+        - confirmedByDocument: DocumentPreuve
+
+    occupation_relation:
+      extends: [temporal_relation, qualified_end]
+      fields:
+        - household: Menage
+        - occupation_kind: string
+
+    billing_relation:
+      extends: [temporal_relation, qualified_end]
+      fields:
+        - billed_household: Menage
+        - rule: RegleFacturation
+
+  scenarios:
+    - id: scenario_immeuble_inventory
+      file: 01_immeuble.yaml
+      terminal_success: scenario_menages_occupants
+    - id: scenario_menages_occupants
+      file: 02_menages.yaml
+      terminal_success: scenario_propriete_immeuble
+    - id: scenario_propriete_immeuble
+      file: 03_propriete.yaml
+      terminal_success: scenario_occupation_facturation
+    - id: scenario_occupation_facturation
+      file: 04_occupation_facturation.yaml
+      terminal_success: scenario_evenements_historique
+    - id: scenario_evenements_historique
+      file: 05_evenements_historique.yaml
+      terminal_success: scenario_agent_queries
+    - id: scenario_agent_queries
+      file: 06_agent_queries.yaml
+      terminal_success: final
+
+  scenario_graph:
+    scenario_immeuble_inventory:
+      possible_actions:
+        - id: action_validate_building_inventory
+          branches:
+            - { condition: valid, next: scenario_menages_occupants }
+            - { condition: missing_lot, next: self, side_effect: require_inventory_correction }
+
+    scenario_menages_occupants:
+      possible_actions:
+        - id: action_validate_households
+          branches:
+            - { condition: valid, next: scenario_propriete_immeuble }
+            - { condition: missing_family_link, next: self, side_effect: require_family_relation }
+
+    scenario_propriete_immeuble:
+      possible_actions:
+        - id: action_validate_ownership
+          branches:
+            - { condition: valid, next: scenario_occupation_facturation }
+            - { condition: missing_evidence, next: self, side_effect: request_title_document }
+
+    scenario_occupation_facturation:
+      possible_actions:
+        - id: action_validate_billing
+          branches:
+            - { condition: valid, next: scenario_evenements_historique }
+            - { condition: missing_billing_group, next: self, side_effect: create_billing_group_version }
+
+    scenario_evenements_historique:
+      possible_actions:
+        - id: action_apply_membership_change
+          branches:
+            - { condition: death_impacts_billing, next: self, side_effect: create_new_billing_group_version }
+            - { condition: death_only_flags_property, next: self, side_effect: mark_property_relation_as_succession_en_cours }
+            - { condition: ownership_transfer_document_received, next: self, side_effect: create_replacement_property_relation }
+
+  user_stories:
+    - id: story_building_baseline
+      name: "Construire le graphe initial de l'immeuble"
+      actor: "Agent syndic"
+      goal: "Creer le graphe complet immeuble -> menages -> propriete -> facturation"
+      story_type: how_to
+      intent_keywords: [immeuble, graphe, initial, syndic, baseline]
+      steps:
+        - { step: 1, scenario: scenario_immeuble_inventory, action: action_validate_building_inventory, branch: valid }
+        - { step: 2, scenario: scenario_menages_occupants, action: action_validate_households, branch: valid }
+        - { step: 3, scenario: scenario_propriete_immeuble, action: action_validate_ownership, branch: valid }
+        - { step: 4, scenario: scenario_occupation_facturation, action: action_validate_billing, branch: valid }
+
+    - id: story_find_son_apartment
+      name: "Trouver l'appartement du fils"
+      actor: "Agent syndic"
+      goal: "Partir du lien familial puis rejoindre le menage et l'appartement occupe"
+      story_type: locate
+      intent_keywords: [fils, appartement, occupe, vieux, couple]
+      steps:
+        - { step: 1, node: andre_vieux_couple, relation: PARENT_DE, target: pierre_fils }
+        - { step: 2, node: pierre_fils, relation: MEMBRE_DE, target: menage_pierre_sophie }
+        - { step: 3, node: menage_pierre_sophie, relation: OCCUPE, target: appartement_04 }
+
+    - id: story_change_billing_group_version
+      name: "Versionner un groupe facturable apres changement"
+      actor: "Agent syndic"
+      goal: "Preserver l'historique des factures"
+      story_type: scenario
+      intent_keywords: [groupe, facturation, version, historique, deces]
+      steps:
+        - { step: 1, scenario: scenario_evenements_historique, action: action_apply_membership_change, branch: death_impacts_billing }
+        - { step: 2, side_effect: close_previous_billing_group_version }
+        - { step: 3, side_effect: create_new_billing_group_version }
+        - { step: 4, rule: invoice_points_to_group_version }
+
+  entity_scenarios:
+    immeuble:
+      scenarios:
+        - name: inventory
+          entry: scenario_immeuble_inventory
+          terminal: scenario_menages_occupants
+    menage:
+      scenarios:
+        - name: occupant_mapping
+          entry: scenario_menages_occupants
+          terminal: scenario_occupation_facturation
+    propriete:
+      scenarios:
+        - name: owner_group
+          entry: scenario_propriete_immeuble
+          terminal: scenario_occupation_facturation
+        - name: transfer_after_succession
+          entry: scenario_evenements_historique
+          action: action_apply_membership_change
+    facturation:
+      scenarios:
+        - name: create_billing_group_version
+          entry: scenario_occupation_facturation
+          terminal: scenario_evenements_historique
+        - name: replace_billing_group_version
+          entry: scenario_evenements_historique
+          action: action_apply_membership_change
+
+  agent_query_index:
+    - query: "Qui possede l'immeuble ?"
+      resolve:
+        node_type: RelationPropriete
+        filter: { target: immeuble_residence_du_parc, status: confirme }
+    - query: "Ou vit le fils du vieux couple ?"
+      resolve:
+        node_type: UserStory
+        filter: { id: story_find_son_apartment }
+    - query: "Quels groupes facturables sont actifs ?"
+      resolve:
+        node_type: GroupeVersion
+        filter: { group_kind: facturation, validTo: null, status: actif }
+    - query: "Que faire si un membre facturable decede ?"
+      resolve:
+        node_type: Branch
+        filter: { action: action_apply_membership_change, condition: death_impacts_billing }

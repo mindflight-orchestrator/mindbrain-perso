@@ -1,0 +1,493 @@
+# Reference GhostCrab ontologies inferred from the v1.3.2 source and the
+# supplied "REFERENCE GHOSTCRAB" screen.
+#
+# Purpose:
+# - make the ontology implicit in src/bootstrap/seed.ts, src/db/ontology-loadouts.ts,
+#   src/tools/catalog.ts, and the reference UI explicit;
+# - keep loadout starters separate from the GhostCrab meta-model;
+# - provide a registration-friendly source for schema, graph, and typed-facet work.
+
+artifact:
+  id: ghostcrab-reference-ontologies
+  version: 1
+  product_version: 1.3.2
+  status: draft-derived-from-code
+  generated_from:
+    - src/bootstrap/seed.ts
+    - src/db/ontology-loadouts.ts
+    - src/tools/catalog.ts
+    - src/tools/facets/typed-facets.ts
+    - src/tools/workspace/loadout-seed.ts
+    - supplied reference screen: REFERENCE GHOSTCRAB
+  image_summary:
+    declared_facets_count: 95
+    native_pg_mindbrain_count: 12
+    loadout_count: 7
+    contract: dist
+    basic_tool_count: 11
+    mcp_module_count: 39
+    visible_loadouts:
+      - default-minimal
+      - crm
+      - kanban
+      - knowledge-base
+      - incident-response
+      - compliance
+    visible_tools:
+      - ghostcrab_typed_facet_upsert
+      - ghostcrab_typed_facet_query
+      - ghostcrab_tool_search
+
+ontologies:
+  - ontology_id: ghostcrab-reference-meta
+    label: GhostCrab Reference Meta Ontology
+    description: >
+      Describes GhostCrab itself: activity families, modeling recipes,
+      projection recipes, intent routing, signal patterns, capability and
+      autonomy policies, typed facets, tool catalog facets, and runtime
+      compatibility signals.
+    scope: product-reference
+    source_confidence: high
+    schemas:
+      - schema_id: ghostcrab:activity-family
+        target: facets
+        description: Reusable domain family used to route modeling, projection, and KPI behavior.
+        required_facets:
+          activity_family: string
+          maturity: enum
+          default_projection: string
+        optional_facets:
+          keywords: array
+          default_scope: string
+          title: string
+      - schema_id: ghostcrab:modeling-recipe
+        target: facets
+        description: Recipe for creating a provisional domain model from facts, graph structure, and projections.
+        required_facets:
+          activity_family: string
+          recipe_stage: string
+          provisional_namespace: string
+        optional_facets:
+          fact_schema_hint: string
+          graph_node_hint: string
+          graph_edge_labels: array
+      - schema_id: ghostcrab:projection-recipe
+        target: facets
+        description: Compact working view or heartbeat recipe for an activity family.
+        required_facets:
+          activity_family: string
+          projection_kind: string
+          trigger: string
+        optional_facets:
+          target_budget: number
+          preferred_kpis: array
+          preferred_proj_type: string
+          render_sections: array
+          preferred_output_formats: array
+      - schema_id: ghostcrab:kpi-pattern
+        target: facets
+        description: Grouped metric pattern to read before loading detailed facts.
+        required_facets:
+          activity_family: string
+          metric_name: string
+          facet_key: string
+        optional_facets:
+          schema_id: string
+          filter_key: string
+          filter_value: string
+      - schema_id: ghostcrab:intent-pattern
+        target: facets
+        description: User intent routing rule toward an activity family and default action.
+        required_facets:
+          intent_id: string
+          job: string
+          requires_ghostcrab: boolean
+        optional_facets:
+          candidate_activity_families: array
+          default_action: string
+          requires_confirmation: boolean
+      - schema_id: ghostcrab:signal-pattern
+        target: facets
+        description: Language or external cue pattern used to infer likely activity families.
+        required_facets:
+          signal_id: string
+          signal_type: string
+          candidate_activity_families: array
+        optional_facets:
+          examples: array
+          implies_tracking: boolean
+          source_kind: string
+      - schema_id: ghostcrab:capability
+        target: facets
+        description: Capability statement controlling what an agent may do without further confirmation.
+        required_facets:
+          capability: string
+          scope: string
+          autonomy_level: enum
+        optional_facets:
+          requires_confirmation: boolean
+          activity_family: string
+      - schema_id: ghostcrab:autonomy-policy
+        target: facets
+        description: Policy for autonomous execution, disclosure, and escalation.
+        required_facets:
+          policy_id: string
+          scope: string
+          action: string
+        optional_facets:
+          confirmation_required: boolean
+          applies_to: string
+          escalation_mode: string
+      - schema_id: ghostcrab:native-compatibility
+        target: facets
+        description: Compatibility statement for native pg_mindbrain and extension-backed capability.
+        required_facets:
+          component: string
+          compatibility_state: enum
+        optional_facets:
+          endpoint_kind: string
+          blocker: boolean
+          confirmation_required: boolean
+      - schema_id: ghostcrab:tool-catalog-entry
+        target: facets
+        description: MCP tool catalog entry exposed through compact default listing plus faceted tool search.
+        required_facets:
+          tool_name: string
+          access: enum
+          subsystem: enum
+          visibility: enum
+        optional_facets:
+          name_prefix: string
+          required_arguments: array
+          arguments: array
+          component: string
+    entity_types:
+      - name: activity_family
+        key_facets: [activity_family, maturity, default_projection, default_scope]
+      - name: modeling_recipe
+        key_facets: [activity_family, recipe_stage, provisional_namespace]
+      - name: projection_recipe
+        key_facets: [activity_family, projection_kind, trigger]
+      - name: kpi_pattern
+        key_facets: [activity_family, metric_name, facet_key]
+      - name: intent_pattern
+        key_facets: [intent_id, job, candidate_activity_families]
+      - name: signal_pattern
+        key_facets: [signal_id, signal_type, candidate_activity_families]
+      - name: capability
+        key_facets: [capability, scope, autonomy_level]
+      - name: autonomy_policy
+        key_facets: [policy_id, scope, action]
+      - name: mcp_tool
+        key_facets: [tool_name, access, subsystem, visibility]
+      - name: native_component
+        key_facets: [component, compatibility_state]
+    relation_types:
+      - name: routes_to_family
+        source: intent_pattern
+        target: activity_family
+      - name: signalled_by
+        source: activity_family
+        target: signal_pattern
+      - name: has_modeling_recipe
+        source: activity_family
+        target: modeling_recipe
+      - name: has_projection_recipe
+        source: activity_family
+        target: projection_recipe
+      - name: has_kpi_pattern
+        source: activity_family
+        target: kpi_pattern
+      - name: governed_by
+        source: capability
+        target: autonomy_policy
+      - name: discovered_by
+        source: mcp_tool
+        target: mcp_tool
+        note: ghostcrab_tool_search discovers extended tools from the compact default surface.
+    typed_facet_namespaces:
+      - namespace: ghostcrab
+        dimensions_from_reference_screen:
+          - action
+          - activity_family
+          - applies_to
+          - autonomy_level
+          - blocker
+          - candidate_activity_families
+          - capability
+          - category
+          - channel
+          - compatibility_state
+          - component
+          - confirmation_required
+          - criticality
+          - customer
+          - default_action
+          - default_projection
+          - default_scope
+          - delivery_surface
+          - domain
+          - examples
+          - endpoint_kind
+          - entry_slug
+          - entry_type
+          - environment
+        supported_value_types:
+          - text
+          - numeric
+          - date
+          - timestamp
+          - boolean
+
+  - ontology_id: ghostcrab-loadout-starters
+    label: GhostCrab Loadout Starter Ontologies
+    description: >
+      Starter domain ontologies defined in src/db/ontology-loadouts.ts.
+      A loadout is a modeling starter, not a dataset: it provides core
+      entity families, relation labels, facet focus, graph focus, and next
+      tools. Materialization happens explicitly through ghostcrab_loadout_seed.
+    scope: workspace-starters
+    source_confidence: high
+    shared_entity_types:
+      - ontology_loadout
+      - modeling_recipe
+      - activity_family
+      - projection_recipe
+      - signal_pattern
+      - ontology_entity
+      - ontology_relation
+    shared_relation_types:
+      - has_recipe
+      - has_family
+      - has_projection
+      - has_signal_pattern
+      - contains_entity
+      - contains_relation
+    loadouts:
+      - loadout_id: default-minimal
+        label: Default Minimal
+        visible_in_reference_image: true
+        domain_profile: default-minimal
+        purpose: Generic ontology starter for an unknown domain.
+        core_entities: [entity, event, topic]
+        core_relations:
+          - relation: references
+            source: entity
+            target: entity
+            inference: generic self-reference
+          - relation: belongs_to
+            source: entity
+            target: topic
+            inference: generic classification link
+          - relation: depends_on
+            source: entity
+            target: entity
+            inference: generic dependency link
+        facet_focus: [status, type, source]
+        graph_focus:
+          - generic identity and dependency links
+        modeling_questions:
+          - What domain are we modeling?
+          - What are the core entity families?
+          - Which relations must exist from day one?
+          - Which facets must be filterable immediately?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_remember
+
+      - loadout_id: crm
+        label: CRM
+        visible_in_reference_image: true
+        domain_profile: crm
+        purpose: Customer, account, pipeline, and activity ontology starter.
+        core_entities: [account, contact, opportunity, activity]
+        core_relations:
+          - relation: account_has_contact
+            source: account
+            target: contact
+          - relation: account_has_opportunity
+            source: account
+            target: opportunity
+          - relation: opportunity_has_activity
+            source: opportunity
+            target: activity
+        facet_focus: [status, stage, owner, source, segment]
+        graph_focus:
+          - customer ownership and pipeline transitions
+        modeling_questions:
+          - What is the account hierarchy?
+          - Which pipeline stages are real in this business?
+          - How are contacts, owners, and opportunities related?
+          - Which records need status and ownership facets?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_workspace_export_model
+
+      - loadout_id: kanban
+        label: Kanban
+        visible_in_reference_image: true
+        domain_profile: kanban
+        purpose: Task, board, sprint, and blocker ontology starter.
+        core_entities: [task, board, project, blocker]
+        core_relations:
+          - relation: board_has_task
+            source: board
+            target: task
+          - relation: task_blocks_task
+            source: task
+            target: task
+          - relation: project_contains_board
+            source: project
+            target: board
+        facet_focus: [status, priority, assignee, project, board]
+        graph_focus:
+          - work items, dependencies, and status movement
+        modeling_questions:
+          - What is the unit of work?
+          - Do we need boards, projects, or both?
+          - Which statuses and priorities are canonical?
+          - What blockers or dependencies matter?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_workspace_export_model
+
+      - loadout_id: knowledge-base
+        label: Knowledge Base
+        visible_in_reference_image: true
+        domain_profile: knowledge-base
+        purpose: Article, note, topic, and reference ontology starter.
+        core_entities: [document, note, topic, source]
+        core_relations:
+          - relation: document_mentions_topic
+            source: document
+            target: topic
+          - relation: note_references_source
+            source: note
+            target: source
+          - relation: document_links_document
+            source: document
+            target: document
+        facet_focus: [topic, source, author, type, language]
+        graph_focus:
+          - document links and topical navigation
+        modeling_questions:
+          - What counts as a document versus a note?
+          - Which topic taxonomy should we use?
+          - What provenance fields are required?
+          - Which facets should power search?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_remember
+
+      - loadout_id: incident-response
+        label: Incident Response
+        visible_in_reference_image: true
+        domain_profile: incident-response
+        purpose: Operational incidents, alerts, services, and remediation ontology starter.
+        core_entities: [service, incident, alert, runbook, action]
+        core_relations:
+          - relation: incident_affects_service
+            source: incident
+            target: service
+          - relation: incident_has_alert
+            source: incident
+            target: alert
+          - relation: incident_has_action
+            source: incident
+            target: action
+        facet_focus: [severity, status, service, owner, impact]
+        graph_focus:
+          - incident causality and remediation links
+        modeling_questions:
+          - What is a service in this environment?
+          - How do incidents relate to alerts and runbooks?
+          - What severity model should be used?
+          - Which ownership facets must be searchable?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_workspace_export_model
+
+      - loadout_id: compliance
+        label: Compliance
+        visible_in_reference_image: true
+        domain_profile: compliance
+        purpose: Policy, control, obligation, evidence, and exception ontology starter.
+        core_entities: [policy, control, obligation, evidence, exception]
+        core_relations:
+          - relation: policy_defines_control
+            source: policy
+            target: control
+          - relation: control_satisfies_obligation
+            source: control
+            target: obligation
+          - relation: evidence_supports_control
+            source: evidence
+            target: control
+        facet_focus: [status, framework, control_area, owner, due_date]
+        graph_focus:
+          - coverage, obligation, and evidence links
+        modeling_questions:
+          - What framework or regulation is in scope?
+          - What counts as evidence?
+          - How should obligations and controls be linked?
+          - Which exception states matter?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_coverage
+
+      - loadout_id: workflow-tracking
+        label: Workflow Tracking
+        visible_in_reference_image: false
+        domain_profile: workflow-tracking
+        purpose: Recurring process, checkpoint, and execution rhythm ontology starter.
+        core_entities: [workflow, run, step, checkpoint]
+        core_relations:
+          - relation: workflow_has_step
+            source: workflow
+            target: step
+          - relation: run_executes_workflow
+            source: run
+            target: workflow
+          - relation: step_has_checkpoint
+            source: step
+            target: checkpoint
+        facet_focus: [status, run_type, owner, schedule, checkpoint]
+        graph_focus:
+          - run lifecycle and step dependencies
+        modeling_questions:
+          - What is the recurring unit of work?
+          - What checkpoints matter in the workflow?
+          - How are runs and steps related?
+          - Which status transitions should be tracked?
+        suggested_next_tools:
+          - ghostcrab_schema_register
+          - ghostcrab_learn
+          - ghostcrab_workspace_export_model
+
+registration_plan:
+  schema_registration_tool: ghostcrab_schema_register
+  native_ontology_tools:
+    - ghostcrab_ontology_register_entity_type
+    - ghostcrab_ontology_register_relation_type
+  loadout_materialization_tool: ghostcrab_loadout_seed
+  typed_facet_tools:
+    - ghostcrab_typed_facet_upsert
+    - ghostcrab_typed_facet_query
+  discovery_tool: ghostcrab_tool_search
+  recommended_order:
+    - Register or inspect meta schemas first.
+    - Apply a loadout to a workspace only after choosing a domain profile.
+    - Seed the loadout skeleton explicitly; do not treat loadout selection as data creation.
+    - Register concrete entity and relation types only when the workspace needs native pg_mindbrain ontology types.
+    - Add typed facets when values need numeric, date, timestamp, or boolean comparison semantics.
+
+notes:
+  - The image shows six loadout cards, but the source catalog defines seven; workflow-tracking is included because it is present in src/db/ontology-loadouts.ts.
+  - Source loadout relations are relation labels; source and target entity mappings above are direct when encoded in the label and marked as inferred where generic.
+  - The reference screen exposes counts and representative facet tags, not all 95 declared facet dimensions; this artifact includes the visible dimensions plus source-level schemas.

@@ -1,0 +1,96 @@
+# ============================================================
+# SCENARIO: Evenements et historique
+# TYPE: temporal_change_model
+# DOMAIN: syndic
+# DESCRIPTION: Decrit comment les changements futurs ajoutent de nouveaux
+#              etats au graphe sans modifier les anciens.
+# ============================================================
+
+scenario:
+  id: scenario_evenements_historique
+  type: temporal_change_model
+  title: "Evenements, preuves et versions"
+  domain: syndic
+  mode: branch_model
+
+  sections:
+    - id: section_event_types
+      role: event_taxonomy
+      title: "Evenements possibles"
+      elements:
+        - { id: event_type_deces, type: CauseFinRelation, code: DEATH, label: "Deces" }
+        - { id: event_type_vente, type: CauseFinRelation, code: SALE, label: "Vente" }
+        - { id: event_type_divorce, type: CauseFinRelation, code: DIVORCE, label: "Divorce" }
+        - { id: event_type_mutation_successorale, type: CauseFinRelation, code: SUCCESSION_TRANSFER, label: "Mutation successorale" }
+        - { id: event_type_changement_payeur, type: CauseFinRelation, code: PAYER_CHANGE, label: "Changement de payeur" }
+
+    - id: section_temporal_fields
+      role: temporal_profile
+      title: "Dates a separer"
+      elements:
+        - id: temporalite_relation
+          type: PropertyProfile
+          fields:
+            - validFrom
+            - validTo
+            - legalEffectiveFrom
+            - legalEffectiveTo
+            - operationalEffectiveFrom
+            - operationalEffectiveTo
+            - billingEffectiveFrom
+            - billingEffectiveTo
+            - recordedAt
+
+    - id: section_death_branch
+      role: example_branch
+      title: "Exemple: deces d'un membre facturable"
+      elements:
+        - id: evenement_deces_exemple
+          type: Evenement
+          label: "Deces d'un membre"
+          eventDate: "YYYY-MM-DD"
+          knownDate: "YYYY-MM-DD"
+          evidenceDate: "YYYY-MM-DD"
+          recordedDate: "YYYY-MM-DD"
+          billingEffectiveDate: "YYYY-MM-DD"
+        - id: document_acte_deces_exemple
+          type: DocumentPreuve
+          document_kind: acte_deces
+          label: "Acte de deces"
+
+  actions:
+    - id: action_apply_membership_change
+      label: "Appliquer un changement de composition"
+      method: temporal_transition
+      branches:
+        - condition: death_impacts_billing
+          next_scenario: scenario_evenements_historique
+          side_effects:
+            - close_previous_membership
+            - close_previous_billing_group_version
+            - create_new_billing_group_version
+            - link_event_and_document
+        - condition: death_only_flags_property
+          next_scenario: scenario_evenements_historique
+          side_effects:
+            - mark_property_relation_as_succession_en_cours
+            - keep_legalEffectiveTo_null_until_succession_document
+        - condition: ownership_transfer_document_received
+          next_scenario: scenario_evenements_historique
+          side_effects:
+            - close_previous_property_relation
+            - create_replacement_property_relation
+
+  modeling_rules:
+    - id: no_in_place_group_mutation
+      text: "Un groupe facturable n'est jamais modifie en place; une nouvelle GroupeVersion est creee."
+    - id: invoice_points_to_group_version
+      text: "Une facture passee pointe vers la version du groupe applicable a la date du fait generateur."
+    - id: legal_billing_dates_are_distinct
+      text: "La fin juridique, operationnelle et de facturation peuvent avoir des dates differentes."
+
+  relations:
+    - { source: evenement_deces_exemple, type: CLOTURE, target: membership_precedent }
+    - { source: evenement_deces_exemple, type: CLOTURE, target: groupe_facturable_precedent }
+    - { source: evenement_deces_exemple, type: CREE, target: groupe_facturable_suivant }
+    - { source: document_acte_deces_exemple, type: PROUVE, target: evenement_deces_exemple }

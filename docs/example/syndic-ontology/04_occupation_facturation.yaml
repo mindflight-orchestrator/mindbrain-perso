@@ -1,0 +1,92 @@
+# ============================================================
+# SCENARIO: Occupation et facturation
+# TYPE: occupancy_billing_model
+# DOMAIN: syndic
+# DESCRIPTION: Associe chaque menage a un appartement et cree un groupe
+#              facturable versionne pour chaque lot occupe.
+# ============================================================
+
+scenario:
+  id: scenario_occupation_facturation
+  type: occupancy_billing_model
+  title: "Occupation et groupes facturables"
+  domain: syndic
+  mode: baseline
+
+  sections:
+    - id: section_occupation
+      role: occupancy_relations
+      title: "Occupation des appartements"
+      elements:
+        - { id: occupation_marie_appartement_01, type: RelationOccupation, household: menage_marie, target: appartement_01, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: occupation_luc_appartement_02, type: RelationOccupation, household: menage_luc, target: appartement_02, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: occupation_andre_jeanne_appartement_03, type: RelationOccupation, household: menage_andre_jeanne, target: appartement_03, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: occupation_pierre_sophie_appartement_04, type: RelationOccupation, household: menage_pierre_sophie, target: appartement_04, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: occupation_karim_nora_appartement_05, type: RelationOccupation, household: menage_karim_nora, target: appartement_05, validFrom: "2026-01-01", validTo: null, status: actif }
+
+    - id: section_billing_groups
+      role: billing_group_versions
+      title: "Groupes facturables"
+      elements:
+        - { id: groupe_facturable_appartement_01, type: GroupeConceptuel, group_kind: facturation, label: "Groupe facturable Appartement 1" }
+        - { id: groupe_facturable_appartement_02, type: GroupeConceptuel, group_kind: facturation, label: "Groupe facturable Appartement 2" }
+        - { id: groupe_facturable_appartement_03, type: GroupeConceptuel, group_kind: facturation, label: "Groupe facturable Appartement 3" }
+        - { id: groupe_facturable_appartement_04, type: GroupeConceptuel, group_kind: facturation, label: "Groupe facturable Appartement 4" }
+        - { id: groupe_facturable_appartement_05, type: GroupeConceptuel, group_kind: facturation, label: "Groupe facturable Appartement 5" }
+        - { id: groupe_facturable_appartement_01_v1, type: GroupeVersion, version_of: groupe_facturable_appartement_01, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: groupe_facturable_appartement_02_v1, type: GroupeVersion, version_of: groupe_facturable_appartement_02, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: groupe_facturable_appartement_03_v1, type: GroupeVersion, version_of: groupe_facturable_appartement_03, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: groupe_facturable_appartement_04_v1, type: GroupeVersion, version_of: groupe_facturable_appartement_04, validFrom: "2026-01-01", validTo: null, status: actif }
+        - { id: groupe_facturable_appartement_05_v1, type: GroupeVersion, version_of: groupe_facturable_appartement_05, validFrom: "2026-01-01", validTo: null, status: actif }
+
+    - id: section_billing_responsibilities
+      role: billing_responsibility
+      title: "Responsabilites de facturation"
+      elements:
+        - { id: facturation_appartement_01_v1, type: ResponsabiliteFacturation, group_version: groupe_facturable_appartement_01_v1, target: appartement_01, billed_household: menage_marie, rule: regle_facturation_par_menage, validFrom: "2026-01-01", validTo: null }
+        - { id: facturation_appartement_02_v1, type: ResponsabiliteFacturation, group_version: groupe_facturable_appartement_02_v1, target: appartement_02, billed_household: menage_luc, rule: regle_facturation_par_menage, validFrom: "2026-01-01", validTo: null }
+        - { id: facturation_appartement_03_v1, type: ResponsabiliteFacturation, group_version: groupe_facturable_appartement_03_v1, target: appartement_03, billed_household: menage_andre_jeanne, rule: regle_facturation_par_menage, validFrom: "2026-01-01", validTo: null }
+        - { id: facturation_appartement_04_v1, type: ResponsabiliteFacturation, group_version: groupe_facturable_appartement_04_v1, target: appartement_04, billed_household: menage_pierre_sophie, rule: regle_facturation_par_menage, validFrom: "2026-01-01", validTo: null }
+        - { id: facturation_appartement_05_v1, type: ResponsabiliteFacturation, group_version: groupe_facturable_appartement_05_v1, target: appartement_05, billed_household: menage_karim_nora, rule: regle_facturation_par_menage, validFrom: "2026-01-01", validTo: null }
+
+    - id: section_rules
+      role: billing_rules
+      title: "Regles"
+      elements:
+        - id: regle_facturation_par_menage
+          type: RegleFacturation
+          label: "Charges imputees au menage occupant"
+          basis: occupant_household
+
+  actions:
+    - id: action_validate_billing
+      label: "Valider la facturation initiale"
+      method: validate
+      checks:
+        - each_apartment_has_one_active_occupancy
+        - each_apartment_has_one_active_billing_group_version
+        - billing_group_points_to_group_version
+        - billing_households_are_occupants_not_owners
+      branches:
+        - condition: valid
+          next_scenario: scenario_evenements_historique
+        - condition: missing_billing_group
+          next_scenario: scenario_occupation_facturation
+          side_effect: create_billing_group_version
+
+  relations:
+    - { source: menage_marie, type: OCCUPE, target: appartement_01 }
+    - { source: menage_luc, type: OCCUPE, target: appartement_02 }
+    - { source: menage_andre_jeanne, type: OCCUPE, target: appartement_03 }
+    - { source: menage_pierre_sophie, type: OCCUPE, target: appartement_04 }
+    - { source: menage_karim_nora, type: OCCUPE, target: appartement_05 }
+    - { source: groupe_facturable_appartement_01, type: A_VERSION, target: groupe_facturable_appartement_01_v1 }
+    - { source: groupe_facturable_appartement_02, type: A_VERSION, target: groupe_facturable_appartement_02_v1 }
+    - { source: groupe_facturable_appartement_03, type: A_VERSION, target: groupe_facturable_appartement_03_v1 }
+    - { source: groupe_facturable_appartement_04, type: A_VERSION, target: groupe_facturable_appartement_04_v1 }
+    - { source: groupe_facturable_appartement_05, type: A_VERSION, target: groupe_facturable_appartement_05_v1 }
+    - { source: groupe_facturable_appartement_01_v1, type: FACTURABLE_POUR, target: appartement_01, billed_household: menage_marie }
+    - { source: groupe_facturable_appartement_02_v1, type: FACTURABLE_POUR, target: appartement_02, billed_household: menage_luc }
+    - { source: groupe_facturable_appartement_03_v1, type: FACTURABLE_POUR, target: appartement_03, billed_household: menage_andre_jeanne }
+    - { source: groupe_facturable_appartement_04_v1, type: FACTURABLE_POUR, target: appartement_04, billed_household: menage_pierre_sophie }
+    - { source: groupe_facturable_appartement_05_v1, type: FACTURABLE_POUR, target: appartement_05, billed_household: menage_karim_nora }

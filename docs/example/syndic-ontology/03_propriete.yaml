@@ -1,0 +1,100 @@
+# ============================================================
+# SCENARIO: Propriete de l'immeuble
+# TYPE: ownership_model
+# DOMAIN: syndic
+# DESCRIPTION: Modele le vieux couple comme groupe de titulaires versionne
+#              possedant 100% de l'immeuble et de ses lots.
+# ============================================================
+
+scenario:
+  id: scenario_propriete_immeuble
+  type: ownership_model
+  title: "Propriete globale par le vieux couple"
+  domain: syndic
+  mode: baseline
+
+  sections:
+    - id: section_owner_group
+      role: ownership_group
+      title: "Groupe de titulaires"
+      elements:
+        - id: groupe_titulaires_immeuble
+          type: GroupeConceptuel
+          label: "Groupe de titulaires de la Residence du Parc"
+          group_kind: patrimonial
+        - id: groupe_titulaires_immeuble_v1
+          type: GroupeVersion
+          label: "Groupe de titulaires v1"
+          version_of: groupe_titulaires_immeuble
+          validFrom: "2026-01-01"
+          validTo: null
+          status: actif
+
+    - id: section_owner_memberships
+      role: group_membership
+      title: "Membres titulaires"
+      elements:
+        - id: membership_andre_titulaires_v1
+          type: Membership
+          member: andre_vieux_couple
+          group: groupe_titulaires_immeuble_v1
+          role: co_titulaire
+          share_bp: 5000
+          validFrom: "2026-01-01"
+          validTo: null
+        - id: membership_jeanne_titulaires_v1
+          type: Membership
+          member: jeanne_vieux_couple
+          group: groupe_titulaires_immeuble_v1
+          role: co_titulaire
+          share_bp: 5000
+          validFrom: "2026-01-01"
+          validTo: null
+
+    - id: section_ownership_relations
+      role: property_relations
+      title: "Relations de propriete"
+      elements:
+        - id: relation_propriete_immeuble_100pct_v1
+          type: RelationPropriete
+          owner_group: groupe_titulaires_immeuble_v1
+          target: immeuble_residence_du_parc
+          ownership_kind: pleine_propriete
+          share_bp: 10000
+          legalEffectiveFrom: "2026-01-01"
+          legalEffectiveTo: null
+          status: confirme
+          confirmedByDocument: titre_propriete_immeuble_2026
+
+    - id: section_evidence
+      role: documentary_evidence
+      title: "Preuves"
+      elements:
+        - id: titre_propriete_immeuble_2026
+          type: DocumentPreuve
+          label: "Titre de propriete de la Residence du Parc"
+          document_kind: titre_propriete
+
+  actions:
+    - id: action_validate_ownership
+      label: "Valider la propriete"
+      method: validate
+      checks:
+        - owner_group_has_two_members
+        - ownership_share_sums_to_10000
+        - property_relation_has_documentary_evidence
+        - son_is_not_owner_in_baseline
+      branches:
+        - condition: valid
+          next_scenario: scenario_occupation_facturation
+        - condition: missing_evidence
+          next_scenario: scenario_propriete_immeuble
+          side_effect: request_title_document
+
+  relations:
+    - { source: groupe_titulaires_immeuble, type: A_VERSION, target: groupe_titulaires_immeuble_v1 }
+    - { source: groupe_titulaires_immeuble_v1, type: VERSION_DE, target: groupe_titulaires_immeuble }
+    - { source: andre_vieux_couple, type: MEMBRE_DE, target: groupe_titulaires_immeuble_v1, role: co_titulaire, share_bp: 5000 }
+    - { source: jeanne_vieux_couple, type: MEMBRE_DE, target: groupe_titulaires_immeuble_v1, role: co_titulaire, share_bp: 5000 }
+    - { source: groupe_titulaires_immeuble_v1, type: POSSEDE, target: immeuble_residence_du_parc, share_bp: 10000 }
+    - { source: titre_propriete_immeuble_2026, type: PROUVE, target: relation_propriete_immeuble_100pct_v1 }

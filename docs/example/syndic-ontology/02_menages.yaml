@@ -1,0 +1,105 @@
+# ============================================================
+# SCENARIO: Menages et personnes
+# TYPE: actor_inventory
+# DOMAIN: syndic
+# DESCRIPTION: Decrit les cinq menages occupants et les liens familiaux.
+# ============================================================
+
+scenario:
+  id: scenario_menages_occupants
+  type: actor_inventory
+  title: "Menages occupants de l'immeuble"
+  domain: syndic
+  mode: baseline
+
+  sections:
+    - id: section_personnes
+      role: people_inventory
+      title: "Personnes"
+      elements:
+        - { id: marie_celibataire, type: Personne, label: "Marie", profile: celibataire }
+        - { id: luc_celibataire, type: Personne, label: "Luc", profile: celibataire }
+        - { id: andre_vieux_couple, type: Personne, label: "Andre", profile: conjoint_proprietaire }
+        - { id: jeanne_vieux_couple, type: Personne, label: "Jeanne", profile: conjoint_proprietaire }
+        - { id: pierre_fils, type: Personne, label: "Pierre", profile: fils_du_couple_proprietaire }
+        - { id: sophie_belle_fille, type: Personne, label: "Sophie", profile: conjointe_du_fils }
+        - { id: emma_enfant_fils, type: Personne, label: "Emma", profile: enfant }
+        - { id: noah_enfant_fils, type: Personne, label: "Noah", profile: enfant }
+        - { id: karim_parent, type: Personne, label: "Karim", profile: conjoint }
+        - { id: nora_parent, type: Personne, label: "Nora", profile: conjointe }
+        - { id: lina_enfant, type: Personne, label: "Lina", profile: enfant }
+        - { id: adam_enfant, type: Personne, label: "Adam", profile: enfant }
+
+    - id: section_menages
+      role: household_inventory
+      title: "Menages"
+      elements:
+        - id: menage_marie
+          type: Menage
+          label: "Menage Marie"
+          household_profile: celibataire
+          members: [marie_celibataire]
+        - id: menage_luc
+          type: Menage
+          label: "Menage Luc"
+          household_profile: celibataire
+          members: [luc_celibataire]
+        - id: menage_andre_jeanne
+          type: Menage
+          label: "Menage Andre et Jeanne"
+          household_profile: vieux_couple_sans_enfants_dans_le_lot
+          members: [andre_vieux_couple, jeanne_vieux_couple]
+          note: "Sans enfant vivant dans l'appartement; Pierre est leur fils adulte."
+        - id: menage_pierre_sophie
+          type: Menage
+          label: "Menage Pierre et Sophie"
+          household_profile: couple_avec_2_enfants
+          members: [pierre_fils, sophie_belle_fille, emma_enfant_fils, noah_enfant_fils]
+        - id: menage_karim_nora
+          type: Menage
+          label: "Menage Karim et Nora"
+          household_profile: couple_avec_2_enfants
+          members: [karim_parent, nora_parent, lina_enfant, adam_enfant]
+
+  actions:
+    - id: action_validate_households
+      label: "Valider les menages"
+      method: validate
+      checks:
+        - exactly_5_households
+        - owners_are_also_occupants
+        - son_is_linked_to_owner_couple
+        - children_are_members_of_parent_households
+      branches:
+        - condition: valid
+          next_scenario: scenario_propriete_immeuble
+        - condition: missing_family_link
+          next_scenario: scenario_menages_occupants
+          side_effect: require_family_relation
+
+  relations:
+    - { source: marie_celibataire, type: MEMBRE_DE, target: menage_marie, role: occupant }
+    - { source: luc_celibataire, type: MEMBRE_DE, target: menage_luc, role: occupant }
+    - { source: andre_vieux_couple, type: MEMBRE_DE, target: menage_andre_jeanne, role: conjoint }
+    - { source: jeanne_vieux_couple, type: MEMBRE_DE, target: menage_andre_jeanne, role: conjoint }
+    - { source: pierre_fils, type: MEMBRE_DE, target: menage_pierre_sophie, role: conjoint }
+    - { source: sophie_belle_fille, type: MEMBRE_DE, target: menage_pierre_sophie, role: conjoint }
+    - { source: emma_enfant_fils, type: MEMBRE_DE, target: menage_pierre_sophie, role: enfant }
+    - { source: noah_enfant_fils, type: MEMBRE_DE, target: menage_pierre_sophie, role: enfant }
+    - { source: karim_parent, type: MEMBRE_DE, target: menage_karim_nora, role: conjoint }
+    - { source: nora_parent, type: MEMBRE_DE, target: menage_karim_nora, role: conjoint }
+    - { source: lina_enfant, type: MEMBRE_DE, target: menage_karim_nora, role: enfant }
+    - { source: adam_enfant, type: MEMBRE_DE, target: menage_karim_nora, role: enfant }
+    - { source: andre_vieux_couple, type: CONJOINT_DE, target: jeanne_vieux_couple }
+    - { source: andre_vieux_couple, type: PARENT_DE, target: pierre_fils }
+    - { source: jeanne_vieux_couple, type: PARENT_DE, target: pierre_fils }
+    - { source: pierre_fils, type: CONJOINT_DE, target: sophie_belle_fille }
+    - { source: pierre_fils, type: PARENT_DE, target: emma_enfant_fils }
+    - { source: sophie_belle_fille, type: PARENT_DE, target: emma_enfant_fils }
+    - { source: pierre_fils, type: PARENT_DE, target: noah_enfant_fils }
+    - { source: sophie_belle_fille, type: PARENT_DE, target: noah_enfant_fils }
+    - { source: karim_parent, type: CONJOINT_DE, target: nora_parent }
+    - { source: karim_parent, type: PARENT_DE, target: lina_enfant }
+    - { source: nora_parent, type: PARENT_DE, target: lina_enfant }
+    - { source: karim_parent, type: PARENT_DE, target: adam_enfant }
+    - { source: nora_parent, type: PARENT_DE, target: adam_enfant }

@@ -1,0 +1,638 @@
+schema_version: "1.0.0"
+artifact_id: "syndic-immeuble-5-appartements"
+language: "fr"
+source:
+  path: "docs/example/reflexion_chatgpt.md"
+  modeling_mode: "graph"
+  notes:
+    - "Les groupes sont versionnes au lieu d'etre modifies en place."
+    - "Les relations importantes portent temporalite, statut, preuve et cause de fin."
+    - "La propriete juridique, l'occupation et la facturation sont des graphes distincts."
+
+ontologies:
+  - ontology_id: "syndic-building-core"
+    label: "Syndic - bati et lots"
+    entity_types:
+      - id: "Immeuble"
+        description: "Batiment gere par le syndic."
+      - id: "Appartement"
+        description: "Lot privatif principal destine a l'habitation."
+      - id: "Garage"
+        description: "Lot ou annexe de stationnement."
+      - id: "Cave"
+        description: "Lot ou annexe de stockage."
+      - id: "Hall"
+        description: "Partie commune d'acces."
+      - id: "Ascenseur"
+        description: "Equipement commun de circulation verticale."
+      - id: "EspaceMachineALaver"
+        description: "Partie commune ou local technique partage."
+    relation_types:
+      - id: "CONTIENT"
+        source: "Immeuble"
+        target: "Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+      - id: "ANNEXE_A"
+        source: "Garage|Cave"
+        target: "Appartement"
+
+  - ontology_id: "syndic-party-core"
+    label: "Syndic - personnes et groupes"
+    entity_types:
+      - id: "Personne"
+        description: "Personne physique."
+      - id: "Menage"
+        description: "Unite de vie occupant un ou plusieurs lots."
+      - id: "GroupeConceptuel"
+        description: "Identite stable d'un groupe metier."
+      - id: "GroupeVersion"
+        description: "Etat date d'un groupe conceptuel."
+      - id: "Membership"
+        description: "Relation reifiee entre une personne et un groupe versionne."
+    relation_types:
+      - id: "A_VERSION"
+        source: "GroupeConceptuel"
+        target: "GroupeVersion"
+      - id: "VERSION_DE"
+        source: "GroupeVersion"
+        target: "GroupeConceptuel"
+      - id: "MEMBRE_DE"
+        source: "Personne"
+        target: "Menage|GroupeVersion"
+      - id: "CONJOINT_DE"
+        source: "Personne"
+        target: "Personne"
+      - id: "PARENT_DE"
+        source: "Personne"
+        target: "Personne"
+      - id: "REMPLACE"
+        source: "GroupeVersion"
+        target: "GroupeVersion"
+
+  - ontology_id: "syndic-rights-billing"
+    label: "Syndic - droits, occupation et facturation"
+    entity_types:
+      - id: "RelationPropriete"
+        description: "Relation reifiee de detention juridique d'un bien."
+      - id: "RelationOccupation"
+        description: "Relation reifiee d'occupation ou usage d'un lot."
+      - id: "GroupeDeTitulaires"
+        description: "Groupe patrimonial portant un droit reel."
+      - id: "GroupeFacturable"
+        description: "Groupe operationnel auquel les charges sont imputees."
+      - id: "RegleFacturation"
+        description: "Regle de repartition ou d'imputation des frais."
+      - id: "ResponsabiliteFacturation"
+        description: "Relation qualifiee entre un groupe facturable et un lot."
+    relation_types:
+      - id: "POSSEDE"
+        source: "Personne|Menage|GroupeVersion|RelationPropriete"
+        target: "Immeuble|Appartement|Garage|Cave"
+      - id: "OCCUPE"
+        source: "Personne|Menage|RelationOccupation"
+        target: "Appartement|Garage|Cave"
+      - id: "FACTURABLE_POUR"
+        source: "GroupeVersion|ResponsabiliteFacturation"
+        target: "Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+      - id: "UTILISE_REGLE"
+        source: "GroupeVersion|ResponsabiliteFacturation"
+        target: "RegleFacturation"
+      - id: "PORTE_SUR"
+        source: "RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+        target: "Immeuble|Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+
+  - ontology_id: "syndic-events-evidence"
+    label: "Syndic - evenements et preuves"
+    entity_types:
+      - id: "Evenement"
+        description: "Evenement qui cree, modifie, cloture ou met en verification un etat du graphe."
+      - id: "DocumentPreuve"
+        description: "Piece qui confirme une relation, un evenement ou un etat."
+      - id: "CauseFinRelation"
+        description: "Valeur controlee expliquant la fin ou la mise en verification d'une relation."
+    relation_types:
+      - id: "PROUVE"
+        source: "DocumentPreuve"
+        target: "RelationPropriete|RelationOccupation|ResponsabiliteFacturation|GroupeVersion|Evenement"
+      - id: "CREE"
+        source: "Evenement"
+        target: "GroupeVersion|Membership|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+      - id: "CLOTURE"
+        source: "Evenement"
+        target: "GroupeVersion|Membership|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+      - id: "IMPACTE"
+        source: "Evenement"
+        target: "Personne|Menage|GroupeVersion|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+    controlled_values:
+      relation_status:
+        - "brouillon"
+        - "confirme"
+        - "actif"
+        - "a_verifier"
+        - "succession_en_cours"
+        - "conteste"
+        - "cloture"
+        - "archive"
+      end_reason:
+        - code: "DEATH"
+          label: "Deces"
+        - code: "DIVORCE"
+          label: "Divorce"
+        - code: "SALE"
+          label: "Vente"
+        - code: "DONATION"
+          label: "Donation"
+        - code: "SUCCESSION_TRANSFER"
+          label: "Mutation successorale"
+        - code: "LEASE_END"
+          label: "Fin de bail"
+        - code: "OWNER_CHANGE"
+          label: "Changement de proprietaire"
+        - code: "PAYER_CHANGE"
+          label: "Changement de payeur"
+        - code: "DATA_CORRECTION"
+          label: "Correction de donnees"
+
+property_profiles:
+  temporal_relation:
+    validFrom: "date"
+    validTo: "date|null"
+    legalEffectiveFrom: "date|null"
+    legalEffectiveTo: "date|null"
+    operationalEffectiveFrom: "date|null"
+    operationalEffectiveTo: "date|null"
+    billingEffectiveFrom: "date|null"
+    billingEffectiveTo: "date|null"
+    recordedAt: "datetime|null"
+  qualified_end:
+    endReasonCode: "controlled:end_reason|null"
+    endEvent: "ref:Evenement|null"
+    endDocument: "ref:DocumentPreuve|null"
+    endNote: "text|null"
+    replacedBy: "ref|null"
+  evidence:
+    createdByDocument: "ref:DocumentPreuve|null"
+    confirmedByDocument: "ref:DocumentPreuve|null"
+    modifiedByEvent: "ref:Evenement|null"
+    closedByDocument: "ref:DocumentPreuve|null"
+
+example_graph:
+  workspace_id: "syndic-demo-5-appartements"
+  default_ontology_ids:
+    - "syndic-building-core"
+    - "syndic-party-core"
+    - "syndic-rights-billing"
+    - "syndic-events-evidence"
+
+  entities:
+    buildings:
+      - id: "immeuble_residence_du_parc"
+        type: "Immeuble"
+        label: "Residence du Parc"
+
+    lots:
+      apartments:
+        - id: "appartement_01"
+          type: "Appartement"
+          label: "Appartement 1"
+          floor: 0
+        - id: "appartement_02"
+          type: "Appartement"
+          label: "Appartement 2"
+          floor: 1
+        - id: "appartement_03"
+          type: "Appartement"
+          label: "Appartement 3"
+          floor: 1
+        - id: "appartement_04"
+          type: "Appartement"
+          label: "Appartement 4"
+          floor: 2
+        - id: "appartement_05"
+          type: "Appartement"
+          label: "Appartement 5"
+          floor: 2
+      garages:
+        - id: "garage_01"
+          type: "Garage"
+          label: "Garage 1"
+          annexed_to: "appartement_01"
+        - id: "garage_02"
+          type: "Garage"
+          label: "Garage 2"
+          annexed_to: "appartement_02"
+        - id: "garage_03"
+          type: "Garage"
+          label: "Garage 3"
+          annexed_to: "appartement_03"
+        - id: "garage_04"
+          type: "Garage"
+          label: "Garage 4"
+          annexed_to: "appartement_04"
+        - id: "garage_05"
+          type: "Garage"
+          label: "Garage 5"
+          annexed_to: "appartement_05"
+      cellars:
+        - id: "cave_01"
+          type: "Cave"
+          label: "Cave 1"
+          annexed_to: "appartement_01"
+        - id: "cave_02"
+          type: "Cave"
+          label: "Cave 2"
+          annexed_to: "appartement_02"
+        - id: "cave_03"
+          type: "Cave"
+          label: "Cave 3"
+          annexed_to: "appartement_03"
+        - id: "cave_04"
+          type: "Cave"
+          label: "Cave 4"
+          annexed_to: "appartement_04"
+        - id: "cave_05"
+          type: "Cave"
+          label: "Cave 5"
+          annexed_to: "appartement_05"
+      common_parts:
+        - id: "hall_principal"
+          type: "Hall"
+          label: "Hall principal"
+        - id: "ascenseur_principal"
+          type: "Ascenseur"
+          label: "Ascenseur principal"
+        - id: "espace_machine_laver"
+          type: "EspaceMachineALaver"
+          label: "Espace machine a laver"
+
+    persons:
+      - id: "marie_celibataire"
+        type: "Personne"
+        label: "Marie"
+        household_role: "celibataire"
+      - id: "luc_celibataire"
+        type: "Personne"
+        label: "Luc"
+        household_role: "celibataire"
+      - id: "andre_vieux_couple"
+        type: "Personne"
+        label: "Andre"
+        household_role: "conjoint_proprietaire"
+      - id: "jeanne_vieux_couple"
+        type: "Personne"
+        label: "Jeanne"
+        household_role: "conjoint_proprietaire"
+      - id: "pierre_fils"
+        type: "Personne"
+        label: "Pierre"
+        household_role: "fils_du_couple_proprietaire"
+      - id: "sophie_belle_fille"
+        type: "Personne"
+        label: "Sophie"
+        household_role: "conjointe_du_fils"
+      - id: "emma_enfant_fils"
+        type: "Personne"
+        label: "Emma"
+        household_role: "enfant"
+      - id: "noah_enfant_fils"
+        type: "Personne"
+        label: "Noah"
+        household_role: "enfant"
+      - id: "karim_parent"
+        type: "Personne"
+        label: "Karim"
+        household_role: "conjoint"
+      - id: "nora_parent"
+        type: "Personne"
+        label: "Nora"
+        household_role: "conjointe"
+      - id: "lina_enfant"
+        type: "Personne"
+        label: "Lina"
+        household_role: "enfant"
+      - id: "adam_enfant"
+        type: "Personne"
+        label: "Adam"
+        household_role: "enfant"
+
+    households:
+      - id: "menage_marie"
+        type: "Menage"
+        label: "Menage Marie"
+        profile: "celibataire"
+        members: ["marie_celibataire"]
+      - id: "menage_luc"
+        type: "Menage"
+        label: "Menage Luc"
+        profile: "celibataire"
+        members: ["luc_celibataire"]
+      - id: "menage_andre_jeanne"
+        type: "Menage"
+        label: "Menage Andre et Jeanne"
+        profile: "vieux_couple_sans_enfants_dans_le_lot"
+        members: ["andre_vieux_couple", "jeanne_vieux_couple"]
+      - id: "menage_pierre_sophie"
+        type: "Menage"
+        label: "Menage Pierre et Sophie"
+        profile: "couple_avec_2_enfants"
+        members: ["pierre_fils", "sophie_belle_fille", "emma_enfant_fils", "noah_enfant_fils"]
+      - id: "menage_karim_nora"
+        type: "Menage"
+        label: "Menage Karim et Nora"
+        profile: "couple_avec_2_enfants"
+        members: ["karim_parent", "nora_parent", "lina_enfant", "adam_enfant"]
+
+    group_identities:
+      - id: "groupe_titulaires_immeuble"
+        type: "GroupeConceptuel"
+        label: "Groupe de titulaires de la Residence du Parc"
+        group_kind: "patrimonial"
+      - id: "groupe_facturable_appartement_01"
+        type: "GroupeConceptuel"
+        label: "Groupe facturable Appartement 1"
+        group_kind: "facturation"
+      - id: "groupe_facturable_appartement_02"
+        type: "GroupeConceptuel"
+        label: "Groupe facturable Appartement 2"
+        group_kind: "facturation"
+      - id: "groupe_facturable_appartement_03"
+        type: "GroupeConceptuel"
+        label: "Groupe facturable Appartement 3"
+        group_kind: "facturation"
+      - id: "groupe_facturable_appartement_04"
+        type: "GroupeConceptuel"
+        label: "Groupe facturable Appartement 4"
+        group_kind: "facturation"
+      - id: "groupe_facturable_appartement_05"
+        type: "GroupeConceptuel"
+        label: "Groupe facturable Appartement 5"
+        group_kind: "facturation"
+
+    group_versions:
+      - id: "groupe_titulaires_immeuble_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_titulaires_immeuble"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "groupe_facturable_appartement_01_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_facturable_appartement_01"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "groupe_facturable_appartement_02_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_facturable_appartement_02"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "groupe_facturable_appartement_03_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_facturable_appartement_03"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "groupe_facturable_appartement_04_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_facturable_appartement_04"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "groupe_facturable_appartement_05_v1"
+        type: "GroupeVersion"
+        version_of: "groupe_facturable_appartement_05"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+
+    rules:
+      - id: "regle_facturation_par_menage"
+        type: "RegleFacturation"
+        label: "Charges imputees au menage occupant"
+        basis: "occupant_household"
+      - id: "regle_propriete_10000bp"
+        type: "RegleFacturation"
+        label: "Quote-part de propriete 100%"
+        basis: "share_bp"
+        share_bp: 10000
+
+    evidence:
+      - id: "titre_propriete_immeuble_2026"
+        type: "DocumentPreuve"
+        label: "Titre de propriete de la Residence du Parc"
+        document_kind: "titre_propriete"
+      - id: "fiche_occupation_2026"
+        type: "DocumentPreuve"
+        label: "Fiche d'occupation initiale 2026"
+        document_kind: "fiche_syndic"
+
+  relations:
+    building_composition:
+      - [ "immeuble_residence_du_parc", "CONTIENT", "appartement_01" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "appartement_02" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "appartement_03" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "appartement_04" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "appartement_05" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "garage_01" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "garage_02" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "garage_03" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "garage_04" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "garage_05" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "cave_01" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "cave_02" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "cave_03" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "cave_04" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "cave_05" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "hall_principal" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "ascenseur_principal" ]
+      - [ "immeuble_residence_du_parc", "CONTIENT", "espace_machine_laver" ]
+
+    annexes:
+      - [ "garage_01", "ANNEXE_A", "appartement_01" ]
+      - [ "garage_02", "ANNEXE_A", "appartement_02" ]
+      - [ "garage_03", "ANNEXE_A", "appartement_03" ]
+      - [ "garage_04", "ANNEXE_A", "appartement_04" ]
+      - [ "garage_05", "ANNEXE_A", "appartement_05" ]
+      - [ "cave_01", "ANNEXE_A", "appartement_01" ]
+      - [ "cave_02", "ANNEXE_A", "appartement_02" ]
+      - [ "cave_03", "ANNEXE_A", "appartement_03" ]
+      - [ "cave_04", "ANNEXE_A", "appartement_04" ]
+      - [ "cave_05", "ANNEXE_A", "appartement_05" ]
+
+    family:
+      - source: "andre_vieux_couple"
+        type: "CONJOINT_DE"
+        target: "jeanne_vieux_couple"
+      - source: "andre_vieux_couple"
+        type: "PARENT_DE"
+        target: "pierre_fils"
+      - source: "jeanne_vieux_couple"
+        type: "PARENT_DE"
+        target: "pierre_fils"
+      - source: "pierre_fils"
+        type: "CONJOINT_DE"
+        target: "sophie_belle_fille"
+      - source: "pierre_fils"
+        type: "PARENT_DE"
+        target: "emma_enfant_fils"
+      - source: "sophie_belle_fille"
+        type: "PARENT_DE"
+        target: "emma_enfant_fils"
+      - source: "pierre_fils"
+        type: "PARENT_DE"
+        target: "noah_enfant_fils"
+      - source: "sophie_belle_fille"
+        type: "PARENT_DE"
+        target: "noah_enfant_fils"
+      - source: "karim_parent"
+        type: "CONJOINT_DE"
+        target: "nora_parent"
+      - source: "karim_parent"
+        type: "PARENT_DE"
+        target: "lina_enfant"
+      - source: "nora_parent"
+        type: "PARENT_DE"
+        target: "lina_enfant"
+      - source: "karim_parent"
+        type: "PARENT_DE"
+        target: "adam_enfant"
+      - source: "nora_parent"
+        type: "PARENT_DE"
+        target: "adam_enfant"
+
+    ownership:
+      - id: "relation_propriete_immeuble_100pct_vieux_couple"
+        type: "POSSEDE"
+        source: "groupe_titulaires_immeuble_v1"
+        target: "immeuble_residence_du_parc"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "confirme"
+        properties:
+          ownership_kind: "pleine_propriete"
+          share_bp: 10000
+          legalEffectiveFrom: "2026-01-01"
+          legalEffectiveTo: null
+          confirmedByDocument: "titre_propriete_immeuble_2026"
+
+    owner_memberships:
+      - id: "membership_andre_titulaires_v1"
+        type: "MEMBRE_DE"
+        source: "andre_vieux_couple"
+        target: "groupe_titulaires_immeuble_v1"
+        validFrom: "2026-01-01"
+        validTo: null
+        role: "co_titulaire"
+        share_bp: 5000
+      - id: "membership_jeanne_titulaires_v1"
+        type: "MEMBRE_DE"
+        source: "jeanne_vieux_couple"
+        target: "groupe_titulaires_immeuble_v1"
+        validFrom: "2026-01-01"
+        validTo: null
+        role: "co_titulaire"
+        share_bp: 5000
+
+    occupation:
+      - id: "occupation_marie_appartement_01"
+        type: "OCCUPE"
+        source: "menage_marie"
+        target: "appartement_01"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "occupation_luc_appartement_02"
+        type: "OCCUPE"
+        source: "menage_luc"
+        target: "appartement_02"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "occupation_andre_jeanne_appartement_03"
+        type: "OCCUPE"
+        source: "menage_andre_jeanne"
+        target: "appartement_03"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "occupation_pierre_sophie_appartement_04"
+        type: "OCCUPE"
+        source: "menage_pierre_sophie"
+        target: "appartement_04"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+      - id: "occupation_karim_nora_appartement_05"
+        type: "OCCUPE"
+        source: "menage_karim_nora"
+        target: "appartement_05"
+        validFrom: "2026-01-01"
+        validTo: null
+        status: "actif"
+
+    billing_groups:
+      - source: "groupe_facturable_appartement_01"
+        type: "A_VERSION"
+        target: "groupe_facturable_appartement_01_v1"
+      - source: "groupe_facturable_appartement_02"
+        type: "A_VERSION"
+        target: "groupe_facturable_appartement_02_v1"
+      - source: "groupe_facturable_appartement_03"
+        type: "A_VERSION"
+        target: "groupe_facturable_appartement_03_v1"
+      - source: "groupe_facturable_appartement_04"
+        type: "A_VERSION"
+        target: "groupe_facturable_appartement_04_v1"
+      - source: "groupe_facturable_appartement_05"
+        type: "A_VERSION"
+        target: "groupe_facturable_appartement_05_v1"
+
+    billing_responsibilities:
+      - id: "facturation_appartement_01_v1"
+        type: "FACTURABLE_POUR"
+        source: "groupe_facturable_appartement_01_v1"
+        target: "appartement_01"
+        billed_household: "menage_marie"
+        rule: "regle_facturation_par_menage"
+        validFrom: "2026-01-01"
+        validTo: null
+      - id: "facturation_appartement_02_v1"
+        type: "FACTURABLE_POUR"
+        source: "groupe_facturable_appartement_02_v1"
+        target: "appartement_02"
+        billed_household: "menage_luc"
+        rule: "regle_facturation_par_menage"
+        validFrom: "2026-01-01"
+        validTo: null
+      - id: "facturation_appartement_03_v1"
+        type: "FACTURABLE_POUR"
+        source: "groupe_facturable_appartement_03_v1"
+        target: "appartement_03"
+        billed_household: "menage_andre_jeanne"
+        rule: "regle_facturation_par_menage"
+        validFrom: "2026-01-01"
+        validTo: null
+      - id: "facturation_appartement_04_v1"
+        type: "FACTURABLE_POUR"
+        source: "groupe_facturable_appartement_04_v1"
+        target: "appartement_04"
+        billed_household: "menage_pierre_sophie"
+        rule: "regle_facturation_par_menage"
+        validFrom: "2026-01-01"
+        validTo: null
+      - id: "facturation_appartement_05_v1"
+        type: "FACTURABLE_POUR"
+        source: "groupe_facturable_appartement_05_v1"
+        target: "appartement_05"
+        billed_household: "menage_karim_nora"
+        rule: "regle_facturation_par_menage"
+        validFrom: "2026-01-01"
+        validTo: null
+
+invariants:
+  - "L'immeuble contient exactement 5 appartements."
+  - "Chaque appartement a exactement 1 garage et 1 cave annexes."
+  - "Le vieux couple possede 100% de l'immeuble via le groupe_titulaires_immeuble_v1."
+  - "Les cinq menages sont occupants facturables, pas coproprietaires."
+  - "Pierre est le fils d'Andre et Jeanne, mais il vit dans son propre menage."
+  - "Toute modification future de composition cree une nouvelle GroupeVersion."

@@ -1,0 +1,73 @@
+# ============================================================
+# SCENARIO: Projections agent
+# TYPE: agent_query_index
+# DOMAIN: syndic
+# DESCRIPTION: Requetes types que l'agent doit pouvoir resoudre a partir du
+#              graphe syndic.
+# ============================================================
+
+scenario:
+  id: scenario_agent_queries
+  type: agent_query_index
+  title: "Index de requetes agent"
+  domain: syndic
+
+  agent_query_index:
+    - query: "Qui possede l'immeuble ?"
+      resolve:
+        node_type: RelationPropriete
+        filter: { target: immeuble_residence_du_parc, status: confirme }
+
+    - query: "Quels menages occupent les cinq appartements ?"
+      resolve:
+        node_type: RelationOccupation
+        filter: { validTo: null, status: actif }
+
+    - query: "Quel appartement est occupe par le fils du vieux couple ?"
+      resolve:
+        node_type: RelationOccupation
+        path:
+          - Personne[pierre_fils]
+          - MEMBRE_DE
+          - Menage
+          - OCCUPE
+          - Appartement
+
+    - query: "Quels groupes sont facturables aujourd'hui ?"
+      resolve:
+        node_type: GroupeVersion
+        filter: { group_kind: facturation, validTo: null, status: actif }
+
+    - query: "Pourquoi faut-il versionner un groupe facturable ?"
+      resolve:
+        node_type: UserStory
+        filter: { id: story_change_billing_group_version }
+
+    - query: "Que se passe-t-il si un coproprietaire decede ?"
+      resolve:
+        node_type: Branch
+        filter: { action: action_apply_membership_change, condition: death_impacts_billing }
+
+  user_stories:
+    - id: story_find_owner_group
+      name: "Identifier les proprietaires de l'immeuble"
+      actor: "Agent syndic"
+      goal: "Trouver le groupe de titulaires et ses membres"
+      story_type: locate
+      intent_keywords: [proprietaire, immeuble, titulaire, possession]
+      steps:
+        - { step: 1, scenario: scenario_propriete_immeuble, action: action_validate_ownership }
+        - { step: 2, node: groupe_titulaires_immeuble_v1 }
+        - { step: 3, relation: MEMBRE_DE, targets: [andre_vieux_couple, jeanne_vieux_couple] }
+
+    - id: story_change_billing_group_version
+      name: "Versionner un groupe facturable apres changement"
+      actor: "Agent syndic"
+      goal: "Preserver l'historique de facturation"
+      story_type: scenario
+      intent_keywords: [groupe, facturation, version, deces, historique]
+      steps:
+        - { step: 1, scenario: scenario_evenements_historique, action: action_apply_membership_change, branch: death_impacts_billing }
+        - { step: 2, side_effect: close_previous_billing_group_version }
+        - { step: 3, side_effect: create_new_billing_group_version }
+        - { step: 4, rule: invoice_points_to_group_version }

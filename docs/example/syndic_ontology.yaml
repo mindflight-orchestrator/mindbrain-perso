@@ -1,0 +1,285 @@
+schema_version: "1.0.0"
+artifact_id: "syndic-ontology"
+language: "fr"
+kind: "ontology_definition"
+source:
+  path: "docs/example/reflexion_chatgpt.md"
+  modeling_mode: "graph"
+  notes:
+    - "Ontologie metier pour syndic, separee des exemples d'instances."
+    - "Les groupes sont versionnes au lieu d'etre modifies en place."
+    - "Les relations importantes portent temporalite, statut, preuve et cause de fin."
+    - "La propriete juridique, l'occupation et la facturation sont des graphes distincts."
+
+ontologies:
+  - ontology_id: "syndic-building-core"
+    label: "Syndic - bati et lots"
+    description: "Structure physique d'un immeuble gere par un syndic."
+    entity_types:
+      - id: "Immeuble"
+        description: "Batiment gere par le syndic."
+      - id: "Appartement"
+        description: "Lot privatif principal destine a l'habitation."
+      - id: "Garage"
+        description: "Lot ou annexe de stationnement."
+      - id: "Cave"
+        description: "Lot ou annexe de stockage."
+      - id: "Hall"
+        description: "Partie commune d'acces."
+      - id: "Ascenseur"
+        description: "Equipement commun de circulation verticale."
+      - id: "EspaceMachineALaver"
+        description: "Partie commune ou local technique partage."
+    relation_types:
+      - id: "CONTIENT"
+        source: "Immeuble"
+        target: "Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+        description: "Relie l'immeuble a ses lots, annexes et parties communes."
+      - id: "ANNEXE_A"
+        source: "Garage|Cave"
+        target: "Appartement"
+        description: "Relie une annexe privative a l'appartement auquel elle est associee."
+
+  - ontology_id: "syndic-party-core"
+    label: "Syndic - personnes et groupes"
+    description: "Personnes, menages et groupes metier versionnes."
+    entity_types:
+      - id: "Personne"
+        description: "Personne physique."
+      - id: "Menage"
+        description: "Unite de vie occupant un ou plusieurs lots."
+      - id: "GroupeConceptuel"
+        description: "Identite stable d'un groupe metier."
+      - id: "GroupeVersion"
+        description: "Etat date d'un groupe conceptuel."
+      - id: "Membership"
+        description: "Relation reifiee entre une personne et un groupe versionne."
+    relation_types:
+      - id: "A_VERSION"
+        source: "GroupeConceptuel"
+        target: "GroupeVersion"
+        description: "Relie une identite stable a une version temporelle."
+      - id: "VERSION_DE"
+        source: "GroupeVersion"
+        target: "GroupeConceptuel"
+        description: "Relation inverse de A_VERSION."
+      - id: "MEMBRE_DE"
+        source: "Personne"
+        target: "Menage|GroupeVersion"
+        description: "Appartenance d'une personne a un menage ou a un groupe versionne."
+        property_profile: "membership_relation"
+      - id: "CONJOINT_DE"
+        source: "Personne"
+        target: "Personne"
+        description: "Lien conjugal ou assimile."
+      - id: "PARENT_DE"
+        source: "Personne"
+        target: "Personne"
+        description: "Lien parent-enfant."
+      - id: "REMPLACE"
+        source: "GroupeVersion"
+        target: "GroupeVersion"
+        description: "Lien entre deux versions successives d'un meme groupe."
+
+  - ontology_id: "syndic-rights-billing"
+    label: "Syndic - droits, occupation et facturation"
+    description: "Relations patrimoniales, occupationnelles et facturables."
+    entity_types:
+      - id: "RelationPropriete"
+        description: "Relation reifiee de detention juridique d'un bien."
+      - id: "RelationOccupation"
+        description: "Relation reifiee d'occupation ou usage d'un lot."
+      - id: "GroupeDeTitulaires"
+        description: "Groupe patrimonial portant un droit reel."
+      - id: "GroupeFacturable"
+        description: "Groupe operationnel auquel les charges sont imputees."
+      - id: "RegleFacturation"
+        description: "Regle de repartition ou d'imputation des frais."
+      - id: "ResponsabiliteFacturation"
+        description: "Relation qualifiee entre un groupe facturable et un lot."
+    relation_types:
+      - id: "POSSEDE"
+        source: "Personne|Menage|GroupeVersion|RelationPropriete"
+        target: "Immeuble|Appartement|Garage|Cave"
+        description: "Detention juridique ou patrimoniale d'un bien."
+        property_profile: "ownership_relation"
+      - id: "OCCUPE"
+        source: "Personne|Menage|RelationOccupation"
+        target: "Appartement|Garage|Cave"
+        description: "Occupation ou usage d'un lot."
+        property_profile: "occupation_relation"
+      - id: "FACTURABLE_POUR"
+        source: "GroupeVersion|ResponsabiliteFacturation"
+        target: "Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+        description: "Responsabilite de facturation applicable a un lot ou une partie commune."
+        property_profile: "billing_relation"
+      - id: "UTILISE_REGLE"
+        source: "GroupeVersion|ResponsabiliteFacturation"
+        target: "RegleFacturation"
+        description: "Associe une responsabilite ou un groupe facturable a sa regle de calcul."
+      - id: "PORTE_SUR"
+        source: "RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+        target: "Immeuble|Appartement|Garage|Cave|Hall|Ascenseur|EspaceMachineALaver"
+        description: "Relie une relation reifiee au bien concerne."
+
+  - ontology_id: "syndic-events-evidence"
+    label: "Syndic - evenements et preuves"
+    description: "Evenements, documents, statuts et causes expliquant l'evolution du graphe."
+    entity_types:
+      - id: "Evenement"
+        description: "Evenement qui cree, modifie, cloture ou met en verification un etat du graphe."
+      - id: "DocumentPreuve"
+        description: "Piece qui confirme une relation, un evenement ou un etat."
+      - id: "CauseFinRelation"
+        description: "Valeur controlee expliquant la fin ou la mise en verification d'une relation."
+    relation_types:
+      - id: "PROUVE"
+        source: "DocumentPreuve"
+        target: "RelationPropriete|RelationOccupation|ResponsabiliteFacturation|GroupeVersion|Evenement"
+        description: "Relie une preuve documentaire a ce qu'elle confirme."
+      - id: "CREE"
+        source: "Evenement"
+        target: "GroupeVersion|Membership|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+        description: "Indique qu'un evenement ouvre un nouvel etat du graphe."
+      - id: "CLOTURE"
+        source: "Evenement"
+        target: "GroupeVersion|Membership|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+        description: "Indique qu'un evenement ferme un etat du graphe."
+      - id: "IMPACTE"
+        source: "Evenement"
+        target: "Personne|Menage|GroupeVersion|RelationPropriete|RelationOccupation|ResponsabiliteFacturation"
+        description: "Indique qu'un evenement modifie le statut ou l'interpretation d'un etat."
+
+property_profiles:
+  temporal_relation:
+    description: "Champs temporels communs aux relations historisees."
+    fields:
+      validFrom: "date"
+      validTo: "date|null"
+      legalEffectiveFrom: "date|null"
+      legalEffectiveTo: "date|null"
+      operationalEffectiveFrom: "date|null"
+      operationalEffectiveTo: "date|null"
+      billingEffectiveFrom: "date|null"
+      billingEffectiveTo: "date|null"
+      recordedAt: "datetime|null"
+
+  qualified_end:
+    description: "Champs expliquant la fin ou le remplacement d'une relation."
+    fields:
+      endReasonCode: "controlled:end_reason|null"
+      endEvent: "ref:Evenement|null"
+      endDocument: "ref:DocumentPreuve|null"
+      endNote: "text|null"
+      replacedBy: "ref|null"
+
+  evidence:
+    description: "Liens de provenance et de justification."
+    fields:
+      createdByDocument: "ref:DocumentPreuve|null"
+      confirmedByDocument: "ref:DocumentPreuve|null"
+      modifiedByEvent: "ref:Evenement|null"
+      closedByDocument: "ref:DocumentPreuve|null"
+
+  ownership_relation:
+    extends: ["temporal_relation", "qualified_end", "evidence"]
+    fields:
+      ownership_kind: "controlled:ownership_kind"
+      share_bp: "integer:0..10000"
+      status: "controlled:relation_status"
+
+  occupation_relation:
+    extends: ["temporal_relation", "qualified_end", "evidence"]
+    fields:
+      occupation_kind: "controlled:occupation_kind"
+      status: "controlled:relation_status"
+
+  billing_relation:
+    extends: ["temporal_relation", "qualified_end", "evidence"]
+    fields:
+      billing_rule: "ref:RegleFacturation"
+      billed_household: "ref:Menage|null"
+      billing_share_bp: "integer:0..10000|null"
+      status: "controlled:relation_status"
+
+  membership_relation:
+    extends: ["temporal_relation", "qualified_end", "evidence"]
+    fields:
+      role: "controlled:membership_role"
+      share_bp: "integer:0..10000|null"
+      status: "controlled:relation_status"
+
+controlled_values:
+  relation_status:
+    - "brouillon"
+    - "confirme"
+    - "actif"
+    - "a_verifier"
+    - "succession_en_cours"
+    - "conteste"
+    - "cloture"
+    - "archive"
+
+  end_reason:
+    - code: "DEATH"
+      label: "Deces"
+      applies_to: ["MEMBRE_DE", "OCCUPE", "FACTURABLE_POUR", "POSSEDE:verification"]
+    - code: "DIVORCE"
+      label: "Divorce"
+      applies_to: ["MEMBRE_DE", "OCCUPE", "FACTURABLE_POUR", "POSSEDE"]
+    - code: "SALE"
+      label: "Vente"
+      applies_to: ["POSSEDE", "OCCUPE", "FACTURABLE_POUR"]
+    - code: "DONATION"
+      label: "Donation"
+      applies_to: ["POSSEDE"]
+    - code: "SUCCESSION_TRANSFER"
+      label: "Mutation successorale"
+      applies_to: ["POSSEDE"]
+    - code: "LEASE_END"
+      label: "Fin de bail"
+      applies_to: ["OCCUPE", "FACTURABLE_POUR"]
+    - code: "OWNER_CHANGE"
+      label: "Changement de proprietaire"
+      applies_to: ["POSSEDE", "FACTURABLE_POUR"]
+    - code: "PAYER_CHANGE"
+      label: "Changement de payeur"
+      applies_to: ["FACTURABLE_POUR"]
+    - code: "DATA_CORRECTION"
+      label: "Correction de donnees"
+      applies_to: ["POSSEDE", "OCCUPE", "MEMBRE_DE", "FACTURABLE_POUR"]
+
+  ownership_kind:
+    - "pleine_propriete"
+    - "nue_propriete"
+    - "usufruit"
+    - "indivision"
+    - "succession_en_cours"
+
+  occupation_kind:
+    - "occupant_proprietaire"
+    - "occupant_facturable"
+    - "locataire"
+    - "usage_familial"
+    - "usage_temporaire"
+
+  membership_role:
+    - "co_titulaire"
+    - "co_redevable"
+    - "occupant"
+    - "conjoint"
+    - "enfant"
+    - "representant"
+    - "payeur_principal"
+
+modeling_rules:
+  - id: "no_in_place_group_mutation"
+    text: "Un changement de composition cree une nouvelle GroupeVersion et ne modifie pas l'ancienne."
+  - id: "invoice_points_to_group_version"
+    text: "Une facture ou charge doit pointer vers la version du groupe facturable applicable a la date du fait generateur."
+  - id: "legal_billing_dates_are_distinct"
+    text: "La date d'effet juridique, operationnelle et de facturation peuvent diverger."
+  - id: "structured_end_reason"
+    text: "Une fin de relation doit utiliser un code structure, un evenement, un document et une note optionnelle."
+  - id: "ownership_occupation_billing_are_distinct"
+    text: "Possession, occupation et responsabilite de facturation sont des relations differentes meme si elles concernent le meme lot."

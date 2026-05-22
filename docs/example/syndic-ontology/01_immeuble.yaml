@@ -1,0 +1,129 @@
+# ============================================================
+# SCENARIO: Inventaire de l'immeuble
+# TYPE: domain_inventory
+# DOMAIN: syndic
+# DESCRIPTION: Decrit la structure physique de l'immeuble, ses lots privatifs,
+#              annexes et parties communes.
+# ============================================================
+
+scenario:
+  id: scenario_immeuble_inventory
+  type: domain_inventory
+  title: "Inventaire immeuble 5 appartements"
+  domain: syndic
+  mode: baseline
+
+  sections:
+    - id: section_building_identity
+      role: primary_entity
+      title: "Immeuble"
+      elements:
+        - id: immeuble_residence_du_parc
+          type: Immeuble
+          label: "Residence du Parc"
+          attributes:
+            lot_count: 5
+            common_part_count: 3
+            status: actif
+
+    - id: section_private_lots
+      role: lot_inventory
+      title: "Lots privatifs"
+      layout: repeated_lot_pairs
+      elements:
+        - id: appartement_01
+          type: Appartement
+          label: "Appartement 1"
+          floor: 0
+          annexes:
+            - garage_01
+            - cave_01
+        - id: appartement_02
+          type: Appartement
+          label: "Appartement 2"
+          floor: 1
+          annexes:
+            - garage_02
+            - cave_02
+        - id: appartement_03
+          type: Appartement
+          label: "Appartement 3"
+          floor: 1
+          annexes:
+            - garage_03
+            - cave_03
+        - id: appartement_04
+          type: Appartement
+          label: "Appartement 4"
+          floor: 2
+          annexes:
+            - garage_04
+            - cave_04
+        - id: appartement_05
+          type: Appartement
+          label: "Appartement 5"
+          floor: 2
+          annexes:
+            - garage_05
+            - cave_05
+
+    - id: section_annexes
+      role: annex_inventory
+      title: "Garages et caves"
+      elements:
+        - { id: garage_01, type: Garage, label: "Garage 1", annexed_to: appartement_01 }
+        - { id: garage_02, type: Garage, label: "Garage 2", annexed_to: appartement_02 }
+        - { id: garage_03, type: Garage, label: "Garage 3", annexed_to: appartement_03 }
+        - { id: garage_04, type: Garage, label: "Garage 4", annexed_to: appartement_04 }
+        - { id: garage_05, type: Garage, label: "Garage 5", annexed_to: appartement_05 }
+        - { id: cave_01, type: Cave, label: "Cave 1", annexed_to: appartement_01 }
+        - { id: cave_02, type: Cave, label: "Cave 2", annexed_to: appartement_02 }
+        - { id: cave_03, type: Cave, label: "Cave 3", annexed_to: appartement_03 }
+        - { id: cave_04, type: Cave, label: "Cave 4", annexed_to: appartement_04 }
+        - { id: cave_05, type: Cave, label: "Cave 5", annexed_to: appartement_05 }
+
+    - id: section_common_parts
+      role: common_part_inventory
+      title: "Parties communes"
+      elements:
+        - { id: hall_principal, type: Hall, label: "Hall principal" }
+        - { id: ascenseur_principal, type: Ascenseur, label: "Ascenseur principal" }
+        - { id: espace_machine_laver, type: EspaceMachineALaver, label: "Espace machine a laver" }
+
+  actions:
+    - id: action_validate_building_inventory
+      label: "Valider l'inventaire de l'immeuble"
+      method: validate
+      checks:
+        - exactly_5_apartments
+        - exactly_5_garages
+        - exactly_5_cellars
+        - one_hall
+        - one_elevator
+        - one_laundry_space
+      branches:
+        - condition: valid
+          next_scenario: scenario_menages_occupants
+        - condition: missing_lot
+          next_scenario: scenario_immeuble_inventory
+          side_effect: require_inventory_correction
+
+  relations:
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: appartement_01 }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: appartement_02 }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: appartement_03 }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: appartement_04 }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: appartement_05 }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: hall_principal }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: ascenseur_principal }
+    - { source: immeuble_residence_du_parc, type: CONTIENT, target: espace_machine_laver }
+    - { source: garage_01, type: ANNEXE_A, target: appartement_01 }
+    - { source: garage_02, type: ANNEXE_A, target: appartement_02 }
+    - { source: garage_03, type: ANNEXE_A, target: appartement_03 }
+    - { source: garage_04, type: ANNEXE_A, target: appartement_04 }
+    - { source: garage_05, type: ANNEXE_A, target: appartement_05 }
+    - { source: cave_01, type: ANNEXE_A, target: appartement_01 }
+    - { source: cave_02, type: ANNEXE_A, target: appartement_02 }
+    - { source: cave_03, type: ANNEXE_A, target: appartement_03 }
+    - { source: cave_04, type: ANNEXE_A, target: appartement_04 }
+    - { source: cave_05, type: ANNEXE_A, target: appartement_05 }

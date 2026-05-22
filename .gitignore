@@ -11,12 +11,10 @@ prebuilds/
 .cursor/
 .claude/
 .claude.md
-docs/ghostcrab-mcp/
-docs/pg_dgraph/
-docs/SOP_REFONTE_PG_MINDBRAIN.md
-docs/PHASE1_EXECUTION_PLAN.md
-docs/pg_facets/
-docs/pg_pragma/
+docs/audit/
+docs/plan/
+docs/comparison/
+docs/dev/
 # Local DBs and large dumps; tracked corpora live under data/sources/
 data/*
 !data/sources/
