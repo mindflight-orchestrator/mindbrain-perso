@@ -134,6 +134,92 @@ pub const Database = struct {
         defer std.heap.page_allocator.free(schema);
         try self.exec(schema);
         try self.applyStandaloneStopwordsSeed();
+        try self.applyGraphEntityWorkspaceMigration();
+    }
+
+    fn migrationApplied(self: Database, migration_id: []const u8) Error!bool {
+        const stmt = try prepare(self, "SELECT 1 FROM mindbrain_schema_migrations WHERE id = ?1 LIMIT 1");
+        defer finalize(stmt);
+        try bindText(stmt, 1, migration_id);
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    fn markMigrationApplied(self: Database, migration_id: []const u8) Error!void {
+        const stmt = try prepare(self, "INSERT OR IGNORE INTO mindbrain_schema_migrations (id) VALUES (?1)");
+        defer finalize(stmt);
+        try bindText(stmt, 1, migration_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn graphEntityHasWorkspaceScopedUnique(self: Database) Error!bool {
+        const stmt = try prepare(
+            self,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'graph_entity' LIMIT 1",
+        );
+        defer finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const create_sql = std.mem.span(c.sqlite3_column_text(stmt, 0) orelse return false);
+        return std.mem.indexOf(u8, create_sql, "UNIQUE(workspace_id, entity_type, name)") != null;
+    }
+
+    fn applyGraphEntityWorkspaceMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-05-23-graph-entity-workspace-unique-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        try self.exec(
+            \\UPDATE graph_entity
+            \\SET workspace_id = COALESCE(
+            \\    NULLIF(json_extract(metadata_json, '$.workspace_id'), ''),
+            \\    workspace_id
+            \\)
+            \\WHERE workspace_id = 'default'
+            \\  AND json_extract(metadata_json, '$.workspace_id') IS NOT NULL
+            \\  AND json_extract(metadata_json, '$.workspace_id') != '';
+        );
+
+        if (try self.graphEntityHasWorkspaceScopedUnique()) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        try self.exec(
+            \\PRAGMA foreign_keys = OFF;
+            \\CREATE TABLE graph_entity__ws_unique_new (
+            \\    entity_id INTEGER PRIMARY KEY,
+            \\    workspace_id TEXT NOT NULL DEFAULT 'default',
+            \\    entity_type TEXT NOT NULL,
+            \\    name TEXT NOT NULL,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    deprecated_at INTEGER,
+            \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    UNIQUE(workspace_id, entity_type, name)
+            \\);
+            \\INSERT INTO graph_entity__ws_unique_new (
+            \\    entity_id, workspace_id, entity_type, name, confidence,
+            \\    deprecated_at, metadata_json, created_at_unix
+            \\)
+            \\SELECT
+            \\    entity_id, workspace_id, entity_type, name, confidence,
+            \\    deprecated_at, metadata_json, created_at_unix
+            \\FROM graph_entity;
+            \\DROP TABLE graph_entity;
+            \\ALTER TABLE graph_entity__ws_unique_new RENAME TO graph_entity;
+            \\CREATE INDEX IF NOT EXISTS graph_entity_name_idx ON graph_entity(name);
+            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
+            \\    ON graph_entity(workspace_id, entity_type, name);
+            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx ON graph_entity(workspace_id);
+            \\PRAGMA foreign_keys = ON;
+        );
+
+        try self.markMigrationApplied(applied_id);
     }
 
     pub fn applyStandaloneImportSchema(self: Database) !void {
@@ -747,6 +833,63 @@ fn loadFacetTableConfigById(
         .schema_name = schema_name_slice,
         .table_name = table_name_slice,
     };
+}
+
+pub fn loadFacetTableConfigByTableId(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+) !interfaces.FacetTableConfig {
+    return try loadFacetTableConfigById(db, allocator, table_id);
+}
+
+pub fn countFacetPostingsForTable(db: Database, table_id: u64) !u64 {
+    const stmt = try prepare(db, "SELECT COUNT(*) FROM facet_postings WHERE table_id = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    return try columnU64(stmt, 0);
+}
+
+pub fn ensureFacetDefinitionId(db: Database, table_id: u64, facet_name: []const u8) !u32 {
+    const existing = loadFacetId(db, table_id, facet_name) catch |err| switch (err) {
+        error.MissingRow => null,
+        else => return err,
+    };
+    if (existing) |id| return id;
+
+    const stmt = try prepare(
+        db,
+        "SELECT COALESCE(MAX(facet_id), 0) + 1 FROM facet_definitions WHERE table_id = ?1",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    const next_id: u32 = @intCast(c.sqlite3_column_int64(stmt, 0));
+    try upsertFacetDefinition(db, table_id, next_id, facet_name);
+    return next_id;
+}
+
+pub fn reconstructFacetBitmapFromPostings(
+    allocator: std.mem.Allocator,
+    chunk_bits: u8,
+    postings: []const interfaces.FacetPosting,
+) !?roaring.Bitmap {
+    var facet_bitmap: ?roaring.Bitmap = null;
+    errdefer if (facet_bitmap) |*bm| bm.deinit();
+
+    for (postings) |posting| {
+        const in_chunk = try posting.bitmap.toArray(allocator);
+        defer allocator.free(in_chunk);
+
+        for (in_chunk) |doc_id_in_chunk| {
+            const original_id: u32 = (posting.chunk_id << @intCast(chunk_bits)) | doc_id_in_chunk;
+            if (facet_bitmap == null) facet_bitmap = try roaring.Bitmap.empty();
+            facet_bitmap.?.add(original_id);
+        }
+    }
+
+    return facet_bitmap;
 }
 
 fn loadFacetTableRuntime(

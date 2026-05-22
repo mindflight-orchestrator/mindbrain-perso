@@ -26,7 +26,8 @@ fn renderImportSchema(allocator: std.mem.Allocator) ![]u8 {
         \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
         \\    UNIQUE(entity_type, name)
     ,
-        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch())
+        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+        \\    UNIQUE(workspace_id, entity_type, name)
     );
 
     try replaceSchemaFragment(allocator, &schema,

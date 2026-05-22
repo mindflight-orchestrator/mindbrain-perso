@@ -163,11 +163,14 @@ CREATE TABLE IF NOT EXISTS graph_entity (
     deprecated_at INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
-    UNIQUE(entity_type, name)
+    UNIQUE(workspace_id, entity_type, name)
 );
 
 CREATE INDEX IF NOT EXISTS graph_entity_name_idx
     ON graph_entity(name);
+
+CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
+    ON graph_entity(workspace_id, entity_type, name);
 
 CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx
     ON graph_entity(workspace_id);

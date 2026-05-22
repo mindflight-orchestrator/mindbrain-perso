@@ -93,6 +93,18 @@ Session close always closes the SQLite handle after attempting the requested
 `COMMIT` or `ROLLBACK`; if `COMMIT` fails, the server attempts a rollback before
 returning the error payload.
 
+### Reindex endpoints
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/api/mindbrain/reindex/graph` | `{ "workspace_id": "ws", "document_table_id": 7 }` | `{ workspace_id, projected_count, document_table_id, adjacency_rebuilt }` |
+| `POST` | `/api/mindbrain/reindex/all` | `{ "workspace_id": "ws", "collection_id": "ws::docs", "table_id": 7 }` | `{ workspace_id, collection_id, table_id, graph_projected, facet_assignments, bm25_documents }` |
+
+`reindex/graph` replays raw graph rows for one workspace into the derived graph
+tables. `reindex/all` rebuilds BM25, facet postings, and graph projections for
+one collection/table pair. The supplied `table_id` must resolve to the requested
+collection table.
+
 ### Fact write endpoint
 
 | Method | Path | Body | Response |
@@ -139,6 +151,7 @@ Write behavior:
 | `GET`/`HEAD` | `/api/mindbrain/graph-path` | `source`, `target`, repeated `edge_label` optional, `max_depth` optional | TOON shortest path |
 | `GET`/`HEAD` | `/api/mindbrain/graph/subgraph` | `seed_ids=1,2`, `hops` optional, `edge_types=a,b` optional | SSE-formatted subgraph body |
 | `GET`/`HEAD` | `/api/mindbrain/traverse` | `start`, `direction`, `depth`, `target` optional, repeated `edge_label` optional | JSON graph traversal result |
+| `GET`/`HEAD` | `/api/mindbrain/collections/facet-search` | `workspace_id`, `collection_id`, `table_id` optional, `namespace` optional, `dimension` optional, `value` optional, `limit` optional | JSON facet matches from derived postings or raw fallback |
 | `GET`/`HEAD` | `/api/mindbrain/pack` | `user_id`, `query`, `scope` optional, `limit` optional | TOON packed context |
 
 ### GhostCrab compatibility endpoints
@@ -173,6 +186,7 @@ mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <i
 mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
+mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
 mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
@@ -203,7 +217,7 @@ Command families:
 
 | Family | Commands |
 |--------|----------|
-| Workspace and collections | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import` |
+| Workspace and collections | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import`, `backup-load` |
 | Ontology | `ontology-register`, `ontology-attach`, `coverage`, `coverage-by-domain` |
 | Documents and chunks | `document-ingest`, `document-by-nanoid`, `document-normalize`, `external-link-add` |
 | LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search`, `search-embedding-batch` |

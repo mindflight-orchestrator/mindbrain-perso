@@ -31,6 +31,7 @@ pub const pragma_projection_types = @import("pragma_projection_types.zig");
 pub const pragma_sqlite = @import("pragma_sqlite.zig");
 pub const query_executor = @import("query_executor.zig");
 pub const queue_sqlite = @import("queue_sqlite.zig");
+pub const reindex_http = @import("reindex_http.zig");
 pub const reference_extractor = @import("reference_extractor.zig");
 pub const roaring = @import("roaring.zig");
 pub const search_compact_store = @import("search_compact_store.zig");

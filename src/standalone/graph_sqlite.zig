@@ -562,13 +562,18 @@ pub fn upsertEntityWithMetadata(
     name: []const u8,
     metadata_json: []const u8,
 ) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO graph_entity(entity_id, entity_type, name, metadata_json) VALUES (?1, ?2, ?3, ?4)");
-    defer finalize(stmt);
-    try bindInt64(stmt, 1, entity_id);
-    try bindText(stmt, 2, entity_type);
-    try bindText(stmt, 3, name);
-    try bindText(stmt, 4, metadata_json);
-    try stepDone(stmt);
+    return upsertEntityWithMetadataWorkspace(db, entity_id, "default", entity_type, name, metadata_json);
+}
+
+pub fn upsertEntityWithMetadataWorkspace(
+    db: Database,
+    entity_id: u32,
+    workspace_id: []const u8,
+    entity_type: []const u8,
+    name: []const u8,
+    metadata_json: []const u8,
+) !void {
+    return upsertEntityFull(db, entity_id, workspace_id, entity_type, name, 1.0, metadata_json);
 }
 
 pub fn upsertEntityFull(
@@ -1010,7 +1015,7 @@ pub fn upsertEntityNatural(
     _ = allocator;
     const stmt = try prepare(
         db,
-        "INSERT INTO graph_entity(entity_type, name, confidence, metadata_json, deprecated_at) VALUES (?1, ?2, ?3, ?4, NULL) " ++ "ON CONFLICT(entity_type, name) DO UPDATE SET confidence = MAX(graph_entity.confidence, excluded.confidence), " ++ "metadata_json = CASE " ++ "WHEN graph_entity.metadata_json = '{}' THEN excluded.metadata_json " ++ "WHEN excluded.metadata_json = '{}' THEN graph_entity.metadata_json " ++ "ELSE excluded.metadata_json END, " ++ "deprecated_at = NULL " ++ "RETURNING entity_id",
+        "INSERT INTO graph_entity(workspace_id, entity_type, name, confidence, metadata_json, deprecated_at) VALUES ('default', ?1, ?2, ?3, ?4, NULL) " ++ "ON CONFLICT(workspace_id, entity_type, name) DO UPDATE SET confidence = MAX(graph_entity.confidence, excluded.confidence), " ++ "metadata_json = CASE " ++ "WHEN graph_entity.metadata_json = '{}' THEN excluded.metadata_json " ++ "WHEN excluded.metadata_json = '{}' THEN graph_entity.metadata_json " ++ "ELSE excluded.metadata_json END, " ++ "deprecated_at = NULL " ++ "RETURNING entity_id",
     );
     defer finalize(stmt);
     try bindText(stmt, 1, entity_type);
@@ -2258,10 +2263,23 @@ pub fn traverse(
     depth: usize,
     target_name: ?[]const u8,
 ) !TraverseResult {
+    return traverseWorkspace(db, allocator, "default", start_name, direction, edge_types, depth, target_name);
+}
+
+pub fn traverseWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    start_name: []const u8,
+    direction: TraverseDirection,
+    edge_types: ?[]const []const u8,
+    depth: usize,
+    target_name: ?[]const u8,
+) !TraverseResult {
     const filter: interfaces.GraphEdgeFilter = .{
         .edge_types = edge_types,
     };
-    const start = loadTraverseEntityByName(db, allocator, start_name) catch |err| switch (err) {
+    const start = loadTraverseEntityByName(db, allocator, workspace_id, start_name) catch |err| switch (err) {
         error.MissingRow => {
             return .{
                 .rows = try allocator.alloc(TraverseRow, 0),
@@ -2273,7 +2291,7 @@ pub fn traverse(
     defer deinitTraverseEntitySummary(allocator, start);
 
     const target_id: ?u32 = if (target_name) |name|
-        (loadTraverseEntityIdByName(db, name) catch |err| switch (err) {
+        (loadTraverseEntityIdByName(db, workspace_id, name) catch |err| switch (err) {
             error.MissingRow => null,
             else => return err,
         })
@@ -2388,12 +2406,24 @@ pub fn shortestPathToon(
     edge_types: ?[]const []const u8,
     max_depth: usize,
 ) ![]u8 {
+    return shortestPathToonWorkspace(db, allocator, "default", source_name, target_name, edge_types, max_depth);
+}
+
+pub fn shortestPathToonWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    source_name: []const u8,
+    target_name: []const u8,
+    edge_types: ?[]const []const u8,
+    max_depth: usize,
+) ![]u8 {
     var runtime = try loadRuntime(db, allocator);
     defer runtime.deinit();
 
-    const source = try loadTraverseEntityByName(db, allocator, source_name);
+    const source = try loadTraverseEntityByName(db, allocator, workspace_id, source_name);
     defer deinitTraverseEntitySummary(allocator, source);
-    const target = try loadTraverseEntityByName(db, allocator, target_name);
+    const target = try loadTraverseEntityByName(db, allocator, workspace_id, target_name);
     defer deinitTraverseEntitySummary(allocator, target);
 
     const path = (try runtime.shortestPath(
@@ -3659,13 +3689,14 @@ fn loadEntity(db: Database, allocator: std.mem.Allocator, entity_id: u32) !Entit
     };
 }
 
-fn loadTraverseEntityByName(db: Database, allocator: std.mem.Allocator, name: []const u8) !TraverseEntitySummary {
+fn loadTraverseEntityByName(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, name: []const u8) !TraverseEntitySummary {
     const stmt = try prepare(
         db,
-        "SELECT entity_id, name, COALESCE(json_extract(metadata_json, '$.label'), name), COALESCE(json_extract(metadata_json, '$.node_type'), 'entity'), metadata_json FROM graph_entity WHERE name = ?1 LIMIT 1",
+        "SELECT entity_id, name, COALESCE(json_extract(metadata_json, '$.label'), name), COALESCE(json_extract(metadata_json, '$.node_type'), 'entity'), metadata_json FROM graph_entity WHERE workspace_id = ?1 AND name = ?2 AND deprecated_at IS NULL LIMIT 1",
     );
     defer finalize(stmt);
-    try bindText(stmt, 1, name);
+    try bindText(stmt, 1, workspace_id);
+    try bindText(stmt, 2, name);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
     return .{
         .entity_id = try columnU32(stmt, 0),
@@ -3693,10 +3724,11 @@ fn loadTraverseEntityById(db: Database, allocator: std.mem.Allocator, entity_id:
     };
 }
 
-fn loadTraverseEntityIdByName(db: Database, name: []const u8) !u32 {
-    const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE name = ?1 LIMIT 1");
+fn loadTraverseEntityIdByName(db: Database, workspace_id: []const u8, name: []const u8) !u32 {
+    const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE workspace_id = ?1 AND name = ?2 AND deprecated_at IS NULL LIMIT 1");
     defer finalize(stmt);
-    try bindText(stmt, 1, name);
+    try bindText(stmt, 1, workspace_id);
+    try bindText(stmt, 2, name);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
     return try columnU32(stmt, 0);
 }

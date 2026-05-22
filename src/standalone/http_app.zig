@@ -6,6 +6,7 @@ const helper_api = @import("helper_api.zig");
 const hybrid_search = @import("hybrid_search.zig");
 const interfaces = @import("interfaces.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
+const reindex_http = @import("reindex_http.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
@@ -82,6 +83,17 @@ const GhostcrabSearchRequest = struct {
     embedding: []const f64 = &.{},
     vector_weight: f64 = 0.5,
     limit: usize = 50,
+};
+
+const ReindexGraphRequest = struct {
+    workspace_id: []const u8,
+    document_table_id: ?u64 = null,
+};
+
+const ReindexAllRequest = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    table_id: u64,
 };
 
 pub const DefaultWorkspaceOptions = struct {
@@ -860,6 +872,16 @@ pub const MindbrainHttpApp = struct {
             return try self.handleGhostcrabSearch(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/reindex/graph")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleReindexGraph(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/reindex/all")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleReindexAll(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -913,6 +935,9 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/graph-search")) {
             return self.handleGhostcrabGraphSearch(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/collections/facet-search")) {
+            return self.handleCollectionFacetSearch(allocator, query);
         }
 
         return self.handleStatic(allocator, path);
@@ -1300,6 +1325,166 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleReindexGraph(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        defer allocator.free(body);
+        const reindex_request = try std.json.parseFromSliceLeaky(
+            ReindexGraphRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+        );
+        if (reindex_request.workspace_id.len == 0) return error.BadRequest;
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const result = try reindex_http.reindexGraph(
+            allocator,
+            &self.writer_db,
+            reindex_request.workspace_id,
+            reindex_request.document_table_id,
+        );
+
+        const payload = .{
+            .workspace_id = reindex_request.workspace_id,
+            .projected_count = result.projected_count,
+            .document_table_id = result.document_table_id,
+            .adjacency_rebuilt = true,
+        };
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
+    fn handleReindexAll(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        defer allocator.free(body);
+        const reindex_request = try std.json.parseFromSliceLeaky(
+            ReindexAllRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+        );
+        if (reindex_request.workspace_id.len == 0 or reindex_request.collection_id.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const result = try reindex_http.reindexAll(
+            allocator,
+            &self.writer_db,
+            reindex_request.workspace_id,
+            reindex_request.collection_id,
+            reindex_request.table_id,
+        );
+
+        const payload = .{
+            .workspace_id = reindex_request.workspace_id,
+            .collection_id = reindex_request.collection_id,
+            .table_id = reindex_request.table_id,
+            .graph_projected = result.graph_projected,
+            .facet_assignments = result.facet_assignments,
+            .bm25_documents = result.bm25_documents,
+        };
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
+    fn handleCollectionFacetSearch(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const collection_id = (try queryValue(allocator, query, "collection_id")) orelse return error.BadRequest;
+        const namespace = try queryValue(allocator, query, "namespace");
+        defer if (namespace) |value| allocator.free(value);
+        const dimension = try queryValue(allocator, query, "dimension");
+        defer if (dimension) |value| allocator.free(value);
+        const value_query = try queryValue(allocator, query, "value");
+        defer if (value_query) |value| allocator.free(value);
+        const table_id = if (try queryValue(allocator, query, "table_id")) |raw|
+            try std.fmt.parseInt(u64, raw, 10)
+        else
+            null;
+        const limit = if (try queryValue(allocator, query, "limit")) |raw|
+            try std.fmt.parseInt(usize, raw, 10)
+        else
+            25;
+
+        const search_result = try reindex_http.searchCollectionFacets(
+            allocator,
+            db,
+            workspace_id,
+            collection_id,
+            table_id,
+            namespace,
+            dimension,
+            value_query,
+            @min(limit, 100),
+        );
+        const rows = search_result.matches;
+        defer {
+            for (rows) |row| row.deinit(allocator);
+            allocator.free(rows);
+        }
+
+        const payload = .{
+            .workspace_id = workspace_id,
+            .collection_id = collection_id,
+            .returned = rows.len,
+            .matches = rows,
+            .source = search_result.source,
+        };
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try out.toOwnedSlice(),
+        };
+    }
+
     fn handleEventStream(self: *MindbrainHttpApp, request: *http.Server.Request) !void {
         var db = try self.openDb();
         defer db.close();
@@ -1524,6 +1709,7 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const start = (try queryValue(allocator, query, "start")) orelse return error.BadRequest;
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse self.default_workspace_id_owned;
         const direction = if (try queryValue(allocator, query, "direction")) |value|
             parseDirection(value) orelse return error.BadRequest
         else
@@ -1536,9 +1722,10 @@ pub const MindbrainHttpApp = struct {
         const edge_labels = try queryValues(allocator, query, "edge_label");
         defer allocator.free(edge_labels);
 
-        var result = try graph_sqlite.traverse(
+        var result = try graph_sqlite.traverseWorkspace(
             db,
             allocator,
+            workspace_id,
             start,
             direction,
             if (edge_labels.len > 0) edge_labels else null,
@@ -2374,6 +2561,8 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/facts/write
         \\  POST /api/mindbrain/search-embedding-upsert
         \\  POST /api/mindbrain/ghostcrab/search
+        \\  POST /api/mindbrain/reindex/graph
+        \\  POST /api/mindbrain/reindex/all
         \\  GET /health
         \\  GET /api/events  (SSE demo_firehose, long-lived)
         \\  GET /api/mindbrain/simulate
@@ -2386,6 +2575,7 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/graph-path?source=...&target=...&max_depth=...
         \\  GET /api/mindbrain/graph/subgraph?seed_ids=1,2&hops=2&edge_types=requires
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
+        \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...
         \\
         \\notes:

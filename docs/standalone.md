@@ -63,10 +63,11 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 |-------------|-------------|-------|
 | `POST /api/mindbrain/sql*` | High | Arbitrary SQL and transaction/session control. Trusted operators only. |
 | `POST /api/mindbrain/facts/write` | High | Durable fact-store mutation. Allocates `doc_id` and writes `facets` rows for downstream retrieval/packing clients. |
+| `POST /api/mindbrain/reindex/*` | High | Rebuilds derived BM25, facet, and graph indexes from raw workspace/collection tables. |
 | `GET /api/mindbrain/sql/write-status` | Medium | Reports serialized writer-lane status and counters. |
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
 | `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get` | High | Retrieval/projection output can expose packed context, evidence, or operational projection rows. |
-| `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
+| `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/collections/facet-search`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
 | `GET /health`, static assets | Low | Basic liveness/static serving only. |
 
 ## CLI: `mindbrain-standalone-tool`
@@ -82,6 +83,7 @@ mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <i
 mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
+mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
 mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
@@ -113,6 +115,7 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`traverse`** — Graph walk from a start node; prints JSON (`target_found`, `rows`).
 - **`workspace-export`** — Emits **TOON** workspace model export to stdout.
 - **`workspace-create` / `collection-create` / `collection-export` / `collection-import`** — Workspace and collection lifecycle plus portable JSON bundle export/import.
+- **`backup-load --reindex`** — Load a bundle and optionally rebuild graph-only or all derived graph/facet/BM25 indexes for the bundle workspace.
 - **`ontology-register` / `ontology-attach`** — Register workspace-scoped ontologies and attach them to collections.
 - **`ontology-import` / `ontology-export`** — Import normalized OWL2/RDF
   N-Triples into `ontology_triples_raw`, project simple ontology facts, optional

@@ -635,7 +635,7 @@ fn loadWorkspaceGraphEntities(
     workspace_id: []const u8,
     entity_types: ?[]const []const u8,
 ) ![]GraphEntityRecord {
-    const stmt = try prepare(db, "SELECT entity_id, name, entity_type FROM graph_entity WHERE json_extract(metadata_json, '$.workspace_id') = ?1 OR ?1 = 'default'");
+    const stmt = try prepare(db, "SELECT entity_id, name, entity_type FROM graph_entity WHERE workspace_id = ?1 AND deprecated_at IS NULL");
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     var rows = std.ArrayList(GraphEntityRecord).empty;

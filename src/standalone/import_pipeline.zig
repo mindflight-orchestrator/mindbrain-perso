@@ -138,7 +138,8 @@ pub const Pipeline = struct {
     }
 
     pub fn upsertEntity(self: *Pipeline, entity: EntityImport) !void {
-        try graph_sqlite.upsertEntity(self.db.*, entity.entity_id, entity.entity_type, entity.name);
+        const ws = self.workspace_id orelse "default";
+        try graph_sqlite.upsertEntityFull(self.db.*, entity.entity_id, ws, entity.entity_type, entity.name, 1.0, "{}");
     }
 
     pub fn addRelation(self: *Pipeline, relation: RelationImport) !void {
@@ -655,10 +656,7 @@ pub const Pipeline = struct {
             current_doc = doc_id;
 
             const facet_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ ns, dim });
-            const facet_id: u32 = facet_sqlite.loadFacetId(self.db.*, table_id, facet_name) catch |err| switch (err) {
-                error.MissingRow => 0,
-                else => return err,
-            };
+            const facet_id = try facet_sqlite.ensureFacetDefinitionId(self.db.*, table_id, facet_name);
             try pending.append(self.allocator, .{
                 .facet_id = facet_id,
                 .facet_name = facet_name,

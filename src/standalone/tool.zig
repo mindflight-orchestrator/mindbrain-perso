@@ -4,6 +4,7 @@ const chunker = mindbrain.chunker;
 const chunking_policy = mindbrain.chunking_policy;
 const collections_io = mindbrain.collections_io;
 const collections_sqlite = mindbrain.collections_sqlite;
+const reindex_http = mindbrain.reindex_http;
 const corpus_eval = mindbrain.corpus_eval;
 const corpus_profile = mindbrain.corpus_profile;
 const corpus_profile_prompt = mindbrain.corpus_profile_prompt;
@@ -320,7 +321,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
-        \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run]
+        \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
         \\  mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
         \\  mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
@@ -1763,11 +1764,24 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     var db_path: ?[]const u8 = null;
     var bundle_path: ?[]const u8 = null;
     var dry_run = false;
+    var reindex_mode: enum { none, graph, all } = .none;
+    var document_table_id: ?u64 = null;
+    var collection_id: ?[]const u8 = null;
+    var table_id: ?u64 = null;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else return CliError.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--reindex")) {
+            const mode = try requireArg(args, &index);
+            if (std.mem.eql(u8, mode, "none")) reindex_mode = .none else if (std.mem.eql(u8, mode, "graph")) reindex_mode = .graph else if (std.mem.eql(u8, mode, "all")) reindex_mode = .all else return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--document-table-id")) {
+            const raw = try requireArg(args, &index);
+            document_table_id = try std.fmt.parseInt(u64, raw, 10);
+        } else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--table-id")) {
+            const raw = try requireArg(args, &index);
+            table_id = try std.fmt.parseInt(u64, raw, 10);
+        } else return CliError.InvalidArguments;
     }
     if (db_path == null or bundle_path == null) return CliError.InvalidArguments;
 
@@ -1794,6 +1808,7 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
                 .chunks = summary.chunk_count,
                 .relation_properties = summary.relation_property_count,
             },
+            .reindex = @tagName(reindex_mode),
         }, .{})});
         return;
     }
@@ -1802,8 +1817,31 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    const summary = try collections_io.summarizeBundleJson(allocator, buf);
+    defer summary.deinit(allocator);
+
     try collections_io.importBundleJson(db, allocator, buf);
     try writeStdout("loaded backup bundle from {s}\n", .{bundle_path.?});
+
+    switch (reindex_mode) {
+        .none => {},
+        .graph => {
+            const result = try reindex_http.reindexGraph(allocator, &db, summary.workspace_id, document_table_id);
+            try writeStdout(
+                "reindexed graph for workspace {s}: projected={d}\n",
+                .{ summary.workspace_id, result.projected_count },
+            );
+        },
+        .all => {
+            const coll = collection_id orelse summary.collection_id orelse return CliError.InvalidArguments;
+            const tid = table_id orelse document_table_id orelse return CliError.InvalidArguments;
+            const result = try reindex_http.reindexAll(allocator, &db, summary.workspace_id, coll, tid);
+            try writeStdout(
+                "reindexed all for workspace {s}: graph={d} facets={d} bm25={d}\n",
+                .{ summary.workspace_id, result.graph_projected, result.facet_assignments, result.bm25_documents },
+            );
+        },
+    }
 }
 
 fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !void {
