@@ -10,7 +10,6 @@ const reindex_http = @import("reindex_http.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
-const tokenization_sqlite = @import("tokenization_sqlite.zig");
 const toon_exports = @import("toon_exports.zig");
 const workspace_sqlite = @import("workspace_sqlite.zig");
 const zig16_compat = @import("zig16_compat.zig");
@@ -83,6 +82,8 @@ const GhostcrabSearchRequest = struct {
     embedding: []const f64 = &.{},
     vector_weight: f64 = 0.5,
     limit: usize = 50,
+    table_id: ?u64 = null,
+    collection_id: ?[]const u8 = null,
 };
 
 const ReindexGraphRequest = struct {
@@ -1217,11 +1218,7 @@ pub const MindbrainHttpApp = struct {
 
         if (search_request.workspace_id.len == 0) return error.BadRequest;
         if (search_request.limit == 0 or search_request.limit > 1000) return error.BadRequest;
-
-        // Tokenise the query text into BM25 term hashes using the same
-        // tokeniser that the BM25 index was built with.
-        const term_hashes = try tokenization_sqlite.tokenizeSearchHashes(allocator, search_request.query, null);
-        defer allocator.free(term_hashes);
+        if (search_request.vector_weight < 0.0 or search_request.vector_weight > 1.0) return error.BadRequest;
 
         // Convert the query embedding from f64 (JSON) to f32 (store format).
         var query_vector_f32 = try allocator.alloc(f32, search_request.embedding.len);
@@ -1233,38 +1230,58 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        var store = try search_sqlite.loadSearchStore(db, allocator);
-        defer store.deinit();
+        const table_id = (try search_sqlite.resolveSearchTableId(
+            db,
+            search_request.workspace_id,
+            search_request.table_id,
+            search_request.collection_id,
+        )) orelse return error.BadRequest;
 
-        const bm25_repo = store.bm25Repository();
-        const vector_repo = store.vectorRepository();
+        const candidate_limit = @min(@as(usize, 1000), search_request.limit * 4);
+        const bm25_matches = if (search_request.query.len > 0)
+            try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit)
+        else
+            try allocator.alloc(search_sqlite.Bm25Match, 0);
+        defer allocator.free(bm25_matches);
 
-        const maybe_vector_request: ?interfaces.VectorSearchRequest = if (query_vector_f32.len > 0) .{
-            .table_name = "facets",
-            .key_column = "doc_id",
-            .vector_column = "embedding_blob",
-            .query_vector = query_vector_f32,
-            .limit = search_request.limit,
-            .table_id = 1,
-        } else null;
+        const vector_matches = if (query_vector_f32.len > 0)
+            try search_sqlite.searchEmbeddingExactTopK(
+                db,
+                allocator,
+                table_id,
+                query_vector_f32,
+                candidate_limit,
+                .cosine,
+            )
+        else
+            try allocator.alloc(interfaces.VectorSearchMatch, 0);
+        defer allocator.free(vector_matches);
 
-        const matches = try hybrid_search.search(
+        const matches = try hybrid_search.fusePreScored(
             allocator,
-            bm25_repo,
-            if (maybe_vector_request != null) vector_repo else null,
-            .{
-                .bm25_table_id = 1,
-                .bm25_term_hashes = term_hashes,
-                .vector = maybe_vector_request,
-                .vector_weight = search_request.vector_weight,
-                .limit = search_request.limit,
-            },
+            bm25_matches,
+            vector_matches,
+            search_request.vector_weight,
+            search_request.limit,
         );
         defer allocator.free(matches);
 
+        const retrieval_mode = if (search_request.query.len > 0 and query_vector_f32.len > 0)
+            "hybrid_bm25_vector"
+        else if (search_request.query.len > 0)
+            "bm25"
+        else if (query_vector_f32.len > 0)
+            "vector"
+        else
+            "empty";
+
         const payload = .{
             .workspace_id = search_request.workspace_id,
+            .collection_id = search_request.collection_id,
+            .table_id = table_id,
             .query = search_request.query,
+            .retrieval_mode = retrieval_mode,
+            .candidate_limit = candidate_limit,
             .returned = matches.len,
             .matches = matches,
         };

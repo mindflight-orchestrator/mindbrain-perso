@@ -157,6 +157,55 @@ pub fn search(
     return results.toOwnedSlice(allocator);
 }
 
+pub fn fusePreScored(
+    allocator: std.mem.Allocator,
+    bm25_matches: []const interfaces.DocScore,
+    vector_matches: []const interfaces.VectorSearchMatch,
+    vector_weight: f64,
+    limit: usize,
+) ![]interfaces.HybridSearchMatch {
+    if (vector_weight < 0.0 or vector_weight > 1.0) return error.InvalidWeight;
+    if (limit == 0) return allocator.alloc(interfaces.HybridSearchMatch, 0);
+
+    var candidate_scores = std.AutoHashMap(interfaces.DocId, CandidateScore).init(allocator);
+    defer candidate_scores.deinit();
+
+    for (bm25_matches) |match| {
+        const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
+        if (match.score > entry.bm25_score) entry.bm25_score = match.score;
+    }
+
+    for (vector_matches) |match| {
+        const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
+        if (match.similarity > entry.vector_score) entry.vector_score = match.similarity;
+    }
+
+    var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
+    defer results.deinit(allocator);
+
+    var iter = candidate_scores.iterator();
+    while (iter.next()) |entry| {
+        var bm25_score = entry.value_ptr.bm25_score;
+        var vector_score = entry.value_ptr.vector_score;
+        if (!std.math.isFinite(bm25_score)) bm25_score = 0.0;
+        if (!std.math.isFinite(vector_score)) vector_score = 0.0;
+
+        var combined_score = bm25_score * (1.0 - vector_weight) +
+            vector_score * vector_weight;
+        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
+
+        try insertTopHybridMatch(allocator, &results, .{
+            .doc_id = entry.key_ptr.*,
+            .bm25_score = bm25_score,
+            .vector_score = vector_score,
+            .combined_score = combined_score,
+        }, limit);
+    }
+
+    sortHybridMatches(results.items);
+    return results.toOwnedSlice(allocator);
+}
+
 fn collectCandidateDocIds(allocator: std.mem.Allocator, candidate_scores: *std.AutoHashMap(interfaces.DocId, CandidateScore)) ![]interfaces.DocId {
     var doc_ids = try std.ArrayList(interfaces.DocId).initCapacity(allocator, candidate_scores.count());
     defer doc_ids.deinit(allocator);
@@ -403,6 +452,34 @@ test "hybrid search rejects invalid vector weights" {
             .vector_weight = 1.5,
         },
     ));
+}
+
+test "fuse pre-scored matches is bounded and deterministic" {
+    const bm25_matches = [_]interfaces.DocScore{
+        .{ .doc_id = 10, .score = 0.5 },
+        .{ .doc_id = 20, .score = 0.5 },
+        .{ .doc_id = 30, .score = 0.1 },
+    };
+    const vector_matches = [_]interfaces.VectorSearchMatch{
+        .{ .doc_id = 20, .distance = 0.0, .similarity = 0.5 },
+        .{ .doc_id = 10, .distance = 0.0, .similarity = 0.5 },
+        .{ .doc_id = 40, .distance = 0.0, .similarity = 0.2 },
+    };
+
+    const results = try fusePreScored(
+        std.testing.allocator,
+        &bm25_matches,
+        &vector_matches,
+        0.5,
+        2,
+    );
+    defer std.testing.allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(interfaces.DocId, 10), results[0].doc_id);
+    try std.testing.expectEqual(@as(interfaces.DocId, 20), results[1].doc_id);
+    try std.testing.expectEqual(@as(f64, 0.5), results[0].combined_score);
+    try std.testing.expectEqual(@as(f64, 0.5), results[1].combined_score);
 }
 
 test "calculateBm25Score normalizes non-finite avg_document_length" {

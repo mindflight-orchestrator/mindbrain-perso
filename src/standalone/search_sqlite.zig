@@ -4,6 +4,7 @@ const facet_sqlite = @import("facet_sqlite.zig");
 const search_store = @import("search_store.zig");
 const search_compact_store = @import("search_compact_store.zig");
 const vector_blob = @import("vector_blob.zig");
+const vector_distance = @import("vector_distance.zig");
 const workspace_sqlite = @import("workspace_sqlite.zig");
 const toon_exports = @import("toon_exports.zig");
 const roaring = @import("roaring.zig");
@@ -22,10 +23,7 @@ pub const CompactSearchSnapshot = struct {
     embeddings: usize,
 };
 
-pub const Bm25Match = struct {
-    doc_id: interfaces.DocId,
-    score: f64,
-};
+pub const Bm25Match = interfaces.DocScore;
 
 pub const SearchDocumentRow = struct {
     table_id: u64,
@@ -266,6 +264,95 @@ pub fn searchFts5Bm25(
     }
 
     return matches.toOwnedSlice(allocator);
+}
+
+pub fn resolveSearchTableId(
+    db: Database,
+    workspace_id: []const u8,
+    explicit_table_id: ?u64,
+    collection_id: ?[]const u8,
+) !?u64 {
+    if (explicit_table_id) |table_id| {
+        if (try searchTableBelongsToWorkspace(db, workspace_id, table_id)) return table_id;
+        return null;
+    }
+
+    if (collection_id) |value| {
+        if (value.len == 0) return null;
+        const stmt = try prepare(db,
+            \\SELECT table_id
+            \\FROM table_semantics
+            \\WHERE workspace_id = ?1 AND table_name = ?2
+            \\ORDER BY table_id
+            \\LIMIT 1
+        );
+        defer finalize(stmt);
+        try bindText(stmt, 1, workspace_id);
+        try bindText(stmt, 2, value);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        return try columnU64(stmt, 0);
+    }
+
+    return 1;
+}
+
+pub fn searchEmbeddingExactTopK(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    query_vector: []const f32,
+    limit: usize,
+    metric: interfaces.VectorDistanceMetric,
+) ![]interfaces.VectorSearchMatch {
+    if (limit == 0 or query_vector.len == 0) return allocator.alloc(interfaces.VectorSearchMatch, 0);
+
+    const sql =
+        \\SELECT doc_id, dimensions, embedding_blob
+        \\FROM search_embeddings
+        \\WHERE table_id = ?1 AND dimensions = ?2
+        \\ORDER BY doc_id
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, query_vector.len);
+
+    var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const doc_id = try columnDocId(stmt, 0);
+        const dimensions = try columnUsize(stmt, 1);
+        const values = try decodeEmbedding(allocator, stmt, 2, dimensions);
+        defer allocator.free(values);
+
+        const score = vector_distance.score(metric, query_vector, values);
+        try vector_distance.insertTopMatch(allocator, &matches, .{
+            .doc_id = doc_id,
+            .distance = score.distance,
+            .similarity = score.similarity,
+        }, limit);
+    }
+
+    std.mem.sort(interfaces.VectorSearchMatch, matches.items, {}, vector_distance.lessThan);
+    return matches.toOwnedSlice(allocator);
+}
+
+fn searchTableBelongsToWorkspace(db: Database, workspace_id: []const u8, table_id: u64) !bool {
+    const stmt = try prepare(db, "SELECT 1 FROM table_semantics WHERE workspace_id = ?1 AND table_id = ?2 LIMIT 1");
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    try bindInt64(stmt, 2, table_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return false;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return true;
 }
 
 pub fn countSearchEmbeddings(db: Database, table_id: u64) !u64 {
@@ -1351,6 +1438,51 @@ test "search sqlite counts embeddings and selects missing embedding batch rows" 
         std.testing.allocator.free(all_rows);
     }
     try std.testing.expectEqual(@as(usize, 2), all_rows.len);
+}
+
+test "search sqlite resolves scoped table ids" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try workspace_sqlite.upsertWorkspace(db, "default", "{}");
+    try setupSearchTable(db, std.testing.allocator, .{
+        .table_id = 31,
+        .workspace_id = "default",
+        .schema_name = "public",
+        .table_name = "documents",
+        .key_column = "id",
+        .content_column = "content",
+        .metadata_column = "metadata",
+        .language = "english",
+        .populate = false,
+    });
+
+    try std.testing.expectEqual(@as(?u64, 31), try resolveSearchTableId(db, "default", 31, null));
+    try std.testing.expectEqual(@as(?u64, 31), try resolveSearchTableId(db, "default", null, "documents"));
+    try std.testing.expectEqual(@as(?u64, null), try resolveSearchTableId(db, "other", 31, null));
+    try std.testing.expectEqual(@as(?u64, null), try resolveSearchTableId(db, "default", null, "missing"));
+    try std.testing.expectEqual(@as(?u64, 1), try resolveSearchTableId(db, "default", null, null));
+}
+
+test "search sqlite searches embeddings with bounded exact top-k" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 1.0, 0.0 });
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 9, &.{ 0.5, 0.5 });
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 11, &.{ 0.0, 1.0 });
+    try upsertSearchEmbedding(db, std.testing.allocator, 2, 13, &.{ 1.0, 0.0 });
+    try upsertSearchEmbedding(db, std.testing.allocator, 1, 15, &.{ 1.0, 0.0, 0.0 });
+
+    const matches = try searchEmbeddingExactTopK(db, std.testing.allocator, 1, &.{ 1.0, 0.0 }, 2, .cosine);
+    defer std.testing.allocator.free(matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(u64, 7), matches[0].doc_id);
+    try std.testing.expectEqual(@as(u64, 9), matches[1].doc_id);
+    try std.testing.expect(matches[0].similarity > matches[1].similarity);
 }
 
 test "search sqlite stores search embeddings as packed f32 blobs" {
