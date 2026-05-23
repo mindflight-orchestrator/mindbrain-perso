@@ -916,6 +916,21 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/workspace-export-by-domain")) {
             return self.handleWorkspaceExport(allocator, query, true);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/list")) {
+            return self.handleOntologyList(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/graph")) {
+            return self.handleOntologyGraph(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/type")) {
+            return self.handleOntologyType(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/entity")) {
+            return self.handleGraphEntityDetail(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/relation")) {
+            return self.handleGraphRelationDetail(allocator, query);
+        }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph-path")) {
             return self.handleGraphPath(allocator, query);
         }
@@ -1502,6 +1517,327 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleOntologyList(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"workspace_id\":");
+        try writeOptionalJsonString(&out.writer, workspace_id);
+        try out.writer.writeAll(",\"default_ontology_id\":");
+        if (workspace_id) |ws| {
+            const default_id = try loadDefaultOntologyId(allocator, db, ws);
+            defer if (default_id) |value| allocator.free(value);
+            try writeOptionalJsonString(&out.writer, default_id);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"ontologies\":[");
+
+        const sql_all =
+            \\SELECT ontology_id, name, version, source_kind, frozen, metadata_json
+            \\FROM ontologies
+            \\ORDER BY COALESCE(workspace_id, ''), name, ontology_id
+        ;
+        const sql_workspace =
+            \\SELECT ontology_id, name, version, source_kind, frozen, metadata_json
+            \\FROM ontologies
+            \\WHERE workspace_id = ?1
+            \\ORDER BY name, ontology_id
+        ;
+        const stmt = try facet_sqlite.prepare(db, if (workspace_id == null) sql_all else sql_workspace);
+        defer facet_sqlite.finalize(stmt);
+        if (workspace_id) |ws| try facet_sqlite.bindText(stmt, 1, ws);
+        var first = true;
+        while (try helper_api.stepRow(stmt)) {
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            try out.writer.writeAll("{\"ontology_id\":");
+            try writeJsonString(&out.writer, try helper_api.dupeColText(allocator, stmt, 0), allocator);
+            try out.writer.writeAll(",\"name\":");
+            try writeJsonString(&out.writer, try helper_api.dupeColText(allocator, stmt, 1), allocator);
+            try out.writer.writeAll(",\"version\":");
+            try writeJsonString(&out.writer, try helper_api.dupeColText(allocator, stmt, 2), allocator);
+            try out.writer.writeAll(",\"source_kind\":");
+            try writeJsonString(&out.writer, try helper_api.dupeColText(allocator, stmt, 3), allocator);
+            try out.writer.print(",\"frozen\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 4) != 0});
+            try out.writer.writeAll(",\"metadata\":");
+            try writeRawJsonObject(&out.writer, try helper_api.dupeColText(allocator, stmt, 5), allocator);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleOntologyGraph(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const ontology_id = try resolveOntologyIdForRequest(allocator, db, workspace_id, normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id")));
+        defer allocator.free(ontology_id);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"ontology_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+        try out.writer.writeAll(",\"nodes\":[");
+
+        var first = true;
+        {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT entity_type, label, metadata_json
+                \\FROM ontology_entity_types
+                \\WHERE ontology_id = ?1
+                \\ORDER BY entity_type
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            while (try helper_api.stepRow(stmt)) {
+                if (!first) try out.writer.writeAll(",");
+                first = false;
+                const entity_type = try helper_api.dupeColText(allocator, stmt, 0);
+                defer allocator.free(entity_type);
+                const label = try helper_api.colTextOptional(allocator, stmt, 1);
+                defer if (label) |value| allocator.free(value);
+                const metadata = try helper_api.dupeColText(allocator, stmt, 2);
+                defer allocator.free(metadata);
+                try out.writer.writeAll("{\"id\":");
+                const id = try std.fmt.allocPrint(allocator, "entity_type:{s}", .{entity_type});
+                defer allocator.free(id);
+                try out.writer.print("{f}", .{std.json.fmt(id, .{})});
+                try out.writer.writeAll(",\"kind\":\"entity_type\",\"type\":");
+                try out.writer.print("{f}", .{std.json.fmt(entity_type, .{})});
+                try out.writer.writeAll(",\"label\":");
+                try writeOptionalJsonString(&out.writer, if (label) |value| value else entity_type);
+                try out.writer.writeAll(",\"metadata\":");
+                try out.writer.writeAll(metadata);
+                try out.writer.writeAll("}");
+            }
+        }
+        try out.writer.writeAll("],\"edges\":[");
+        first = true;
+        {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT edge_type, directed, source_entity_type, target_entity_type, metadata_json
+                \\FROM ontology_edge_types
+                \\WHERE ontology_id = ?1
+                \\ORDER BY edge_type
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            while (try helper_api.stepRow(stmt)) {
+                if (!first) try out.writer.writeAll(",");
+                first = false;
+                const edge_type = try helper_api.dupeColText(allocator, stmt, 0);
+                defer allocator.free(edge_type);
+                const source_type = try helper_api.colTextOptional(allocator, stmt, 2);
+                defer if (source_type) |value| allocator.free(value);
+                const target_type = try helper_api.colTextOptional(allocator, stmt, 3);
+                defer if (target_type) |value| allocator.free(value);
+                const metadata = try helper_api.dupeColText(allocator, stmt, 4);
+                defer allocator.free(metadata);
+                try out.writer.writeAll("{\"id\":");
+                const id = try std.fmt.allocPrint(allocator, "edge_type:{s}", .{edge_type});
+                defer allocator.free(id);
+                try out.writer.print("{f}", .{std.json.fmt(id, .{})});
+                try out.writer.writeAll(",\"kind\":\"edge_type\",\"type\":");
+                try out.writer.print("{f}", .{std.json.fmt(edge_type, .{})});
+                try out.writer.writeAll(",\"source_type\":");
+                try writeOptionalJsonString(&out.writer, source_type);
+                try out.writer.writeAll(",\"target_type\":");
+                try writeOptionalJsonString(&out.writer, target_type);
+                try out.writer.print(",\"directed\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 1) != 0});
+                try out.writer.writeAll(",\"metadata\":");
+                try out.writer.writeAll(metadata);
+                try out.writer.writeAll("}");
+            }
+        }
+        try out.writer.writeAll("],\"seed_nodes\":[");
+        try writeOntologySeedNodes(allocator, db, ontology_id, &out.writer);
+        try out.writer.writeAll("],\"seed_edges\":[");
+        try writeOntologySeedEdges(allocator, db, ontology_id, &out.writer);
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleOntologyType(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const ontology_id = (try queryValue(allocator, query, "ontology_id")) orelse return error.BadRequest;
+        const kind = (try queryValue(allocator, query, "kind")) orelse return error.BadRequest;
+        const type_name = (try queryValue(allocator, query, "type")) orelse return error.BadRequest;
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        if (std.mem.eql(u8, kind, "entity")) {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT label, metadata_json
+                \\FROM ontology_entity_types
+                \\WHERE ontology_id = ?1 AND entity_type = ?2
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            try facet_sqlite.bindText(stmt, 2, type_name);
+            if (!try helper_api.stepRow(stmt)) return error.NotFound;
+            const label = try helper_api.colTextOptional(allocator, stmt, 0);
+            defer if (label) |value| allocator.free(value);
+            const metadata = try helper_api.dupeColText(allocator, stmt, 1);
+            defer allocator.free(metadata);
+            try out.writer.writeAll("{\"ontology_id\":");
+            try out.writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+            try out.writer.writeAll(",\"kind\":\"entity\",\"type\":");
+            try out.writer.print("{f}", .{std.json.fmt(type_name, .{})});
+            try out.writer.writeAll(",\"label\":");
+            try writeOptionalJsonString(&out.writer, label);
+            try out.writer.writeAll(",\"metadata\":");
+            try out.writer.writeAll(metadata);
+        } else if (std.mem.eql(u8, kind, "edge")) {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT directed, source_entity_type, target_entity_type, metadata_json
+                \\FROM ontology_edge_types
+                \\WHERE ontology_id = ?1 AND edge_type = ?2
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            try facet_sqlite.bindText(stmt, 2, type_name);
+            if (!try helper_api.stepRow(stmt)) return error.NotFound;
+            const source_type = try helper_api.colTextOptional(allocator, stmt, 1);
+            defer if (source_type) |value| allocator.free(value);
+            const target_type = try helper_api.colTextOptional(allocator, stmt, 2);
+            defer if (target_type) |value| allocator.free(value);
+            const metadata = try helper_api.dupeColText(allocator, stmt, 3);
+            defer allocator.free(metadata);
+            try out.writer.writeAll("{\"ontology_id\":");
+            try out.writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+            try out.writer.writeAll(",\"kind\":\"edge\",\"type\":");
+            try out.writer.print("{f}", .{std.json.fmt(type_name, .{})});
+            try out.writer.writeAll(",\"label\":");
+            try out.writer.print("{f}", .{std.json.fmt(type_name, .{})});
+            try out.writer.writeAll(",\"source_type\":");
+            try writeOptionalJsonString(&out.writer, source_type);
+            try out.writer.writeAll(",\"target_type\":");
+            try writeOptionalJsonString(&out.writer, target_type);
+            try out.writer.print(",\"directed\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 0) != 0});
+            try out.writer.writeAll(",\"metadata\":");
+            try out.writer.writeAll(metadata);
+        } else {
+            return error.BadRequest;
+        }
+        try out.writer.writeAll(",\"triples\":[");
+        try writeOntologyTypeTriples(allocator, db, ontology_id, type_name, &out.writer);
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleGraphEntityDetail(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const entity_id_text = (try queryValue(allocator, query, "entity_id")) orelse return error.BadRequest;
+        const entity_id = try std.fmt.parseInt(u32, entity_id_text, 10);
+        const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+
+        const stmt = try facet_sqlite.prepare(db,
+            \\SELECT entity_id, workspace_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix
+            \\FROM graph_entity
+            \\WHERE entity_id = ?1
+        );
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindInt64(stmt, 1, entity_id);
+        if (!try helper_api.stepRow(stmt)) return error.NotFound;
+        const workspace_id = try helper_api.dupeColText(allocator, stmt, 1);
+        defer allocator.free(workspace_id);
+        if (workspace_filter) |ws| if (!std.mem.eql(u8, ws, workspace_id)) return error.NotFound;
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"workspace_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(workspace_id, .{})});
+        try out.writer.writeAll(",\"entity\":{");
+        try out.writer.print("\"entity_id\":{},\"workspace_id\":{f},\"entity_type\":{f},\"name\":{f},\"confidence\":{d}", .{
+            entity_id,
+            std.json.fmt(workspace_id, .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 3), .{}),
+            facet_sqlite.c.sqlite3_column_double(stmt, 4),
+        });
+        try out.writer.writeAll(",\"metadata\":");
+        try writeRawJsonObject(&out.writer, try helper_api.dupeColText(allocator, stmt, 5), allocator);
+        try out.writer.writeAll(",\"deprecated_at_unix\":");
+        try writeOptionalSqliteI64(&out.writer, stmt, 6);
+        try out.writer.print(",\"created_at_unix\":{} }}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 7)});
+        try out.writer.writeAll(",\"facets\":[");
+        try writeEntityFacets(allocator, db, workspace_id, entity_id, &out.writer);
+        try out.writer.writeAll("],\"incident_relations\":[");
+        try writeIncidentRelations(allocator, db, workspace_id, entity_id, &out.writer);
+        try out.writer.writeAll("],\"evidence_links\":[");
+        try writeEntityEvidenceLinks(allocator, db, workspace_id, entity_id, &out.writer);
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleGraphRelationDetail(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const relation_id_text = (try queryValue(allocator, query, "relation_id")) orelse return error.BadRequest;
+        const relation_id = try std.fmt.parseInt(u32, relation_id_text, 10);
+        const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+
+        const stmt = try facet_sqlite.prepare(db,
+            \\SELECT relation_id, workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, deprecated_at, run_id, patch_id, metadata_json, created_at_unix
+            \\FROM graph_relation
+            \\WHERE relation_id = ?1
+        );
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindInt64(stmt, 1, relation_id);
+        if (!try helper_api.stepRow(stmt)) return error.NotFound;
+        const workspace_id = try helper_api.dupeColText(allocator, stmt, 1);
+        defer allocator.free(workspace_id);
+        if (workspace_filter) |ws| if (!std.mem.eql(u8, ws, workspace_id)) return error.NotFound;
+        const source_id: u32 = @intCast(facet_sqlite.c.sqlite3_column_int64(stmt, 3));
+        const target_id: u32 = @intCast(facet_sqlite.c.sqlite3_column_int64(stmt, 4));
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"workspace_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(workspace_id, .{})});
+        try out.writer.writeAll(",\"relation\":{");
+        try out.writer.print("\"relation_id\":{},\"workspace_id\":{f},\"relation_type\":{f},\"source_id\":{},\"target_id\":{}", .{
+            relation_id,
+            std.json.fmt(workspace_id, .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+            source_id,
+            target_id,
+        });
+        try out.writer.writeAll(",\"valid_from_unix\":");
+        try writeOptionalSqliteI64(&out.writer, stmt, 5);
+        try out.writer.writeAll(",\"valid_to_unix\":");
+        try writeOptionalSqliteI64(&out.writer, stmt, 6);
+        try out.writer.print(",\"confidence\":{d},\"deprecated_at_unix\":", .{facet_sqlite.c.sqlite3_column_double(stmt, 7)});
+        try writeOptionalSqliteI64(&out.writer, stmt, 8);
+        try out.writer.writeAll(",\"run_id\":");
+        try writeOptionalSqliteI64(&out.writer, stmt, 9);
+        try out.writer.writeAll(",\"patch_id\":");
+        try writeOptionalSqliteI64(&out.writer, stmt, 10);
+        try out.writer.writeAll(",\"metadata\":");
+        try writeRawJsonObject(&out.writer, try helper_api.dupeColText(allocator, stmt, 11), allocator);
+        try out.writer.print(",\"created_at_unix\":{} }}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 12)});
+        try out.writer.writeAll(",\"source\":");
+        try writeCompactEntity(allocator, db, workspace_id, source_id, &out.writer);
+        try out.writer.writeAll(",\"target\":");
+        try writeCompactEntity(allocator, db, workspace_id, target_id, &out.writer);
+        try out.writer.writeAll(",\"properties\":[");
+        try writeRelationProperties(allocator, db, relation_id, &out.writer);
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
     fn handleEventStream(self: *MindbrainHttpApp, request: *http.Server.Request) !void {
         var db = try self.openDb();
         defer db.close();
@@ -1687,6 +2023,7 @@ pub const MindbrainHttpApp = struct {
         const format_text = try queryValue(allocator, query, "format");
         defer if (format_text) |value| allocator.free(value);
         const json_format = format_text != null and std.mem.eql(u8, format_text.?, "json");
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
 
         const events = try graph_sqlite.streamSubgraph(
             db,
@@ -1698,6 +2035,7 @@ pub const MindbrainHttpApp = struct {
             null,
             null,
             null,
+            workspace_id,
         );
         defer {
             for (events) |*event| event.deinit(allocator);
@@ -2659,6 +2997,280 @@ fn queryValues(allocator: std.mem.Allocator, query: []const u8, key: []const u8)
     return result.toOwnedSlice(allocator);
 }
 
+fn loadDefaultOntologyId(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8) !?[]const u8 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT default_ontology_id FROM workspace_settings WHERE workspace_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (!try helper_api.stepRow(stmt)) return null;
+    return try helper_api.colTextOptional(allocator, stmt, 0);
+}
+
+fn resolveOntologyIdForRequest(
+    allocator: std.mem.Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: ?[]const u8,
+    ontology_id: ?[]const u8,
+) ![]const u8 {
+    if (ontology_id) |id| return try allocator.dupe(u8, id);
+    const ws = workspace_id orelse return error.BadRequest;
+    return (try loadDefaultOntologyId(allocator, db, ws)) orelse error.NotFound;
+}
+
+fn writeJsonString(writer: *std.Io.Writer, owned_value: []const u8, allocator: std.mem.Allocator) !void {
+    defer allocator.free(owned_value);
+    try writer.print("{f}", .{std.json.fmt(owned_value, .{})});
+}
+
+fn writeOptionalJsonString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |text| {
+        try writer.print("{f}", .{std.json.fmt(text, .{})});
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeRawJsonObject(writer: *std.Io.Writer, owned_value: []const u8, allocator: std.mem.Allocator) !void {
+    defer allocator.free(owned_value);
+    const trimmed = std.mem.trim(u8, owned_value, " \t\r\n");
+    if (trimmed.len == 0) {
+        try writer.writeAll("{}");
+    } else {
+        try writer.writeAll(trimmed);
+    }
+}
+
+fn writeOptionalSqliteI64(writer: *std.Io.Writer, stmt: *facet_sqlite.c.sqlite3_stmt, col: c_int) !void {
+    if (facet_sqlite.c.sqlite3_column_type(stmt, col) == facet_sqlite.c.SQLITE_NULL) {
+        try writer.writeAll("null");
+    } else {
+        try writer.print("{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, col)});
+    }
+}
+
+fn writeOntologySeedNodes(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_id, entity_type, name, metadata_json
+        \\FROM ontology_entities_raw
+        \\WHERE ontology_id = ?1
+        \\ORDER BY entity_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"id\":{},\"kind\":\"seed_entity\",\"type\":{f},\"label\":{f},\"metadata\":", .{
+            facet_sqlite.c.sqlite3_column_int64(stmt, 0),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+        });
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 3), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeOntologySeedEdges(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT relation_id, edge_type, source_entity_id, target_entity_id, metadata_json
+        \\FROM ontology_relations_raw
+        \\WHERE ontology_id = ?1
+        \\ORDER BY relation_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"id\":{},\"kind\":\"seed_relation\",\"type\":{f},\"source_id\":{},\"target_id\":{},\"metadata\":", .{
+            facet_sqlite.c.sqlite3_column_int64(stmt, 0),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 2),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 3),
+        });
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 4), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, type_name: []const u8, writer: *std.Io.Writer) !void {
+    const like_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{type_name});
+    defer allocator.free(like_pattern);
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT triple_index, subject_kind, subject, predicate, object_kind, object_value, object_datatype, object_language, source_line, metadata_json
+        \\FROM ontology_triples_raw
+        \\WHERE ontology_id = ?1
+        \\  AND (subject = ?2 OR predicate = ?2 OR subject LIKE ?3 OR predicate LIKE ?3)
+        \\ORDER BY triple_index
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    try facet_sqlite.bindText(stmt, 2, type_name);
+    try facet_sqlite.bindText(stmt, 3, like_pattern);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"triple_index\":{},\"subject_kind\":{f},\"subject\":{f},\"predicate\":{f},\"object_kind\":{f},\"object_value\":{f},\"object_datatype\":", .{
+            facet_sqlite.c.sqlite3_column_int64(stmt, 0),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 3), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 4), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 5), .{}),
+        });
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 6));
+        try writer.writeAll(",\"object_language\":");
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 7));
+        try writer.writeAll(",\"source_line\":");
+        try writer.print("{f}", .{std.json.fmt(try helper_api.dupeColText(allocator, stmt, 8), .{})});
+        try writer.writeAll(",\"metadata\":");
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 9), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeEntityFacets(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
+    const entity_text = try std.fmt.allocPrint(allocator, "{}", .{entity_id});
+    defer allocator.free(entity_text);
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT id, schema_id, content, facets_json, source_ref, doc_id
+        \\FROM facets
+        \\WHERE workspace_id = ?1
+        \\  AND (source_ref = ?2 OR CAST(doc_id AS TEXT) = ?2 OR json_extract(facets_json, '$.entity_id') = ?2)
+        \\ORDER BY updated_at_unix DESC, created_at_unix DESC
+        \\LIMIT 10
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, entity_text);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"id\":{f},\"schema_id\":{f},\"content\":{f},\"facets\":", .{
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 0), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+        });
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 3), allocator);
+        try writer.writeAll(",\"source_ref\":");
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 4));
+        try writer.writeAll(",\"doc_id\":");
+        try writeOptionalSqliteI64(writer, stmt, 5);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeIncidentRelations(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT relation_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, metadata_json
+        \\FROM graph_relation
+        \\WHERE workspace_id = ?1 AND (source_id = ?2 OR target_id = ?2)
+        \\ORDER BY relation_id
+        \\LIMIT 100
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindInt64(stmt, 2, entity_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"relation_id\":{},\"relation_type\":{f},\"source_id\":{},\"target_id\":{},\"valid_from_unix\":", .{
+            facet_sqlite.c.sqlite3_column_int64(stmt, 0),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 2),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 3),
+        });
+        try writeOptionalSqliteI64(writer, stmt, 4);
+        try writer.writeAll(",\"valid_to_unix\":");
+        try writeOptionalSqliteI64(writer, stmt, 5);
+        try writer.print(",\"confidence\":{d},\"metadata\":", .{facet_sqlite.c.sqlite3_column_double(stmt, 6)});
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 7), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeEntityEvidenceLinks(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT collection_id, doc_id, chunk_index, role, confidence, metadata_json
+        \\FROM graph_entity_chunk
+        \\WHERE workspace_id = ?1 AND entity_id = ?2
+        \\ORDER BY confidence DESC, doc_id, chunk_index
+        \\LIMIT 50
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindInt64(stmt, 2, entity_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"collection_id\":{f},\"doc_id\":{},\"chunk_index\":{},\"role\":", .{
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 0), .{}),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 1),
+            facet_sqlite.c.sqlite3_column_int64(stmt, 2),
+        });
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 3));
+        try writer.print(",\"confidence\":{d},\"metadata\":", .{facet_sqlite.c.sqlite3_column_double(stmt, 4)});
+        try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 5), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeCompactEntity(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_id, workspace_id, entity_type, name, confidence, metadata_json
+        \\FROM graph_entity
+        \\WHERE workspace_id = ?1 AND entity_id = ?2
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindInt64(stmt, 2, entity_id);
+    if (!try helper_api.stepRow(stmt)) return error.NotFound;
+    try writer.print("{{\"entity_id\":{},\"workspace_id\":{f},\"entity_type\":{f},\"name\":{f},\"confidence\":{d},\"metadata\":", .{
+        facet_sqlite.c.sqlite3_column_int64(stmt, 0),
+        std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+        std.json.fmt(try helper_api.dupeColText(allocator, stmt, 2), .{}),
+        std.json.fmt(try helper_api.dupeColText(allocator, stmt, 3), .{}),
+        facet_sqlite.c.sqlite3_column_double(stmt, 4),
+    });
+    try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 5), allocator);
+    try writer.writeAll("}");
+}
+
+fn writeRelationProperties(allocator: std.mem.Allocator, db: facet_sqlite.Database, relation_id: u32, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
+        \\FROM graph_relation_property
+        \\WHERE relation_id = ?1
+        \\ORDER BY property_key
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, relation_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.print("{{\"property_key\":{f},\"value_type\":{f},\"value_text\":", .{
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 0), .{}),
+            std.json.fmt(try helper_api.dupeColText(allocator, stmt, 1), .{}),
+        });
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 2));
+        try writer.writeAll(",\"value_number\":");
+        if (facet_sqlite.c.sqlite3_column_type(stmt, 3) == facet_sqlite.c.SQLITE_NULL) try writer.writeAll("null") else try writer.print("{d}", .{facet_sqlite.c.sqlite3_column_double(stmt, 3)});
+        try writer.writeAll(",\"value_integer\":");
+        try writeOptionalSqliteI64(writer, stmt, 4);
+        try writer.writeAll(",\"ref_doc_id\":");
+        try writeOptionalSqliteI64(writer, stmt, 5);
+        try writer.writeAll(",\"currency\":");
+        try writeOptionalJsonString(writer, try helper_api.colTextOptional(allocator, stmt, 6));
+        try writer.writeAll("}");
+    }
+}
+
 fn encodeGraphSubgraphSseBody(allocator: std.mem.Allocator, events: []const graph_sqlite.GraphStreamEvent) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -2789,6 +3401,73 @@ test "graph subgraph sse encoder emits expected frames" {
     try std.testing.expect(std.mem.indexOf(u8, body, "data: {\"entity\":{\"entity_id\":1}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "event: done\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"subgraph\"") != null);
+}
+
+test "graph explorer backend endpoints expose ontology and workspace scoped graph detail" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-graph-explorer-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_api', 'ws_api', 'API Workspace');
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_other', 'ws_other', 'Other Workspace');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name, version, source_kind, metadata_json) VALUES ('ws_api::core', 'ws_api', 'core', '1.0.0', 'constructed', '{"domain":"demo"}');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_api', 'ws_api::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'person', 'Personne', '{"definition":"human"}');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'unit', 'Lot', '{}');
+        \\INSERT INTO ontology_edge_types(ontology_id, edge_type, directed, source_entity_type, target_entity_type, metadata_json) VALUES ('ws_api::core', 'owns', 1, 'person', 'unit', '{"definition":"ownership"}');
+        \\INSERT INTO ontology_triples_raw(ontology_id, triple_index, subject_kind, subject, predicate, object_kind, object_value, source_line, metadata_json) VALUES ('ws_api::core', 1, 'iri', 'owns', 'rdfs:domain', 'iri', 'person', '<owns> <rdfs:domain> <person> .', '{}');
+        \\INSERT INTO ontology_entities_raw(ontology_id, entity_id, entity_type, name, metadata_json) VALUES ('ws_api::core', 1, 'person', 'Ada seed', '{}');
+        \\INSERT INTO ontology_relations_raw(ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, metadata_json) VALUES ('ws_api::core', 1, 'owns', 1, 2, '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (1, 'ws_api', 'person', 'Ada', 0.99, '{"label":"Ada"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (2, 'ws_api', 'unit', 'Unit 1', 0.95, '{"label":"Unit 1"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (3, 'ws_other', 'unit', 'Other Unit', 0.95, '{}');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, valid_from_unix, confidence, metadata_json) VALUES (10, 'ws_api', 'owns', 1, 2, 1700000000, 0.9, '{"source":"registry"}');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence, metadata_json) VALUES (11, 'ws_other', 'owns', 1, 3, 0.9, '{}');
+        \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_integer, ref_doc_id) VALUES (10, 'share_bp', 'percentage_bp', 10000, 42);
+        \\INSERT INTO graph_entity_chunk(entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json) VALUES (1, 'ws_api', 'registry', 42, 0, 'mention', 0.8, '{"quote":"Ada owns Unit 1"}');
+        \\INSERT INTO facets(id, schema_id, content, facets_json, workspace_id, source_ref, doc_id) VALUES ('facet-1', 'ownership', 'Ada owns Unit 1', '{"entity_id":"1","status":"active"}', 'ws_api', '1', 42);
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const list = try app.handleOntologyList(arena, "workspace_id=ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, list.body, "\"default_ontology_id\":\"ws_api::core\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list.body, "\"metadata\":{\"domain\":\"demo\"}") != null);
+
+    const graph = try app.handleOntologyGraph(arena, "workspace_id=ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, graph.body, "\"id\":\"entity_type:person\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.body, "\"id\":\"edge_type:owns\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.body, "\"seed_nodes\"") != null);
+
+    const type_detail = try app.handleOntologyType(arena, "ontology_id=ws_api%3A%3Acore&kind=edge&type=owns");
+    try std.testing.expect(std.mem.indexOf(u8, type_detail.body, "\"predicate\":\"rdfs:domain\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_detail.body, "\"source_type\":\"person\"") != null);
+
+    const entity = try app.handleGraphEntityDetail(arena, "workspace_id=ws_api&entity_id=1");
+    try std.testing.expect(std.mem.indexOf(u8, entity.body, "\"facets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entity.body, "\"incident_relations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entity.body, "\"evidence_links\"") != null);
+
+    const relation = try app.handleGraphRelationDetail(arena, "workspace_id=ws_api&relation_id=10");
+    try std.testing.expect(std.mem.indexOf(u8, relation.body, "\"property_key\":\"share_bp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, relation.body, "\"ref_doc_id\":42") != null);
+
+    const subgraph = try app.handleGraphSubgraph(arena, "workspace_id=ws_api&seed_ids=1&hops=1&format=json");
+    try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":11") == null);
+    try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "Other Unit") == null);
 }
 
 test "http sql writer lane classifier separates reads from writes" {
