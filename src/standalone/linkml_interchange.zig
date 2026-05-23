@@ -158,9 +158,64 @@ const Section = enum { none, prefixes, imports, classes, slots, enums };
 const AnnotationTarget = enum { none, class, slot };
 const EnumContext = enum { none, permissible_values, value };
 
+const ImportLoadContext = struct {
+    allocator: Allocator,
+    visiting: std.StringHashMap(void),
+    loaded: std.StringHashMap(void),
+
+    fn init(allocator: Allocator) ImportLoadContext {
+        return .{
+            .allocator = allocator,
+            .visiting = std.StringHashMap(void).init(allocator),
+            .loaded = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *ImportLoadContext) void {
+        freeStringMapKeys(self.allocator, &self.visiting);
+        freeStringMapKeys(self.allocator, &self.loaded);
+        self.visiting.deinit();
+        self.loaded.deinit();
+        self.* = undefined;
+    }
+};
+
+const SchemaIndex = struct {
+    native_type_by_class: std.StringHashMap([]const u8),
+    class_uri_by_name: std.StringHashMap([]const u8),
+    enum_names: std.StringHashMap(void),
+
+    fn init(allocator: Allocator, schema: *const Schema) !SchemaIndex {
+        var index = SchemaIndex{
+            .native_type_by_class = std.StringHashMap([]const u8).init(allocator),
+            .class_uri_by_name = std.StringHashMap([]const u8).init(allocator),
+            .enum_names = std.StringHashMap(void).init(allocator),
+        };
+        errdefer index.deinit();
+
+        for (schema.classes.items) |class| {
+            try index.native_type_by_class.put(class.name, nativeEntityType(class));
+            if (class.class_uri) |class_uri| try index.class_uri_by_name.put(class.name, class_uri);
+        }
+        for (schema.enums.items) |enum_def| {
+            try index.enum_names.put(enum_def.name, {});
+        }
+        return index;
+    }
+
+    fn deinit(self: *SchemaIndex) void {
+        self.native_type_by_class.deinit();
+        self.class_uri_by_name.deinit();
+        self.enum_names.deinit();
+        self.* = undefined;
+    }
+};
+
 pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !CompileResult {
     var schema = try loadSchema(allocator, options.input_path);
     defer schema.deinit(allocator);
+    var index = try SchemaIndex.init(allocator, &schema);
+    defer index.deinit();
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -186,8 +241,8 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
 
     try out.writer.writeAll("  \"ontology_namespaces\": [],\n  \"ontology_dimensions\": [");
     var enum_value_count: usize = 0;
-    for (schema.enums.items, 0..) |enum_def, index| {
-        if (index > 0) try out.writer.writeAll(",");
+    for (schema.enums.items, 0..) |enum_def, enum_index| {
+        if (enum_index > 0) try out.writer.writeAll(",");
         const metadata = try enumMetadataJson(allocator, enum_def);
         defer allocator.free(metadata);
         try out.writer.print("\n    {{ \"ontology_id\": {f}, \"namespace\": {f}, \"dimension\": {f}, \"value_type\": \"string\", \"is_multi\": false, \"hierarchy_kind\": \"flat\", \"metadata_json\": {f} }}", .{
@@ -237,11 +292,11 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
     try out.writer.writeAll("\n  ],\n  \"ontology_edge_types\": [");
     var edge_count: usize = 0;
     for (schema.slots.items) |slot| {
-        if (!shouldProjectSlot(schema, slot)) continue;
+        if (!shouldProjectSlot(&index, slot)) continue;
         if (edge_count > 0) try out.writer.writeAll(",");
         const edge_type = nativeEdgeType(slot);
-        const source = if (slot.domain) |domain| nativeEntityTypeByName(schema, domain) else null;
-        const target = if (slot.range) |range| nativeEntityTypeByName(schema, range) else null;
+        const source = if (slot.domain) |domain| nativeEntityTypeByName(&index, domain) else null;
+        const target = if (slot.range) |range| nativeEntityTypeByName(&index, range) else null;
         const metadata = try slotMetadataJson(allocator, schema, slot);
         defer allocator.free(metadata);
         try out.writer.print("\n    {{ \"ontology_id\": {f}, \"edge_type\": {f}, \"directed\": true, \"source_entity_type\": ", .{
@@ -257,7 +312,7 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
     try out.writer.writeAll("\n  ],\n  \"ontology_entities\": [],\n  \"ontology_relations\": [],\n  \"ontology_triples\": [");
 
     var triple_count: usize = 0;
-    try emitTriples(allocator, &schema, options.ontology_id, &out.writer, &triples.writer, &triple_count);
+    try emitTriples(allocator, &schema, &index, options.ontology_id, &out.writer, &triples.writer, &triple_count);
 
     try out.writer.writeAll("\n  ],\n  \"collection_ontologies\": [],\n  \"workspace_settings\": [");
     try out.writer.print("{{ \"workspace_id\": {f}, \"default_ontology_id\": {f}, \"metadata_json\": \"{{}}\" }}],\n", .{
@@ -342,8 +397,26 @@ pub fn exportLinkmlFromBundleJson(allocator: Allocator, bundle_json: []const u8,
 }
 
 fn loadSchema(allocator: Allocator, input_path: []const u8) !Schema {
+    var context = ImportLoadContext.init(allocator);
+    defer context.deinit();
+    return try loadSchemaWithContext(allocator, input_path, &context);
+}
+
+fn loadSchemaWithContext(allocator: Allocator, input_path: []const u8, context: *ImportLoadContext) !Schema {
     const absolute_path = try std.fs.path.resolve(allocator, &.{input_path});
     defer allocator.free(absolute_path);
+    if (context.visiting.contains(absolute_path)) return error.CyclicImport;
+    if (context.loaded.contains(absolute_path)) return Schema{ .source_path = try allocator.dupe(u8, absolute_path) };
+
+    const visiting_key = try allocator.dupe(u8, absolute_path);
+    context.visiting.put(visiting_key, {}) catch |err| {
+        allocator.free(visiting_key);
+        return err;
+    };
+    defer {
+        if (context.visiting.fetchRemove(absolute_path)) |entry| allocator.free(entry.key);
+    }
+
     var raw = try parseSchemaFile(allocator, absolute_path);
     defer raw.deinit(allocator);
 
@@ -353,11 +426,16 @@ fn loadSchema(allocator: Allocator, input_path: []const u8) !Schema {
         if (std.mem.startsWith(u8, import_ref, "linkml:")) continue;
         const import_path = try resolveImportPath(allocator, absolute_path, import_ref);
         defer allocator.free(import_path);
-        var imported = try loadSchema(allocator, import_path);
+        var imported = try loadSchemaWithContext(allocator, import_path, context);
         defer imported.deinit(allocator);
         try mergeImportedSchema(allocator, &merged, imported);
     }
     try mergeRawSchema(allocator, &merged, raw);
+    const loaded_key = try allocator.dupe(u8, absolute_path);
+    context.loaded.put(loaded_key, {}) catch |err| {
+        allocator.free(loaded_key);
+        return err;
+    };
     return merged;
 }
 
@@ -558,6 +636,11 @@ fn appendPrefixIfMissing(allocator: Allocator, schema: *Schema, prefix: Prefix) 
     });
 }
 
+fn freeStringMapKeys(allocator: Allocator, map: *std.StringHashMap(void)) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+}
+
 const KeyValue = struct { key: []const u8, value: []const u8 };
 
 fn splitYamlKeyValue(line: []const u8) ?KeyValue {
@@ -639,10 +722,10 @@ fn shouldProjectClass(class: ClassDef) bool {
     return !std.mem.eql(u8, layer, "core") and !std.mem.eql(u8, layer, "generic_business");
 }
 
-fn shouldProjectSlot(schema: Schema, slot: SlotDef) bool {
+fn shouldProjectSlot(index: *const SchemaIndex, slot: SlotDef) bool {
     if (annotationValue(slot.annotations.items, "ghostcrab.native_edge_type") != null) return true;
     if (!slot.is_root) return false;
-    return isObjectRange(schema, slot.range);
+    return isObjectRange(index, slot.range);
 }
 
 fn nativeEntityType(class: ClassDef) []const u8 {
@@ -653,19 +736,14 @@ fn nativeEdgeType(slot: SlotDef) []const u8 {
     return annotationValue(slot.annotations.items, "ghostcrab.native_edge_type") orelse slot.name;
 }
 
-fn nativeEntityTypeByName(schema: Schema, class_name: []const u8) ?[]const u8 {
-    for (schema.classes.items) |class| {
-        if (std.mem.eql(u8, class.name, class_name)) return nativeEntityType(class);
-    }
-    return class_name;
+fn nativeEntityTypeByName(index: *const SchemaIndex, class_name: []const u8) ?[]const u8 {
+    return index.native_type_by_class.get(class_name) orelse class_name;
 }
 
-fn isObjectRange(schema: Schema, range: ?[]const u8) bool {
+fn isObjectRange(index: *const SchemaIndex, range: ?[]const u8) bool {
     const value = range orelse return false;
     if (isPrimitiveRange(value)) return false;
-    for (schema.enums.items) |enum_def| {
-        if (std.mem.eql(u8, enum_def.name, value)) return false;
-    }
+    if (index.enum_names.contains(value)) return false;
     return true;
 }
 
@@ -770,7 +848,7 @@ fn writeOptionalJsonString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     if (value) |text| try writer.print("{f}", .{std.json.fmt(text, .{})}) else try writer.writeAll("null");
 }
 
-fn emitTriples(allocator: Allocator, schema: *const Schema, ontology_id: []const u8, bundle_writer: *std.Io.Writer, nt_writer: *std.Io.Writer, count: *usize) !void {
+fn emitTriples(allocator: Allocator, schema: *const Schema, index: *const SchemaIndex, ontology_id: []const u8, bundle_writer: *std.Io.Writer, nt_writer: *std.Io.Writer, count: *usize) !void {
     for (schema.classes.items) |class| {
         if (!shouldProjectClass(class)) continue;
         const class_uri = (try expandCurie(allocator, schema.*, class.class_uri orelse class.name)) orelse class.name;
@@ -779,34 +857,27 @@ fn emitTriples(allocator: Allocator, schema: *const Schema, ontology_id: []const
         try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, class_uri, "http://www.w3.org/2000/01/rdf-schema#label", nativeEntityType(class), true);
         if (class.description) |description| try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, class_uri, "http://www.w3.org/2004/02/skos/core#definition", description, true);
         if (class.is_a) |parent_name| {
-            const parent_uri = try expandCurie(allocator, schema.*, classUriByName(schema.*, parent_name) orelse parent_name);
+            const parent_uri = try expandCurie(allocator, schema.*, index.class_uri_by_name.get(parent_name) orelse parent_name);
             defer if (parent_uri) |value| allocator.free(value);
             if (parent_uri) |value| try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, class_uri, "http://www.w3.org/2000/01/rdf-schema#subClassOf", value, false);
         }
     }
     for (schema.slots.items) |slot| {
-        if (!shouldProjectSlot(schema.*, slot)) continue;
+        if (!shouldProjectSlot(index, slot)) continue;
         const slot_uri = (try expandCurie(allocator, schema.*, slot.slot_uri orelse slot.name)) orelse slot.name;
         defer if (slot_uri.ptr != slot.name.ptr) allocator.free(slot_uri);
         try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, slot_uri, "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "http://www.w3.org/2002/07/owl#ObjectProperty", false);
         if (slot.domain) |domain| {
-            const domain_uri = try expandCurie(allocator, schema.*, classUriByName(schema.*, domain) orelse domain);
+            const domain_uri = try expandCurie(allocator, schema.*, index.class_uri_by_name.get(domain) orelse domain);
             defer if (domain_uri) |value| allocator.free(value);
             if (domain_uri) |value| try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, slot_uri, "http://www.w3.org/2000/01/rdf-schema#domain", value, false);
         }
         if (slot.range) |range| {
-            const range_uri = try expandCurie(allocator, schema.*, classUriByName(schema.*, range) orelse range);
+            const range_uri = try expandCurie(allocator, schema.*, index.class_uri_by_name.get(range) orelse range);
             defer if (range_uri) |value| allocator.free(value);
             if (range_uri) |value| try emitTriple(allocator, ontology_id, count, bundle_writer, nt_writer, slot_uri, "http://www.w3.org/2000/01/rdf-schema#range", value, false);
         }
     }
-}
-
-fn classUriByName(schema: Schema, name: []const u8) ?[]const u8 {
-    for (schema.classes.items) |class| {
-        if (std.mem.eql(u8, class.name, name)) return class.class_uri;
-    }
-    return null;
 }
 
 fn emitTriple(allocator: Allocator, ontology_id: []const u8, count: *usize, bundle_writer: *std.Io.Writer, nt_writer: *std.Io.Writer, subject: []const u8, predicate: []const u8, object_value: []const u8, literal: bool) !void {
@@ -902,26 +973,49 @@ fn writeSlotsYaml(allocator: Allocator, db: Database, ontology_id: []const u8, w
 }
 
 fn writeEnumsYaml(allocator: Allocator, db: Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
-    const dim_stmt = try prepare(db, "SELECT namespace, dimension, metadata_json FROM ontology_dimensions WHERE ontology_id = ?1 ORDER BY namespace, dimension");
-    defer finalize(dim_stmt);
-    try bindText(dim_stmt, 1, ontology_id);
+    const stmt = try prepare(db,
+        \\SELECT d.namespace, d.dimension, v.value
+        \\FROM ontology_dimensions d
+        \\LEFT JOIN ontology_values v
+        \\  ON v.ontology_id = d.ontology_id
+        \\ AND v.namespace = d.namespace
+        \\ AND v.dimension = d.dimension
+        \\WHERE d.ontology_id = ?1
+        \\ORDER BY d.namespace, d.dimension, v.value_id
+    );
+    defer finalize(stmt);
+    try bindText(stmt, 1, ontology_id);
     var emitted = false;
-    while (c.sqlite3_step(dim_stmt) == c.SQLITE_ROW) {
-        emitted = true;
-        const namespace = try dupeColumnText(allocator, dim_stmt, 0);
+    var current_namespace: ?[]const u8 = null;
+    defer if (current_namespace) |value| allocator.free(value);
+    var current_dimension: ?[]const u8 = null;
+    defer if (current_dimension) |value| allocator.free(value);
+
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const namespace = try dupeColumnText(allocator, stmt, 0);
         defer allocator.free(namespace);
-        const dimension = try dupeColumnText(allocator, dim_stmt, 1);
+        const dimension = try dupeColumnText(allocator, stmt, 1);
         defer allocator.free(dimension);
-        try writer.print("  {s}:\n    permissible_values:\n", .{dimension});
-        const value_stmt = try prepare(db, "SELECT value FROM ontology_values WHERE ontology_id = ?1 AND namespace = ?2 AND dimension = ?3 ORDER BY value_id");
-        defer finalize(value_stmt);
-        try bindText(value_stmt, 1, ontology_id);
-        try bindText(value_stmt, 2, namespace);
-        try bindText(value_stmt, 3, dimension);
-        while (c.sqlite3_step(value_stmt) == c.SQLITE_ROW) {
-            const value = try dupeColumnText(allocator, value_stmt, 0);
-            defer allocator.free(value);
-            try writer.print("      {s}: {{}}\n", .{value});
+
+        const changed = current_namespace == null or
+            !std.mem.eql(u8, current_namespace.?, namespace) or
+            !std.mem.eql(u8, current_dimension.?, dimension);
+        if (changed) {
+            emitted = true;
+            const new_namespace = try allocator.dupe(u8, namespace);
+            errdefer allocator.free(new_namespace);
+            const new_dimension = try allocator.dupe(u8, dimension);
+            if (current_namespace) |value| allocator.free(value);
+            if (current_dimension) |value| allocator.free(value);
+            current_namespace = new_namespace;
+            current_dimension = new_dimension;
+            try writer.print("  {s}:\n    permissible_values:\n", .{dimension});
+        }
+
+        const value = try optionalColumnText(allocator, stmt, 2);
+        if (value) |text| {
+            defer allocator.free(text);
+            try writer.print("      {s}: {{}}\n", .{text});
         }
     }
     if (!emitted) try writer.writeAll("  {}\n");
@@ -991,4 +1085,134 @@ test "LinkML interchange imports bundle and exports YAML" {
     try std.testing.expect(std.mem.indexOf(u8, yaml, "classes:") != null);
     try std.testing.expect(std.mem.indexOf(u8, yaml, "ghostcrab.native_entity_type: building") != null);
     try std.testing.expect(std.mem.indexOf(u8, yaml, "ghostcrab.native_edge_type: owns") != null);
+}
+
+test "LinkML interchange rejects cyclic imports" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "a.yaml",
+        .data =
+        \\id: test:a
+        \\name: a
+        \\imports:
+        \\  - b.yaml
+        \\classes:
+        \\  A:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: a
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "b.yaml",
+        .data =
+        \\id: test:b
+        \\name: b
+        \\imports:
+        \\  - a.yaml
+        \\classes:
+        \\  B:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: b
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/a.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.CyclicImport, compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = path,
+        .workspace_id = "test",
+        .ontology_id = "test::cycle",
+    }));
+}
+
+test "LinkML interchange merges diamond imports once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "shared.yaml",
+        .data =
+        \\id: test:shared
+        \\name: shared
+        \\classes:
+        \\  Shared:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: shared
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "a.yaml",
+        .data =
+        \\id: test:a
+        \\name: a
+        \\imports:
+        \\  - shared.yaml
+        \\classes:
+        \\  A:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: a
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "b.yaml",
+        .data =
+        \\id: test:b
+        \\name: b
+        \\imports:
+        \\  - shared.yaml
+        \\classes:
+        \\  B:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: b
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "root.yaml",
+        .data =
+        \\id: test:root
+        \\name: root
+        \\imports:
+        \\  - a.yaml
+        \\  - b.yaml
+        \\classes:
+        \\  Root:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: root
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/root.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(path);
+    var result = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = path,
+        .workspace_id = "test",
+        .ontology_id = "test::diamond",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(result.bundle_json, "\"entity_type\": \"shared\""));
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |index| {
+        count += 1;
+        rest = rest[index + needle.len ..];
+    }
+    return count;
 }
