@@ -148,8 +148,13 @@ Write behavior:
 | `GET`/`HEAD` | `/api/mindbrain/coverage-by-domain` | `domain_or_workspace`, repeated `entity_type` optional | TOON coverage report after workspace resolution |
 | `GET`/`HEAD` | `/api/mindbrain/workspace-export` | `workspace_id` | TOON workspace model export |
 | `GET`/`HEAD` | `/api/mindbrain/workspace-export-by-domain` | `domain_or_workspace` | TOON workspace export after workspace resolution |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/list` | `workspace_id` optional | JSON ontology catalog and default ontology id |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/graph` | `workspace_id` optional, `ontology_id` optional | JSON ontology schema graph: entity types, edge types, seed nodes/edges |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/type` | `ontology_id`, `kind=entity\|edge`, `type` | JSON entity-type or edge-type detail plus related triples |
+| `GET`/`HEAD` | `/api/mindbrain/graph/entity` | `entity_id`, `workspace_id` optional | JSON graph entity detail with facets, incident relations, evidence links |
+| `GET`/`HEAD` | `/api/mindbrain/graph/relation` | `relation_id`, `workspace_id` optional | JSON graph relation detail with endpoints and properties |
 | `GET`/`HEAD` | `/api/mindbrain/graph-path` | `source`, `target`, repeated `edge_label` optional, `max_depth` optional | TOON shortest path |
-| `GET`/`HEAD` | `/api/mindbrain/graph/subgraph` | `seed_ids=1,2`, `hops` optional, `edge_types=a,b` optional | SSE-formatted subgraph body |
+| `GET`/`HEAD` | `/api/mindbrain/graph/subgraph` | `seed_ids=1,2`, `hops` optional, `edge_types=a,b` optional, `workspace_id` optional, `format=json` optional | SSE-formatted subgraph body, or JSON when `format=json` |
 | `GET`/`HEAD` | `/api/mindbrain/traverse` | `start`, `direction`, `depth`, `target` optional, repeated `edge_label` optional | JSON graph traversal result |
 | `GET`/`HEAD` | `/api/mindbrain/collections/facet-search` | `workspace_id`, `collection_id`, `table_id` optional, `namespace` optional, `dimension` optional, `value` optional, `limit` optional | JSON facet matches from derived postings or raw fallback |
 | `GET`/`HEAD` | `/api/mindbrain/pack` | `user_id`, `query`, `scope` optional, `limit` optional | TOON packed context |
@@ -184,6 +189,10 @@ mindbrain-standalone-tool workspace-create --db <sqlite_path> --workspace-id <id
 mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
 mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
 mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
+mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
+mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
+mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
+mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
 mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
@@ -218,7 +227,7 @@ Command families:
 | Family | Commands |
 |--------|----------|
 | Workspace and collections | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import`, `backup-load` |
-| Ontology | `ontology-register`, `ontology-attach`, `coverage`, `coverage-by-domain` |
+| Ontology | `ontology-register`, `ontology-attach`, `ontology-import`, `ontology-export`, `ontology-compile-linkml`, `ontology-export-linkml`, `coverage`, `coverage-by-domain` |
 | Documents and chunks | `document-ingest`, `document-by-nanoid`, `document-normalize`, `external-link-add` |
 | LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search`, `search-embedding-batch` |
 | Graph | `traverse`, `graph-path` |

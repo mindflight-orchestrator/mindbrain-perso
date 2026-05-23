@@ -25,7 +25,7 @@ Reverse (OWL → LinkML): Schema Automator `schemauto import-owl` — lossy on c
 
 ## GhostCrab native model
 
-Native interchange is the SQLite / `ghostcrab_backup_bundle` ontology blocks defined in `vendor/mindbrain/src/standalone/collections_io.zig`.
+Native interchange is the SQLite / `ghostcrab_backup_bundle` ontology blocks defined in [`src/standalone/collections_io.zig`](../../src/standalone/collections_io.zig).
 
 | Native block | Role |
 |--------------|------|
@@ -36,7 +36,7 @@ Native interchange is the SQLite / `ghostcrab_backup_bundle` ontology blocks def
 | `ontology_entities_raw` / `ontology_relations_raw` | Seed ontology individuals |
 | `relation_properties_raw` | Qualified relation attributes on instances |
 
-Ontology **loadouts** (`src/db/ontology-loadouts.ts`) are agent modeling recipes, not part of core interchange unless merged explicitly.
+Ontology **loadouts** in GhostCrab are agent modeling recipes, not part of core interchange unless merged explicitly.
 
 ## Mapping: LinkML → GhostCrab
 
@@ -77,17 +77,19 @@ Ontology **loadouts** (`src/db/ontology-loadouts.ts`) are agent modeling recipes
 
 ## CLI
 
+The canonical runtime is native Zig in this repository:
+
 ```bash
 # Compile LinkML → native bundle + optional SQLite import
-gcp brain ontology compile \
+mindbrain-standalone-tool ontology-compile-linkml \
   --input ontologies/immeuble-demo/core.yaml \
   --workspace-id immeuble-demo \
   --ontology-id immeuble-demo::core \
-  --output examples/immeuble-demo/ontology-compiled.json
+  --output /tmp/immeuble-demo/ontology-compiled.json
 
 # Export native ontology → LinkML
-gcp brain ontology export-linkml \
-  --input examples/immeuble-demo/bundle.json \
+mindbrain-standalone-tool ontology-export-linkml \
+  --input-bundle /tmp/immeuble-demo/ontology-compiled.json \
   --ontology-id immeuble-demo::core \
   --output ontologies/immeuble-demo/exported.yaml
 ```
@@ -95,11 +97,13 @@ gcp brain ontology export-linkml \
 With SQLite:
 
 ```bash
-gcp brain ontology export-linkml \
-  --db data/ghostcrab.sqlite \
+mindbrain-standalone-tool ontology-export-linkml \
+  --db data/mindbrain.sqlite \
   --ontology-id immeuble-demo::core \
   --output ontologies/immeuble-demo/exported.yaml
 ```
+
+GhostCrab downstream wrappers (`gcp brain ontology compile`, `gcp brain ontology export-linkml`) spawn these native commands; they do not define the interchange contract.
 
 ## Pipeline diagram
 
@@ -111,7 +115,7 @@ LinkML YAML
        ↓
 GhostCrab native (bundle or SQLite)
        ↓
-ghostcrab2linkml → LinkML YAML (+ preserved_triples_ref when needed)
+mindbrain-standalone-tool ontology-export-linkml → LinkML YAML (+ preserved_triples_ref when needed)
 ```
 
 ## Existing tools (not replaced)
@@ -120,12 +124,12 @@ ghostcrab2linkml → LinkML YAML (+ preserved_triples_ref when needed)
 |------|-----|
 | LinkML | Authoring + standard generators |
 | W3C yml2vocab | Simple RDFS vocabs only |
-| `gcp brain ontology import/export` | N-Triples ↔ SQLite |
-| `gcp brain load` | Full backup bundle |
-| GhostCrab ↔ LinkML converters | **This repo** (`scripts/ontology/`) |
+| `mindbrain-standalone-tool ontology-import/export` | N-Triples ↔ SQLite |
+| `mindbrain-standalone-tool backup-load` | Full backup bundle |
+| `gcp brain ontology compile/export-linkml` | GhostCrab CLI wrappers over native commands |
+| Legacy TS scripts under `ghostcrab-personal-mcp/scripts/ontology/` | Compatibility tests only; not the source of truth |
 
 ## Dependencies
 
 - Python: `linkml`, `linkml-runtime` (optional `schema-automator` for OWL recovery)
-- Node: `yaml` (already in package.json)
-- Native: `mindbrain-standalone-tool ontology-import`
+- Native: `mindbrain-standalone-tool ontology-import`, `ontology-compile-linkml`, `ontology-export-linkml`
