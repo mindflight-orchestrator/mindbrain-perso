@@ -13,6 +13,7 @@ const facet_sqlite = mindbrain.facet_sqlite;
 const graph_sqlite = mindbrain.graph_sqlite;
 const interfaces = mindbrain.interfaces;
 const legal_chunker = mindbrain.legal_chunker;
+const linkml_interchange = mindbrain.linkml_interchange;
 const llm = mindbrain.llm;
 const nanoid = mindbrain.nanoid;
 const pragma_sqlite = mindbrain.pragma_sqlite;
@@ -79,6 +80,16 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "ontology-export")) {
         try runOntologyExportCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "ontology-compile-linkml")) {
+        try runOntologyCompileLinkmlCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "ontology-export-linkml")) {
+        try runOntologyExportLinkmlCommand(allocator, args[2..]);
         return;
     }
 
@@ -319,6 +330,8 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
         \\  mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
         \\  mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
+        \\  mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
+        \\  mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
         \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
@@ -1717,6 +1730,99 @@ fn runOntologyExportCommand(allocator: Allocator, args: []const []const u8) !voi
     }
 
     return CliError.InvalidArguments;
+}
+
+fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u8) !void {
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var ntriples_path: ?[]const u8 = null;
+    var db_path: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ntriples")) ntriples_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (workspace_id == null or ontology_id == null or input_path == null) return CliError.InvalidArguments;
+
+    var result = try linkml_interchange.compileLinkmlToBundle(allocator, .{
+        .input_path = input_path.?,
+        .workspace_id = workspace_id.?,
+        .ontology_id = ontology_id.?,
+        .ontology_name = name,
+    });
+    defer result.deinit(allocator);
+
+    const io = mindbrain.zig16_compat.io();
+    if (output_path) |path| {
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = result.bundle_json,
+            .flags = .{ .truncate = true },
+        });
+    } else {
+        try writeStdout("{s}\n", .{result.bundle_json});
+    }
+    if (ntriples_path) |path| {
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = result.ntriples,
+            .flags = .{ .truncate = true },
+        });
+    }
+
+    if (db_path) |path| {
+        var db = try facet_sqlite.Database.open(path);
+        defer db.close();
+        try db.applyStandaloneSchema();
+        try linkml_interchange.importCompiledBundle(db, allocator, result.bundle_json);
+    }
+
+    if (output_path != null) {
+        try writeStdout(
+            "{{\"ontology_id\":{f},\"entity_types\":{},\"edge_types\":{},\"enum_values\":{},\"triples\":{},\"imported\":{}}}\n",
+            .{ std.json.fmt(ontology_id.?, .{}), result.entity_type_count, result.edge_type_count, result.enum_value_count, result.triple_count, db_path != null },
+        );
+    }
+}
+
+fn runOntologyExportLinkmlCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var bundle_path: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (ontology_id == null or (db_path == null and bundle_path == null) or (db_path != null and bundle_path != null)) return CliError.InvalidArguments;
+
+    const payload = if (bundle_path) |path| blk: {
+        const bundle = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(bundle);
+        break :blk try linkml_interchange.exportLinkmlFromBundleJson(allocator, bundle, ontology_id.?);
+    } else blk: {
+        var db = try facet_sqlite.Database.open(db_path.?);
+        defer db.close();
+        try db.applyStandaloneSchema();
+        break :blk try linkml_interchange.exportLinkmlFromDb(allocator, db, ontology_id.?);
+    };
+    defer allocator.free(payload);
+
+    if (output_path) |path| {
+        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+            .sub_path = path,
+            .data = payload,
+            .flags = .{ .truncate = true },
+        });
+    } else {
+        try writeStdout("{s}", .{payload});
+    }
 }
 
 fn runBackupExportCommand(allocator: Allocator, args: []const []const u8) !void {
