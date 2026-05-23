@@ -194,11 +194,15 @@ const SchemaIndex = struct {
         errdefer index.deinit();
 
         for (schema.classes.items) |class| {
-            try index.native_type_by_class.put(class.name, nativeEntityType(class));
-            if (class.class_uri) |class_uri| try index.class_uri_by_name.put(class.name, class_uri);
+            if (!index.native_type_by_class.contains(class.name)) {
+                try index.native_type_by_class.put(class.name, nativeEntityType(class));
+            }
+            if (class.class_uri) |class_uri| {
+                if (!index.class_uri_by_name.contains(class.name)) try index.class_uri_by_name.put(class.name, class_uri);
+            }
         }
         for (schema.enums.items) |enum_def| {
-            try index.enum_names.put(enum_def.name, {});
+            if (!index.enum_names.contains(enum_def.name)) try index.enum_names.put(enum_def.name, {});
         }
         return index;
     }
@@ -1205,6 +1209,66 @@ test "LinkML interchange merges diamond imports once" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(result.bundle_json, "\"entity_type\": \"shared\""));
+}
+
+test "LinkML interchange index preserves first duplicate class definition" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "base.yaml",
+        .data =
+        \\id: test:base
+        \\name: base
+        \\classes:
+        \\  Asset:
+        \\    class_uri: test:ImportedAsset
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: imported_asset
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "root.yaml",
+        .data =
+        \\id: test:root
+        \\name: root
+        \\prefixes:
+        \\  test: https://example.test/
+        \\imports:
+        \\  - base.yaml
+        \\classes:
+        \\  Asset:
+        \\    class_uri: test:LocalAsset
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: local_asset
+        \\  Holding:
+        \\    class_uri: test:Holding
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: holding
+        \\slots:
+        \\  owns:
+        \\    domain: Holding
+        \\    range: Asset
+        \\    annotations:
+        \\      ghostcrab.native_edge_type: owns
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/root.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(path);
+    var result = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = path,
+        .workspace_id = "test",
+        .ontology_id = "test::duplicates",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"target_entity_type\": \"imported_asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "https://example.test/ImportedAsset") != null);
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
