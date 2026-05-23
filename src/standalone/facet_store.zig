@@ -451,7 +451,7 @@ pub fn listHierarchyChildren(
 }
 
 fn reconstructFacetBitmap(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     chunk_bits: u8,
     postings: []const interfaces.FacetPosting,
 ) !?roaring.Bitmap {
@@ -459,14 +459,8 @@ fn reconstructFacetBitmap(
     errdefer if (facet_bitmap) |*bm| bm.deinit();
 
     for (postings) |posting| {
-        const in_chunk = try posting.bitmap.toArray(allocator);
-        defer allocator.free(in_chunk);
-
-        for (in_chunk) |doc_id_in_chunk| {
-            const original_id: u32 = (posting.chunk_id << @intCast(chunk_bits)) | doc_id_in_chunk;
-            if (facet_bitmap == null) facet_bitmap = try roaring.Bitmap.empty();
-            facet_bitmap.?.add(original_id);
-        }
+        if (facet_bitmap == null) facet_bitmap = try roaring.Bitmap.empty();
+        facet_bitmap.?.orShiftedChunkInPlace(posting.bitmap, posting.chunk_id, chunk_bits);
     }
 
     return facet_bitmap;

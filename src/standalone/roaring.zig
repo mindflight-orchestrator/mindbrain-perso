@@ -34,6 +34,20 @@ extern fn roaring_bitmap_portable_size_in_bytes(bitmap: *const roaring_bitmap_t)
 extern fn roaring_bitmap_portable_serialize(bitmap: *const roaring_bitmap_t, buf: [*]u8) usize;
 extern fn roaring_bitmap_portable_deserialize_safe(buf: [*]const u8, maxbytes: usize) ?*roaring_bitmap_t;
 extern fn roaring_bitmap_to_uint32_array(bitmap: *const roaring_bitmap_t, ans: [*]u32) void;
+extern fn roaring_iterator_init(r: *const roaring_bitmap_t, newit: *RoaringUint32Iterator) void;
+extern fn roaring_uint32_iterator_advance(it: *RoaringUint32Iterator) bool;
+
+/// CRoaring iterator state — only `current_value` and `has_value` are public.
+pub const RoaringUint32Iterator = extern struct {
+    parent: *const roaring_bitmap_t,
+    container: ?*anyopaque,
+    typecode: u8,
+    container_index: i32,
+    highbits: u32,
+    container_it_index: i32,
+    current_value: DenseId,
+    has_value: bool,
+};
 
 pub const Bitmap = struct {
     handle: *roaring_bitmap_t,
@@ -157,4 +171,37 @@ pub const Bitmap = struct {
         roaring_bitmap_to_uint32_array(self.handle, values.ptr);
         return values;
     }
+
+    /// Merge a chunk-local posting bitmap into `self` using global doc ids.
+    pub fn orShiftedChunkInPlace(self: *Bitmap, chunk_bitmap: Bitmap, chunk_id: u32, chunk_bits: u8) void {
+        var iter: RoaringUint32Iterator = undefined;
+        roaring_iterator_init(chunk_bitmap.handle, &iter);
+        const offset = chunk_id << @intCast(chunk_bits);
+        while (iter.has_value) {
+            self.add(offset | iter.current_value);
+            _ = roaring_uint32_iterator_advance(&iter);
+        }
+    }
+
+    pub const UInt32Iterator = struct {
+        iter: RoaringUint32Iterator,
+
+        pub fn init(bitmap: Bitmap) UInt32Iterator {
+            var iter: RoaringUint32Iterator = undefined;
+            roaring_iterator_init(bitmap.handle, &iter);
+            return .{ .iter = iter };
+        }
+
+        pub fn hasValue(self: *const UInt32Iterator) bool {
+            return self.iter.has_value;
+        }
+
+        pub fn currentValue(self: *const UInt32Iterator) DenseId {
+            return self.iter.current_value;
+        }
+
+        pub fn advance(self: *UInt32Iterator) void {
+            _ = roaring_uint32_iterator_advance(&self.iter);
+        }
+    };
 };

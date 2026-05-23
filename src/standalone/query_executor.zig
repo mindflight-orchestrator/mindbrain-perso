@@ -229,13 +229,35 @@ fn loadSourceRefsForDocs(
         dedupe.deinit();
     }
 
-    const stmt = try prepare(db, "SELECT COALESCE(source_ref, id) FROM facets WHERE workspace_id = ?1 AND doc_id = ?2");
-    defer finalize(stmt);
+    const batch_size: usize = 500;
+    var offset: usize = 0;
+    while (offset < doc_ids.len) {
+        const end = @min(offset + batch_size, doc_ids.len);
+        const batch = doc_ids[offset..end];
 
-    for (doc_ids) |doc_id| {
-        try resetStatement(stmt);
+        var placeholders = std.ArrayList(u8).empty;
+        defer placeholders.deinit(allocator);
+        for (0..batch.len) |index| {
+            if (index > 0) try placeholders.append(allocator, ',');
+            const placeholder = try std.fmt.allocPrint(allocator, "?{d}", .{@as(c_int, @intCast(index + 2))});
+            defer allocator.free(placeholder);
+            try placeholders.appendSlice(allocator, placeholder);
+        }
+
+        const sql = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COALESCE(source_ref, id) FROM facets WHERE workspace_id = ?1 AND doc_id IN ({s})",
+            .{placeholders.items},
+        );
+        defer allocator.free(sql);
+
+        const stmt = try prepare(db, sql);
+        defer finalize(stmt);
         try bindText(stmt, 1, workspace_id);
-        try bindInt64(stmt, 2, doc_id);
+        for (batch, 0..) |doc_id, index| {
+            try bindInt64(stmt, @intCast(@as(c_int, @intCast(index + 2))), doc_id);
+        }
+
         while (true) {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
@@ -250,6 +272,8 @@ fn loadSourceRefsForDocs(
                 gop.value_ptr.* = {};
             }
         }
+
+        offset = end;
     }
 
     var source_refs = std.ArrayList([]const u8).empty;

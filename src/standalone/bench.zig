@@ -9,6 +9,8 @@ const search_store = @import("search_store.zig");
 const roaring = @import("roaring.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
 const query_executor = @import("query_executor.zig");
+const hybrid_search = @import("hybrid_search.zig");
+const interfaces = @import("interfaces.zig");
 const compat = @import("zig16_compat.zig");
 const tokenization_sqlite = @import("tokenization_sqlite.zig");
 
@@ -321,6 +323,15 @@ pub fn main(init: std.process.Init) !void {
     (try microGraphSingleUpdate(allocator, iters.graph_mutation_nodes, iters.graph_single_mutations)).print();
     (try microGraphSingleRemove(allocator, iters.graph_mutation_nodes, iters.graph_single_mutations)).print();
     (try microGraphBatchPatch(allocator, iters.graph_mutation_nodes, iters.graph_batch_mutations)).print();
+
+    std.debug.print("roaring filter benchmarks\n", .{});
+    (try microHybridUnionToArrayHashmap(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microHybridUnionOrBitmap(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microFacetReconstructToArray(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microFacetReconstructOrChunks(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microFacetCountPerValuePostings(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microFacetCountBitmapIntersectOnly(allocator, dataset.facet_docs, iters.facet_filters)).print();
+    (try microHybridSearchE2e(allocator, dataset.search_docs, iters.composite_queries)).print();
 
     std.debug.print("large-scale benchmarks\n", .{});
     try runLargeScaleBenchmarks(allocator);
@@ -867,6 +878,446 @@ test "graph stream benchmark emits a metric" {
     try std.testing.expectEqualStrings("micro_graph_stream_subgraph", stat.name);
     try std.testing.expectEqual(@as(usize, 1), stat.iterations);
     try std.testing.expect(stat.max_ns >= stat.min_ns);
+}
+
+const HybridPostingFixture = struct {
+    term_bitmaps: []roaring.Bitmap,
+    term_hashes: []const u64,
+
+    fn init(allocator: std.mem.Allocator, doc_count: usize, term_count: usize) !HybridPostingFixture {
+        const term_bitmaps = try allocator.alloc(roaring.Bitmap, term_count);
+        errdefer allocator.free(term_bitmaps);
+
+        const term_hashes = try allocator.alloc(u64, term_count);
+        errdefer allocator.free(term_hashes);
+
+        for (0..term_count) |term_index| {
+            term_hashes[term_index] = 1_000 + term_index;
+            term_bitmaps[term_index] = try roaring.Bitmap.empty();
+            for (0..doc_count) |doc_index| {
+                const doc_id: u32 = @intCast(doc_index + 1);
+                if (doc_index % (term_count + term_index + 1) == 0) {
+                    term_bitmaps[term_index].add(doc_id);
+                }
+            }
+        }
+
+        return .{
+            .term_bitmaps = term_bitmaps,
+            .term_hashes = term_hashes,
+        };
+    }
+
+    fn deinit(self: *HybridPostingFixture, allocator: std.mem.Allocator) void {
+        for (self.term_bitmaps) |*bitmap| bitmap.deinit();
+        allocator.free(self.term_bitmaps);
+        allocator.free(self.term_hashes);
+        self.* = undefined;
+    }
+};
+
+fn microHybridUnionToArrayHashmap(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    var fixture = try HybridPostingFixture.init(allocator, doc_count, 5);
+    defer fixture.deinit(allocator);
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        fixture: *HybridPostingFixture,
+    };
+    var ctx = Ctx{ .allocator = allocator, .fixture = &fixture };
+    return measure("micro_hybrid_union_to_array_hashmap", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            var candidates = std.AutoHashMap(u64, void).init(local.allocator);
+            defer candidates.deinit();
+
+            for (local.fixture.term_bitmaps) |bitmap| {
+                var cloned = try bitmap.clone();
+                defer cloned.deinit();
+                const doc_ids = try cloned.toArray(local.allocator);
+                defer local.allocator.free(doc_ids);
+                for (doc_ids) |doc_id| {
+                    _ = try candidates.getOrPut(@intCast(doc_id));
+                }
+            }
+            std.mem.doNotOptimizeAway(candidates.count());
+        }
+    }.run);
+}
+
+fn microHybridUnionOrBitmap(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    var fixture = try HybridPostingFixture.init(allocator, doc_count, 5);
+    defer fixture.deinit(allocator);
+
+    const Ctx = struct {
+        fixture: *HybridPostingFixture,
+    };
+    var ctx = Ctx{ .fixture = &fixture };
+    return measure("micro_hybrid_union_or_bitmap", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            var union_bitmap = try roaring.Bitmap.empty();
+            defer union_bitmap.deinit();
+            for (local.fixture.term_bitmaps) |bitmap| {
+                union_bitmap.orInPlace(bitmap);
+            }
+            std.mem.doNotOptimizeAway(union_bitmap.cardinality());
+        }
+    }.run);
+}
+
+fn buildChunkedFacetPostings(allocator: std.mem.Allocator, doc_count: usize, chunk_bits: u8) ![]interfaces.FacetPosting {
+    const shift_bits: u5 = @intCast(chunk_bits);
+    const chunk_mask: u32 = @intCast((@as(u64, 1) << @intCast(chunk_bits)) - 1);
+
+    var chunks = std.AutoHashMap(u32, roaring.Bitmap).init(allocator);
+    defer {
+        var it = chunks.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit();
+        chunks.deinit();
+    }
+
+    for (0..doc_count) |index| {
+        const doc_id: u32 = @intCast(index + 1);
+        const chunk_id = doc_id >> shift_bits;
+        const gop = try chunks.getOrPut(chunk_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try roaring.Bitmap.empty();
+        }
+        gop.value_ptr.add(doc_id & chunk_mask);
+    }
+
+    var postings = std.ArrayList(interfaces.FacetPosting).empty;
+    errdefer {
+        for (postings.items) |posting| {
+            var bitmap = posting.bitmap;
+            bitmap.deinit();
+        }
+        postings.deinit(allocator);
+    }
+
+    var chunk_iter = chunks.iterator();
+    while (chunk_iter.next()) |entry| {
+        try postings.append(allocator, .{
+            .chunk_id = entry.key_ptr.*,
+            .bitmap = entry.value_ptr.*,
+        });
+        _ = chunks.remove(entry.key_ptr.*);
+    }
+
+    return postings.toOwnedSlice(allocator);
+}
+
+fn reconstructFacetBitmapLegacy(
+    allocator: std.mem.Allocator,
+    chunk_bits: u8,
+    postings: []const interfaces.FacetPosting,
+) !?roaring.Bitmap {
+    var facet_bitmap: ?roaring.Bitmap = null;
+    errdefer if (facet_bitmap) |*bm| bm.deinit();
+
+    for (postings) |posting| {
+        const in_chunk = try posting.bitmap.toArray(allocator);
+        defer allocator.free(in_chunk);
+
+        for (in_chunk) |doc_id_in_chunk| {
+            const original_id: u32 = (posting.chunk_id << @intCast(chunk_bits)) | doc_id_in_chunk;
+            if (facet_bitmap == null) facet_bitmap = try roaring.Bitmap.empty();
+            facet_bitmap.?.add(original_id);
+        }
+    }
+
+    return facet_bitmap;
+}
+
+fn reconstructFacetBitmapOrChunks(
+    chunk_bits: u8,
+    postings: []const interfaces.FacetPosting,
+) !?roaring.Bitmap {
+    var facet_bitmap: ?roaring.Bitmap = null;
+    errdefer if (facet_bitmap) |*bm| bm.deinit();
+
+    for (postings) |posting| {
+        if (facet_bitmap == null) facet_bitmap = try roaring.Bitmap.empty();
+        facet_bitmap.?.orShiftedChunkInPlace(posting.bitmap, posting.chunk_id, chunk_bits);
+    }
+
+    return facet_bitmap;
+}
+
+fn microFacetReconstructToArray(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    const postings = try buildChunkedFacetPostings(allocator, doc_count, 8);
+    defer {
+        for (postings) |posting| {
+            var bitmap = posting.bitmap;
+            bitmap.deinit();
+        }
+        allocator.free(postings);
+    }
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        postings: []const interfaces.FacetPosting,
+    };
+    var ctx = Ctx{ .allocator = allocator, .postings = postings };
+    return measure("micro_facet_reconstruct_to_array", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            var bitmap = (try reconstructFacetBitmapLegacy(local.allocator, 8, local.postings)).?;
+            defer bitmap.deinit();
+            std.mem.doNotOptimizeAway(bitmap.cardinality());
+        }
+    }.run);
+}
+
+fn microFacetReconstructOrChunks(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    const postings = try buildChunkedFacetPostings(allocator, doc_count, 8);
+    defer {
+        for (postings) |posting| {
+            var bitmap = posting.bitmap;
+            bitmap.deinit();
+        }
+        allocator.free(postings);
+    }
+
+    const Ctx = struct {
+        postings: []const interfaces.FacetPosting,
+    };
+    var ctx = Ctx{ .postings = postings };
+    return measure("micro_facet_reconstruct_or_chunks", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            var bitmap = (try reconstructFacetBitmapOrChunks(8, local.postings)).?;
+            defer bitmap.deinit();
+            std.mem.doNotOptimizeAway(bitmap.cardinality());
+        }
+    }.run);
+}
+
+fn microFacetCountPerValuePostings(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var collectors = try FacetCollectorSet.init(allocator);
+    defer collectors.deinit();
+    for (0..doc_count) |index| {
+        try collectors.appendDoc(@intCast(index + 1));
+    }
+    try collectors.persist(db, 902, "bench_facet_counts", 8);
+
+    var filter_bitmap = try roaring.Bitmap.empty();
+    defer filter_bitmap.deinit();
+    for (0..doc_count) |index| {
+        if (index % 2 == 0) filter_bitmap.add(@intCast(index + 1));
+    }
+
+    const repo = facet_sqlite.Repository{ .db = &db };
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        repo: @TypeOf(repo),
+        filter_bitmap: *roaring.Bitmap,
+    };
+    var ctx = Ctx{ .allocator = allocator, .repo = repo, .filter_bitmap = &filter_bitmap };
+    return measure("micro_facet_count_per_value_postings", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            const counts = try facet_store.countFacetValues(
+                local.allocator,
+                local.repo.asFacetRepository(),
+                "bench_facet_counts",
+                "category",
+                local.filter_bitmap.*,
+            );
+            defer {
+                for (counts) |count| local.allocator.free(count.facet_value);
+                local.allocator.free(counts);
+            }
+            std.mem.doNotOptimizeAway(counts.len);
+        }
+    }.run);
+}
+
+fn microFacetCountBitmapIntersectOnly(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    var value_bitmaps = std.ArrayList(roaring.Bitmap).empty;
+    defer {
+        for (value_bitmaps.items) |*bitmap| bitmap.deinit();
+        value_bitmaps.deinit(allocator);
+    }
+
+    for (synthetic_facet_specs[0].values, 0..) |_, value_index| {
+        var bitmap = try roaring.Bitmap.empty();
+        for (0..doc_count) |doc_index| {
+            if (syntheticValueIndex(0, @intCast(doc_index + 1), synthetic_facet_specs[0].values.len) == value_index) {
+                bitmap.add(@intCast(doc_index + 1));
+            }
+        }
+        try value_bitmaps.append(allocator, bitmap);
+    }
+
+    var filter_bitmap = try roaring.Bitmap.empty();
+    defer filter_bitmap.deinit();
+    for (0..doc_count) |index| {
+        if (index % 2 == 0) filter_bitmap.add(@intCast(index + 1));
+    }
+
+    const Ctx = struct {
+        value_bitmaps: []roaring.Bitmap,
+        filter_bitmap: *roaring.Bitmap,
+    };
+    var ctx = Ctx{ .value_bitmaps = value_bitmaps.items, .filter_bitmap = &filter_bitmap };
+    return measure("micro_facet_count_bitmap_intersect_only", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            var total: u64 = 0;
+            for (local.value_bitmaps) |value_bitmap| {
+                var intersection = try value_bitmap.andNew(local.filter_bitmap.*);
+                defer intersection.deinit();
+                total += intersection.cardinality();
+            }
+            std.mem.doNotOptimizeAway(total);
+        }
+    }.run);
+}
+
+fn seedHybridSearchCompactStore(allocator: std.mem.Allocator, doc_count: usize) !search_compact_store.Store {
+    var store = search_compact_store.Store.init(allocator);
+    errdefer store.deinit();
+
+    const table_id: u64 = 42;
+    const term_hashes = [_]u64{ 11, 22, 33 };
+    var total_length: u64 = 0;
+
+    for (0..doc_count) |index| {
+        const doc_id: interfaces.DocId = @intCast(index + 1);
+        const doc_length: u32 = @intCast(80 + (index % 40));
+        total_length += doc_length;
+        try store.document_stats.append(allocator, .{
+            .table_id = table_id,
+            .stats = .{
+                .doc_id = doc_id,
+                .document_length = doc_length,
+                .unique_terms = 3,
+            },
+        });
+
+        for (term_hashes) |term_hash| {
+            if (index % (@as(usize, @intCast(term_hash % 7)) + 1) == 0) {
+                try store.term_frequencies.append(allocator, .{
+                    .table_id = table_id,
+                    .doc_id = doc_id,
+                    .frequency = .{
+                        .term_hash = term_hash,
+                        .frequency = @intCast((index % 5) + 1),
+                    },
+                });
+            }
+        }
+
+        const embedding = [_]f32{
+            @as(f32, @floatFromInt((index % 17) + 1)) / 17.0,
+            @as(f32, @floatFromInt((index % 13) + 1)) / 13.0,
+            @as(f32, @floatFromInt((index % 11) + 1)) / 11.0,
+        };
+        try store.embeddings.append(allocator, .{
+            .table_id = table_id,
+            .doc_id = doc_id,
+            .values = try allocator.dupe(f32, &embedding),
+        });
+    }
+
+    const avg_len = if (doc_count == 0) 0.0 else @as(f64, @floatFromInt(total_length)) / @as(f64, @floatFromInt(doc_count));
+    try store.collection_stats.append(allocator, .{
+        .table_id = table_id,
+        .stats = .{
+            .total_documents = doc_count,
+            .avg_document_length = avg_len,
+        },
+    });
+
+    for (term_hashes) |term_hash| {
+        var posting_bitmap = try roaring.Bitmap.empty();
+        for (0..doc_count) |index| {
+            if (index % (@as(usize, @intCast(term_hash % 7)) + 1) == 0) {
+                posting_bitmap.add(@intCast(index + 1));
+            }
+        }
+        try store.term_stats.append(allocator, .{
+            .table_id = table_id,
+            .stat = .{
+                .term_hash = term_hash,
+                .document_frequency = posting_bitmap.cardinality(),
+            },
+        });
+        try store.postings.append(allocator, .{
+            .table_id = table_id,
+            .term_hash = term_hash,
+            .bitmap = posting_bitmap,
+        });
+    }
+
+    try store.buildIndexes();
+    return store;
+}
+
+fn microHybridSearchE2e(allocator: std.mem.Allocator, doc_count: usize, iterations: usize) !MicroStat {
+    var store = try seedHybridSearchCompactStore(allocator, doc_count);
+    defer store.deinit();
+
+    const bm25_repo = store.bm25Repository();
+    const vector_repo = store.vectorRepository();
+    const query_vector = [_]f32{ 0.8, 0.2, 0.1 };
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        bm25_repo: @TypeOf(bm25_repo),
+        vector_repo: @TypeOf(vector_repo),
+        query_vector: []const f32,
+    };
+    var ctx = Ctx{
+        .allocator = allocator,
+        .bm25_repo = bm25_repo,
+        .vector_repo = vector_repo,
+        .query_vector = &query_vector,
+    };
+    return measure("micro_hybrid_search_e2e", iterations, &ctx, struct {
+        fn run(local: *Ctx) !void {
+            const results = try hybrid_search.search(
+                local.allocator,
+                local.bm25_repo,
+                local.vector_repo,
+                .{
+                    .bm25_table_id = 42,
+                    .bm25_term_hashes = &.{ 11, 22, 33 },
+                    .vector = .{
+                        .table_name = "search_embeddings",
+                        .key_column = "doc_id",
+                        .vector_column = "embedding_blob",
+                        .query_vector = local.query_vector,
+                        .limit = 20,
+                        .table_id = 42,
+                    },
+                    .limit = 20,
+                    .vector_weight = 0.35,
+                },
+            );
+            defer local.allocator.free(results);
+            if (results.len > 0) std.mem.doNotOptimizeAway(results[0].doc_id);
+        }
+    }.run);
+}
+
+test "hybrid union benchmark emits a metric" {
+    const stat = try microHybridUnionOrBitmap(std.testing.allocator, 128, 1);
+    try std.testing.expectEqualStrings("micro_hybrid_union_or_bitmap", stat.name);
+    try std.testing.expectEqual(@as(usize, 1), stat.iterations);
+}
+
+test "facet reconstruct benchmark emits a metric" {
+    const stat = try microFacetReconstructOrChunks(std.testing.allocator, 128, 1);
+    try std.testing.expectEqualStrings("micro_facet_reconstruct_or_chunks", stat.name);
+    try std.testing.expectEqual(@as(usize, 1), stat.iterations);
+}
+
+test "hybrid search e2e benchmark emits a metric" {
+    const stat = try microHybridSearchE2e(std.testing.allocator, 128, 1);
+    try std.testing.expectEqualStrings("micro_hybrid_search_e2e", stat.name);
+    try std.testing.expectEqual(@as(usize, 1), stat.iterations);
 }
 
 fn microCompositeQuery(allocator: std.mem.Allocator, iterations: usize) !MicroStat {

@@ -43,6 +43,9 @@ pub fn search(
     var candidate_scores = std.AutoHashMap(interfaces.DocId, CandidateScore).init(allocator);
     defer candidate_scores.deinit();
 
+    var bm25_candidates = try roaring.Bitmap.empty();
+    defer bm25_candidates.deinit();
+
     for (request.bm25_term_hashes) |term_hash| {
         const maybe_bitmap = try bm25_repository.getPostingBitmapFn(
             bm25_repository.ctx,
@@ -56,13 +59,15 @@ pub fn search(
                 var bm = bitmap;
                 bm.deinit();
             }
+            bm25_candidates.orInPlace(bitmap);
+        }
+    }
 
-            const doc_ids = try bitmap.toArray(allocator);
-            defer allocator.free(doc_ids);
-
-            for (doc_ids) |doc_id| {
-                _ = try getOrPutCandidate(&candidate_scores, doc_id);
-            }
+    if (!bm25_candidates.isEmpty()) {
+        const doc_ids = try bm25_candidates.toArray(allocator);
+        defer allocator.free(doc_ids);
+        for (doc_ids) |doc_id| {
+            _ = try getOrPutCandidate(&candidate_scores, doc_id);
         }
     }
 

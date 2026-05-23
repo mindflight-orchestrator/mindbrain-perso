@@ -8,6 +8,7 @@ const import_pipeline = @import("import_pipeline.zig");
 const interfaces = @import("interfaces.zig");
 const search_sqlite = @import("search_sqlite.zig");
 const search_store = @import("search_store.zig");
+const roaring = @import("roaring.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = facet_sqlite.Database;
@@ -274,7 +275,7 @@ fn searchCollectionFacetsPostings(
         rows.deinit(allocator);
     }
 
-    var seen_docs = std.AutoHashMap(u64, void).init(allocator);
+    var seen_docs = try roaring.Bitmap.empty();
     defer seen_docs.deinit();
 
     for (facet_values) |facet_value| {
@@ -303,18 +304,16 @@ fn searchCollectionFacetsPostings(
         )) orelse continue;
         defer facet_bitmap.deinit();
 
-        const doc_ids = try facet_bitmap.toArray(allocator);
-        defer allocator.free(doc_ids);
-
-        for (doc_ids) |doc_id| {
+        var iter = roaring.Bitmap.UInt32Iterator.init(facet_bitmap);
+        while (iter.hasValue()) {
             if (rows.items.len >= limit) break;
-            const doc_id_u64: u64 = doc_id;
-            const gop = try seen_docs.getOrPut(doc_id_u64);
-            if (gop.found_existing) continue;
-            gop.value_ptr.* = {};
+            const doc_id = iter.currentValue();
+            iter.advance();
+            if (seen_docs.contains(doc_id)) continue;
+            seen_docs.add(doc_id);
 
             try rows.append(allocator, .{
-                .doc_id = doc_id_u64,
+                .doc_id = doc_id,
                 .chunk_index = null,
                 .namespace = try allocator.dupe(u8, namespace),
                 .dimension = try allocator.dupe(u8, dimension),
