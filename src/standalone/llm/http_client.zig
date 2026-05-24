@@ -78,10 +78,13 @@ fn post(
     if (fetch_result.status.class() != .success) {
         const body = response_body.written();
         const preview_len = @min(body.len, 4096);
-        std.debug.print("LLM HTTP request failed: status={d} body={s}\n", .{
+        var stderr_file_writer = std.Io.File.stderr().writer(io, &.{});
+        const stderr = &stderr_file_writer.interface;
+        stderr.print("LLM HTTP request failed: status={d} body={s}\n", .{
             @intFromEnum(fetch_result.status),
             body[0..preview_len],
-        });
+        }) catch {};
+        stderr.flush() catch {};
         return error.HttpRequestFailed;
     }
 
