@@ -1802,7 +1802,28 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
         return err;
     };
     defer response.deinit(allocator);
-    return try allocator.dupe(u8, response.content);
+    const content = std.mem.trim(u8, response.content, " \t\r\n");
+    if (content.len == 0) {
+        try writeLlmQualificationFailure(allocator, .{
+            .reason = "empty_content",
+            .model = opts.model,
+            .content = response.content,
+            .raw_json = response.raw_json,
+            .parse_error = null,
+        });
+        return error.InvalidLlmQualificationResponse;
+    }
+    validateQualificationEnvelope(allocator, content) catch |err| {
+        try writeLlmQualificationFailure(allocator, .{
+            .reason = "invalid_json",
+            .model = opts.model,
+            .content = response.content,
+            .raw_json = response.raw_json,
+            .parse_error = @errorName(err),
+        });
+        return error.InvalidLlmQualificationResponse;
+    };
+    return try allocator.dupe(u8, content);
 }
 
 fn writeLastLlmHttpFailure(allocator: Allocator) !void {
@@ -1812,6 +1833,31 @@ fn writeLastLlmHttpFailure(allocator: Allocator) !void {
     const stderr = &stderr_file_writer.interface;
     try stderr.print("LLM_HTTP_FAILURE_JSON={s}\n", .{json});
     try stderr.flush();
+}
+
+const LlmQualificationFailure = struct {
+    reason: []const u8,
+    model: []const u8,
+    content: []const u8,
+    raw_json: []const u8,
+    parse_error: ?[]const u8 = null,
+};
+
+fn writeLlmQualificationFailure(allocator: Allocator, failure: LlmQualificationFailure) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, failure, .{});
+    defer allocator.free(json);
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("LLM_QUALIFICATION_FAILURE_JSON={s}\n", .{json});
+    try stderr.flush();
+}
+
+fn validateQualificationEnvelope(allocator: Allocator, json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
 }
 
 fn buildQualificationDryRunEnvelope(

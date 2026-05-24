@@ -306,3 +306,18 @@ test "parseResponse extracts content and tool calls" {
     try std.testing.expectEqual(@as(usize, 1), response.tool_calls.len);
     try std.testing.expectEqualStrings("lookup", response.tool_calls[0].name);
 }
+
+test "parseResponse preserves raw JSON when assistant content is empty" {
+    const raw = try std.testing.allocator.dupe(u8,
+        \\{
+        \\  "choices": [
+        \\    {"finish_reason":"length","message":{"role":"assistant","content":null}}
+        \\  ]
+        \\}
+    );
+    var response = try parseResponse(std.testing.allocator, raw);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", response.content);
+    try std.testing.expect(std.mem.indexOf(u8, response.raw_json, "\"finish_reason\":\"length\"") != null);
+}
