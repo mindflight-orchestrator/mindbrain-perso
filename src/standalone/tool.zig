@@ -2146,6 +2146,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var output_path: ?[]const u8 = null;
     var raw_output_path: ?[]const u8 = null;
     var request_output_path: ?[]const u8 = null;
+    var input_json_path: ?[]const u8 = null;
     var limit: usize = 20;
     var temperature: f32 = 0.0;
     var max_tokens: ?u32 = null;
@@ -2153,7 +2154,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-json")) input_json_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -2164,11 +2165,25 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
             max_tokens = std.fmt.parseInt(u32, v, 10) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
     }
-    if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null or expected_path == null or base_url == null or model == null) return CliError.InvalidArguments;
+    if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null) return CliError.InvalidArguments;
+    if (input_json_path == null and (expected_path == null or base_url == null or model == null)) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
     try db.applyStandaloneSchema();
+
+    if (input_json_path) |path| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(content);
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        try applyAndWriteBusinessExtraction(allocator, db, .{
+            .workspace_id = workspace_id.?,
+            .collection_id = collection_id.?,
+            .ontology_id = ontology_id.?,
+            .json = trimmed,
+        }, output_path);
+        return;
+    }
 
     const expected_json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), expected_path.?, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(expected_json);
@@ -2251,21 +2266,24 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         return error.InvalidLlmBusinessExtractionResponse;
     };
 
-    _ = try applyBusinessExtractionEnvelope(allocator, db, .{
+    try applyAndWriteBusinessExtraction(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
         .ontology_id = ontology_id.?,
         .json = content,
-    });
+    }, output_path);
+}
 
+fn applyAndWriteBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionApplyOptions, output_path: ?[]const u8) !void {
+    _ = try applyBusinessExtractionEnvelope(allocator, db, opts);
     if (output_path) |path| {
         try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
             .sub_path = path,
-            .data = content,
+            .data = opts.json,
             .flags = .{ .truncate = true },
         });
     } else {
-        try writeStdout("{s}\n", .{content});
+        try writeStdout("{s}\n", .{opts.json});
     }
 }
 
@@ -2543,7 +2561,7 @@ fn applyBusinessExtractionEnvelope(allocator: Allocator, db: facet_sqlite.Databa
             .value_number = row.value_number,
             .value_integer = row.value_integer,
             .ref_doc_id = if (row.ref_doc_id) |v| std.math.cast(u64, v) orelse return CliError.InvalidArguments else null,
-            .currency = row.currency,
+            .currency = if (value_type == .money_minor) row.currency else null,
         });
         summary.relation_properties += 1;
     }
@@ -2563,11 +2581,22 @@ fn jsonValueString(allocator: Allocator, value: std.json.Value) ![]const u8 {
 
 fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
     if (std.mem.eql(u8, value, "text")) return .text;
+    if (std.mem.eql(u8, value, "string")) return .text;
+    if (std.mem.eql(u8, value, "date")) return .text;
+    if (std.mem.eql(u8, value, "datetime")) return .text;
     if (std.mem.eql(u8, value, "number")) return .number;
+    if (std.mem.eql(u8, value, "integer")) return .number;
+    if (std.mem.eql(u8, value, "float")) return .number;
+    if (std.mem.eql(u8, value, "decimal")) return .number;
+    if (std.mem.eql(u8, value, "percentage")) return .percentage_bp;
     if (std.mem.eql(u8, value, "percentage_bp")) return .percentage_bp;
+    if (std.mem.eql(u8, value, "money")) return .money_minor;
+    if (std.mem.eql(u8, value, "currency")) return .money_minor;
     if (std.mem.eql(u8, value, "money_minor")) return .money_minor;
     if (std.mem.eql(u8, value, "date_unix")) return .date_unix;
+    if (std.mem.eql(u8, value, "document_ref")) return .doc_ref;
     if (std.mem.eql(u8, value, "doc_ref")) return .doc_ref;
+    if (std.mem.eql(u8, value, "url")) return .uri;
     if (std.mem.eql(u8, value, "uri")) return .uri;
     return null;
 }
@@ -2620,7 +2649,8 @@ test "document business extraction applies symbolic external ids with sqlite-gen
         \\    {"entity_external_id":"unit:a1","doc_id":1,"chunk_index":0,"role":"mention"}
         \\  ],
         \\  "relation_properties_raw": [
-        \\    {"relation_external_id":"owns:alice:a1","property_key":"share_bp","value_type":"percentage_bp","value_integer":10000}
+        \\    {"relation_external_id":"owns:alice:a1","property_key":"share_bp","value_type":"percentage_bp","value_integer":10000},
+        \\    {"relation_external_id":"owns:alice:a1","property_key":"start_date","value_type":"string","value_text":"2025-09-01","currency":"EUR"}
         \\  ]
         \\}
     ;
@@ -2633,7 +2663,7 @@ test "document business extraction applies symbolic external ids with sqlite-gen
     });
     try std.testing.expectEqual(@as(usize, 2), summary.entities);
     try std.testing.expectEqual(@as(usize, 1), summary.relations);
-    try std.testing.expectEqual(@as(usize, 1), summary.relation_properties);
+    try std.testing.expectEqual(@as(usize, 2), summary.relation_properties);
 
     const alice_id = try collections_sqlite.selectEntityRawIdByExternalId(db, "ws-business", "person:alice");
     const relation_id = try collections_sqlite.selectRelationRawIdByExternalId(db, "ws-business", "owns:alice:a1");
