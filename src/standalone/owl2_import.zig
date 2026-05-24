@@ -151,9 +151,9 @@ const ImportSession = struct {
         var stmt_relation_raw: ?*c.sqlite3_stmt = null;
         if (materialize_graph) {
             const er = try facet_sqlite.prepare(db,
-                \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, entity_type, name, confidence, metadata_json)
-                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                \\ON CONFLICT(workspace_id, entity_id) DO UPDATE SET
+                \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, external_id, entity_type, name, confidence, metadata_json)
+                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                \\ON CONFLICT(entity_id) DO UPDATE SET
                 \\    ontology_id = excluded.ontology_id,
                 \\    entity_type = excluded.entity_type,
                 \\    name = excluded.name,
@@ -164,9 +164,9 @@ const ImportSession = struct {
             stmt_entity_raw = er;
 
             stmt_relation_raw = try facet_sqlite.prepare(db,
-                \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
-                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                \\ON CONFLICT(workspace_id, relation_id) DO UPDATE SET
+                \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
+                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                \\ON CONFLICT(relation_id) DO UPDATE SET
                 \\    ontology_id = excluded.ontology_id,
                 \\    edge_type = excluded.edge_type,
                 \\    source_entity_id = excluded.source_entity_id,
@@ -292,10 +292,11 @@ const ImportSession = struct {
         try facet_sqlite.bindText(stmt, 1, s.workspace_id);
         try facet_sqlite.bindText(stmt, 2, s.ontology_id);
         try facet_sqlite.bindInt64(stmt, 3, entity_id);
-        try facet_sqlite.bindText(stmt, 4, entity_type);
-        try facet_sqlite.bindText(stmt, 5, name);
-        if (c.sqlite3_bind_double(stmt, 6, 1.0) != c.SQLITE_OK) return error.BindFailed;
-        try facet_sqlite.bindText(stmt, 7, metadata_json);
+        try facet_sqlite.bindNull(stmt, 4);
+        try facet_sqlite.bindText(stmt, 5, entity_type);
+        try facet_sqlite.bindText(stmt, 6, name);
+        if (c.sqlite3_bind_double(stmt, 7, 1.0) != c.SQLITE_OK) return error.BindFailed;
+        try facet_sqlite.bindText(stmt, 8, metadata_json);
         try facet_sqlite.stepDone(stmt);
     }
 
@@ -305,13 +306,14 @@ const ImportSession = struct {
         try facet_sqlite.bindText(stmt, 1, s.workspace_id);
         try facet_sqlite.bindText(stmt, 2, s.ontology_id);
         try facet_sqlite.bindInt64(stmt, 3, relation_id);
-        try facet_sqlite.bindText(stmt, 4, edge_type);
-        try facet_sqlite.bindInt64(stmt, 5, source_entity_id);
-        try facet_sqlite.bindInt64(stmt, 6, target_entity_id);
-        try facet_sqlite.bindNull(stmt, 7);
+        try facet_sqlite.bindNull(stmt, 4);
+        try facet_sqlite.bindText(stmt, 5, edge_type);
+        try facet_sqlite.bindInt64(stmt, 6, source_entity_id);
+        try facet_sqlite.bindInt64(stmt, 7, target_entity_id);
         try facet_sqlite.bindNull(stmt, 8);
-        if (c.sqlite3_bind_double(stmt, 9, 1.0) != c.SQLITE_OK) return error.BindFailed;
-        try facet_sqlite.bindText(stmt, 10, metadata_json);
+        try facet_sqlite.bindNull(stmt, 9);
+        if (c.sqlite3_bind_double(stmt, 10, 1.0) != c.SQLITE_OK) return error.BindFailed;
+        try facet_sqlite.bindText(stmt, 11, metadata_json);
         try facet_sqlite.stepDone(stmt);
     }
 };

@@ -935,13 +935,14 @@ CREATE INDEX IF NOT EXISTS facet_assignments_raw_lookup_idx
 CREATE TABLE IF NOT EXISTS entities_raw (
     workspace_id TEXT NOT NULL,
     ontology_id TEXT NOT NULL,
-    entity_id INTEGER NOT NULL,
+    entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT,
     entity_type TEXT NOT NULL,
     name TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(workspace_id, entity_id),
+    UNIQUE(workspace_id, external_id),
     UNIQUE(workspace_id, entity_type, name),
     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
     FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id)
@@ -956,7 +957,7 @@ CREATE TABLE IF NOT EXISTS entity_aliases_raw (
     term TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     PRIMARY KEY(workspace_id, entity_id, term),
-    FOREIGN KEY(workspace_id, entity_id) REFERENCES entities_raw(workspace_id, entity_id)
+    FOREIGN KEY(entity_id) REFERENCES entities_raw(entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS entity_aliases_raw_term_idx
@@ -965,7 +966,8 @@ CREATE INDEX IF NOT EXISTS entity_aliases_raw_term_idx
 CREATE TABLE IF NOT EXISTS relations_raw (
     workspace_id TEXT NOT NULL,
     ontology_id TEXT NOT NULL,
-    relation_id INTEGER NOT NULL,
+    relation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT,
     edge_type TEXT NOT NULL,
     source_entity_id INTEGER NOT NULL,
     target_entity_id INTEGER NOT NULL,
@@ -974,11 +976,11 @@ CREATE TABLE IF NOT EXISTS relations_raw (
     confidence REAL NOT NULL DEFAULT 1.0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(workspace_id, relation_id),
+    UNIQUE(workspace_id, external_id),
     FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
     FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
-    FOREIGN KEY(workspace_id, source_entity_id) REFERENCES entities_raw(workspace_id, entity_id),
-    FOREIGN KEY(workspace_id, target_entity_id) REFERENCES entities_raw(workspace_id, entity_id)
+    FOREIGN KEY(source_entity_id) REFERENCES entities_raw(entity_id),
+    FOREIGN KEY(target_entity_id) REFERENCES entities_raw(entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS relations_raw_source_idx
@@ -1006,7 +1008,7 @@ CREATE TABLE IF NOT EXISTS relation_properties_raw (
     CHECK (currency IS NULL OR value_type = 'money_minor'),
     PRIMARY KEY (workspace_id, relation_id, property_key),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
-    FOREIGN KEY (workspace_id, relation_id) REFERENCES relations_raw(workspace_id, relation_id)
+    FOREIGN KEY (relation_id) REFERENCES relations_raw(relation_id)
 );
 
 CREATE INDEX IF NOT EXISTS relation_properties_raw_relation_idx
@@ -1020,7 +1022,7 @@ CREATE TABLE IF NOT EXISTS entity_documents_raw (
     role TEXT,
     confidence REAL NOT NULL DEFAULT 1.0,
     PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id),
-    FOREIGN KEY(workspace_id, entity_id) REFERENCES entities_raw(workspace_id, entity_id),
+    FOREIGN KEY(entity_id) REFERENCES entities_raw(entity_id),
     FOREIGN KEY(workspace_id, collection_id, doc_id) REFERENCES documents_raw(workspace_id, collection_id, doc_id)
 );
 
@@ -1036,7 +1038,7 @@ CREATE TABLE IF NOT EXISTS entity_chunks_raw (
     role TEXT,
     confidence REAL NOT NULL DEFAULT 1.0,
     PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id, chunk_index),
-    FOREIGN KEY(workspace_id, entity_id) REFERENCES entities_raw(workspace_id, entity_id),
+    FOREIGN KEY(entity_id) REFERENCES entities_raw(entity_id),
     FOREIGN KEY(workspace_id, collection_id, doc_id, chunk_index) REFERENCES chunks_raw(workspace_id, collection_id, doc_id, chunk_index)
 );
 

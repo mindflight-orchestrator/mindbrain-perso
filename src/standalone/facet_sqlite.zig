@@ -135,6 +135,7 @@ pub const Database = struct {
         try self.exec(schema);
         try self.applyStandaloneStopwordsSeed();
         try self.applyGraphEntityWorkspaceMigration();
+        try self.applyRawGraphAutoincrementMigration();
     }
 
     fn migrationApplied(self: Database, migration_id: []const u8) Error!bool {
@@ -219,6 +220,241 @@ pub const Database = struct {
             \\PRAGMA foreign_keys = ON;
         );
 
+        try self.markMigrationApplied(applied_id);
+    }
+
+    fn rawGraphHasExternalIds(self: Database) Error!bool {
+        const stmt = try prepare(self, "PRAGMA table_info(entities_raw)");
+        defer finalize(stmt);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            const name = std.mem.span(c.sqlite3_column_text(stmt, 1) orelse continue);
+            if (std.mem.eql(u8, name, "external_id")) return true;
+        }
+        return false;
+    }
+
+    fn applyRawGraphAutoincrementMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-05-24-raw-graph-autoincrement-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        if (try self.rawGraphHasExternalIds()) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        try self.exec(
+            \\PRAGMA foreign_keys = OFF;
+            \\
+            \\CREATE TABLE entities_raw__autoinc_new (
+            \\    workspace_id TEXT NOT NULL,
+            \\    ontology_id TEXT NOT NULL,
+            \\    entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    external_id TEXT,
+            \\    entity_type TEXT NOT NULL,
+            \\    name TEXT NOT NULL,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    UNIQUE(workspace_id, external_id),
+            \\    UNIQUE(workspace_id, entity_type, name),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id)
+            \\);
+            \\
+            \\INSERT INTO entities_raw__autoinc_new (
+            \\    workspace_id, ontology_id, external_id, entity_type, name,
+            \\    confidence, metadata_json, created_at
+            \\)
+            \\SELECT
+            \\    workspace_id, ontology_id,
+            \\    'legacy:entity:' || workspace_id || ':' || entity_id,
+            \\    entity_type, name, confidence, metadata_json, created_at
+            \\FROM entities_raw
+            \\ORDER BY workspace_id, entity_id;
+            \\
+            \\CREATE TEMP TABLE raw_graph_entity_id_map AS
+            \\SELECT
+            \\    old.workspace_id AS workspace_id,
+            \\    old.entity_id AS old_entity_id,
+            \\    new.entity_id AS new_entity_id
+            \\FROM entities_raw old
+            \\JOIN entities_raw__autoinc_new new
+            \\  ON new.workspace_id = old.workspace_id
+            \\ AND new.external_id = 'legacy:entity:' || old.workspace_id || ':' || old.entity_id;
+            \\
+            \\CREATE TABLE relations_raw__autoinc_new (
+            \\    workspace_id TEXT NOT NULL,
+            \\    ontology_id TEXT NOT NULL,
+            \\    relation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    external_id TEXT,
+            \\    edge_type TEXT NOT NULL,
+            \\    source_entity_id INTEGER NOT NULL,
+            \\    target_entity_id INTEGER NOT NULL,
+            \\    valid_from TEXT,
+            \\    valid_to TEXT,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    UNIQUE(workspace_id, external_id),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+            \\    FOREIGN KEY(source_entity_id) REFERENCES entities_raw__autoinc_new(entity_id),
+            \\    FOREIGN KEY(target_entity_id) REFERENCES entities_raw__autoinc_new(entity_id)
+            \\);
+            \\
+            \\INSERT INTO relations_raw__autoinc_new (
+            \\    workspace_id, ontology_id, external_id, edge_type,
+            \\    source_entity_id, target_entity_id, valid_from, valid_to,
+            \\    confidence, metadata_json, created_at
+            \\)
+            \\SELECT
+            \\    r.workspace_id, r.ontology_id,
+            \\    'legacy:relation:' || r.workspace_id || ':' || r.relation_id,
+            \\    r.edge_type,
+            \\    src.new_entity_id,
+            \\    dst.new_entity_id,
+            \\    r.valid_from, r.valid_to, r.confidence, r.metadata_json, r.created_at
+            \\FROM relations_raw r
+            \\JOIN raw_graph_entity_id_map src
+            \\  ON src.workspace_id = r.workspace_id AND src.old_entity_id = r.source_entity_id
+            \\JOIN raw_graph_entity_id_map dst
+            \\  ON dst.workspace_id = r.workspace_id AND dst.old_entity_id = r.target_entity_id
+            \\ORDER BY r.workspace_id, r.relation_id;
+            \\
+            \\CREATE TEMP TABLE raw_graph_relation_id_map AS
+            \\SELECT
+            \\    old.workspace_id AS workspace_id,
+            \\    old.relation_id AS old_relation_id,
+            \\    new.relation_id AS new_relation_id
+            \\FROM relations_raw old
+            \\JOIN relations_raw__autoinc_new new
+            \\  ON new.workspace_id = old.workspace_id
+            \\ AND new.external_id = 'legacy:relation:' || old.workspace_id || ':' || old.relation_id;
+            \\
+            \\CREATE TABLE entity_aliases_raw__autoinc_new (
+            \\    workspace_id TEXT NOT NULL,
+            \\    entity_id INTEGER NOT NULL,
+            \\    term TEXT NOT NULL,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    PRIMARY KEY(workspace_id, entity_id, term),
+            \\    FOREIGN KEY(entity_id) REFERENCES entities_raw__autoinc_new(entity_id)
+            \\);
+            \\INSERT INTO entity_aliases_raw__autoinc_new(workspace_id, entity_id, term, confidence)
+            \\SELECT a.workspace_id, m.new_entity_id, a.term, a.confidence
+            \\FROM entity_aliases_raw a
+            \\JOIN raw_graph_entity_id_map m
+            \\  ON m.workspace_id = a.workspace_id AND m.old_entity_id = a.entity_id;
+            \\
+            \\CREATE TABLE relation_properties_raw__autoinc_new (
+            \\    workspace_id  TEXT    NOT NULL,
+            \\    relation_id   INTEGER NOT NULL,
+            \\    property_key  TEXT    NOT NULL,
+            \\    value_type    TEXT    NOT NULL CHECK(value_type IN (
+            \\                      'text', 'number', 'percentage_bp', 'money_minor',
+            \\                      'date_unix', 'doc_ref', 'uri')),
+            \\    value_text    TEXT,
+            \\    value_number  REAL,
+            \\    value_integer INTEGER,
+            \\    ref_doc_id    INTEGER,
+            \\    currency      TEXT,
+            \\    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    CHECK (currency IS NULL OR value_type = 'money_minor'),
+            \\    PRIMARY KEY (workspace_id, relation_id, property_key),
+            \\    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
+            \\    FOREIGN KEY (relation_id) REFERENCES relations_raw__autoinc_new(relation_id)
+            \\);
+            \\INSERT INTO relation_properties_raw__autoinc_new(
+            \\    workspace_id, relation_id, property_key, value_type,
+            \\    value_text, value_number, value_integer, ref_doc_id, currency, created_at
+            \\)
+            \\SELECT
+            \\    p.workspace_id, m.new_relation_id, p.property_key, p.value_type,
+            \\    p.value_text, p.value_number, p.value_integer, p.ref_doc_id, p.currency, p.created_at
+            \\FROM relation_properties_raw p
+            \\JOIN raw_graph_relation_id_map m
+            \\  ON m.workspace_id = p.workspace_id AND m.old_relation_id = p.relation_id;
+            \\
+            \\CREATE TABLE entity_documents_raw__autoinc_new (
+            \\    workspace_id TEXT NOT NULL,
+            \\    entity_id INTEGER NOT NULL,
+            \\    collection_id TEXT NOT NULL,
+            \\    doc_id INTEGER NOT NULL,
+            \\    role TEXT,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id),
+            \\    FOREIGN KEY(entity_id) REFERENCES entities_raw__autoinc_new(entity_id),
+            \\    FOREIGN KEY(workspace_id, collection_id, doc_id) REFERENCES documents_raw(workspace_id, collection_id, doc_id)
+            \\);
+            \\INSERT INTO entity_documents_raw__autoinc_new(workspace_id, entity_id, collection_id, doc_id, role, confidence)
+            \\SELECT d.workspace_id, m.new_entity_id, d.collection_id, d.doc_id, d.role, d.confidence
+            \\FROM entity_documents_raw d
+            \\JOIN raw_graph_entity_id_map m
+            \\  ON m.workspace_id = d.workspace_id AND m.old_entity_id = d.entity_id;
+            \\
+            \\CREATE TABLE entity_chunks_raw__autoinc_new (
+            \\    workspace_id TEXT NOT NULL,
+            \\    entity_id INTEGER NOT NULL,
+            \\    collection_id TEXT NOT NULL,
+            \\    doc_id INTEGER NOT NULL,
+            \\    chunk_index INTEGER NOT NULL,
+            \\    role TEXT,
+            \\    confidence REAL NOT NULL DEFAULT 1.0,
+            \\    PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id, chunk_index),
+            \\    FOREIGN KEY(entity_id) REFERENCES entities_raw__autoinc_new(entity_id),
+            \\    FOREIGN KEY(workspace_id, collection_id, doc_id, chunk_index) REFERENCES chunks_raw(workspace_id, collection_id, doc_id, chunk_index)
+            \\);
+            \\INSERT INTO entity_chunks_raw__autoinc_new(workspace_id, entity_id, collection_id, doc_id, chunk_index, role, confidence)
+            \\SELECT ch.workspace_id, m.new_entity_id, ch.collection_id, ch.doc_id, ch.chunk_index, ch.role, ch.confidence
+            \\FROM entity_chunks_raw ch
+            \\JOIN raw_graph_entity_id_map m
+            \\  ON m.workspace_id = ch.workspace_id AND m.old_entity_id = ch.entity_id;
+            \\
+            \\DROP TABLE entity_chunks_raw;
+            \\DROP TABLE entity_documents_raw;
+            \\DROP TABLE relation_properties_raw;
+            \\DROP TABLE entity_aliases_raw;
+            \\DROP TABLE relations_raw;
+            \\DROP TABLE entities_raw;
+            \\ALTER TABLE entities_raw__autoinc_new RENAME TO entities_raw;
+            \\ALTER TABLE relations_raw__autoinc_new RENAME TO relations_raw;
+            \\ALTER TABLE entity_aliases_raw__autoinc_new RENAME TO entity_aliases_raw;
+            \\ALTER TABLE relation_properties_raw__autoinc_new RENAME TO relation_properties_raw;
+            \\ALTER TABLE entity_documents_raw__autoinc_new RENAME TO entity_documents_raw;
+            \\ALTER TABLE entity_chunks_raw__autoinc_new RENAME TO entity_chunks_raw;
+            \\
+            \\CREATE INDEX IF NOT EXISTS entities_raw_ontology_idx
+            \\    ON entities_raw(workspace_id, ontology_id);
+            \\CREATE INDEX IF NOT EXISTS entity_aliases_raw_term_idx
+            \\    ON entity_aliases_raw(workspace_id, term);
+            \\CREATE INDEX IF NOT EXISTS relations_raw_source_idx
+            \\    ON relations_raw(workspace_id, source_entity_id);
+            \\CREATE INDEX IF NOT EXISTS relations_raw_target_idx
+            \\    ON relations_raw(workspace_id, target_entity_id);
+            \\CREATE INDEX IF NOT EXISTS relations_raw_edge_type_idx
+            \\    ON relations_raw(workspace_id, edge_type);
+            \\CREATE INDEX IF NOT EXISTS relation_properties_raw_relation_idx
+            \\    ON relation_properties_raw(workspace_id, relation_id);
+            \\CREATE INDEX IF NOT EXISTS entity_documents_raw_doc_idx
+            \\    ON entity_documents_raw(workspace_id, collection_id, doc_id);
+            \\CREATE INDEX IF NOT EXISTS entity_chunks_raw_chunk_idx
+            \\    ON entity_chunks_raw(workspace_id, collection_id, doc_id, chunk_index);
+            \\
+            \\DROP TABLE raw_graph_entity_id_map;
+            \\DROP TABLE raw_graph_relation_id_map;
+            \\PRAGMA foreign_keys = ON;
+        );
+
+        try self.exec("PRAGMA foreign_key_check;");
         try self.markMigrationApplied(applied_id);
     }
 

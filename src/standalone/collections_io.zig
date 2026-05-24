@@ -281,6 +281,7 @@ const EntityRow = struct {
     workspace_id: []const u8,
     ontology_id: []const u8,
     entity_id: i64,
+    external_id: ?[]const u8 = null,
     entity_type: []const u8,
     name: []const u8,
     confidence: f64,
@@ -298,6 +299,7 @@ const RelationRow = struct {
     workspace_id: []const u8,
     ontology_id: []const u8,
     relation_id: i64,
+    external_id: ?[]const u8 = null,
     edge_type: []const u8,
     source_entity_id: i64,
     target_entity_id: i64,
@@ -688,46 +690,65 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         });
     }
 
+    var entity_id_map = std.StringHashMap(u64).init(allocator);
+    defer freeStringHashMapKeys(allocator, &entity_id_map);
+    var relation_id_map = std.StringHashMap(u64).init(allocator);
+    defer freeStringHashMapKeys(allocator, &relation_id_map);
+
     for (bundle.entities_raw) |row| {
-        try collections_sqlite.upsertEntityRaw(db, .{
+        const old_entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange;
+        const external_id = row.external_id orelse try bundleEntityExternalId(allocator, row.workspace_id, old_entity_id);
+        defer if (row.external_id == null) allocator.free(external_id);
+        const new_entity_id = try collections_sqlite.upsertEntityRawAuto(db, .{
             .workspace_id = row.workspace_id,
             .ontology_id = row.ontology_id,
-            .entity_id = @intCast(row.entity_id),
+            .external_id = external_id,
             .entity_type = row.entity_type,
             .name = row.name,
             .confidence = row.confidence,
             .metadata_json = row.metadata_json,
         });
+        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_entity_id);
+        try entity_id_map.put(map_key, new_entity_id);
     }
 
     for (bundle.entity_aliases_raw) |row| {
+        const entity_id = try lookupRawId(&entity_id_map, row.workspace_id, row.entity_id);
         try collections_sqlite.upsertEntityAliasRaw(db, .{
             .workspace_id = row.workspace_id,
-            .entity_id = @intCast(row.entity_id),
+            .entity_id = entity_id,
             .term = row.term,
             .confidence = row.confidence,
         });
     }
 
     for (bundle.relations_raw) |row| {
-        try collections_sqlite.upsertRelationRaw(db, .{
+        const old_relation_id = std.math.cast(u64, row.relation_id) orelse return error.ValueOutOfRange;
+        const external_id = row.external_id orelse try bundleRelationExternalId(allocator, row.workspace_id, old_relation_id);
+        defer if (row.external_id == null) allocator.free(external_id);
+        const source_entity_id = try lookupRawId(&entity_id_map, row.workspace_id, row.source_entity_id);
+        const target_entity_id = try lookupRawId(&entity_id_map, row.workspace_id, row.target_entity_id);
+        const new_relation_id = try collections_sqlite.upsertRelationRawAuto(db, .{
             .workspace_id = row.workspace_id,
             .ontology_id = row.ontology_id,
-            .relation_id = @intCast(row.relation_id),
+            .external_id = external_id,
             .edge_type = row.edge_type,
-            .source_entity_id = @intCast(row.source_entity_id),
-            .target_entity_id = @intCast(row.target_entity_id),
+            .source_entity_id = source_entity_id,
+            .target_entity_id = target_entity_id,
             .valid_from = row.valid_from,
             .valid_to = row.valid_to,
             .confidence = row.confidence,
             .metadata_json = row.metadata_json,
         });
+        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_relation_id);
+        try relation_id_map.put(map_key, new_relation_id);
     }
 
     for (bundle.relation_properties_raw) |row| {
+        const relation_id = try lookupRawId(&relation_id_map, row.workspace_id, row.relation_id);
         try collections_sqlite.upsertRelationPropertyRaw(db, .{
             .workspace_id = row.workspace_id,
-            .relation_id = @intCast(row.relation_id),
+            .relation_id = relation_id,
             .property_key = row.property_key,
             .value_type = parseRelationPropertyValueType(row.value_type) orelse return error.ValueOutOfRange,
             .value_text = row.value_text,
@@ -739,9 +760,10 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     }
 
     for (bundle.entity_documents_raw) |row| {
+        const entity_id = try lookupRawId(&entity_id_map, row.workspace_id, row.entity_id);
         try collections_sqlite.linkEntityDocumentRaw(db, .{
             .workspace_id = row.workspace_id,
-            .entity_id = @intCast(row.entity_id),
+            .entity_id = entity_id,
             .collection_id = row.collection_id,
             .doc_id = @intCast(row.doc_id),
             .role = row.role,
@@ -750,9 +772,10 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     }
 
     for (bundle.entity_chunks_raw) |row| {
+        const entity_id = try lookupRawId(&entity_id_map, row.workspace_id, row.entity_id);
         try collections_sqlite.linkEntityChunkRaw(db, .{
             .workspace_id = row.workspace_id,
-            .entity_id = @intCast(row.entity_id),
+            .entity_id = entity_id,
             .collection_id = row.collection_id,
             .doc_id = @intCast(row.doc_id),
             .chunk_index = std.math.cast(u32, row.chunk_index) orelse return error.ValueOutOfRange,
@@ -794,6 +817,31 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     }
 
     try db.exec("COMMIT");
+}
+
+fn rawIdMapKey(allocator: Allocator, workspace_id: []const u8, id: u64) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "{s}:{d}", .{ workspace_id, id });
+}
+
+fn lookupRawId(map: *std.StringHashMap(u64), workspace_id: []const u8, old_id: i64) !u64 {
+    const id = std.math.cast(u64, old_id) orelse return error.ValueOutOfRange;
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}:{d}", .{ workspace_id, id }) catch return error.ValueOutOfRange;
+    return map.get(key) orelse error.MissingRow;
+}
+
+fn bundleEntityExternalId(allocator: Allocator, workspace_id: []const u8, entity_id: u64) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "legacy:entity:{s}:{d}", .{ workspace_id, entity_id });
+}
+
+fn bundleRelationExternalId(allocator: Allocator, workspace_id: []const u8, relation_id: u64) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "legacy:relation:{s}:{d}", .{ workspace_id, relation_id });
+}
+
+fn freeStringHashMapKeys(allocator: Allocator, map: *std.StringHashMap(u64)) void {
+    var it = map.keyIterator();
+    while (it.next()) |key| allocator.free(key.*);
+    map.deinit();
 }
 
 pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !BundleSummary {
@@ -1592,7 +1640,7 @@ fn selectFacetAssignments(arena: Allocator, db: Database, workspace_id: []const 
 
 fn selectEntities(arena: Allocator, db: Database, workspace_id: []const u8) ![]EntityRow {
     const sql =
-        \\SELECT workspace_id, ontology_id, entity_id, entity_type, name, confidence, metadata_json
+        \\SELECT workspace_id, ontology_id, entity_id, external_id, entity_type, name, confidence, metadata_json
         \\FROM entities_raw WHERE workspace_id = ?1
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -1607,10 +1655,11 @@ fn selectEntities(arena: Allocator, db: Database, workspace_id: []const u8) ![]E
             .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
             .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
             .entity_id = c.sqlite3_column_int64(stmt, 2),
-            .entity_type = try facet_sqlite.dupeColumnText(arena, stmt, 3),
-            .name = try facet_sqlite.dupeColumnText(arena, stmt, 4),
-            .confidence = c.sqlite3_column_double(stmt, 5),
-            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+            .external_id = try maybeColText(arena, stmt, 3),
+            .entity_type = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .name = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .confidence = c.sqlite3_column_double(stmt, 6),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 7),
         });
     }
     return rows.toOwnedSlice(arena);
@@ -1641,7 +1690,7 @@ fn selectEntityAliases(arena: Allocator, db: Database, workspace_id: []const u8)
 
 fn selectRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]RelationRow {
     const sql =
-        \\SELECT workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json
+        \\SELECT workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json
         \\FROM relations_raw WHERE workspace_id = ?1
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -1656,13 +1705,14 @@ fn selectRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]
             .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
             .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
             .relation_id = c.sqlite3_column_int64(stmt, 2),
-            .edge_type = try facet_sqlite.dupeColumnText(arena, stmt, 3),
-            .source_entity_id = c.sqlite3_column_int64(stmt, 4),
-            .target_entity_id = c.sqlite3_column_int64(stmt, 5),
-            .valid_from = try maybeColText(arena, stmt, 6),
-            .valid_to = try maybeColText(arena, stmt, 7),
-            .confidence = c.sqlite3_column_double(stmt, 8),
-            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 9),
+            .external_id = try maybeColText(arena, stmt, 3),
+            .edge_type = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .source_entity_id = c.sqlite3_column_int64(stmt, 5),
+            .target_entity_id = c.sqlite3_column_int64(stmt, 6),
+            .valid_from = try maybeColText(arena, stmt, 7),
+            .valid_to = try maybeColText(arena, stmt, 8),
+            .confidence = c.sqlite3_column_double(stmt, 9),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 10),
         });
     }
     return rows.toOwnedSlice(arena);
