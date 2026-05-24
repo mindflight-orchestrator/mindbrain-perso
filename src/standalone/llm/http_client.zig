@@ -13,6 +13,32 @@ pub const Header = struct {
     value: []const u8,
 };
 
+const max_error_body_bytes = 4096;
+threadlocal var last_http_status: ?u16 = null;
+threadlocal var last_http_body: [max_error_body_bytes]u8 = undefined;
+threadlocal var last_http_body_len: usize = 0;
+
+pub fn clearLastHttpFailure() void {
+    last_http_status = null;
+    last_http_body_len = 0;
+}
+
+pub fn lastHttpFailureJson(allocator: std.mem.Allocator) !?[]u8 {
+    const status = last_http_status orelse return null;
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .ok = false,
+        .@"error" = "HttpRequestFailed",
+        .status = status,
+        .body = last_http_body[0..last_http_body_len],
+    }, .{});
+}
+
+fn rememberHttpFailure(status: std.http.Status, body: []const u8) void {
+    last_http_status = @intFromEnum(status);
+    last_http_body_len = @min(body.len, max_error_body_bytes);
+    @memcpy(last_http_body[0..last_http_body_len], body[0..last_http_body_len]);
+}
+
 pub fn postJson(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -67,6 +93,7 @@ fn post(
     };
     defer client.deinit();
 
+    clearLastHttpFailure();
     const fetch_result = try client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
@@ -77,12 +104,12 @@ fn post(
     });
     if (fetch_result.status.class() != .success) {
         const body = response_body.written();
-        const preview_len = @min(body.len, 4096);
+        rememberHttpFailure(fetch_result.status, body);
         var stderr_file_writer = std.Io.File.stderr().writer(io, &.{});
         const stderr = &stderr_file_writer.interface;
         stderr.print("LLM HTTP request failed: status={d} body={s}\n", .{
             @intFromEnum(fetch_result.status),
-            body[0..preview_len],
+            last_http_body[0..last_http_body_len],
         }) catch {};
         stderr.flush() catch {};
         return error.HttpRequestFailed;
@@ -95,4 +122,14 @@ pub fn trimRight(text: []const u8, byte: u8) []const u8 {
     var end = text.len;
     while (end > 0 and text[end - 1] == byte) : (end -= 1) {}
     return text[0..end];
+}
+
+test "lastHttpFailureJson exposes status and response body" {
+    clearLastHttpFailure();
+    rememberHttpFailure(.bad_request, "{\"error\":{\"message\":\"bad request\"}}");
+    const json = (try lastHttpFailureJson(std.testing.allocator)).?;
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "bad request") != null);
 }

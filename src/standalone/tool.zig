@@ -1791,13 +1791,27 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
         .providers = &.{provider},
         .default_provider = "default",
     });
-    var response = try manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
         .temperature = opts.temperature,
         .max_tokens = opts.max_tokens,
         .json_mode = true,
-    });
+    }) catch |err| {
+        if (err == error.HttpRequestFailed) {
+            try writeLastLlmHttpFailure(allocator);
+        }
+        return err;
+    };
     defer response.deinit(allocator);
     return try allocator.dupe(u8, response.content);
+}
+
+fn writeLastLlmHttpFailure(allocator: Allocator) !void {
+    const json = try llm.http_client.lastHttpFailureJson(allocator) orelse return;
+    defer allocator.free(json);
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("LLM_HTTP_FAILURE_JSON={s}\n", .{json});
+    try stderr.flush();
 }
 
 fn buildQualificationDryRunEnvelope(
