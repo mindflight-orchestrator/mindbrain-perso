@@ -262,6 +262,19 @@ test "renderRequest uses reasoning-model chat completion fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":{\"type\":\"json_object\"}") != null);
 }
 
+test "renderRequest omits token cap when max tokens is unset" {
+    const messages = [_]types.Message{.{ .role = "user", .content = "Return JSON." }};
+    const body = try renderRequest(std.testing.allocator, "gpt-5-nano", .{
+        .messages = &messages,
+        .json_mode = true,
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":{\"type\":\"json_object\"}") != null);
+}
+
 test "renderRequest emits tool metadata and image parts" {
     const parts = [_]types.ContentPart{
         .{ .text = "Describe this." },

@@ -1465,7 +1465,7 @@ fn writeQualificationTaxonomiesJson(
         \\  ON co.workspace_id = ?1
         \\ AND co.collection_id = ?2
         \\ AND co.ontology_id = o.ontology_id
-        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL)
+        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL OR co.ontology_id IS NOT NULL)
         \\  AND (?2 IS NULL OR co.collection_id = ?2)
         \\ORDER BY o.ontology_id
     ;
@@ -1526,7 +1526,7 @@ fn writeQualificationFacetsJson(
         \\  ON v.ontology_id = d.ontology_id
         \\ AND v.namespace = d.namespace
         \\ AND v.dimension = d.dimension
-        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL)
+        \\WHERE (o.workspace_id = ?1 OR o.workspace_id IS NULL OR co.ontology_id IS NOT NULL)
         \\  AND (?2 IS NULL OR co.collection_id = ?2)
         \\GROUP BY d.ontology_id, d.namespace, d.dimension, d.value_type, d.is_multi, d.hierarchy_kind
         \\ORDER BY d.ontology_id, d.namespace, d.dimension
@@ -1679,7 +1679,7 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !vo
     var limit: usize = 20;
     var target: []const u8 = "doc";
     var temperature: f32 = 0.0;
-    var max_tokens: u32 = 1800;
+    var max_tokens: ?u32 = null;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -1770,7 +1770,7 @@ const LiveQualificationOptions = struct {
     api_key: ?[]const u8,
     model: []const u8,
     temperature: f32,
-    max_tokens: u32,
+    max_tokens: ?u32,
 };
 
 fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database, opts: LiveQualificationOptions) ![]u8 {
@@ -1897,13 +1897,105 @@ fn buildQualificationPrompt(
         \\Use ontology_id "{s}" unless a row needs a more specific attached ontology.
         \\Allowed target: {s}.
         \\Allowed facets: {s}.
+        \\Use the taxonomy and facet vocabulary below when choosing namespace, dimension, and value.
         \\Only use values that are directly supported by the text. Do not invent facts.
+        \\
+        \\Vocabulary:
+        \\
+    , .{ ontology_id, target, facet_filter });
+    try appendQualificationVocabulary(&out.writer, allocator, db, workspace_id, collection_id, ontology_id, facet_filter);
+    try out.writer.writeAll(
+        \\
         \\
         \\Documents:
         \\
-    , .{ ontology_id, target, facet_filter });
+    );
     try appendQualificationDocuments(&out.writer, db, workspace_id, collection_id, limit);
     return try out.toOwnedSlice();
+}
+
+fn appendQualificationVocabulary(
+    writer: *std.Io.Writer,
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+) !void {
+    try writer.writeAll("{\"taxonomies\":[");
+    try writeQualificationTaxonomiesJson(writer, db, workspace_id, collection_id, ontology_id);
+    try writer.writeAll("],\"facets\":[");
+    try writeQualificationFacetsJson(allocator, writer, db, workspace_id, collection_id, ontology_id, facet_filter);
+    try writer.writeAll("],\"entity_types\":[");
+    try writeQualificationEntityTypesJson(writer, db, ontology_id);
+    try writer.writeAll("],\"edge_types\":[");
+    try writeQualificationEdgeTypesJson(writer, db, ontology_id);
+    try writer.writeAll("]}");
+}
+
+fn writeQualificationEntityTypesJson(
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+) !void {
+    const sql =
+        \\SELECT entity_type, label
+        \\FROM ontology_entity_types
+        \\WHERE ontology_id = ?1
+        \\ORDER BY entity_type
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+
+    const c = facet_sqlite.c;
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{\"entity_type\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 0), .{})});
+        try writer.writeAll(",\"label\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 1), .{})});
+        try writer.writeAll("}");
+    }
+}
+
+fn writeQualificationEdgeTypesJson(
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+) !void {
+    const sql =
+        \\SELECT edge_type, source_entity_type, target_entity_type
+        \\FROM ontology_edge_types
+        \\WHERE ontology_id = ?1
+        \\ORDER BY edge_type
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+
+    const c = facet_sqlite.c;
+    var first = true;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{\"edge_type\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 0), .{})});
+        try writer.writeAll(",\"source_entity_type\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 1), .{})});
+        try writer.writeAll(",\"target_entity_type\":");
+        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 2), .{})});
+        try writer.writeAll("}");
+    }
 }
 
 fn appendQualificationDocuments(
