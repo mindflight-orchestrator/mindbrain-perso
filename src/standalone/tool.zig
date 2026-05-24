@@ -98,6 +98,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "document-qualify")) {
+        try runDocumentQualifyCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "backup-export")) {
         try runBackupExportCommand(allocator, args[2..]);
         return;
@@ -333,6 +338,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
         \\  mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
+        \\  mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> (--base-url <url> --model <name> [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
         \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
@@ -1642,6 +1648,309 @@ fn facetCsvContains(csv: ?[]const u8, namespace: []const u8, dimension: []const 
     return false;
 }
 
+const QualificationAssignmentRow = struct {
+    target_kind: []const u8 = "doc",
+    doc_id: u64,
+    chunk_index: ?u32 = null,
+    ontology_id: ?[]const u8 = null,
+    namespace: []const u8,
+    dimension: []const u8,
+    value: []const u8,
+    value_id: ?u32 = null,
+    weight: f64 = 1.0,
+    source: ?[]const u8 = null,
+};
+
+const QualificationEnvelope = struct {
+    assignments: []QualificationAssignmentRow = &.{},
+};
+
+fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var collection_id: ?[]const u8 = null;
+    var taxonomy_filter: ?[]const u8 = null;
+    var facet_filter: ?[]const u8 = null;
+    var base_url: ?[]const u8 = null;
+    var api_key: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    var mock_qualification_file: ?[]const u8 = null;
+    var dry_run = false;
+    var limit: usize = 20;
+    var target: []const u8 = "doc";
+    var temperature: f32 = 0.0;
+    var max_tokens: u32 = 1800;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--taxonomies")) taxonomy_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--facets")) facet_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mock-qualification-json")) mock_qualification_file = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--target")) target = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
+            const v = try requireArg(args, &index);
+            limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            const v = try requireArg(args, &index);
+            temperature = std.fmt.parseFloat(f32, v) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-tokens")) {
+            const v = try requireArg(args, &index);
+            max_tokens = std.fmt.parseInt(u32, v, 10) catch return CliError.InvalidArguments;
+        } else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null or collection_id == null or taxonomy_filter == null or facet_filter == null) return CliError.InvalidArguments;
+    if (!std.mem.eql(u8, target, "doc") and !std.mem.eql(u8, target, "chunk") and !std.mem.eql(u8, target, "both")) return CliError.InvalidArguments;
+    if (!dry_run and mock_qualification_file == null and (base_url == null or model == null)) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const ontology_id = firstCsvValue(taxonomy_filter.?) orelse return CliError.InvalidArguments;
+    const qualification_json = if (mock_qualification_file) |path|
+        try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), path, allocator, .unlimited)
+    else if (dry_run)
+        try buildQualificationDryRunEnvelope(allocator, db, workspace_id.?, collection_id.?, ontology_id, facet_filter.?, target, limit)
+    else
+        try runLiveDocumentQualification(allocator, db, .{
+            .workspace_id = workspace_id.?,
+            .collection_id = collection_id.?,
+            .ontology_id = ontology_id,
+            .facet_filter = facet_filter.?,
+            .target = target,
+            .limit = limit,
+            .base_url = base_url.?,
+            .api_key = api_key,
+            .model = model.?,
+            .temperature = temperature,
+            .max_tokens = max_tokens,
+        });
+    defer allocator.free(qualification_json);
+
+    const applied = try applyQualificationEnvelope(allocator, db, .{
+        .workspace_id = workspace_id.?,
+        .collection_id = collection_id.?,
+        .ontology_id = ontology_id,
+        .facet_filter = facet_filter.?,
+        .source = if (mock_qualification_file != null) "mock-qualification-json" else if (dry_run) "dry-run" else "llm-document-qualify",
+        .dry_run = dry_run,
+        .json = qualification_json,
+    });
+
+    if (dry_run) {
+        try writeStdout(
+            "{{\"ok\":true,\"workspace_id\":{f},\"collection_id\":{f},\"dry_run\":true,\"accepted\":{},\"payload\":{s}}}\n",
+            .{ std.json.fmt(workspace_id.?, .{}), std.json.fmt(collection_id.?, .{}), applied, qualification_json },
+        );
+    } else {
+        try writeStdout("{f}\n", .{std.json.fmt(.{
+            .ok = true,
+            .workspace_id = workspace_id.?,
+            .collection_id = collection_id.?,
+            .dry_run = dry_run,
+            .accepted = applied,
+        }, .{})});
+    }
+}
+
+fn firstCsvValue(csv: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+const LiveQualificationOptions = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+    target: []const u8,
+    limit: usize,
+    base_url: []const u8,
+    api_key: ?[]const u8,
+    model: []const u8,
+    temperature: f32,
+    max_tokens: u32,
+};
+
+fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database, opts: LiveQualificationOptions) ![]u8 {
+    const prompt = try buildQualificationPrompt(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit);
+    defer allocator.free(prompt);
+    const messages = [_]llm.Message{
+        .{ .role = "system", .content = "You qualify source documents against a controlled ontology. Return strict JSON only." },
+        .{ .role = "user", .content = prompt },
+    };
+    const provider = llm.ProviderConfig{
+        .name = "default",
+        .kind = .openai_compatible,
+        .base_url = opts.base_url,
+        .api_key = opts.api_key,
+        .model = opts.model,
+    };
+    const manager = llm.Manager.init(.{
+        .providers = &.{provider},
+        .default_provider = "default",
+    });
+    var response = try manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+        .temperature = opts.temperature,
+        .max_tokens = opts.max_tokens,
+        .json_mode = true,
+    });
+    defer response.deinit(allocator);
+    return try allocator.dupe(u8, response.content);
+}
+
+fn buildQualificationDryRunEnvelope(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+    target: []const u8,
+    limit: usize,
+) ![]u8 {
+    const prompt = try buildQualificationPrompt(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target, limit);
+    defer allocator.free(prompt);
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .assignments = &[_]QualificationAssignmentRow{},
+        .dry_run_prompt = prompt,
+    }, .{});
+}
+
+fn buildQualificationPrompt(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+    target: []const u8,
+    limit: usize,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print(
+        \\Classify the following MindBrain documents.
+        \\Return JSON exactly as {{"assignments":[...]}}.
+        \\Each assignment requires target_kind, doc_id, namespace, dimension, value, weight.
+        \\Use ontology_id "{s}" unless a row needs a more specific attached ontology.
+        \\Allowed target: {s}.
+        \\Allowed facets: {s}.
+        \\Only use values that are directly supported by the text. Do not invent facts.
+        \\
+        \\Documents:
+        \\
+    , .{ ontology_id, target, facet_filter });
+    try appendQualificationDocuments(&out.writer, db, workspace_id, collection_id, limit);
+    return try out.toOwnedSlice();
+}
+
+fn appendQualificationDocuments(
+    writer: *std.Io.Writer,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    limit: usize,
+) !void {
+    const sql =
+        \\SELECT doc_id, source_ref, summary, substr(content, 1, 5000)
+        \\FROM documents_raw
+        \\WHERE workspace_id = ?1 AND collection_id = ?2
+        \\ORDER BY doc_id
+        \\LIMIT ?3
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, collection_id);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(limit)));
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try writer.print("doc_id={d}\nsource_ref={s}\nsummary={s}\ncontent:\n{s}\n---\n", .{
+            c.sqlite3_column_int64(stmt, 0),
+            columnText(stmt, 1),
+            columnText(stmt, 2),
+            columnText(stmt, 3),
+        });
+    }
+}
+
+const ApplyQualificationOptions = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+    source: []const u8,
+    dry_run: bool,
+    json: []const u8,
+};
+
+fn applyQualificationEnvelope(allocator: Allocator, db: facet_sqlite.Database, opts: ApplyQualificationOptions) !usize {
+    var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, opts.json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    var accepted: usize = 0;
+    for (parsed.value.assignments) |row| {
+        if (!facetCsvContains(opts.facet_filter, row.namespace, row.dimension)) return CliError.InvalidArguments;
+        const target_kind: collections_sqlite.TargetKind = if (std.mem.eql(u8, row.target_kind, "doc"))
+            .doc
+        else if (std.mem.eql(u8, row.target_kind, "chunk"))
+            .chunk
+        else
+            return CliError.InvalidArguments;
+        if (!try documentOrChunkExists(db, opts.workspace_id, opts.collection_id, row.doc_id, target_kind, row.chunk_index)) return CliError.InvalidArguments;
+        if (!opts.dry_run) {
+            try collections_sqlite.upsertFacetAssignmentRaw(db, .{
+                .workspace_id = opts.workspace_id,
+                .collection_id = opts.collection_id,
+                .target_kind = target_kind,
+                .doc_id = row.doc_id,
+                .chunk_index = if (target_kind == .chunk) (row.chunk_index orelse return CliError.InvalidArguments) else null,
+                .ontology_id = row.ontology_id orelse opts.ontology_id,
+                .namespace = row.namespace,
+                .dimension = row.dimension,
+                .value = row.value,
+                .value_id = row.value_id,
+                .weight = row.weight,
+                .source = row.source orelse opts.source,
+            });
+        }
+        accepted += 1;
+    }
+    return accepted;
+}
+
+fn documentOrChunkExists(
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    doc_id: u64,
+    target_kind: collections_sqlite.TargetKind,
+    chunk_index: ?u32,
+) !bool {
+    const sql_doc = "SELECT COUNT(*) FROM documents_raw WHERE workspace_id = ?1 AND collection_id = ?2 AND doc_id = ?3";
+    const sql_chunk = "SELECT COUNT(*) FROM chunks_raw WHERE workspace_id = ?1 AND collection_id = ?2 AND doc_id = ?3 AND chunk_index = ?4";
+    const stmt = try facet_sqlite.prepare(db, if (target_kind == .doc) sql_doc else sql_chunk);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, collection_id);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(doc_id)));
+    if (target_kind == .chunk) {
+        const ci = chunk_index orelse return CliError.InvalidArguments;
+        try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(ci)));
+    }
+    const c = facet_sqlite.c;
+    const rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_int64(stmt, 0) > 0;
+}
+
 fn runOntologyImportCommand(allocator: Allocator, args: []const []const u8) !void {
     var db_path: ?[]const u8 = null;
     var workspace_id: ?[]const u8 = null;
@@ -1912,6 +2221,7 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
                 .ontology_values = summary.ontology_value_count,
                 .documents = summary.document_count,
                 .chunks = summary.chunk_count,
+                .facet_tables = summary.facet_table_count,
                 .relation_properties = summary.relation_property_count,
             },
             .reindex = @tagName(reindex_mode),
@@ -1939,8 +2249,8 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
             );
         },
         .all => {
-            const coll = collection_id orelse summary.collection_id orelse return CliError.InvalidArguments;
-            const tid = table_id orelse document_table_id orelse return CliError.InvalidArguments;
+            const coll = collection_id orelse summary.collection_id orelse summary.facet_collection_id orelse return CliError.InvalidArguments;
+            const tid = table_id orelse document_table_id orelse summary.facet_table_id orelse return CliError.InvalidArguments;
             const result = try reindex_http.reindexAll(allocator, &db, summary.workspace_id, coll, tid);
             try writeStdout(
                 "reindexed all for workspace {s}: graph={d} facets={d} bm25={d}\n",

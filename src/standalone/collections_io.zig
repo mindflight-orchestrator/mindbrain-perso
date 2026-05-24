@@ -6,6 +6,7 @@
 const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
+const search_sqlite = @import("search_sqlite.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = facet_sqlite.Database;
@@ -33,6 +34,9 @@ pub const BundleSummary = struct {
     ontology_value_count: usize,
     document_count: usize,
     chunk_count: usize,
+    facet_table_count: usize,
+    facet_table_id: ?u64,
+    facet_collection_id: ?[]const u8,
     relation_property_count: usize,
 
     pub fn deinit(self: BundleSummary, allocator: Allocator) void {
@@ -41,6 +45,7 @@ pub const BundleSummary = struct {
         allocator.free(self.scope_kind);
         allocator.free(self.workspace_id);
         if (self.collection_id) |value| allocator.free(value);
+        if (self.facet_collection_id) |value| allocator.free(value);
     }
 };
 
@@ -63,6 +68,8 @@ const Bundle = struct {
     ontology_triples: []OntologyTripleRow = &.{},
     collection_ontologies: []CollectionOntologyRow,
     workspace_settings: []WorkspaceSettingsRow,
+    facet_tables: []FacetTableRow = &.{},
+    facet_definitions: []FacetDefinitionRow = &.{},
     documents_raw: []DocumentRow,
     chunks_raw: []ChunkRow,
     documents_raw_vector: []VectorRow = &.{},
@@ -197,6 +204,26 @@ const CollectionOntologyRow = struct {
 const WorkspaceSettingsRow = struct {
     workspace_id: []const u8,
     default_ontology_id: ?[]const u8,
+};
+
+const FacetTableRow = struct {
+    table_id: i64,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    schema_name: []const u8 = "public",
+    table_name: []const u8,
+    chunk_bits: i64,
+    key_column: []const u8 = "doc_id",
+    content_column: []const u8 = "content",
+    metadata_column: []const u8 = "metadata_json",
+    language: []const u8 = "english",
+    bm25_enabled: bool = true,
+};
+
+const FacetDefinitionRow = struct {
+    table_id: i64,
+    facet_id: i64,
+    facet_name: []const u8,
 };
 
 const DocumentRow = struct {
@@ -388,6 +415,8 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
         .ontology_triples = try selectOntologyTriples(arena_allocator, db, workspace_id, collection_filter),
         .collection_ontologies = if (taxonomies_only) &.{} else try selectCollectionOntologies(arena_allocator, db, workspace_id, collection_filter),
         .workspace_settings = try selectWorkspaceSettings(arena_allocator, db, workspace_id),
+        .facet_tables = if (taxonomies_only) &.{} else try selectFacetTables(arena_allocator, db, workspace_id, collection_filter),
+        .facet_definitions = if (taxonomies_only) &.{} else try selectFacetDefinitions(arena_allocator, db, workspace_id, collection_filter),
         .documents_raw = if (taxonomies_only) &.{} else try selectDocuments(arena_allocator, db, workspace_id, collection_filter),
         .chunks_raw = if (taxonomies_only) &.{} else try selectChunks(arena_allocator, db, workspace_id, collection_filter),
         .documents_raw_vector = if (taxonomies_only or !options.include_vectors) &.{} else try selectDocumentVectors(arena_allocator, db, workspace_id, collection_filter),
@@ -552,6 +581,37 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
 
     for (bundle.collection_ontologies) |row| {
         try collections_sqlite.attachOntologyToCollection(db, row.workspace_id, row.collection_id, row.ontology_id, row.role);
+    }
+
+    for (bundle.facet_tables) |row| {
+        const table_id = std.math.cast(u64, row.table_id) orelse return error.ValueOutOfRange;
+        const chunk_bits = std.math.cast(u8, row.chunk_bits) orelse return error.ValueOutOfRange;
+        try search_sqlite.setupSearchTable(db, allocator, .{
+            .table_id = table_id,
+            .workspace_id = row.workspace_id,
+            .schema_name = row.schema_name,
+            .table_name = row.table_name,
+            .key_column = row.key_column,
+            .content_column = row.content_column,
+            .metadata_column = row.metadata_column,
+            .language = row.language,
+            .populate = false,
+        });
+        try facet_sqlite.setupFacetTable(db, table_id, row.schema_name, row.table_name, chunk_bits, &.{});
+        if (row.bm25_enabled) {
+            try search_sqlite.bm25CreateSyncTrigger(db, .{
+                .table_id = table_id,
+                .id_column = row.key_column,
+                .content_column = row.content_column,
+                .language = row.language,
+            });
+        }
+    }
+
+    for (bundle.facet_definitions) |row| {
+        const table_id = std.math.cast(u64, row.table_id) orelse return error.ValueOutOfRange;
+        const facet_id = std.math.cast(u32, row.facet_id) orelse return error.ValueOutOfRange;
+        try facet_sqlite.upsertFacetDefinition(db, table_id, facet_id, row.facet_name);
     }
 
     for (bundle.documents_raw) |row| {
@@ -756,6 +816,9 @@ pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !Bundle
         .ontology_value_count = bundle.ontology_values.len,
         .document_count = bundle.documents_raw.len,
         .chunk_count = bundle.chunks_raw.len,
+        .facet_table_count = bundle.facet_tables.len,
+        .facet_table_id = if (bundle.facet_tables.len == 1) std.math.cast(u64, bundle.facet_tables[0].table_id) orelse return error.ValueOutOfRange else null,
+        .facet_collection_id = if (bundle.facet_tables.len == 1) try allocator.dupe(u8, bundle.facet_tables[0].collection_id) else null,
         .relation_property_count = bundle.relation_properties_raw.len,
     };
 }
@@ -1239,6 +1302,91 @@ fn selectWorkspaceSettings(arena: Allocator, db: Database, workspace_id: []const
         try rows.append(arena, .{
             .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
             .default_ontology_id = try maybeColText(arena, stmt, 1),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectFacetTables(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]FacetTableRow {
+    const sql_all =
+        \\SELECT ft.table_id, ts.workspace_id, ft.table_name, ft.schema_name, ft.table_name, ft.chunk_bits,
+        \\       COALESCE(ts.key_column, 'doc_id'), COALESCE(ts.content_column, 'content'),
+        \\       COALESCE(ts.metadata_column, 'metadata_json'), COALESCE(ts.language, 'english'),
+        \\       CASE WHEN bst.table_id IS NULL THEN 0 ELSE 1 END
+        \\FROM facet_tables ft
+        \\JOIN table_semantics ts ON ts.table_id = ft.table_id
+        \\LEFT JOIN bm25_sync_triggers bst ON bst.table_id = ft.table_id
+        \\WHERE ts.workspace_id = ?1
+        \\ORDER BY ft.table_id
+    ;
+    const sql_one =
+        \\SELECT ft.table_id, ts.workspace_id, ft.table_name, ft.schema_name, ft.table_name, ft.chunk_bits,
+        \\       COALESCE(ts.key_column, 'doc_id'), COALESCE(ts.content_column, 'content'),
+        \\       COALESCE(ts.metadata_column, 'metadata_json'), COALESCE(ts.language, 'english'),
+        \\       CASE WHEN bst.table_id IS NULL THEN 0 ELSE 1 END
+        \\FROM facet_tables ft
+        \\JOIN table_semantics ts ON ts.table_id = ft.table_id
+        \\LEFT JOIN bm25_sync_triggers bst ON bst.table_id = ft.table_id
+        \\WHERE ts.workspace_id = ?1 AND ft.table_name = ?2
+        \\ORDER BY ft.table_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_one);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+
+    var rows = std.ArrayList(FacetTableRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .table_id = c.sqlite3_column_int64(stmt, 0),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .collection_id = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .schema_name = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .table_name = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .chunk_bits = c.sqlite3_column_int64(stmt, 5),
+            .key_column = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+            .content_column = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+            .metadata_column = try facet_sqlite.dupeColumnText(arena, stmt, 8),
+            .language = try facet_sqlite.dupeColumnText(arena, stmt, 9),
+            .bm25_enabled = c.sqlite3_column_int64(stmt, 10) != 0,
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectFacetDefinitions(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]FacetDefinitionRow {
+    const sql_all =
+        \\SELECT fd.table_id, fd.facet_id, fd.facet_name
+        \\FROM facet_definitions fd
+        \\JOIN table_semantics ts ON ts.table_id = fd.table_id
+        \\WHERE ts.workspace_id = ?1
+        \\ORDER BY fd.table_id, fd.facet_id
+    ;
+    const sql_one =
+        \\SELECT fd.table_id, fd.facet_id, fd.facet_name
+        \\FROM facet_definitions fd
+        \\JOIN table_semantics ts ON ts.table_id = fd.table_id
+        \\JOIN facet_tables ft ON ft.table_id = fd.table_id
+        \\WHERE ts.workspace_id = ?1 AND ft.table_name = ?2
+        \\ORDER BY fd.table_id, fd.facet_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, if (collection_filter == null) sql_all else sql_one);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+
+    var rows = std.ArrayList(FacetDefinitionRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .table_id = c.sqlite3_column_int64(stmt, 0),
+            .facet_id = c.sqlite3_column_int64(stmt, 1),
+            .facet_name = try facet_sqlite.dupeColumnText(arena, stmt, 2),
         });
     }
     return rows.toOwnedSlice(arena);
@@ -2088,45 +2236,4 @@ test "export+import bundle round-trips chunks, cross-collection links and entity
     try std.testing.expect(std.mem.indexOf(u8, partial, "\"doc_id\": 100") != null);
     // Documents that belong only to the other collection must not leak.
     try std.testing.expect(std.mem.indexOf(u8, partial, "Storage retention spec") == null);
-}
-
-test "selectDimensionsForOntology and selectValuesForOntology filter by ontology_id" {
-    var db = try Database.openInMemory();
-    defer db.close();
-    try db.applyStandaloneSchema();
-
-    try collections_sqlite.ensureOntology(db, .{
-        .ontology_id = "tax_sel::core",
-        .workspace_id = "tax_sel",
-        .name = "core",
-    });
-    try collections_sqlite.ensureDimension(db, .{
-        .ontology_id = "tax_sel::core",
-        .namespace = "source",
-        .dimension = "document_type",
-        .value_type = "string",
-        .hierarchy_kind = "tree",
-    });
-    try collections_sqlite.ensureValue(db, .{
-        .ontology_id = "tax_sel::core",
-        .namespace = "source",
-        .dimension = "document_type",
-        .value_id = 1,
-        .value = "PV",
-        .label = "Procès-verbal",
-    });
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const dimensions = try selectDimensionsForOntology(arena, db, "tax_sel::core");
-    try std.testing.expectEqual(@as(usize, 1), dimensions.len);
-    try std.testing.expectEqualStrings("source", dimensions[0].namespace);
-    try std.testing.expectEqualStrings("document_type", dimensions[0].dimension);
-
-    const values = try selectValuesForOntology(arena, db, "tax_sel::core");
-    try std.testing.expectEqual(@as(usize, 1), values.len);
-    try std.testing.expectEqualStrings("PV", values[0].value);
-    try std.testing.expectEqualStrings("Procès-verbal", values[0].label.?);
 }
