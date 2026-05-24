@@ -1956,8 +1956,17 @@ fn applyQualificationEnvelope(allocator: Allocator, db: facet_sqlite.Database, o
     });
     defer parsed.deinit();
     var accepted: usize = 0;
-    for (parsed.value.assignments) |row| {
-        if (!facetCsvContains(opts.facet_filter, row.namespace, row.dimension)) return CliError.InvalidArguments;
+    for (parsed.value.assignments, 0..) |row, row_index| {
+        if (!facetCsvContains(opts.facet_filter, row.namespace, row.dimension)) {
+            try writeQualificationApplyFailure(allocator, .{
+                .reason = "facet_not_allowed",
+                .assignment_index = row_index,
+                .allowed_facets = opts.facet_filter,
+                .row = row,
+                .envelope_json = opts.json,
+            });
+            return CliError.InvalidArguments;
+        }
         const target_kind: collections_sqlite.TargetKind = if (std.mem.eql(u8, row.target_kind, "doc"))
             .doc
         else if (std.mem.eql(u8, row.target_kind, "chunk"))
@@ -1984,6 +1993,23 @@ fn applyQualificationEnvelope(allocator: Allocator, db: facet_sqlite.Database, o
         accepted += 1;
     }
     return accepted;
+}
+
+const QualificationApplyFailure = struct {
+    reason: []const u8,
+    assignment_index: usize,
+    allowed_facets: []const u8,
+    row: QualificationAssignmentRow,
+    envelope_json: []const u8,
+};
+
+fn writeQualificationApplyFailure(allocator: Allocator, failure: QualificationApplyFailure) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, failure, .{});
+    defer allocator.free(json);
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("QUALIFICATION_APPLY_FAILURE_JSON={s}\n", .{json});
+    try stderr.flush();
 }
 
 fn documentOrChunkExists(
