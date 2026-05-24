@@ -2488,8 +2488,8 @@ fn applyBusinessExtractionEnvelope(allocator: Allocator, db: facet_sqlite.Databa
 
     for (parsed.value.relations_raw) |row| {
         if (row.external_id.len == 0) return CliError.InvalidArguments;
-        const source_id = entity_ids.get(row.source_external_id) orelse try collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, row.source_external_id);
-        const target_id = entity_ids.get(row.target_external_id) orelse try collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, row.target_external_id);
+        const source_id = try resolveBusinessRelationEndpoint(allocator, db, opts, &entity_ids, row, .source);
+        const target_id = try resolveBusinessRelationEndpoint(allocator, db, opts, &entity_ids, row, .target);
         const metadata_json = try jsonValueObjectString(allocator, row.metadata_json);
         defer allocator.free(metadata_json);
         const id = try collections_sqlite.upsertRelationRawAuto(db, .{
@@ -2570,6 +2570,111 @@ fn applyBusinessExtractionEnvelope(allocator: Allocator, db: facet_sqlite.Databa
     return summary;
 }
 
+const BusinessRelationEndpointSide = enum { source, target };
+
+fn resolveBusinessRelationEndpoint(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionApplyOptions,
+    entity_ids: *std.StringHashMap(u64),
+    row: BusinessRelationRow,
+    side: BusinessRelationEndpointSide,
+) !u64 {
+    const external_id = switch (side) {
+        .source => row.source_external_id,
+        .target => row.target_external_id,
+    };
+    if (entity_ids.get(external_id)) |id| return id;
+    const id = collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, external_id) catch |err| switch (err) {
+        error.NotFound => try createPlaceholderEndpointEntity(allocator, db, opts, row, side, external_id),
+        else => return err,
+    };
+    try entity_ids.put(external_id, id);
+    return id;
+}
+
+fn createPlaceholderEndpointEntity(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionApplyOptions,
+    row: BusinessRelationRow,
+    side: BusinessRelationEndpointSide,
+    external_id: []const u8,
+) !u64 {
+    const entity_type = try lookupRelationEndpointEntityType(allocator, db, opts.ontology_id, row.edge_type, side);
+    defer allocator.free(entity_type);
+    const name = try humanizeExternalId(allocator, external_id);
+    defer allocator.free(name);
+    const metadata_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"inferred_placeholder\":true,\"missing_external_id\":{f},\"relation_external_id\":{f},\"edge_type\":{f},\"endpoint_side\":{f}}}",
+        .{
+            std.json.fmt(external_id, .{}),
+            std.json.fmt(row.external_id, .{}),
+            std.json.fmt(row.edge_type, .{}),
+            std.json.fmt(@tagName(side), .{}),
+        },
+    );
+    defer allocator.free(metadata_json);
+    return collections_sqlite.upsertEntityRawAuto(db, .{
+        .workspace_id = opts.workspace_id,
+        .ontology_id = opts.ontology_id,
+        .external_id = external_id,
+        .entity_type = entity_type,
+        .name = name,
+        .confidence = @min(row.confidence, 0.4),
+        .metadata_json = metadata_json,
+    });
+}
+
+fn lookupRelationEndpointEntityType(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+    edge_type: []const u8,
+    side: BusinessRelationEndpointSide,
+) ![]const u8 {
+    const column = switch (side) {
+        .source => "source_entity_type",
+        .target => "target_entity_type",
+    };
+    var sql_buf: [256]u8 = undefined;
+    const sql = try std.fmt.bufPrint(
+        &sql_buf,
+        "SELECT {s} FROM ontology_edge_types WHERE ontology_id = ?1 AND edge_type = ?2 LIMIT 1",
+        .{column},
+    );
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    try facet_sqlite.bindText(stmt, 2, edge_type);
+    const rc = facet_sqlite.c.sqlite3_step(stmt);
+    if (rc == facet_sqlite.c.SQLITE_ROW and facet_sqlite.c.sqlite3_column_type(stmt, 0) != facet_sqlite.c.SQLITE_NULL) {
+        return try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+    }
+    if (rc == facet_sqlite.c.SQLITE_ROW or rc == facet_sqlite.c.SQLITE_DONE) {
+        return try allocator.dupe(u8, "entity");
+    }
+    return error.StepFailed;
+}
+
+fn humanizeExternalId(allocator: Allocator, external_id: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var capitalize_next = true;
+    for (external_id) |ch| {
+        if (ch == '_' or ch == '-' or ch == ':' or ch == '/') {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(allocator, ' ');
+            capitalize_next = true;
+            continue;
+        }
+        const normalized = if (capitalize_next and ch >= 'a' and ch <= 'z') ch - 32 else ch;
+        try out.append(allocator, normalized);
+        capitalize_next = false;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn jsonValueObjectString(allocator: Allocator, value: ?std.json.Value) ![]const u8 {
     if (value) |v| return try jsonValueString(allocator, v);
     return try allocator.dupe(u8, "{}");
@@ -2616,6 +2721,12 @@ test "document business extraction applies symbolic external ids with sqlite-gen
         .collection_id = "ws-business::docs",
         .name = "docs",
     });
+    try collections_sqlite.ensureEdgeType(db, .{
+        .ontology_id = "ws-business::core",
+        .edge_type = "OWNS",
+        .source_entity_type = "person",
+        .target_entity_type = "unit",
+    });
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = "ws-business",
         .collection_id = "ws-business::docs",
@@ -2637,7 +2748,8 @@ test "document business extraction applies symbolic external ids with sqlite-gen
         \\    {"external_id":"unit:a1","entity_type":"unit","name":"A1","metadata_json":{"lot":"A1"}}
         \\  ],
         \\  "relations_raw": [
-        \\    {"external_id":"owns:alice:a1","edge_type":"OWNS","source_external_id":"person:alice","target_external_id":"unit:a1","confidence":0.9}
+        \\    {"external_id":"owns:alice:a1","edge_type":"OWNS","source_external_id":"person:alice","target_external_id":"unit:a1","confidence":0.9},
+        \\    {"external_id":"owns:lena:a1","edge_type":"OWNS","source_external_id":"lena_peeters","target_external_id":"unit:a1","confidence":0.9}
         \\  ],
         \\  "entity_aliases_raw": [
         \\    {"entity_external_id":"person:alice","term":"Mme Alice"}
@@ -2662,12 +2774,14 @@ test "document business extraction applies symbolic external ids with sqlite-gen
         .json = json,
     });
     try std.testing.expectEqual(@as(usize, 2), summary.entities);
-    try std.testing.expectEqual(@as(usize, 1), summary.relations);
+    try std.testing.expectEqual(@as(usize, 2), summary.relations);
     try std.testing.expectEqual(@as(usize, 2), summary.relation_properties);
 
     const alice_id = try collections_sqlite.selectEntityRawIdByExternalId(db, "ws-business", "person:alice");
+    const lena_id = try collections_sqlite.selectEntityRawIdByExternalId(db, "ws-business", "lena_peeters");
     const relation_id = try collections_sqlite.selectRelationRawIdByExternalId(db, "ws-business", "owns:alice:a1");
     try std.testing.expect(alice_id > 0);
+    try std.testing.expect(lena_id > 0);
     try std.testing.expect(relation_id > 0);
 }
 
