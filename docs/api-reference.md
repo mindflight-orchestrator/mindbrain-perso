@@ -135,6 +135,18 @@ Write behavior:
   integer document key, and new clients should prefer this endpoint instead of
   writing `facets` directly.
 
+### Ontology taxonomy write endpoints
+
+These routes use the serialized writer lane. Writes are rejected with HTTP 409
+when the target ontology has `frozen=true`.
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/api/mindbrain/ontology/taxonomy/dimension` | `{ "ontology_id", "namespace", "dimension", "value_type" optional, "is_multi" optional, "hierarchy_kind" optional, "metadata_json" optional }` | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/ontology/taxonomy/value` | `{ "ontology_id", "namespace", "dimension", "value_id", "value", "parent_value_id" optional, "label" optional, "metadata_json" optional }` | `{ "ok": true }` |
+
+Required string fields must be non-empty. `value_id` must be non-negative.
+
 ### Read endpoints
 
 | Method | Path | Query | Response |
@@ -151,6 +163,9 @@ Write behavior:
 | `GET`/`HEAD` | `/api/mindbrain/ontology/list` | `workspace_id` optional | JSON ontology catalog and default ontology id |
 | `GET`/`HEAD` | `/api/mindbrain/ontology/graph` | `workspace_id` optional, `ontology_id` optional | JSON ontology schema graph: entity types, edge types, seed nodes/edges |
 | `GET`/`HEAD` | `/api/mindbrain/ontology/type` | `ontology_id`, `kind=entity\|edge`, `type` | JSON entity-type or edge-type detail plus related triples |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/taxonomy` | `ontology_id`, `workspace_id` optional | JSON SKOS-style dimensions and values for one ontology |
+| `GET`/`HEAD` | `/api/mindbrain/workspace/list` | none | JSON workspace catalog with entity counts and default ontology ids |
+| `GET`/`HEAD` | `/api/mindbrain/graph/type-counts` | `workspace_id` | JSON per-type instance counts with ontology labels |
 | `GET`/`HEAD` | `/api/mindbrain/graph/entity` | `entity_id`, `workspace_id` optional | JSON graph entity detail with facets, incident relations, evidence links |
 | `GET`/`HEAD` | `/api/mindbrain/graph/relation` | `relation_id`, `workspace_id` optional | JSON graph relation detail with endpoints and properties |
 | `GET`/`HEAD` | `/api/mindbrain/graph-path` | `source`, `target`, repeated `edge_label` optional, `max_depth` optional | TOON shortest path |
@@ -166,7 +181,8 @@ GhostCrab SQLite integrations can consume MindBrain-owned read behavior.
 
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
-| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/pack-projections` | `agent_id`, `query`, `scope` optional, `limit` optional | JSON projection rows for packed context |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/pack-projections` | `agent_id`, `query` optional, `scope` optional, `limit` optional | JSON projection rows for packed context; empty or omitted `query` matches all active rows |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projections/relevance` | `agent_id`, `entity_name`, `query` optional, `scope` optional, `limit` optional | JSON projection rows ranked by graph-context relevance |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, `collection_id` optional, `include_evidence` optional, `include_deltas` optional | JSON projection result, linked evidence, deltas, and report |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/graph-search` | `workspace_id`, `query` optional, `collection_id` optional, repeated `entity_type` optional, `metadata_filters` optional, `limit` optional | JSON graph entity search result |
 

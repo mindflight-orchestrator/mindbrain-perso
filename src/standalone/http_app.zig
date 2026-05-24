@@ -6,6 +6,8 @@ const helper_api = @import("helper_api.zig");
 const hybrid_search = @import("hybrid_search.zig");
 const interfaces = @import("interfaces.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
+const collections_io = @import("collections_io.zig");
+const collections_sqlite = @import("collections_sqlite.zig");
 const reindex_http = @import("reindex_http.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
@@ -95,6 +97,27 @@ const ReindexAllRequest = struct {
     workspace_id: []const u8,
     collection_id: []const u8,
     table_id: u64,
+};
+
+const OntologyTaxonomyDimensionRequest = struct {
+    ontology_id: []const u8,
+    namespace: []const u8,
+    dimension: []const u8,
+    value_type: []const u8 = "text",
+    is_multi: bool = false,
+    hierarchy_kind: []const u8 = "flat",
+    metadata_json: []const u8 = "{}",
+};
+
+const OntologyTaxonomyValueRequest = struct {
+    ontology_id: []const u8,
+    namespace: []const u8,
+    dimension: []const u8,
+    value_id: i64,
+    value: []const u8,
+    parent_value_id: ?i64 = null,
+    label: ?[]const u8 = null,
+    metadata_json: []const u8 = "{}",
 };
 
 pub const DefaultWorkspaceOptions = struct {
@@ -805,6 +828,7 @@ pub const MindbrainHttpApp = struct {
                     error.BadRequest => .bad_request,
                     error.RequestTooLarge => .bad_request,
                     error.NotFound => .not_found,
+                    error.Forbidden => .forbidden,
                     error.MethodNotAllowed => .method_not_allowed,
                     else => .internal_server_error,
                 };
@@ -883,6 +907,16 @@ pub const MindbrainHttpApp = struct {
             return try self.handleReindexAll(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy/dimension")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyTaxonomyDimensionPost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy/value")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyTaxonomyValuePost(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -925,6 +959,15 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ontology/type")) {
             return self.handleOntologyType(allocator, query);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy")) {
+            return self.handleOntologyTaxonomyGet(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/workspace/list")) {
+            return self.handleWorkspaceList(allocator);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/type-counts")) {
+            return self.handleGraphTypeCounts(allocator, query);
+        }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/entity")) {
             return self.handleGraphEntityDetail(allocator, query);
         }
@@ -945,6 +988,9 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/pack-projections")) {
             return self.handleGhostcrabPackProjections(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projections/relevance")) {
+            return self.handleGhostcrabProjectionsRelevance(allocator, query);
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projection-get")) {
             return self.handleGhostcrabProjectionGet(allocator, query);
@@ -1734,6 +1780,298 @@ pub const MindbrainHttpApp = struct {
         return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
     }
 
+    fn handleOntologyTaxonomyGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const ontology_id = (try queryValue(allocator, query, "ontology_id")) orelse return error.BadRequest;
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        try verifyOntologyWorkspaceAccess(allocator, db, ontology_id, workspace_id);
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const dimensions = try collections_io.selectDimensionsForOntology(arena, db, ontology_id);
+        const values = try collections_io.selectValuesForOntology(arena, db, ontology_id);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"ontology_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+        try out.writer.writeAll(",\"dimensions\":[");
+        var first = true;
+        for (dimensions) |row| {
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            try out.writer.writeAll("{\"namespace\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.namespace, .{})});
+            try out.writer.writeAll(",\"dimension\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.dimension, .{})});
+            try out.writer.writeAll(",\"value_type\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.value_type, .{})});
+            try out.writer.print(",\"is_multi\":{}", .{row.is_multi});
+            try out.writer.writeAll(",\"hierarchy_kind\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.hierarchy_kind, .{})});
+            try out.writer.writeAll(",\"metadata\":");
+            const metadata = try allocator.dupe(u8, row.metadata_json);
+            try writeRawJsonObject(&out.writer, metadata, allocator);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("],\"values\":[");
+        first = true;
+        for (values) |row| {
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            try out.writer.writeAll("{\"namespace\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.namespace, .{})});
+            try out.writer.writeAll(",\"dimension\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.dimension, .{})});
+            try out.writer.print(",\"value_id\":{}", .{row.value_id});
+            try out.writer.writeAll(",\"value\":");
+            try out.writer.print("{f}", .{std.json.fmt(row.value, .{})});
+            try out.writer.writeAll(",\"parent_value_id\":");
+            if (row.parent_value_id) |parent| {
+                try out.writer.print("{d}", .{parent});
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"label\":");
+            try writeOptionalJsonString(&out.writer, row.label);
+            try out.writer.writeAll(",\"metadata\":");
+            const metadata = try allocator.dupe(u8, row.metadata_json);
+            try writeRawJsonObject(&out.writer, metadata, allocator);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleWorkspaceList(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"workspaces\":[");
+
+        const stmt = try facet_sqlite.prepare(db,
+            \\SELECT w.workspace_id, w.label, ws.default_ontology_id, COUNT(ge.entity_id)
+            \\FROM workspaces w
+            \\LEFT JOIN workspace_settings ws ON ws.workspace_id = w.workspace_id
+            \\LEFT JOIN graph_entity ge ON ge.workspace_id = w.workspace_id
+            \\GROUP BY w.workspace_id, w.label, ws.default_ontology_id
+            \\ORDER BY w.workspace_id
+        );
+        defer facet_sqlite.finalize(stmt);
+        var first = true;
+        while (try helper_api.stepRow(stmt)) {
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            const workspace_id = try helper_api.dupeColText(allocator, stmt, 0);
+            defer allocator.free(workspace_id);
+            const label = try helper_api.dupeColText(allocator, stmt, 1);
+            defer allocator.free(label);
+            const default_ontology_id = try helper_api.colTextOptional(allocator, stmt, 2);
+            defer if (default_ontology_id) |value| allocator.free(value);
+            const entity_count = facet_sqlite.c.sqlite3_column_int64(stmt, 3);
+            try out.writer.writeAll("{\"id\":");
+            try out.writer.print("{f}", .{std.json.fmt(workspace_id, .{})});
+            try out.writer.writeAll(",\"label\":");
+            try out.writer.print("{f}", .{std.json.fmt(label, .{})});
+            try out.writer.print(",\"entity_count\":{}", .{entity_count});
+            try out.writer.writeAll(",\"default_ontology_id\":");
+            try writeOptionalJsonString(&out.writer, default_ontology_id);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleGraphTypeCounts(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const default_ontology_id = try loadDefaultOntologyId(allocator, db, workspace_id);
+        defer if (default_ontology_id) |value| allocator.free(value);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"workspace_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(workspace_id, .{})});
+        try out.writer.writeAll(",\"types\":[");
+
+        const sql =
+            if (default_ontology_id != null)
+                \\SELECT ge.entity_type, COUNT(*) AS cnt, oet.label
+                \\FROM graph_entity ge
+                \\LEFT JOIN ontology_entity_types oet
+                \\  ON oet.ontology_id = ?2 AND oet.entity_type = ge.entity_type
+                \\WHERE ge.workspace_id = ?1
+                \\GROUP BY ge.entity_type
+                \\ORDER BY ge.entity_type
+            else
+                \\SELECT ge.entity_type, COUNT(*) AS cnt, NULL
+                \\FROM graph_entity ge
+                \\WHERE ge.workspace_id = ?1
+                \\GROUP BY ge.entity_type
+                \\ORDER BY ge.entity_type
+            ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, workspace_id);
+        if (default_ontology_id) |ontology_id| try facet_sqlite.bindText(stmt, 2, ontology_id);
+
+        var first = true;
+        while (try helper_api.stepRow(stmt)) {
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            const entity_type = try helper_api.dupeColText(allocator, stmt, 0);
+            defer allocator.free(entity_type);
+            const count = facet_sqlite.c.sqlite3_column_int64(stmt, 1);
+            const label = try helper_api.colTextOptional(allocator, stmt, 2);
+            defer if (label) |value| allocator.free(value);
+            try out.writer.writeAll("{\"entity_type\":");
+            try out.writer.print("{f}", .{std.json.fmt(entity_type, .{})});
+            try out.writer.print(",\"count\":{}", .{count});
+            try out.writer.writeAll(",\"label\":");
+            try writeOptionalJsonString(&out.writer, if (label) |value| value else entity_type);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleOntologyTaxonomyDimensionPost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyTaxonomyDimensionRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or write_request.namespace.len == 0 or write_request.dimension.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        try collections_sqlite.ensureDimension(self.writer_db, .{
+            .ontology_id = write_request.ontology_id,
+            .namespace = write_request.namespace,
+            .dimension = write_request.dimension,
+            .value_type = write_request.value_type,
+            .is_multi = write_request.is_multi,
+            .hierarchy_kind = write_request.hierarchy_kind,
+            .metadata_json = write_request.metadata_json,
+        });
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleOntologyTaxonomyValuePost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyTaxonomyValueRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or
+            write_request.namespace.len == 0 or
+            write_request.dimension.len == 0 or
+            write_request.value.len == 0 or
+            write_request.value_id < 0)
+        {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        const parent_value_id: ?u32 = if (write_request.parent_value_id) |parent| blk: {
+            if (parent < 0) return error.BadRequest;
+            break :blk @intCast(parent);
+        } else null;
+
+        try collections_sqlite.ensureValue(self.writer_db, .{
+            .ontology_id = write_request.ontology_id,
+            .namespace = write_request.namespace,
+            .dimension = write_request.dimension,
+            .value_id = @intCast(write_request.value_id),
+            .value = write_request.value,
+            .parent_value_id = parent_value_id,
+            .label = write_request.label,
+            .metadata_json = write_request.metadata_json,
+        });
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn parseOntologyTaxonomyDimensionRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyTaxonomyDimensionRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyTaxonomyDimensionRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseOntologyTaxonomyValueRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyTaxonomyValueRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyTaxonomyValueRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn readPostBody(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) ![]const u8 {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+        const reader = request.readerExpectNone(body_buffer);
+        return try reader.readAlloc(allocator, @intCast(content_length));
+    }
+
+    fn ontologyFrozenResponse(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        _ = self;
+        return .{
+            .status = .conflict,
+            .content_type = "application/json; charset=utf-8",
+            .body = try allocator.dupe(u8, "{\"error\":\"ontology_frozen\"}"),
+        };
+    }
+
     fn handleGraphEntityDetail(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
         var db = try self.openDb();
         defer db.close();
@@ -2142,7 +2480,7 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const agent_id = (try queryValue(allocator, query, "agent_id")) orelse return error.BadRequest;
-        const query_text = (try queryValue(allocator, query, "query")) orelse return error.BadRequest;
+        const query_text = (try queryValue(allocator, query, "query")) orelse "";
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try std.fmt.parseInt(usize, value, 10)
@@ -2182,6 +2520,69 @@ pub const MindbrainHttpApp = struct {
 
         const payload = .{
             .agent_id = agent_id,
+            .query = query_text,
+            .scope = scope,
+            .rows = response_rows,
+        };
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("{f}", .{std.json.fmt(payload, .{})});
+        const body = try out.toOwnedSlice();
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = body,
+        };
+    }
+
+    fn handleGhostcrabProjectionsRelevance(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const agent_id = (try queryValue(allocator, query, "agent_id")) orelse return error.BadRequest;
+        const entity_name = (try queryValue(allocator, query, "entity_name")) orelse return error.BadRequest;
+        const query_text = (try queryValue(allocator, query, "query")) orelse "";
+        const scope = try queryValue(allocator, query, "scope");
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            15;
+
+        const rows = try ontology_sqlite.materializeRelevanceProjections(
+            db,
+            allocator,
+            agent_id,
+            scope,
+            entity_name,
+            query_text,
+            limit,
+        );
+        defer ontology_sqlite.deinitProjectionRows(allocator, rows);
+
+        const ResponseRow = struct {
+            id: []const u8,
+            proj_type: []const u8,
+            content: []const u8,
+            weight: f32,
+            source_ref: ?[]const u8,
+            status: []const u8,
+        };
+        const response_rows = try allocator.alloc(ResponseRow, rows.len);
+        defer allocator.free(response_rows);
+        for (rows, 0..) |row, index| {
+            response_rows[index] = .{
+                .id = row.id,
+                .proj_type = row.proj_type,
+                .content = row.content,
+                .weight = row.weight,
+                .source_ref = row.source_ref,
+                .status = row.status,
+            };
+        }
+
+        const payload = .{
+            .agent_id = agent_id,
+            .entity_name = entity_name,
             .query = query_text,
             .scope = scope,
             .rows = response_rows,
@@ -3005,6 +3406,25 @@ fn loadDefaultOntologyId(allocator: std.mem.Allocator, db: facet_sqlite.Database
     return try helper_api.colTextOptional(allocator, stmt, 0);
 }
 
+fn verifyOntologyWorkspaceAccess(
+    allocator: std.mem.Allocator,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+    workspace_id: ?[]const u8,
+) !void {
+    const stmt = try facet_sqlite.prepare(db, "SELECT workspace_id FROM ontologies WHERE ontology_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    if (!try helper_api.stepRow(stmt)) return error.NotFound;
+    const ontology_workspace = try helper_api.colTextOptional(allocator, stmt, 0);
+    defer if (ontology_workspace) |value| allocator.free(value);
+    if (workspace_id) |requested| {
+        if (ontology_workspace) |actual| {
+            if (!std.mem.eql(u8, requested, actual)) return error.Forbidden;
+        }
+    }
+}
+
 fn resolveOntologyIdForRequest(
     allocator: std.mem.Allocator,
     db: facet_sqlite.Database,
@@ -3468,6 +3888,79 @@ test "graph explorer backend endpoints expose ontology and workspace scoped grap
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":10") != null);
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":11") == null);
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "Other Unit") == null);
+}
+
+test "studio taxonomy and projection endpoints expose taxonomy workspace and relevance APIs" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-studio-taxonomy-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_api', 'ws_api', 'API Workspace');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name, version, source_kind, metadata_json) VALUES ('ws_api::core', 'ws_api', 'core', '1.0.0', 'constructed', '{}');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_api', 'ws_api::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'person', 'Personne', '{}');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'unit', 'Lot', '{}');
+        \\INSERT INTO ontology_dimensions(ontology_id, namespace, dimension, value_type, is_multi, hierarchy_kind, metadata_json) VALUES ('ws_api::core', 'source', 'document_type', 'string', 0, 'tree', '{}');
+        \\INSERT INTO ontology_values(ontology_id, namespace, dimension, value_id, value, parent_value_id, label, metadata_json) VALUES ('ws_api::core', 'source', 'document_type', 1, 'PV', NULL, 'Procès-verbal', '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (1, 'ws_api', 'person', 'Ada', 0.99, '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (2, 'ws_api', 'unit', 'Unit 1', 0.95, '{}');
+        \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-pack', 'agent-studio', 'ws_api', 'FACT', 'Ada owns Unit 1', 1.0, 'active');
+        \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-other', 'agent-studio', 'ws_api', 'FACT', 'Other context', 0.9, 'active');
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const taxonomy = try app.handleOntologyTaxonomyGet(arena, "ontology_id=ws_api%3A%3Acore&workspace_id=ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, taxonomy.body, "\"dimension\":\"document_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, taxonomy.body, "\"value\":\"PV\"") != null);
+
+    try collections_sqlite.ensureValue(app.writer_db, .{
+        .ontology_id = "ws_api::core",
+        .namespace = "source",
+        .dimension = "document_type",
+        .value_id = 2,
+        .value = "CODA",
+        .parent_value_id = 1,
+        .label = "CODA",
+    });
+    const taxonomy_after = try app.handleOntologyTaxonomyGet(arena, "ontology_id=ws_api%3A%3Acore");
+    try std.testing.expect(std.mem.indexOf(u8, taxonomy_after.body, "\"value\":\"CODA\"") != null);
+
+    const workspaces = try app.handleWorkspaceList(arena);
+    try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"id\":\"ws_api\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"entity_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"default_ontology_id\":\"ws_api::core\"") != null);
+
+    const type_counts = try app.handleGraphTypeCounts(arena, "workspace_id=ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, type_counts.body, "\"entity_type\":\"person\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_counts.body, "\"label\":\"Personne\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_counts.body, "\"entity_type\":\"unit\"") != null);
+
+    const pack = try app.handleGhostcrabPackProjections(arena, "agent_id=agent-studio");
+    try std.testing.expect(std.mem.indexOf(u8, pack.body, "Ada owns Unit 1") != null);
+
+    const relevance = try app.handleGhostcrabProjectionsRelevance(arena, "agent_id=agent-studio&entity_name=Ada&query=Other");
+    const ada_pos = std.mem.indexOf(u8, relevance.body, "Ada owns Unit 1").?;
+    const other_pos = std.mem.indexOf(u8, relevance.body, "Other context").?;
+    try std.testing.expect(ada_pos < other_pos);
+
+    try app.writer_db.exec("UPDATE ontologies SET frozen = 1 WHERE ontology_id = 'ws_api::core'");
+    try std.testing.expect(try collections_sqlite.isOntologyFrozen(app.writer_db, "ws_api::core"));
+    const frozen_resp = try app.ontologyFrozenResponse(arena);
+    try std.testing.expect(frozen_resp.status == .conflict);
+    try std.testing.expect(std.mem.indexOf(u8, frozen_resp.body, "ontology_frozen") != null);
 }
 
 test "http sql writer lane classifier separates reads from writes" {

@@ -42,10 +42,10 @@ Clicking the ontological type opens **Modèle** centered on that class.
 
 | Tab | Purpose |
 |-----|---------|
-| **Modèle** | Ontology schema graph (`ontology_entities_raw` / `ontology_relations_raw` + type metadata) |
-| **Données** | Instance subgraph (`graph_entity` / `graph_relation`) |
+| **Modèle** | Ontology schema graph (`ontology_entities_raw` / `ontology_relations_raw` + type metadata); taxonomy trees via `GET /api/mindbrain/ontology/taxonomy` |
+| **Données** | Instance subgraph (`graph_entity` / `graph_relation`); type filter via `GET /api/mindbrain/graph/type-counts` |
 | **Historique** | Closed relations, triggering events, group versions, proof documents |
-| **Projections** | Agent projection pack test panel (`pack-projections`, `projection-get`) |
+| **Projections** | Agent projection pack test panel ([`pack-projections`](../../api-reference.md), [`projections/relevance`](../../api-reference.md), [`projection-get`](../../api-reference.md)) |
 
 ## Visual taxonomy
 

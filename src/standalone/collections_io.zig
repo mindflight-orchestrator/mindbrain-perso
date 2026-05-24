@@ -119,7 +119,7 @@ const OntologyNamespaceRow = struct {
     metadata_json: []const u8,
 };
 
-const OntologyDimensionRow = struct {
+pub const OntologyDimensionRow = struct {
     ontology_id: []const u8,
     namespace: []const u8,
     dimension: []const u8,
@@ -129,7 +129,7 @@ const OntologyDimensionRow = struct {
     metadata_json: []const u8,
 };
 
-const OntologyValueRow = struct {
+pub const OntologyValueRow = struct {
     ontology_id: []const u8,
     namespace: []const u8,
     dimension: []const u8,
@@ -940,6 +940,63 @@ fn selectOntologyValues(arena: Allocator, db: Database, workspace_id: []const u8
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     if (collection_filter) |coll| try facet_sqlite.bindText(stmt, 2, coll);
+    var rows = std.ArrayList(OntologyValueRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .namespace = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .dimension = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_id = c.sqlite3_column_int64(stmt, 3),
+            .value = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .parent_value_id = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 5),
+            .label = try maybeColText(arena, stmt, 6),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+pub fn selectDimensionsForOntology(arena: Allocator, db: Database, ontology_id: []const u8) ![]OntologyDimensionRow {
+    const sql =
+        \\SELECT ontology_id, namespace, dimension, value_type, is_multi, hierarchy_kind, metadata_json
+        \\FROM ontology_dimensions
+        \\WHERE ontology_id = ?1
+        \\ORDER BY namespace, dimension
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    var rows = std.ArrayList(OntologyDimensionRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .ontology_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .namespace = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .dimension = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_type = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .is_multi = c.sqlite3_column_int64(stmt, 4) != 0,
+            .hierarchy_kind = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+pub fn selectValuesForOntology(arena: Allocator, db: Database, ontology_id: []const u8) ![]OntologyValueRow {
+    const sql =
+        \\SELECT ontology_id, namespace, dimension, value_id, value, parent_value_id, label, metadata_json
+        \\FROM ontology_values
+        \\WHERE ontology_id = ?1
+        \\ORDER BY namespace, dimension, value_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
     var rows = std.ArrayList(OntologyValueRow).empty;
     while (true) {
         const status = c.sqlite3_step(stmt);
@@ -2031,4 +2088,45 @@ test "export+import bundle round-trips chunks, cross-collection links and entity
     try std.testing.expect(std.mem.indexOf(u8, partial, "\"doc_id\": 100") != null);
     // Documents that belong only to the other collection must not leak.
     try std.testing.expect(std.mem.indexOf(u8, partial, "Storage retention spec") == null);
+}
+
+test "selectDimensionsForOntology and selectValuesForOntology filter by ontology_id" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = "tax_sel::core",
+        .workspace_id = "tax_sel",
+        .name = "core",
+    });
+    try collections_sqlite.ensureDimension(db, .{
+        .ontology_id = "tax_sel::core",
+        .namespace = "source",
+        .dimension = "document_type",
+        .value_type = "string",
+        .hierarchy_kind = "tree",
+    });
+    try collections_sqlite.ensureValue(db, .{
+        .ontology_id = "tax_sel::core",
+        .namespace = "source",
+        .dimension = "document_type",
+        .value_id = 1,
+        .value = "PV",
+        .label = "Procès-verbal",
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dimensions = try selectDimensionsForOntology(arena, db, "tax_sel::core");
+    try std.testing.expectEqual(@as(usize, 1), dimensions.len);
+    try std.testing.expectEqualStrings("source", dimensions[0].namespace);
+    try std.testing.expectEqualStrings("document_type", dimensions[0].dimension);
+
+    const values = try selectValuesForOntology(arena, db, "tax_sel::core");
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings("PV", values[0].value);
+    try std.testing.expectEqualStrings("Procès-verbal", values[0].label.?);
 }

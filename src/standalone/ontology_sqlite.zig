@@ -323,6 +323,80 @@ pub fn projectionRelevance(
     return score;
 }
 
+fn scoreProjectionRow(row: ProjectionRecord, entity_name: []const u8, query: []const u8) f32 {
+    if (matchesText(row.content, entity_name)) return row.weight;
+    if (query.len > 0 and matchesText(row.content, query)) return row.weight * 0.6;
+    return 0;
+}
+
+pub fn materializeRelevanceProjections(
+    db: Database,
+    allocator: std.mem.Allocator,
+    agent_id: []const u8,
+    scope: ?[]const u8,
+    entity_name: []const u8,
+    query: []const u8,
+    limit_n: usize,
+) ![]ProjectionRecord {
+    const rows = try loadAgentProjections(db, allocator, agent_id);
+    defer deinitProjectionRows(allocator, rows);
+
+    const ScoredRow = struct {
+        row: ProjectionRecord,
+        score: f32,
+    };
+
+    var materialized = std.ArrayList(ScoredRow).empty;
+    errdefer {
+        for (materialized.items) |entry| deinitProjectionRecord(allocator, entry.row);
+        materialized.deinit(allocator);
+    }
+
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.status, "active") and !std.mem.eql(u8, row.status, "blocking")) continue;
+        if (!matchesPackScope(scope, row.scope)) continue;
+
+        const score = scoreProjectionRow(row, entity_name, query);
+        if (score <= 0) continue;
+
+        try materialized.append(allocator, .{
+            .row = .{
+                .id = try allocator.dupe(u8, row.id),
+                .agent_id = try allocator.dupe(u8, row.agent_id),
+                .scope = if (row.scope) |value| try allocator.dupe(u8, value) else null,
+                .proj_type = try allocator.dupe(u8, row.proj_type),
+                .content = try allocator.dupe(u8, row.content),
+                .weight = row.weight,
+                .source_ref = if (row.source_ref) |value| try allocator.dupe(u8, value) else null,
+                .source_type = if (row.source_type) |value| try allocator.dupe(u8, value) else null,
+                .status = try allocator.dupe(u8, row.status),
+            },
+            .score = score,
+        });
+    }
+
+    std.mem.sort(ScoredRow, materialized.items, {}, struct {
+        fn lessThan(_: void, lhs: ScoredRow, rhs: ScoredRow) bool {
+            if (lhs.score != rhs.score) return lhs.score > rhs.score;
+            if (lhs.row.weight != rhs.row.weight) return lhs.row.weight > rhs.row.weight;
+            return std.mem.order(u8, lhs.row.id, rhs.row.id) == .lt;
+        }
+    }.lessThan);
+
+    if (materialized.items.len > limit_n) {
+        for (materialized.items[limit_n..]) |entry| deinitProjectionRecord(allocator, entry.row);
+        materialized.shrinkRetainingCapacity(limit_n);
+    }
+
+    var out = try allocator.alloc(ProjectionRecord, materialized.items.len);
+    for (materialized.items, 0..) |entry, index| {
+        out[index] = entry.row;
+    }
+    materialized.clearRetainingCapacity();
+    materialized.deinit(allocator);
+    return out;
+}
+
 pub fn materializeTaxonomyProjections(
     db: Database,
     allocator: std.mem.Allocator,
@@ -1264,4 +1338,43 @@ test "taxonomy projections and coverage report derive from imported taxonomy row
     try std.testing.expectEqualStrings("acme", report.gaps[0].id);
     try std.testing.expect(report.gaps[0].decayed_confidence == null);
     try std.testing.expectEqual(@as(usize, 2), report.summary.projection_rows);
+}
+
+test "materializeRelevanceProjections ranks entity matches above query-only matches" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertProjection(db, .{
+        .id = "proj-entity",
+        .agent_id = "agent-rel",
+        .scope = "default",
+        .proj_type = "FACT",
+        .content = "Ada owns Unit 1",
+        .weight = 1.0,
+        .status = "active",
+    });
+    try insertProjection(db, .{
+        .id = "proj-query",
+        .agent_id = "agent-rel",
+        .scope = "default",
+        .proj_type = "FACT",
+        .content = "Acme subsidiary details",
+        .weight = 0.5,
+        .status = "active",
+    });
+
+    const rows = try materializeRelevanceProjections(
+        db,
+        std.testing.allocator,
+        "agent-rel",
+        null,
+        "Ada",
+        "Acme",
+        10,
+    );
+    defer deinitProjectionRows(std.testing.allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("proj-entity", rows[0].id);
 }
