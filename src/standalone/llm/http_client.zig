@@ -75,7 +75,15 @@ fn post(
         .extra_headers = headers,
         .keep_alive = false,
     });
-    if (fetch_result.status.class() != .success) return error.HttpRequestFailed;
+    if (fetch_result.status.class() != .success) {
+        const body = response_body.written();
+        const preview_len = @min(body.len, 4096);
+        std.debug.print("LLM HTTP request failed: status={d} body={s}\n", .{
+            @intFromEnum(fetch_result.status),
+            body[0..preview_len],
+        });
+        return error.HttpRequestFailed;
+    }
 
     return .{ .body = try response_body.toOwnedSlice() };
 }

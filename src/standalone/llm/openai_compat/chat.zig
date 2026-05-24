@@ -45,10 +45,12 @@ pub fn renderRequest(
     try out.writer.writeByte(']');
 
     if (request.temperature) |temperature| {
-        try out.writer.print(",\"temperature\":{d}", .{temperature});
+        if (!usesReasoningChatFields(model))
+            try out.writer.print(",\"temperature\":{d}", .{temperature});
     }
     if (request.max_tokens) |max_tokens| {
-        try out.writer.print(",\"max_tokens\":{d}", .{max_tokens});
+        const token_field = if (usesReasoningChatFields(model)) "max_completion_tokens" else "max_tokens";
+        try out.writer.print(",\"{s}\":{d}", .{ token_field, max_tokens });
     }
     if (request.json_mode) {
         try out.writer.writeAll(",\"response_format\":{\"type\":\"json_object\"}");
@@ -62,6 +64,13 @@ pub fn renderRequest(
     try out.writer.writeByte('}');
 
     return try out.toOwnedSlice();
+}
+
+fn usesReasoningChatFields(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "gpt-5") or
+        std.mem.startsWith(u8, model, "o1") or
+        std.mem.startsWith(u8, model, "o3") or
+        std.mem.startsWith(u8, model, "o4");
 }
 
 fn renderMessage(writer: *std.Io.Writer, message: types.Message) !void {
@@ -231,6 +240,25 @@ test "renderRequest emits legacy messages and json mode" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"local-model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":{\"type\":\"json_object\"}") != null);
+}
+
+test "renderRequest uses reasoning-model chat completion fields" {
+    const messages = [_]types.Message{.{ .role = "user", .content = "Return JSON." }};
+    const body = try renderRequest(std.testing.allocator, "gpt-5-nano", .{
+        .messages = &messages,
+        .temperature = 0.0,
+        .max_tokens = 1800,
+        .json_mode = true,
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-5-nano\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":1800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"response_format\":{\"type\":\"json_object\"}") != null);
 }
 
