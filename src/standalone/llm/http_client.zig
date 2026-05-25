@@ -13,6 +13,37 @@ pub const Header = struct {
     value: []const u8,
 };
 
+threadlocal var last_http_status: ?u16 = null;
+threadlocal var last_http_body: ?[]u8 = null;
+threadlocal var last_http_allocator: ?std.mem.Allocator = null;
+
+pub fn clearLastHttpFailure() void {
+    if (last_http_body) |body| {
+        if (last_http_allocator) |allocator| allocator.free(body);
+    }
+    last_http_status = null;
+    last_http_body = null;
+    last_http_allocator = null;
+}
+
+pub fn lastHttpFailureJson(allocator: std.mem.Allocator) !?[]u8 {
+    const status = last_http_status orelse return null;
+    const body = last_http_body orelse "";
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .ok = false,
+        .@"error" = "HttpRequestFailed",
+        .status = status,
+        .body = body,
+    }, .{});
+}
+
+fn rememberHttpFailure(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) !void {
+    clearLastHttpFailure();
+    last_http_status = @intFromEnum(status);
+    last_http_body = try allocator.dupe(u8, body);
+    last_http_allocator = allocator;
+}
+
 pub fn postJson(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -67,6 +98,7 @@ fn post(
     };
     defer client.deinit();
 
+    clearLastHttpFailure();
     const fetch_result = try client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
@@ -75,7 +107,18 @@ fn post(
         .extra_headers = headers,
         .keep_alive = false,
     });
-    if (fetch_result.status.class() != .success) return error.HttpRequestFailed;
+    if (fetch_result.status.class() != .success) {
+        const body = response_body.written();
+        try rememberHttpFailure(allocator, fetch_result.status, body);
+        var stderr_file_writer = std.Io.File.stderr().writer(io, &.{});
+        const stderr = &stderr_file_writer.interface;
+        stderr.print("LLM HTTP request failed: status={d} body={s}\n", .{
+            @intFromEnum(fetch_result.status),
+            body,
+        }) catch {};
+        stderr.flush() catch {};
+        return error.HttpRequestFailed;
+    }
 
     return .{ .body = try response_body.toOwnedSlice() };
 }
@@ -84,4 +127,15 @@ pub fn trimRight(text: []const u8, byte: u8) []const u8 {
     var end = text.len;
     while (end > 0 and text[end - 1] == byte) : (end -= 1) {}
     return text[0..end];
+}
+
+test "lastHttpFailureJson exposes status and response body" {
+    clearLastHttpFailure();
+    try rememberHttpFailure(std.testing.allocator, .bad_request, "{\"error\":{\"message\":\"bad request\"}}");
+    defer clearLastHttpFailure();
+    const json = (try lastHttpFailureJson(std.testing.allocator)).?;
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "bad request") != null);
 }
