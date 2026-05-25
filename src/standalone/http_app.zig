@@ -120,6 +120,48 @@ const OntologyTaxonomyValueRequest = struct {
     metadata_json: []const u8 = "{}",
 };
 
+const OntologyEntityTypeRequest = struct {
+    ontology_id: []const u8,
+    entity_type: []const u8,
+    label: ?[]const u8 = null,
+    metadata_json: []const u8 = "{}",
+    parent_entity_type: ?[]const u8 = null,
+};
+
+const OntologyEdgeTypeRequest = struct {
+    ontology_id: []const u8,
+    edge_type: []const u8,
+    source_entity_type: ?[]const u8 = null,
+    target_entity_type: ?[]const u8 = null,
+    directed: bool = true,
+    metadata_json: []const u8 = "{}",
+};
+
+const OntologyPropertyRequest = struct {
+    ontology_id: []const u8,
+    name: []const u8,
+    kind: []const u8,
+    domain: []const u8,
+    range: []const u8,
+    label: ?[]const u8 = null,
+    required: bool = false,
+    metadata_json: []const u8 = "{}",
+};
+
+const OntologyTripleRequest = struct {
+    ontology_id: []const u8,
+    triple_index: i64,
+    subject_kind: []const u8,
+    subject: []const u8,
+    predicate: []const u8,
+    object_kind: []const u8,
+    object_value: []const u8,
+    object_datatype: ?[]const u8 = null,
+    object_language: ?[]const u8 = null,
+    source_line: []const u8 = "studio:/ontology/triple",
+    metadata_json: []const u8 = "{}",
+};
+
 pub const DefaultWorkspaceOptions = struct {
     id: []const u8 = "default",
     domain_profile_json: []const u8 = "{\"domain\":\"ghostcrab\"}",
@@ -915,6 +957,26 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy/value")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleOntologyTaxonomyValuePost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/entity-type")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyEntityTypePost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/edge-type")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyEdgeTypePost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/property")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyPropertyPost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/triple")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyTriplePost(allocator, request, body_buffer);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
@@ -2018,6 +2080,234 @@ pub const MindbrainHttpApp = struct {
         });
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleOntologyEntityTypePost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyEntityTypeRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or write_request.entity_type.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        try collections_sqlite.ensureEntityType(self.writer_db, .{
+            .ontology_id = write_request.ontology_id,
+            .entity_type = write_request.entity_type,
+            .label = write_request.label,
+            .metadata_json = write_request.metadata_json,
+        });
+
+        if (write_request.parent_entity_type) |parent| {
+            if (parent.len > 0) {
+                const subject_uri = try studioClassUri(allocator, write_request.entity_type);
+                defer allocator.free(subject_uri);
+                const parent_uri = try studioClassUri(allocator, parent);
+                defer allocator.free(parent_uri);
+                _ = try collections_sqlite.ensureSubClassOfTriple(
+                    self.writer_db,
+                    write_request.ontology_id,
+                    subject_uri,
+                    parent_uri,
+                    null,
+                );
+            }
+        }
+
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleOntologyEdgeTypePost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyEdgeTypeRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or write_request.edge_type.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        try collections_sqlite.ensureEdgeType(self.writer_db, .{
+            .ontology_id = write_request.ontology_id,
+            .edge_type = write_request.edge_type,
+            .directed = write_request.directed,
+            .source_entity_type = write_request.source_entity_type,
+            .target_entity_type = write_request.target_entity_type,
+            .metadata_json = write_request.metadata_json,
+        });
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleOntologyPropertyPost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyPropertyRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or write_request.name.len == 0 or write_request.domain.len == 0 or write_request.range.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        if (std.mem.eql(u8, write_request.kind, "object")) {
+            try collections_sqlite.ensureEdgeType(self.writer_db, .{
+                .ontology_id = write_request.ontology_id,
+                .edge_type = write_request.name,
+                .directed = true,
+                .source_entity_type = write_request.domain,
+                .target_entity_type = write_request.range,
+                .metadata_json = write_request.metadata_json,
+            });
+        } else if (std.mem.eql(u8, write_request.kind, "datatype")) {
+            const property_uri = try studioPropertyUri(allocator, write_request.name);
+            defer allocator.free(property_uri);
+            const domain_uri = try studioClassUri(allocator, write_request.domain);
+            defer allocator.free(domain_uri);
+            const range_uri = try studioDatatypeUri(allocator, write_request.range);
+            defer allocator.free(range_uri);
+            _ = try collections_sqlite.ensureDatatypeProperty(self.writer_db, .{
+                .ontology_id = write_request.ontology_id,
+                .property_uri = property_uri,
+                .domain_uri = domain_uri,
+                .range_uri = range_uri,
+                .triple_index = null,
+            });
+        } else {
+            return error.BadRequest;
+        }
+
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleOntologyTriplePost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const write_request = try self.parseOntologyTripleRequest(allocator, request, body_buffer);
+        if (write_request.ontology_id.len == 0 or write_request.subject.len == 0 or write_request.predicate.len == 0 or write_request.object_value.len == 0) {
+            return error.BadRequest;
+        }
+        if (write_request.triple_index < 0) return error.BadRequest;
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        try collections_sqlite.upsertOntologyTriple(self.writer_db, .{
+            .ontology_id = write_request.ontology_id,
+            .triple_index = @intCast(write_request.triple_index),
+            .subject_kind = write_request.subject_kind,
+            .subject = write_request.subject,
+            .predicate = write_request.predicate,
+            .object_kind = write_request.object_kind,
+            .object_value = write_request.object_value,
+            .object_datatype = write_request.object_datatype,
+            .object_language = write_request.object_language,
+            .source_line = write_request.source_line,
+            .metadata_json = write_request.metadata_json,
+        });
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn parseOntologyEntityTypeRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyEntityTypeRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyEntityTypeRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseOntologyEdgeTypeRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyEdgeTypeRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyEdgeTypeRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseOntologyPropertyRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyPropertyRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyPropertyRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseOntologyTripleRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyTripleRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyTripleRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
     }
 
     fn parseOntologyTaxonomyDimensionRequest(
@@ -3467,6 +3757,36 @@ fn writeOptionalSqliteI64(writer: *std.Io.Writer, stmt: *facet_sqlite.c.sqlite3_
     }
 }
 
+fn studioClassUri(allocator: std.mem.Allocator, entity_type: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "studio:class:{s}", .{entity_type});
+}
+
+fn studioPropertyUri(allocator: std.mem.Allocator, property_name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "studio:property:{s}", .{property_name});
+}
+
+fn studioDatatypeUri(allocator: std.mem.Allocator, range: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, range, "http://") or std.mem.startsWith(u8, range, "https://")) {
+        return allocator.dupe(u8, range);
+    }
+    if (std.mem.eql(u8, range, "string")) return allocator.dupe(u8, "http://www.w3.org/2001/XMLSchema#string");
+    if (std.mem.eql(u8, range, "date")) return allocator.dupe(u8, "http://www.w3.org/2001/XMLSchema#date");
+    if (std.mem.eql(u8, range, "integer")) return allocator.dupe(u8, "http://www.w3.org/2001/XMLSchema#integer");
+    if (std.mem.eql(u8, range, "number") or std.mem.eql(u8, range, "decimal")) {
+        return allocator.dupe(u8, "http://www.w3.org/2001/XMLSchema#decimal");
+    }
+    if (std.mem.eql(u8, range, "boolean")) return allocator.dupe(u8, "http://www.w3.org/2001/XMLSchema#boolean");
+    return try std.fmt.allocPrint(allocator, "studio:datatype:{s}", .{range});
+}
+
+fn countOntologyTriples(db: facet_sqlite.Database, ontology_id: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    if (!try helper_api.stepRow(stmt)) return 0;
+    return @intCast(facet_sqlite.c.sqlite3_column_int64(stmt, 0));
+}
+
 fn writeOntologySeedNodes(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT entity_id, entity_type, name, metadata_json
@@ -3517,17 +3837,23 @@ fn writeOntologySeedEdges(allocator: std.mem.Allocator, db: facet_sqlite.Databas
 fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, type_name: []const u8, writer: *std.Io.Writer) !void {
     const like_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{type_name});
     defer allocator.free(like_pattern);
+    const class_uri = try std.fmt.allocPrint(allocator, "studio:class:{s}", .{type_name});
+    defer allocator.free(class_uri);
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT triple_index, subject_kind, subject, predicate, object_kind, object_value, object_datatype, object_language, source_line, metadata_json
         \\FROM ontology_triples_raw
         \\WHERE ontology_id = ?1
-        \\  AND (subject = ?2 OR predicate = ?2 OR subject LIKE ?3 OR predicate LIKE ?3)
+        \\  AND (
+        \\    subject = ?2 OR predicate = ?2 OR object_value = ?2 OR object_value = ?4
+        \\    OR subject LIKE ?3 OR predicate LIKE ?3 OR object_value LIKE ?3
+        \\  )
         \\ORDER BY triple_index
     );
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, ontology_id);
     try facet_sqlite.bindText(stmt, 2, type_name);
     try facet_sqlite.bindText(stmt, 3, like_pattern);
+    try facet_sqlite.bindText(stmt, 4, class_uri);
     var first = true;
     while (try helper_api.stepRow(stmt)) {
         if (!first) try writer.writeAll(",");
@@ -3961,6 +4287,74 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
     const frozen_resp = try app.ontologyFrozenResponse(arena);
     try std.testing.expect(frozen_resp.status == .conflict);
     try std.testing.expect(std.mem.indexOf(u8, frozen_resp.body, "ontology_frozen") != null);
+}
+
+test "studio ontology schema write endpoints expose entity edge property and triple APIs" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-studio-schema-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_schema', 'ws_schema', 'Schema Workspace');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name, version, source_kind, metadata_json) VALUES ('ws_schema::core', 'ws_schema', 'core', '1.0.0', 'constructed', '{}');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_schema', 'ws_schema::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_schema::core', 'person', 'Personne', '{}');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_schema::core', 'unit', 'Lot', '{}');
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try collections_sqlite.ensureEntityType(app.writer_db, .{
+        .ontology_id = "ws_schema::core",
+        .entity_type = "household",
+        .label = "Ménage",
+        .metadata_json = "{}",
+    });
+    const subject_uri = try studioClassUri(arena, "household");
+    const parent_uri = try studioClassUri(arena, "person");
+    _ = try collections_sqlite.ensureSubClassOfTriple(app.writer_db, "ws_schema::core", subject_uri, parent_uri, null);
+
+    try collections_sqlite.ensureEdgeType(app.writer_db, .{
+        .ontology_id = "ws_schema::core",
+        .edge_type = "member_of",
+        .source_entity_type = "person",
+        .target_entity_type = "household",
+    });
+
+    const property_uri = try studioPropertyUri(arena, "quotePart");
+    const domain_uri = try studioClassUri(arena, "unit");
+    const range_uri = try studioDatatypeUri(arena, "string");
+    _ = try collections_sqlite.ensureDatatypeProperty(app.writer_db, .{
+        .ontology_id = "ws_schema::core",
+        .property_uri = property_uri,
+        .domain_uri = domain_uri,
+        .range_uri = range_uri,
+        .triple_index = null,
+    });
+
+    const type_detail = try app.handleOntologyType(arena, "ontology_id=ws_schema%3A%3Acore&kind=entity&type=household");
+    try std.testing.expect(std.mem.indexOf(u8, type_detail.body, "subClassOf") != null);
+
+    const graph = try app.handleOntologyGraph(arena, "ontology_id=ws_schema%3A%3Acore");
+    try std.testing.expect(std.mem.indexOf(u8, graph.body, "member_of") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.body, "household") != null);
+
+    const triple_count = try countOntologyTriples(app.writer_db, "ws_schema::core");
+    try std.testing.expect(triple_count >= 4);
+
+    try app.writer_db.exec("UPDATE ontologies SET frozen = 1 WHERE ontology_id = 'ws_schema::core'");
+    try std.testing.expect(try collections_sqlite.isOntologyFrozen(app.writer_db, "ws_schema::core"));
 }
 
 test "http sql writer lane classifier separates reads from writes" {

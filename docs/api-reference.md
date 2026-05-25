@@ -144,6 +144,10 @@ when the target ontology has `frozen=true`.
 |--------|------|------|----------|
 | `POST` | `/api/mindbrain/ontology/taxonomy/dimension` | `{ "ontology_id", "namespace", "dimension", "value_type" optional, "is_multi" optional, "hierarchy_kind" optional, "metadata_json" optional }` | `{ "ok": true }` |
 | `POST` | `/api/mindbrain/ontology/taxonomy/value` | `{ "ontology_id", "namespace", "dimension", "value_id", "value", "parent_value_id" optional, "label" optional, "metadata_json" optional }` | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/ontology/entity-type` | `{ "ontology_id", "entity_type", "label" optional, "metadata_json" optional, "parent_entity_type" optional }` | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/ontology/edge-type` | `{ "ontology_id", "edge_type", "source_entity_type" optional, "target_entity_type" optional, "directed" optional, "metadata_json" optional }` | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/ontology/property` | `{ "ontology_id", "name", "kind": "object"\|"datatype", "domain", "range", "label" optional, "required" optional, "metadata_json" optional }` | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/ontology/triple` | full triple row (`triple_index`, `subject_kind`, `subject`, `predicate`, `object_kind`, `object_value`, optional datatype/language, `source_line` optional) | `{ "ok": true }` |
 
 Required string fields must be non-empty. `value_id` must be non-negative.
 
