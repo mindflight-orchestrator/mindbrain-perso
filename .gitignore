@@ -19,3 +19,4 @@ docs/dev/
 data/*
 !data/sources/
 !data/sources/**
+.understand-anything/

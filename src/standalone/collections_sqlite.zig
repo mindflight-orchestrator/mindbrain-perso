@@ -420,6 +420,17 @@ pub fn ensureOntology(db: Database, spec: OntologySpec) !void {
     try facet_sqlite.stepDone(stmt);
 }
 
+pub fn isOntologyFrozen(db: Database, ontology_id: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db, "SELECT frozen FROM ontologies WHERE ontology_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    return switch (c.sqlite3_step(stmt)) {
+        c.SQLITE_ROW => c.sqlite3_column_int64(stmt, 0) != 0,
+        c.SQLITE_DONE => error.NotFound,
+        else => error.StepFailed,
+    };
+}
+
 pub fn attachOntologyToCollection(
     db: Database,
     workspace_id: []const u8,
@@ -1435,4 +1446,25 @@ test "documents_raw enforces nanoid uniqueness only for non-empty values" {
     const lookup = (try lookupDocByNanoid(db, std.testing.allocator, "shared-nano")) orelse return error.MissingNanoid;
     defer lookup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 1), lookup.doc_id);
+}
+
+test "isOntologyFrozen reflects ontologies.frozen column" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureOntology(db, .{
+        .ontology_id = "frozen_test::core",
+        .workspace_id = "frozen_test",
+        .name = "core",
+    });
+    try std.testing.expect(!try isOntologyFrozen(db, "frozen_test::core"));
+
+    try ensureOntology(db, .{
+        .ontology_id = "frozen_test::core",
+        .workspace_id = "frozen_test",
+        .name = "core",
+        .frozen = true,
+    });
+    try std.testing.expect(try isOntologyFrozen(db, "frozen_test::core"));
 }
