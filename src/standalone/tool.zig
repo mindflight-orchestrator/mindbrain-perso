@@ -2146,6 +2146,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var output_path: ?[]const u8 = null;
     var raw_output_path: ?[]const u8 = null;
     var request_output_path: ?[]const u8 = null;
+    var input_json_path: ?[]const u8 = null;
     var limit: usize = 20;
     var temperature: f32 = 0.0;
     var max_tokens: ?u32 = null;
@@ -2153,7 +2154,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-json")) input_json_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -2164,11 +2165,25 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
             max_tokens = std.fmt.parseInt(u32, v, 10) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
     }
-    if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null or expected_path == null or base_url == null or model == null) return CliError.InvalidArguments;
+    if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null) return CliError.InvalidArguments;
+    if (input_json_path == null and (expected_path == null or base_url == null or model == null)) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
     try db.applyStandaloneSchema();
+
+    if (input_json_path) |path| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(content);
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        try applyAndWriteBusinessExtraction(allocator, db, .{
+            .workspace_id = workspace_id.?,
+            .collection_id = collection_id.?,
+            .ontology_id = ontology_id.?,
+            .json = trimmed,
+        }, output_path);
+        return;
+    }
 
     const expected_json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), expected_path.?, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(expected_json);
@@ -2251,14 +2266,24 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         return error.InvalidLlmBusinessExtractionResponse;
     };
 
+    try applyAndWriteBusinessExtraction(allocator, db, .{
+        .workspace_id = workspace_id.?,
+        .collection_id = collection_id.?,
+        .ontology_id = ontology_id.?,
+        .json = content,
+    }, output_path);
+}
+
+fn applyAndWriteBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionApplyOptions, output_path: ?[]const u8) !void {
+    _ = try applyBusinessExtractionEnvelope(allocator, db, opts);
     if (output_path) |path| {
         try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
             .sub_path = path,
-            .data = content,
+            .data = opts.json,
             .flags = .{ .truncate = true },
         });
     } else {
-        try writeStdout("{s}\n", .{content});
+        try writeStdout("{s}\n", .{opts.json});
     }
 }
 
@@ -2280,12 +2305,14 @@ fn buildBusinessExtractionPrompt(allocator: Allocator, db: facet_sqlite.Database
         \\Use workspace_id "{s}".
         \\
         \\Return exactly one JSON object with these arrays:
-        \\- entities_raw: rows with entity_id, entity_type, name, confidence, metadata_json object
-        \\- relations_raw: rows with relation_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json object
-        \\- entity_aliases_raw: rows with entity_id, term
-        \\- entity_documents_raw: rows with entity_id, doc_id, evidence_kind, confidence
-        \\- entity_chunks_raw: rows with entity_id, doc_id, chunk_index, evidence_kind, confidence
-        \\- relation_properties_raw: rows with relation_id, property_name, value_json object, confidence, ref_doc_id
+        \\- entities_raw: rows with external_id, entity_type, name, confidence, metadata_json object
+        \\- relations_raw: rows with external_id, edge_type, source_external_id, target_external_id, valid_from, valid_to, confidence, metadata_json object
+        \\- entity_aliases_raw: rows with entity_external_id, term, confidence
+        \\- entity_documents_raw: rows with entity_external_id, doc_id, role, confidence
+        \\- entity_chunks_raw: rows with entity_external_id, doc_id, chunk_index, role, confidence
+        \\- relation_properties_raw: rows with relation_external_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
+        \\
+        \\Do not return internal numeric IDs. Use stable external_id strings and reference those strings.
         \\
         \\Entity types and relation edge types must come from the syndic ontology vocabulary.
         \\Preserve exact apartment identity: building, block, floor, lot, door_label, tantiemes, quota_basis.
@@ -2344,6 +2371,418 @@ fn appendBusinessExtractionDocumentsJson(
         try writer.writeAll("}");
     }
     try writer.writeAll("]");
+}
+
+const BusinessExtractionEnvelope = struct {
+    entities_raw: []BusinessEntityRow = &.{},
+    relations_raw: []BusinessRelationRow = &.{},
+    entity_aliases_raw: []BusinessAliasRow = &.{},
+    entity_documents_raw: []BusinessEntityDocumentRow = &.{},
+    entity_chunks_raw: []BusinessEntityChunkRow = &.{},
+    relation_properties_raw: []BusinessRelationPropertyRow = &.{},
+};
+
+const BusinessEntityRow = struct {
+    external_id: []const u8,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f64 = 1.0,
+    metadata_json: ?std.json.Value = null,
+};
+
+const BusinessRelationRow = struct {
+    external_id: []const u8,
+    edge_type: []const u8,
+    source_external_id: []const u8,
+    target_external_id: []const u8,
+    valid_from: ?[]const u8 = null,
+    valid_to: ?[]const u8 = null,
+    confidence: f64 = 1.0,
+    metadata_json: ?std.json.Value = null,
+};
+
+const BusinessAliasRow = struct {
+    entity_external_id: []const u8,
+    term: []const u8,
+    confidence: f64 = 1.0,
+};
+
+const BusinessEntityDocumentRow = struct {
+    entity_external_id: []const u8,
+    doc_id: i64,
+    role: ?[]const u8 = null,
+    evidence_kind: ?[]const u8 = null,
+    confidence: f64 = 1.0,
+};
+
+const BusinessEntityChunkRow = struct {
+    entity_external_id: []const u8,
+    doc_id: i64,
+    chunk_index: i64,
+    role: ?[]const u8 = null,
+    evidence_kind: ?[]const u8 = null,
+    confidence: f64 = 1.0,
+};
+
+const BusinessRelationPropertyRow = struct {
+    relation_external_id: []const u8,
+    property_key: ?[]const u8 = null,
+    property_name: ?[]const u8 = null,
+    value_type: ?[]const u8 = null,
+    value_text: ?[]const u8 = null,
+    value_number: ?f64 = null,
+    value_integer: ?i64 = null,
+    value_json: ?std.json.Value = null,
+    ref_doc_id: ?i64 = null,
+    currency: ?[]const u8 = null,
+};
+
+const BusinessExtractionApplyOptions = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    json: []const u8,
+};
+
+const BusinessExtractionApplySummary = struct {
+    entities: usize = 0,
+    relations: usize = 0,
+    aliases: usize = 0,
+    entity_documents: usize = 0,
+    entity_chunks: usize = 0,
+    relation_properties: usize = 0,
+};
+
+fn applyBusinessExtractionEnvelope(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionApplyOptions) !BusinessExtractionApplySummary {
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, opts.json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    var entity_ids = std.StringHashMap(u64).init(allocator);
+    defer entity_ids.deinit();
+    var relation_ids = std.StringHashMap(u64).init(allocator);
+    defer relation_ids.deinit();
+    var summary = BusinessExtractionApplySummary{};
+
+    try db.exec("BEGIN");
+    errdefer db.exec("ROLLBACK") catch {};
+
+    for (parsed.value.entities_raw) |row| {
+        if (row.external_id.len == 0) return CliError.InvalidArguments;
+        const metadata_json = try jsonValueObjectString(allocator, row.metadata_json);
+        defer allocator.free(metadata_json);
+        const id = try collections_sqlite.upsertEntityRawAuto(db, .{
+            .workspace_id = opts.workspace_id,
+            .ontology_id = opts.ontology_id,
+            .external_id = row.external_id,
+            .entity_type = row.entity_type,
+            .name = row.name,
+            .confidence = row.confidence,
+            .metadata_json = metadata_json,
+        });
+        try entity_ids.put(row.external_id, id);
+        summary.entities += 1;
+    }
+
+    for (parsed.value.relations_raw) |row| {
+        if (row.external_id.len == 0) return CliError.InvalidArguments;
+        const source_id = try resolveBusinessRelationEndpoint(allocator, db, opts, &entity_ids, row, .source);
+        const target_id = try resolveBusinessRelationEndpoint(allocator, db, opts, &entity_ids, row, .target);
+        const metadata_json = try jsonValueObjectString(allocator, row.metadata_json);
+        defer allocator.free(metadata_json);
+        const id = try collections_sqlite.upsertRelationRawAuto(db, .{
+            .workspace_id = opts.workspace_id,
+            .ontology_id = opts.ontology_id,
+            .external_id = row.external_id,
+            .edge_type = row.edge_type,
+            .source_entity_id = source_id,
+            .target_entity_id = target_id,
+            .valid_from = row.valid_from,
+            .valid_to = row.valid_to,
+            .confidence = row.confidence,
+            .metadata_json = metadata_json,
+        });
+        try relation_ids.put(row.external_id, id);
+        summary.relations += 1;
+    }
+
+    for (parsed.value.entity_aliases_raw) |row| {
+        const entity_id = entity_ids.get(row.entity_external_id) orelse try collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, row.entity_external_id);
+        try collections_sqlite.upsertEntityAliasRaw(db, .{
+            .workspace_id = opts.workspace_id,
+            .entity_id = entity_id,
+            .term = row.term,
+            .confidence = row.confidence,
+        });
+        summary.aliases += 1;
+    }
+
+    for (parsed.value.entity_documents_raw) |row| {
+        const entity_id = entity_ids.get(row.entity_external_id) orelse try collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, row.entity_external_id);
+        try collections_sqlite.linkEntityDocumentRaw(db, .{
+            .workspace_id = opts.workspace_id,
+            .entity_id = entity_id,
+            .collection_id = opts.collection_id,
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return CliError.InvalidArguments,
+            .role = row.role orelse row.evidence_kind,
+            .confidence = row.confidence,
+        });
+        summary.entity_documents += 1;
+    }
+
+    for (parsed.value.entity_chunks_raw) |row| {
+        const entity_id = entity_ids.get(row.entity_external_id) orelse try collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, row.entity_external_id);
+        try collections_sqlite.linkEntityChunkRaw(db, .{
+            .workspace_id = opts.workspace_id,
+            .entity_id = entity_id,
+            .collection_id = opts.collection_id,
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return CliError.InvalidArguments,
+            .chunk_index = std.math.cast(u32, row.chunk_index) orelse return CliError.InvalidArguments,
+            .role = row.role orelse row.evidence_kind,
+            .confidence = row.confidence,
+        });
+        summary.entity_chunks += 1;
+    }
+
+    for (parsed.value.relation_properties_raw) |row| {
+        const relation_id = relation_ids.get(row.relation_external_id) orelse try collections_sqlite.selectRelationRawIdByExternalId(db, opts.workspace_id, row.relation_external_id);
+        const property_key = row.property_key orelse row.property_name orelse return CliError.InvalidArguments;
+        const value_type = if (row.value_type) |v| parseRelationPropertyValueType(v) orelse return CliError.InvalidArguments else collections_sqlite.RelationPropertyValueType.text;
+        const value_text_from_json = if (row.value_text == null and row.value_json != null) try jsonValueString(allocator, row.value_json.?) else null;
+        defer if (value_text_from_json) |v| allocator.free(v);
+        try collections_sqlite.upsertRelationPropertyRaw(db, .{
+            .workspace_id = opts.workspace_id,
+            .relation_id = relation_id,
+            .property_key = property_key,
+            .value_type = value_type,
+            .value_text = row.value_text orelse value_text_from_json,
+            .value_number = row.value_number,
+            .value_integer = row.value_integer,
+            .ref_doc_id = if (row.ref_doc_id) |v| std.math.cast(u64, v) orelse return CliError.InvalidArguments else null,
+            .currency = if (value_type == .money_minor) row.currency else null,
+        });
+        summary.relation_properties += 1;
+    }
+
+    try db.exec("COMMIT");
+    return summary;
+}
+
+const BusinessRelationEndpointSide = enum { source, target };
+
+fn resolveBusinessRelationEndpoint(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionApplyOptions,
+    entity_ids: *std.StringHashMap(u64),
+    row: BusinessRelationRow,
+    side: BusinessRelationEndpointSide,
+) !u64 {
+    const external_id = switch (side) {
+        .source => row.source_external_id,
+        .target => row.target_external_id,
+    };
+    if (entity_ids.get(external_id)) |id| return id;
+    const id = collections_sqlite.selectEntityRawIdByExternalId(db, opts.workspace_id, external_id) catch |err| switch (err) {
+        error.NotFound => try createPlaceholderEndpointEntity(allocator, db, opts, row, side, external_id),
+        else => return err,
+    };
+    try entity_ids.put(external_id, id);
+    return id;
+}
+
+fn createPlaceholderEndpointEntity(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionApplyOptions,
+    row: BusinessRelationRow,
+    side: BusinessRelationEndpointSide,
+    external_id: []const u8,
+) !u64 {
+    const entity_type = try lookupRelationEndpointEntityType(allocator, db, opts.ontology_id, row.edge_type, side);
+    defer allocator.free(entity_type);
+    const name = try humanizeExternalId(allocator, external_id);
+    defer allocator.free(name);
+    const metadata_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"inferred_placeholder\":true,\"missing_external_id\":{f},\"relation_external_id\":{f},\"edge_type\":{f},\"endpoint_side\":{f}}}",
+        .{
+            std.json.fmt(external_id, .{}),
+            std.json.fmt(row.external_id, .{}),
+            std.json.fmt(row.edge_type, .{}),
+            std.json.fmt(@tagName(side), .{}),
+        },
+    );
+    defer allocator.free(metadata_json);
+    return collections_sqlite.upsertEntityRawAuto(db, .{
+        .workspace_id = opts.workspace_id,
+        .ontology_id = opts.ontology_id,
+        .external_id = external_id,
+        .entity_type = entity_type,
+        .name = name,
+        .confidence = @min(row.confidence, 0.4),
+        .metadata_json = metadata_json,
+    });
+}
+
+fn lookupRelationEndpointEntityType(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    ontology_id: []const u8,
+    edge_type: []const u8,
+    side: BusinessRelationEndpointSide,
+) ![]const u8 {
+    const column = switch (side) {
+        .source => "source_entity_type",
+        .target => "target_entity_type",
+    };
+    var sql_buf: [256]u8 = undefined;
+    const sql = try std.fmt.bufPrint(
+        &sql_buf,
+        "SELECT {s} FROM ontology_edge_types WHERE ontology_id = ?1 AND edge_type = ?2 LIMIT 1",
+        .{column},
+    );
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    try facet_sqlite.bindText(stmt, 2, edge_type);
+    const rc = facet_sqlite.c.sqlite3_step(stmt);
+    if (rc == facet_sqlite.c.SQLITE_ROW and facet_sqlite.c.sqlite3_column_type(stmt, 0) != facet_sqlite.c.SQLITE_NULL) {
+        return try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+    }
+    if (rc == facet_sqlite.c.SQLITE_ROW or rc == facet_sqlite.c.SQLITE_DONE) {
+        return try allocator.dupe(u8, "entity");
+    }
+    return error.StepFailed;
+}
+
+fn humanizeExternalId(allocator: Allocator, external_id: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var capitalize_next = true;
+    for (external_id) |ch| {
+        if (ch == '_' or ch == '-' or ch == ':' or ch == '/') {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(allocator, ' ');
+            capitalize_next = true;
+            continue;
+        }
+        const normalized = if (capitalize_next and ch >= 'a' and ch <= 'z') ch - 32 else ch;
+        try out.append(allocator, normalized);
+        capitalize_next = false;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn jsonValueObjectString(allocator: Allocator, value: ?std.json.Value) ![]const u8 {
+    if (value) |v| return try jsonValueString(allocator, v);
+    return try allocator.dupe(u8, "{}");
+}
+
+fn jsonValueString(allocator: Allocator, value: std.json.Value) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
+    if (std.mem.eql(u8, value, "text")) return .text;
+    if (std.mem.eql(u8, value, "string")) return .text;
+    if (std.mem.eql(u8, value, "date")) return .text;
+    if (std.mem.eql(u8, value, "datetime")) return .text;
+    if (std.mem.eql(u8, value, "number")) return .number;
+    if (std.mem.eql(u8, value, "integer")) return .number;
+    if (std.mem.eql(u8, value, "float")) return .number;
+    if (std.mem.eql(u8, value, "decimal")) return .number;
+    if (std.mem.eql(u8, value, "percentage")) return .percentage_bp;
+    if (std.mem.eql(u8, value, "percentage_bp")) return .percentage_bp;
+    if (std.mem.eql(u8, value, "money")) return .money_minor;
+    if (std.mem.eql(u8, value, "currency")) return .money_minor;
+    if (std.mem.eql(u8, value, "money_minor")) return .money_minor;
+    if (std.mem.eql(u8, value, "date_unix")) return .date_unix;
+    if (std.mem.eql(u8, value, "document_ref")) return .doc_ref;
+    if (std.mem.eql(u8, value, "doc_ref")) return .doc_ref;
+    if (std.mem.eql(u8, value, "url")) return .uri;
+    if (std.mem.eql(u8, value, "uri")) return .uri;
+    return null;
+}
+
+test "document business extraction applies symbolic external ids with sqlite-generated raw ids" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-business" });
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = "ws-business::core",
+        .workspace_id = "ws-business",
+        .name = "core",
+    });
+    try collections_sqlite.ensureCollection(db, .{
+        .workspace_id = "ws-business",
+        .collection_id = "ws-business::docs",
+        .name = "docs",
+    });
+    try collections_sqlite.ensureEdgeType(db, .{
+        .ontology_id = "ws-business::core",
+        .edge_type = "OWNS",
+        .source_entity_type = "person",
+        .target_entity_type = "unit",
+    });
+    try collections_sqlite.upsertDocumentRaw(db, .{
+        .workspace_id = "ws-business",
+        .collection_id = "ws-business::docs",
+        .doc_id = 1,
+        .content = "Alice owns apartment A1.",
+    });
+    try collections_sqlite.upsertChunkRaw(db, .{
+        .workspace_id = "ws-business",
+        .collection_id = "ws-business::docs",
+        .doc_id = 1,
+        .chunk_index = 0,
+        .content = "Alice owns apartment A1.",
+    });
+
+    const json =
+        \\{
+        \\  "entities_raw": [
+        \\    {"external_id":"person:alice","entity_type":"person","name":"Alice","metadata_json":{"kind":"owner"}},
+        \\    {"external_id":"unit:a1","entity_type":"unit","name":"A1","metadata_json":{"lot":"A1"}}
+        \\  ],
+        \\  "relations_raw": [
+        \\    {"external_id":"owns:alice:a1","edge_type":"OWNS","source_external_id":"person:alice","target_external_id":"unit:a1","confidence":0.9},
+        \\    {"external_id":"owns:lena:a1","edge_type":"OWNS","source_external_id":"lena_peeters","target_external_id":"unit:a1","confidence":0.9}
+        \\  ],
+        \\  "entity_aliases_raw": [
+        \\    {"entity_external_id":"person:alice","term":"Mme Alice"}
+        \\  ],
+        \\  "entity_documents_raw": [
+        \\    {"entity_external_id":"person:alice","doc_id":1,"role":"mention"}
+        \\  ],
+        \\  "entity_chunks_raw": [
+        \\    {"entity_external_id":"unit:a1","doc_id":1,"chunk_index":0,"role":"mention"}
+        \\  ],
+        \\  "relation_properties_raw": [
+        \\    {"relation_external_id":"owns:alice:a1","property_key":"share_bp","value_type":"percentage_bp","value_integer":10000},
+        \\    {"relation_external_id":"owns:alice:a1","property_key":"start_date","value_type":"string","value_text":"2025-09-01","currency":"EUR"}
+        \\  ]
+        \\}
+    ;
+
+    const summary = try applyBusinessExtractionEnvelope(std.testing.allocator, db, .{
+        .workspace_id = "ws-business",
+        .collection_id = "ws-business::docs",
+        .ontology_id = "ws-business::core",
+        .json = json,
+    });
+    try std.testing.expectEqual(@as(usize, 2), summary.entities);
+    try std.testing.expectEqual(@as(usize, 2), summary.relations);
+    try std.testing.expectEqual(@as(usize, 2), summary.relation_properties);
+
+    const alice_id = try collections_sqlite.selectEntityRawIdByExternalId(db, "ws-business", "person:alice");
+    const lena_id = try collections_sqlite.selectEntityRawIdByExternalId(db, "ws-business", "lena_peeters");
+    const relation_id = try collections_sqlite.selectRelationRawIdByExternalId(db, "ws-business", "owns:alice:a1");
+    try std.testing.expect(alice_id > 0);
+    try std.testing.expect(lena_id > 0);
+    try std.testing.expect(relation_id > 0);
 }
 
 fn renderOpenAiChatRequestForDebug(allocator: Allocator, model: []const u8, messages: []const llm.Message, options: llm.ChatOptions) ![]u8 {

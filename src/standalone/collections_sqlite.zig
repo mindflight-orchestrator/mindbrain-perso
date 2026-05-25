@@ -204,6 +204,7 @@ pub const EntityRawSpec = struct {
     workspace_id: []const u8,
     ontology_id: []const u8,
     entity_id: u64,
+    external_id: ?[]const u8 = null,
     entity_type: []const u8,
     name: []const u8,
     confidence: f64 = 1.0,
@@ -221,6 +222,7 @@ pub const RelationRawSpec = struct {
     workspace_id: []const u8,
     ontology_id: []const u8,
     relation_id: u64,
+    external_id: ?[]const u8 = null,
     edge_type: []const u8,
     source_entity_id: u64,
     target_entity_id: u64,
@@ -782,10 +784,11 @@ pub fn upsertFacetAssignmentRaw(db: Database, spec: FacetAssignmentRawSpec) !voi
 
 pub fn upsertEntityRaw(db: Database, spec: EntityRawSpec) !void {
     const sql =
-        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, entity_type, name, confidence, metadata_json)
-        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        \\ON CONFLICT(workspace_id, entity_id) DO UPDATE SET
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, external_id, entity_type, name, confidence, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\ON CONFLICT(entity_id) DO UPDATE SET
         \\    ontology_id = excluded.ontology_id,
+        \\    external_id = COALESCE(excluded.external_id, entities_raw.external_id),
         \\    entity_type = excluded.entity_type,
         \\    name = excluded.name,
         \\    confidence = excluded.confidence,
@@ -796,11 +799,102 @@ pub fn upsertEntityRaw(db: Database, spec: EntityRawSpec) !void {
     try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
     try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
     try facet_sqlite.bindInt64(stmt, 3, spec.entity_id);
+    if (spec.external_id) |v| try facet_sqlite.bindText(stmt, 4, v) else try facet_sqlite.bindNull(stmt, 4);
+    try facet_sqlite.bindText(stmt, 5, spec.entity_type);
+    try facet_sqlite.bindText(stmt, 6, spec.name);
+    if (c.sqlite3_bind_double(stmt, 7, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 8, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub const EntityRawAutoSpec = struct {
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    external_id: []const u8,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f64 = 1.0,
+    metadata_json: []const u8 = "{}",
+};
+
+pub fn upsertEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
+    const existing_id = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
+            error.NotFound => null,
+            else => return natural_err,
+        },
+        else => return err,
+    };
+    if (existing_id) |id| {
+        try updateEntityRawAutoById(db, id, spec);
+        return id;
+    }
+
+    const sql =
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
+        \\    ontology_id = excluded.ontology_id,
+        \\    entity_type = excluded.entity_type,
+        \\    name = excluded.name,
+        \\    confidence = excluded.confidence,
+        \\    metadata_json = excluded.metadata_json
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, spec.external_id);
     try facet_sqlite.bindText(stmt, 4, spec.entity_type);
     try facet_sqlite.bindText(stmt, 5, spec.name);
     if (c.sqlite3_bind_double(stmt, 6, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 7, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
+    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+}
+
+fn updateEntityRawAutoById(db: Database, entity_id: u64, spec: EntityRawAutoSpec) !void {
+    const sql =
+        \\UPDATE entities_raw
+        \\SET ontology_id = ?2,
+        \\    entity_type = ?3,
+        \\    name = ?4,
+        \\    confidence = ?5,
+        \\    metadata_json = ?6
+        \\WHERE entity_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, entity_id);
+    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, spec.entity_type);
+    try facet_sqlite.bindText(stmt, 4, spec.name);
+    if (c.sqlite3_bind_double(stmt, 5, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 6, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub fn selectEntityRawIdByExternalId(db: Database, workspace_id: []const u8, external_id: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND external_id = ?2");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, external_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    if (rc == c.SQLITE_DONE) return error.NotFound;
+    return error.StepFailed;
+}
+
+pub fn selectEntityRawIdByNaturalKey(db: Database, workspace_id: []const u8, entity_type: []const u8, name: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND entity_type = ?2 AND name = ?3");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, entity_type);
+    try facet_sqlite.bindText(stmt, 3, name);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    if (rc == c.SQLITE_DONE) return error.NotFound;
+    return error.StepFailed;
 }
 
 pub fn upsertEntityAliasRaw(db: Database, spec: EntityAliasRawSpec) !void {
@@ -820,10 +914,11 @@ pub fn upsertEntityAliasRaw(db: Database, spec: EntityAliasRawSpec) !void {
 
 pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
     const sql =
-        \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
-        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        \\ON CONFLICT(workspace_id, relation_id) DO UPDATE SET
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        \\ON CONFLICT(relation_id) DO UPDATE SET
         \\    ontology_id = excluded.ontology_id,
+        \\    external_id = COALESCE(excluded.external_id, relations_raw.external_id),
         \\    edge_type = excluded.edge_type,
         \\    source_entity_id = excluded.source_entity_id,
         \\    target_entity_id = excluded.target_entity_id,
@@ -837,6 +932,61 @@ pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
     try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
     try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
     try facet_sqlite.bindInt64(stmt, 3, spec.relation_id);
+    if (spec.external_id) |v| try facet_sqlite.bindText(stmt, 4, v) else try facet_sqlite.bindNull(stmt, 4);
+    try facet_sqlite.bindText(stmt, 5, spec.edge_type);
+    try facet_sqlite.bindInt64(stmt, 6, spec.source_entity_id);
+    try facet_sqlite.bindInt64(stmt, 7, spec.target_entity_id);
+    if (spec.valid_from) |v| try facet_sqlite.bindText(stmt, 8, v) else try facet_sqlite.bindNull(stmt, 8);
+    if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 9, v) else try facet_sqlite.bindNull(stmt, 9);
+    if (c.sqlite3_bind_double(stmt, 10, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 11, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub const RelationRawAutoSpec = struct {
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    external_id: []const u8,
+    edge_type: []const u8,
+    source_entity_id: u64,
+    target_entity_id: u64,
+    valid_from: ?[]const u8 = null,
+    valid_to: ?[]const u8 = null,
+    confidence: f64 = 1.0,
+    metadata_json: []const u8 = "{}",
+};
+
+pub fn upsertRelationRawAuto(db: Database, spec: RelationRawAutoSpec) !u64 {
+    const existing_id = selectRelationRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectRelationRawIdByNaturalKey(db, spec) catch |natural_err| switch (natural_err) {
+            error.NotFound => null,
+            else => return natural_err,
+        },
+        else => return err,
+    };
+    if (existing_id) |id| {
+        try updateRelationRawAutoById(db, id, spec);
+        return id;
+    }
+
+    const sql =
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
+        \\    ontology_id = excluded.ontology_id,
+        \\    edge_type = excluded.edge_type,
+        \\    source_entity_id = excluded.source_entity_id,
+        \\    target_entity_id = excluded.target_entity_id,
+        \\    valid_from = excluded.valid_from,
+        \\    valid_to = excluded.valid_to,
+        \\    confidence = excluded.confidence,
+        \\    metadata_json = excluded.metadata_json
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, spec.external_id);
     try facet_sqlite.bindText(stmt, 4, spec.edge_type);
     try facet_sqlite.bindInt64(stmt, 5, spec.source_entity_id);
     try facet_sqlite.bindInt64(stmt, 6, spec.target_entity_id);
@@ -845,6 +995,70 @@ pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
     if (c.sqlite3_bind_double(stmt, 9, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 10, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
+    return try selectRelationRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+}
+
+fn updateRelationRawAutoById(db: Database, relation_id: u64, spec: RelationRawAutoSpec) !void {
+    const sql =
+        \\UPDATE relations_raw
+        \\SET ontology_id = ?2,
+        \\    edge_type = ?3,
+        \\    source_entity_id = ?4,
+        \\    target_entity_id = ?5,
+        \\    valid_from = ?6,
+        \\    valid_to = ?7,
+        \\    confidence = ?8,
+        \\    metadata_json = ?9
+        \\WHERE relation_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, relation_id);
+    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, spec.edge_type);
+    try facet_sqlite.bindInt64(stmt, 4, spec.source_entity_id);
+    try facet_sqlite.bindInt64(stmt, 5, spec.target_entity_id);
+    if (spec.valid_from) |v| try facet_sqlite.bindText(stmt, 6, v) else try facet_sqlite.bindNull(stmt, 6);
+    if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 7, v) else try facet_sqlite.bindNull(stmt, 7);
+    if (c.sqlite3_bind_double(stmt, 8, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 9, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+}
+
+pub fn selectRelationRawIdByExternalId(db: Database, workspace_id: []const u8, external_id: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT relation_id FROM relations_raw WHERE workspace_id = ?1 AND external_id = ?2");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, external_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    if (rc == c.SQLITE_DONE) return error.NotFound;
+    return error.StepFailed;
+}
+
+pub fn selectRelationRawIdByNaturalKey(db: Database, spec: RelationRawAutoSpec) !u64 {
+    const sql =
+        \\SELECT relation_id FROM relations_raw
+        \\WHERE workspace_id = ?1
+        \\  AND edge_type = ?2
+        \\  AND source_entity_id = ?3
+        \\  AND target_entity_id = ?4
+        \\  AND valid_from IS ?5
+        \\  AND valid_to IS ?6
+        \\LIMIT 1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, spec.edge_type);
+    try facet_sqlite.bindInt64(stmt, 3, spec.source_entity_id);
+    try facet_sqlite.bindInt64(stmt, 4, spec.target_entity_id);
+    if (spec.valid_from) |v| try facet_sqlite.bindText(stmt, 5, v) else try facet_sqlite.bindNull(stmt, 5);
+    if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 6, v) else try facet_sqlite.bindNull(stmt, 6);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    if (rc == c.SQLITE_DONE) return error.NotFound;
+    return error.StepFailed;
 }
 
 pub fn upsertRelationPropertyRaw(db: Database, spec: RelationPropertyRawSpec) !void {
@@ -1446,6 +1660,144 @@ test "documents_raw enforces nanoid uniqueness only for non-empty values" {
     const lookup = (try lookupDocByNanoid(db, std.testing.allocator, "shared-nano")) orelse return error.MissingNanoid;
     defer lookup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 1), lookup.doc_id);
+}
+
+test "raw graph auto ids resolve external entity and relation identifiers" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws-auto" });
+    try ensureOntology(db, .{
+        .ontology_id = "ws-auto::core",
+        .workspace_id = "ws-auto",
+        .name = "core",
+    });
+
+    const alice_id = try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws-auto",
+        .ontology_id = "ws-auto::core",
+        .external_id = "person:alice",
+        .entity_type = "person",
+        .name = "Alice",
+    });
+    const unit_id = try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws-auto",
+        .ontology_id = "ws-auto::core",
+        .external_id = "unit:a1",
+        .entity_type = "unit",
+        .name = "Appartement A1",
+    });
+    try std.testing.expect(alice_id > 0);
+    try std.testing.expect(unit_id > alice_id);
+    try std.testing.expectEqual(alice_id, try selectEntityRawIdByExternalId(db, "ws-auto", "person:alice"));
+
+    const relation_id = try upsertRelationRawAuto(db, .{
+        .workspace_id = "ws-auto",
+        .ontology_id = "ws-auto::core",
+        .external_id = "ownership:alice:a1",
+        .edge_type = "OWNS",
+        .source_entity_id = alice_id,
+        .target_entity_id = unit_id,
+    });
+    try std.testing.expect(relation_id > 0);
+    try std.testing.expectEqual(relation_id, try selectRelationRawIdByExternalId(db, "ws-auto", "ownership:alice:a1"));
+
+    try upsertEntityAliasRaw(db, .{
+        .workspace_id = "ws-auto",
+        .entity_id = alice_id,
+        .term = "Mme Alice",
+    });
+    try upsertRelationPropertyRaw(db, .{
+        .workspace_id = "ws-auto",
+        .relation_id = relation_id,
+        .property_key = "share_bp",
+        .value_type = .percentage_bp,
+        .value_integer = 10000,
+    });
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT e.external_id, r.external_id, p.value_integer
+        \\FROM entities_raw e
+        \\JOIN relations_raw r ON r.source_entity_id = e.entity_id
+        \\JOIN relation_properties_raw p ON p.relation_id = r.relation_id
+        \\WHERE e.workspace_id = 'ws-auto'
+    );
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    const entity_external_id = try facet_sqlite.dupeColumnText(std.testing.allocator, stmt, 0);
+    defer std.testing.allocator.free(entity_external_id);
+    const relation_external_id = try facet_sqlite.dupeColumnText(std.testing.allocator, stmt, 1);
+    defer std.testing.allocator.free(relation_external_id);
+    try std.testing.expectEqualStrings("person:alice", entity_external_id);
+    try std.testing.expectEqualStrings("ownership:alice:a1", relation_external_id);
+    try std.testing.expectEqual(@as(i64, 10000), c.sqlite3_column_int64(stmt, 2));
+}
+
+test "raw graph auto ids are idempotent when llm external ids change" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws-retry" });
+    try ensureOntology(db, .{
+        .ontology_id = "ws-retry::core",
+        .workspace_id = "ws-retry",
+        .name = "core",
+    });
+
+    const first_alice = try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws-retry",
+        .ontology_id = "ws-retry::core",
+        .external_id = "person::alice_bernard",
+        .entity_type = "person",
+        .name = "Alice Bernard",
+    });
+    const retry_alice = try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws-retry",
+        .ontology_id = "ws-retry::core",
+        .external_id = "alice_bernard",
+        .entity_type = "person",
+        .name = "Alice Bernard",
+        .confidence = 0.8,
+    });
+    try std.testing.expectEqual(first_alice, retry_alice);
+
+    const unit = try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws-retry",
+        .ontology_id = "ws-retry::core",
+        .external_id = "unit::a1",
+        .entity_type = "unit",
+        .name = "Appartement A1",
+    });
+    const first_relation = try upsertRelationRawAuto(db, .{
+        .workspace_id = "ws-retry",
+        .ontology_id = "ws-retry::core",
+        .external_id = "owns::alice::a1",
+        .edge_type = "owns",
+        .source_entity_id = first_alice,
+        .target_entity_id = unit,
+    });
+    const retry_relation = try upsertRelationRawAuto(db, .{
+        .workspace_id = "ws-retry",
+        .ontology_id = "ws-retry::core",
+        .external_id = "alice_owns_a1",
+        .edge_type = "owns",
+        .source_entity_id = retry_alice,
+        .target_entity_id = unit,
+        .confidence = 0.8,
+    });
+    try std.testing.expectEqual(first_relation, retry_relation);
+
+    const count_stmt = try facet_sqlite.prepare(db,
+        \\SELECT
+        \\  (SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-retry'),
+        \\  (SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws-retry')
+    );
+    defer facet_sqlite.finalize(count_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+    try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(count_stmt, 0));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(count_stmt, 1));
 }
 
 test "isOntologyFrozen reflects ontologies.frozen column" {
