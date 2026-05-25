@@ -19,6 +19,7 @@ pub const interfaces = @import("interfaces.zig");
 pub const helper_api = @import("helper_api.zig");
 pub const http_app = @import("http_app.zig");
 pub const legal_chunker = @import("legal_chunker.zig");
+pub const linkml_interchange = @import("linkml_interchange.zig");
 pub const llm = @import("llm/lib.zig");
 pub const llm_client = @import("llm_client.zig");
 pub const nanoid = @import("nanoid.zig");

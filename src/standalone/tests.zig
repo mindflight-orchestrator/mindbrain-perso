@@ -32,6 +32,7 @@ comptime {
     _ = @import("hybrid_search.zig");
     _ = @import("import_pipeline.zig");
     _ = @import("legal_chunker.zig");
+    _ = @import("linkml_interchange.zig");
     _ = @import("llm.zig");
     _ = @import("llm/gemini/client.zig");
     _ = @import("llm/openai_compat/responses.zig");
