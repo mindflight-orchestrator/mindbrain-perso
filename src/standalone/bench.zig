@@ -863,7 +863,7 @@ fn microGraphStreamSubgraph(allocator: std.mem.Allocator, node_count: usize, ite
     var ctx = Ctx{ .allocator = allocator, .db = db };
     return measure("micro_graph_stream_subgraph", iterations, &ctx, struct {
         fn run(local: *Ctx) !void {
-            const events = try graph_sqlite.streamSubgraph(local.db, local.allocator, &.{1}, 2, null, null, null, null, null);
+            const events = try graph_sqlite.streamSubgraph(local.db, local.allocator, &.{1}, 2, null, null, null, null, null, null);
             defer {
                 for (events) |*event| event.deinit(local.allocator);
                 local.allocator.free(events);

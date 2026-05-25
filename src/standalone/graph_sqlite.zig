@@ -1184,6 +1184,17 @@ pub fn loadEntityFull(
     };
 }
 
+fn entityInWorkspace(db: Database, entity_id: u32, workspace_id: []const u8) !bool {
+    const stmt = try prepare(db, "SELECT 1 FROM graph_entity WHERE entity_id = ?1 AND workspace_id = ?2");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, entity_id);
+    try bindText(stmt, 2, workspace_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return true;
+    if (rc == c.SQLITE_DONE) return false;
+    return error.StepFailed;
+}
+
 pub fn getEntity(
     db: Database,
     allocator: std.mem.Allocator,
@@ -2332,7 +2343,7 @@ pub fn traverseWorkspace(
         next_frontier.clearRetainingCapacity();
 
         for (frontier.items) |node_id| {
-            const neighbors = try loadTraverseNeighbors(db, allocator, node_id, direction, filter);
+            const neighbors = try loadTraverseNeighbors(db, allocator, node_id, direction, filter, null);
             defer {
                 for (neighbors) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
                 allocator.free(neighbors);
@@ -2932,6 +2943,7 @@ pub fn streamEntityNeighborhood(
         entity_id,
         .outbound,
         .{ .confidence_min = min_confidence },
+        null,
     );
     defer {
         for (outbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -2964,6 +2976,7 @@ pub fn streamEntityNeighborhood(
         entity_id,
         .inbound,
         .{ .confidence_min = min_confidence },
+        null,
     );
     defer {
         for (inbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3011,6 +3024,7 @@ pub fn streamSubgraph(
     confidence_max: ?f32,
     after_unix_seconds: ?i64,
     before_unix_seconds: ?i64,
+    workspace_id: ?[]const u8,
 ) ![]GraphStreamEvent {
     if (seed_ids.len == 0) return allocator.alloc(GraphStreamEvent, 0);
 
@@ -3028,6 +3042,9 @@ pub fn streamSubgraph(
     var frontier = std.ArrayList(u32).empty;
     defer frontier.deinit(allocator);
     for (seed_ids) |seed_id| {
+        if (workspace_id) |ws| {
+            if (!try entityInWorkspace(db, seed_id, ws)) continue;
+        }
         if ((try seen_nodes.getOrPut(seed_id)).found_existing) continue;
         try frontier.append(allocator, seed_id);
         var seed = try loadEntityFull(db, allocator, seed_id);
@@ -3055,6 +3072,7 @@ pub fn streamSubgraph(
                     .after_unix_seconds = after_unix_seconds,
                     .before_unix_seconds = before_unix_seconds,
                 },
+                workspace_id,
             );
             defer {
                 for (outbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3094,6 +3112,7 @@ pub fn streamSubgraph(
                     .after_unix_seconds = after_unix_seconds,
                     .before_unix_seconds = before_unix_seconds,
                 },
+                workspace_id,
             );
             defer {
                 for (inbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3739,14 +3758,19 @@ fn loadTraverseNeighbors(
     entity_id: u32,
     direction: TraverseDirection,
     filter: interfaces.GraphEdgeFilter,
+    workspace_id: ?[]const u8,
 ) ![]TraverseNeighbor {
-    const sql = switch (direction) {
+    const sql = if (workspace_id == null) switch (direction) {
         .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 ORDER BY r.relation_id ASC",
         .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 ORDER BY r.relation_id ASC",
+    } else switch (direction) {
+        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 ORDER BY r.relation_id ASC",
+        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 ORDER BY r.relation_id ASC",
     };
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindInt64(stmt, 1, entity_id);
+    if (workspace_id) |ws| try bindText(stmt, 2, ws);
 
     var neighbors = std.ArrayList(TraverseNeighbor).empty;
     errdefer {
@@ -4549,7 +4573,7 @@ test "sqlite graph stream helpers emit json events" {
     try std.testing.expect(std.mem.indexOf(u8, neighborhood[neighborhood.len - 1].payload, "\"node_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, neighborhood[neighborhood.len - 1].payload, "\"edge_count\":2") != null);
 
-    const subgraph = try streamSubgraph(db, std.testing.allocator, &.{1}, 2, null, null, null, null, null);
+    const subgraph = try streamSubgraph(db, std.testing.allocator, &.{1}, 2, null, null, null, null, null, null);
     defer {
         for (subgraph) |*event| event.deinit(std.testing.allocator);
         std.testing.allocator.free(subgraph);
