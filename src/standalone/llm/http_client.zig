@@ -110,13 +110,10 @@ fn post(
     if (fetch_result.status.class() != .success) {
         const body = response_body.written();
         try rememberHttpFailure(allocator, fetch_result.status, body);
-        var stderr_file_writer = std.Io.File.stderr().writer(io, &.{});
-        const stderr = &stderr_file_writer.interface;
-        stderr.print("LLM HTTP request failed: status={d} body={s}\n", .{
+        std.debug.print("LLM HTTP request failed: status={d} body={s}\n", .{
             @intFromEnum(fetch_result.status),
             body,
-        }) catch {};
-        stderr.flush() catch {};
+        });
         return error.HttpRequestFailed;
     }
 

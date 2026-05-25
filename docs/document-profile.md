@@ -13,7 +13,7 @@ The CLI for this lives in [`mindbrain-standalone-tool`](../src/standalone/tool.z
 
 ## LLM providers
 
-The standalone LLM library lives under [`src/standalone/llm/`](../src/standalone/llm) and is re-exported through [`llm.zig`](../src/standalone/llm.zig). Document profiling still uses OpenAI-compatible Chat Completions with JSON-mode requests for compatibility, while the library also exposes provider-neutral types for Responses/OpenResponses, streaming events, tool calls, multimodal message parts, embeddings, and audio transcription.
+The standalone LLM library lives under [`src/standalone/llm/`](../src/standalone/llm) and is re-exported through [`llm.zig`](../src/standalone/llm.zig). Document profiling can resolve OpenAI, OpenRouter, or native Anthropic from `--llm-provider` / `MB_DOCUMENTS_LLM_PROVIDER`, while the library also exposes provider-neutral types for Responses/OpenResponses, streaming events, tool calls, multimodal message parts, embeddings, and audio transcription.
 
 | Kind | Example base URL | Chat | Responses | Streaming | Tools | Images/audio parts | Embeddings | Audio transcription | State notes |
 |------|------------------|------|-----------|-----------|-------|--------------------|------------|---------------------|-------------|
@@ -21,6 +21,7 @@ The standalone LLM library lives under [`src/standalone/llm/`](../src/standalone
 | Ollama | `http://127.0.0.1:11434/v1` | Yes | Yes, recent Ollama versions | Chat + Responses when supported | Depends on model/server | Depends on model/server | Yes, when `/v1/embeddings` is exposed | No | Responses are stateless: no `previous_response_id` or conversation object. |
 | vLLM / llama.cpp server | your server `/v1` | Yes | Provider-dependent | When exposed | Depends on server | Depends on server | Yes, when exposed | No | Treat as stateless unless the server documents Responses state. |
 | OpenRouter / other gateways | provider URL + `/v1` | Yes | Beta/OpenResponses | Yes | Yes, provider permitting | Yes, provider permitting | Provider-dependent | Provider-dependent | OpenRouter Responses are beta and stateless; include full history each request. |
+| Anthropic native | `https://api.anthropic.com/v1` | Yes | No | Later | Later | Images via Messages | No | No | Uses Messages API with top-level `system` and `anthropic-version`. |
 | Gemini REST | `https://generativelanguage.googleapis.com/v1beta` | Yes | Via native `generateContent` adapter | Native streaming separately | Native tools later | Images/audio/file inline parts are rendered | Yes | Not yet | Does not expose OpenAI Responses; library normalizes native output into `ResponseResult`. |
 
 Use `Manager.chat` for legacy Chat Completions workflows and `Manager.respond` for new OpenResponses-style generation. Responses structured output uses `text.format`; Chat Completions JSON mode still uses `response_format`.
@@ -67,7 +68,9 @@ One-shot profiling of a single file, inline text, or a whole directory (JSON arr
 
 **LLM (exactly one mode):**
 
-- `--base-url <url>` and `--model <name>` — live call; optional `--api-key <key>`.
+- `--llm-provider openai|openrouter|anthropic` — live call resolved from
+  provider-specific env vars; optional `--base-url`, `--model`, and `--api-key`
+  override the resolved values.
 - `--mock-profile-json <path>` — read JSON, validate with `corpus_profile.parseJson`, return as the profile (no network).
 - `--dry-run` — print JSON with prompt messages and sample parameters (no LLM, no strict validation of profile shape).
 

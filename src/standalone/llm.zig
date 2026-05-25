@@ -9,6 +9,7 @@ pub const types = lib.types;
 pub const http_client = lib.http_client;
 pub const openai_compat = lib.openai_compat;
 pub const gemini = lib.gemini;
+pub const anthropic = lib.anthropic;
 pub const manager = lib.manager;
 
 pub const ProviderKind = lib.ProviderKind;

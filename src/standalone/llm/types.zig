@@ -33,6 +33,7 @@ pub const ProviderConfig = struct {
     model: []const u8,
     embedding_model: ?[]const u8 = null,
     audio_model: ?[]const u8 = null,
+    anthropic_version: ?[]const u8 = null,
     capabilities: []const Capability = &.{ .chat, .json_output },
 };
 

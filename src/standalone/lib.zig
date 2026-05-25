@@ -22,6 +22,7 @@ pub const legal_chunker = @import("legal_chunker.zig");
 pub const linkml_interchange = @import("linkml_interchange.zig");
 pub const llm = @import("llm/lib.zig");
 pub const llm_client = @import("llm_client.zig");
+pub const llm_provider = @import("llm_provider.zig");
 pub const nanoid = @import("nanoid.zig");
 pub const chunker = @import("chunker.zig");
 pub const chunking_policy = @import("chunking_policy.zig");

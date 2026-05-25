@@ -15,6 +15,7 @@ const interfaces = mindbrain.interfaces;
 const legal_chunker = mindbrain.legal_chunker;
 const linkml_interchange = mindbrain.linkml_interchange;
 const llm = mindbrain.llm;
+const llm_provider = mindbrain.llm_provider;
 const nanoid = mindbrain.nanoid;
 const pragma_sqlite = mindbrain.pragma_sqlite;
 const queue_sqlite = mindbrain.queue_sqlite;
@@ -36,6 +37,7 @@ const CliError = error{
 pub fn main(init: std.process.Init) !void {
     mindbrain.zig16_compat.setIo(init.io);
     const allocator = init.gpa;
+    defer llm.http_client.clearLastHttpFailure();
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
@@ -99,12 +101,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "document-qualify")) {
-        try runDocumentQualifyCommand(allocator, args[2..]);
+        try runDocumentQualifyCommand(allocator, args[2..], init.environ_map);
         return;
     }
 
     if (std.mem.eql(u8, args[1], "document-business-extract")) {
-        try runDocumentBusinessExtractCommand(allocator, args[2..]);
+        try runDocumentBusinessExtractCommand(allocator, args[2..], init.environ_map);
         return;
     }
 
@@ -144,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "document-profile")) {
-        try runDocumentProfileCommand(allocator, args[2..]);
+        try runDocumentProfileCommand(allocator, args[2..], init.environ_map);
         return;
     }
 
@@ -154,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "document-profile-worker")) {
-        try runDocumentProfileWorkerCommand(allocator, args[2..]);
+        try runDocumentProfileWorkerCommand(allocator, args[2..], init.environ_map);
         return;
     }
 
@@ -343,7 +345,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
         \\  mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
-        \\  mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> (--base-url <url> --model <name> [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
+        \\  mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
         \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
@@ -351,9 +353,9 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
         \\  mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
         \\  mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
-        \\  mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
+        \\  mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-profile-json <path> | --dry-run) [--source-ref <ref>]
         \\  mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
-        \\  mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
+        \\  mindbrain-standalone-tool document-profile-worker --db <sqlite_path> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
         \\  mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> [--base-url <url> --embedding-model <name> [--api-key <key>]] [--limit <n>] [--vector-weight <0..1>] [--rerank --rerank-base-url <url> --rerank-model <name> [--rerank-api-key <key>] [--rerank-candidates <n>] [--rerank-max-doc-chars <n>]]
         \\  mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <n> --embedding-base-url <url> --embedding-model <name> [--embedding-api-key <key>] [--limit <n>] [--missing-only]
         \\  mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
@@ -1670,12 +1672,13 @@ const QualificationEnvelope = struct {
     assignments: []QualificationAssignmentRow = &.{},
 };
 
-fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !void {
+fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var db_path: ?[]const u8 = null;
     var workspace_id: ?[]const u8 = null;
     var collection_id: ?[]const u8 = null;
     var taxonomy_filter: ?[]const u8 = null;
     var facet_filter: ?[]const u8 = null;
+    var llm_provider_arg: ?[]const u8 = null;
     var base_url: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
@@ -1689,7 +1692,7 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !vo
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--taxonomies")) taxonomy_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--facets")) facet_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mock-qualification-json")) mock_qualification_file = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--target")) target = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--taxonomies")) taxonomy_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--facets")) facet_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--llm-provider")) llm_provider_arg = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mock-qualification-json")) mock_qualification_file = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--target")) target = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -1702,7 +1705,14 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !vo
     }
     if (db_path == null or workspace_id == null or collection_id == null or taxonomy_filter == null or facet_filter == null) return CliError.InvalidArguments;
     if (!std.mem.eql(u8, target, "doc") and !std.mem.eql(u8, target, "chunk") and !std.mem.eql(u8, target, "both")) return CliError.InvalidArguments;
-    if (!dry_run and mock_qualification_file == null and (base_url == null or model == null)) return CliError.InvalidArguments;
+    var loaded_env = try llm_provider.loadEnvValues(allocator, mindbrain.zig16_compat.io(), env_map);
+    defer loaded_env.deinit(allocator);
+    const resolved_provider = try llm_provider.resolve(.{
+        .provider = llm_provider_arg,
+        .base_url = base_url,
+        .api_key = api_key,
+        .model = model,
+    }, loaded_env.values);
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
@@ -1721,9 +1731,7 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8) !vo
             .facet_filter = facet_filter.?,
             .target = target,
             .limit = limit,
-            .base_url = base_url.?,
-            .api_key = api_key,
-            .model = model.?,
+            .provider = resolved_provider.provider,
             .temperature = temperature,
             .max_tokens = max_tokens,
         });
@@ -1771,29 +1779,20 @@ const LiveQualificationOptions = struct {
     facet_filter: []const u8,
     target: []const u8,
     limit: usize,
-    base_url: []const u8,
-    api_key: ?[]const u8,
-    model: []const u8,
+    provider: llm.ProviderConfig,
     temperature: f32,
     max_tokens: ?u32,
 };
 
 fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database, opts: LiveQualificationOptions) ![]u8 {
-    const prompt = try buildQualificationPrompt(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit);
-    defer allocator.free(prompt);
+    var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit);
+    defer prompt.deinit(allocator);
     const messages = [_]llm.Message{
-        .{ .role = "system", .content = "You qualify source documents against a controlled ontology. Return strict JSON only." },
-        .{ .role = "user", .content = prompt },
-    };
-    const provider = llm.ProviderConfig{
-        .name = "default",
-        .kind = .openai_compatible,
-        .base_url = opts.base_url,
-        .api_key = opts.api_key,
-        .model = opts.model,
+        .{ .role = "system", .content = prompt.system },
+        .{ .role = "user", .content = prompt.user },
     };
     const manager = llm.Manager.init(.{
-        .providers = &.{provider},
+        .providers = &.{opts.provider},
         .default_provider = "default",
     });
     var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
@@ -1811,7 +1810,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
     if (content.len == 0) {
         try writeLlmQualificationFailure(allocator, .{
             .reason = "empty_content",
-            .model = opts.model,
+            .model = opts.provider.model,
             .content = response.content,
             .raw_json = response.raw_json,
             .parse_error = null,
@@ -1821,7 +1820,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
     validateQualificationEnvelope(allocator, content) catch |err| {
         try writeLlmQualificationFailure(allocator, .{
             .reason = "invalid_json",
-            .model = opts.model,
+            .model = opts.provider.model,
             .content = response.content,
             .raw_json = response.raw_json,
             .parse_error = @errorName(err),
@@ -1875,15 +1874,26 @@ fn buildQualificationDryRunEnvelope(
     target: []const u8,
     limit: usize,
 ) ![]u8 {
-    const prompt = try buildQualificationPrompt(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target, limit);
-    defer allocator.free(prompt);
+    var prompt = try buildQualificationPrompts(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target, limit);
+    defer prompt.deinit(allocator);
     return try std.json.Stringify.valueAlloc(allocator, .{
         .assignments = &[_]QualificationAssignmentRow{},
-        .dry_run_prompt = prompt,
+        .dry_run_system_prompt = prompt.system,
+        .dry_run_user_prompt = prompt.user,
     }, .{});
 }
 
-fn buildQualificationPrompt(
+const PromptPair = struct {
+    system: []u8,
+    user: []u8,
+
+    fn deinit(self: PromptPair, allocator: Allocator) void {
+        allocator.free(self.system);
+        allocator.free(self.user);
+    }
+};
+
+fn buildQualificationPrompts(
     allocator: Allocator,
     db: facet_sqlite.Database,
     workspace_id: []const u8,
@@ -1892,11 +1902,11 @@ fn buildQualificationPrompt(
     facet_filter: []const u8,
     target: []const u8,
     limit: usize,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.print(
-        \\Classify the following MindBrain documents.
+) !PromptPair {
+    var system: std.Io.Writer.Allocating = .init(allocator);
+    errdefer system.deinit();
+    try system.writer.print(
+        \\You qualify source documents against a controlled ontology.
         \\Return JSON exactly as {{"assignments":[...]}}.
         \\Each assignment requires target_kind, doc_id, namespace, dimension, value, weight.
         \\Use ontology_id "{s}" unless a row needs a more specific attached ontology.
@@ -1908,15 +1918,82 @@ fn buildQualificationPrompt(
         \\Vocabulary:
         \\
     , .{ ontology_id, target, facet_filter });
-    try appendQualificationVocabulary(&out.writer, allocator, db, workspace_id, collection_id, ontology_id, facet_filter);
-    try out.writer.writeAll(
-        \\
+    try appendQualificationVocabulary(&system.writer, allocator, db, workspace_id, collection_id, ontology_id, facet_filter);
+
+    var user: std.Io.Writer.Allocating = .init(allocator);
+    errdefer user.deinit();
+    try user.writer.writeAll(
+        \\Classify the following MindBrain documents.
         \\
         \\Documents:
         \\
     );
-    try appendQualificationDocuments(&out.writer, db, workspace_id, collection_id, limit);
-    return try out.toOwnedSlice();
+    try appendQualificationDocuments(&user.writer, db, workspace_id, collection_id, limit);
+    return .{
+        .system = try system.toOwnedSlice(),
+        .user = try user.toOwnedSlice(),
+    };
+}
+
+fn seedPromptSplitFixture(db: facet_sqlite.Database) !void {
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-prompt" });
+    try collections_sqlite.ensureCollection(db, .{
+        .workspace_id = "ws-prompt",
+        .collection_id = "ws-prompt::docs",
+        .name = "docs",
+    });
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = "ws-prompt::core",
+        .workspace_id = "ws-prompt",
+        .name = "core",
+    });
+    try collections_sqlite.attachOntologyToCollection(db, "ws-prompt", "ws-prompt::docs", "ws-prompt::core", "primary");
+    try collections_sqlite.ensureDimension(db, .{
+        .ontology_id = "ws-prompt::core",
+        .namespace = "topic",
+        .dimension = "category",
+    });
+    try collections_sqlite.ensureValue(db, .{
+        .ontology_id = "ws-prompt::core",
+        .namespace = "topic",
+        .dimension = "category",
+        .value_id = 1,
+        .value = "access-control",
+    });
+    try collections_sqlite.ensureEntityType(db, .{
+        .ontology_id = "ws-prompt::core",
+        .entity_type = "policy",
+        .label = "Policy",
+    });
+    try collections_sqlite.ensureEdgeType(db, .{
+        .ontology_id = "ws-prompt::core",
+        .edge_type = "GOVERNS",
+        .source_entity_type = "policy",
+        .target_entity_type = "policy",
+    });
+    try collections_sqlite.upsertDocumentRaw(db, .{
+        .workspace_id = "ws-prompt",
+        .collection_id = "ws-prompt::docs",
+        .doc_id = 1,
+        .source_ref = "policy.md",
+        .summary = "Access decisions must be documented.",
+        .content = "Article 1. Operators must document access control decisions.",
+    });
+}
+
+test "qualification prompt keeps ontology vocabulary in system and documents in user" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try seedPromptSplitFixture(db);
+
+    var prompt = try buildQualificationPrompts(std.testing.allocator, db, "ws-prompt", "ws-prompt::docs", "ws-prompt::core", "topic.category", "doc", 1);
+    defer prompt.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt.system, "\"taxonomies\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.system, "access-control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "Article 1. Operators") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "\"taxonomies\"") == null);
 }
 
 fn appendQualificationVocabulary(
@@ -2134,12 +2211,13 @@ fn documentOrChunkExists(
     return c.sqlite3_column_int64(stmt, 0) > 0;
 }
 
-fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const u8) !void {
+fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var db_path: ?[]const u8 = null;
     var workspace_id: ?[]const u8 = null;
     var collection_id: ?[]const u8 = null;
     var ontology_id: ?[]const u8 = null;
     var expected_path: ?[]const u8 = null;
+    var llm_provider_arg: ?[]const u8 = null;
     var base_url: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
@@ -2154,7 +2232,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-json")) input_json_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--expected-coverage-json")) expected_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--llm-provider")) llm_provider_arg = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--raw-output")) raw_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--request-output")) request_output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-json")) input_json_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -2166,7 +2244,15 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         } else return CliError.InvalidArguments;
     }
     if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null) return CliError.InvalidArguments;
-    if (input_json_path == null and (expected_path == null or base_url == null or model == null)) return CliError.InvalidArguments;
+    if (input_json_path == null and expected_path == null) return CliError.InvalidArguments;
+    var loaded_env = try llm_provider.loadEnvValues(allocator, mindbrain.zig16_compat.io(), env_map);
+    defer loaded_env.deinit(allocator);
+    const resolved_provider = try llm_provider.resolve(.{
+        .provider = llm_provider_arg,
+        .base_url = base_url,
+        .api_key = api_key,
+        .model = model,
+    }, loaded_env.values);
 
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
@@ -2188,21 +2274,21 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     const expected_json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), expected_path.?, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(expected_json);
 
-    const prompt = try buildBusinessExtractionPrompt(allocator, db, .{
+    var prompt = try buildBusinessExtractionPrompts(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
         .ontology_id = ontology_id.?,
         .expected_json = expected_json,
         .limit = limit,
     });
-    defer allocator.free(prompt);
+    defer prompt.deinit(allocator);
 
     const messages = [_]llm.Message{
-        .{ .role = "system", .content = "You extract a Belgian syndic copropriete business graph. Return strict JSON only. Do not invent facts not supported by the source documents." },
-        .{ .role = "user", .content = prompt },
+        .{ .role = "system", .content = prompt.system },
+        .{ .role = "user", .content = prompt.user },
     };
     if (request_output_path) |path| {
-        const request_json = try renderOpenAiChatRequestForDebug(allocator, model.?, &messages, .{
+        const request_json = try renderChatRequestForDebug(allocator, resolved_provider.provider, &messages, .{
             .temperature = temperature,
             .max_tokens = max_tokens,
             .json_mode = true,
@@ -2215,15 +2301,8 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         });
     }
 
-    const provider = llm.ProviderConfig{
-        .name = "default",
-        .kind = .openai_compatible,
-        .base_url = base_url.?,
-        .api_key = api_key,
-        .model = model.?,
-    };
     const manager = llm.Manager.init(.{
-        .providers = &.{provider},
+        .providers = &.{resolved_provider.provider},
         .default_provider = "default",
     });
     var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
@@ -2248,7 +2327,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     if (content.len == 0) {
         try writeLlmBusinessExtractionFailure(allocator, .{
             .reason = "empty_content",
-            .model = model.?,
+            .model = resolved_provider.provider.model,
             .content = response.content,
             .raw_json = response.raw_json,
             .parse_error = null,
@@ -2258,7 +2337,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     validateJsonObject(allocator, content) catch |err| {
         try writeLlmBusinessExtractionFailure(allocator, .{
             .reason = "invalid_json",
-            .model = model.?,
+            .model = resolved_provider.provider.model,
             .content = response.content,
             .raw_json = response.raw_json,
             .parse_error = @errorName(err),
@@ -2295,10 +2374,10 @@ const BusinessExtractionPromptOptions = struct {
     limit: usize,
 };
 
-fn buildBusinessExtractionPrompt(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionPromptOptions) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.print(
+fn buildBusinessExtractionPrompts(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionPromptOptions) !PromptPair {
+    var system: std.Io.Writer.Allocating = .init(allocator);
+    errdefer system.deinit();
+    try system.writer.print(
         \\Extract the business graph described by the source documents.
         \\
         \\Use ontology_id "{s}".
@@ -2320,18 +2399,44 @@ fn buildBusinessExtractionPrompt(allocator: Allocator, db: facet_sqlite.Database
         \\Ontology vocabulary:
         \\
     , .{ opts.ontology_id, opts.workspace_id });
-    try appendQualificationVocabulary(&out.writer, allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, "");
-    try out.writer.print(
-        \\
-        \\
+    try appendQualificationVocabulary(&system.writer, allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, "");
+
+    var user: std.Io.Writer.Allocating = .init(allocator);
+    errdefer user.deinit();
+    try user.writer.print(
         \\Expected coverage contract:
         \\{s}
         \\
         \\Source documents:
         \\
     , .{opts.expected_json});
-    try appendBusinessExtractionDocumentsJson(&out.writer, db, opts.workspace_id, opts.collection_id, opts.limit);
-    return try out.toOwnedSlice();
+    try appendBusinessExtractionDocumentsJson(&user.writer, db, opts.workspace_id, opts.collection_id, opts.limit);
+    return .{
+        .system = try system.toOwnedSlice(),
+        .user = try user.toOwnedSlice(),
+    };
+}
+
+test "business extraction prompt keeps ontology vocabulary in system and coverage contract in user" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try seedPromptSplitFixture(db);
+
+    var prompt = try buildBusinessExtractionPrompts(std.testing.allocator, db, .{
+        .workspace_id = "ws-prompt",
+        .collection_id = "ws-prompt::docs",
+        .ontology_id = "ws-prompt::core",
+        .expected_json = "{\"must_cover\":[\"access-control\"]}",
+        .limit = 1,
+    });
+    defer prompt.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt.system, "\"taxonomies\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.system, "GOVERNS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "must_cover") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "Article 1. Operators") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "\"taxonomies\"") == null);
 }
 
 fn appendBusinessExtractionDocumentsJson(
@@ -2785,13 +2890,18 @@ test "document business extraction applies symbolic external ids with sqlite-gen
     try std.testing.expect(relation_id > 0);
 }
 
-fn renderOpenAiChatRequestForDebug(allocator: Allocator, model: []const u8, messages: []const llm.Message, options: llm.ChatOptions) ![]u8 {
-    return llm.openai_compat.chat.renderRequest(allocator, model, .{
+fn renderChatRequestForDebug(allocator: Allocator, provider: llm.ProviderConfig, messages: []const llm.Message, options: llm.ChatOptions) ![]u8 {
+    const request = llm.ChatRequest{
         .messages = messages,
         .temperature = options.temperature,
         .max_tokens = options.max_tokens,
         .json_mode = options.json_mode,
-    });
+    };
+    return switch (provider.kind) {
+        .anthropic => llm.anthropic.renderMessagesRequest(allocator, provider.model, request),
+        .gemini => llm.gemini.client.renderGenerateContentRequest(allocator, request),
+        else => llm.openai_compat.chat.renderRequest(allocator, provider.model, request),
+    };
 }
 
 const LlmBusinessExtractionFailure = struct {
@@ -3408,11 +3518,12 @@ fn matchesIncludedExtension(path: []const u8, include_exts: []const []const u8) 
     return false;
 }
 
-fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8) !void {
+fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var content: ?[]const u8 = null;
     var content_file: ?[]const u8 = null;
     var content_dir: ?[]const u8 = null;
     var source_ref: ?[]const u8 = null;
+    var llm_provider_arg: ?[]const u8 = null;
     var base_url: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
@@ -3425,7 +3536,7 @@ fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8) !vo
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--content")) content = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--content-file")) content_file = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--content-dir")) content_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--source-ref")) source_ref = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--sample-chars")) {
+        if (std.mem.eql(u8, arg, "--content")) content = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--content-file")) content_file = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--content-dir")) content_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--source-ref")) source_ref = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--llm-provider")) llm_provider_arg = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--sample-chars")) {
             const v = try requireArg(args, &index);
             sample_chars = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -3446,12 +3557,16 @@ fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8) !vo
     if (input_count != 1) return CliError.InvalidArguments;
 
     if (content_dir) |dir_path| {
+        var loaded_env = try llm_provider.loadEnvValues(allocator, mindbrain.zig16_compat.io(), env_map);
+        defer loaded_env.deinit(allocator);
         try runDocumentProfileDirectory(allocator, .{
             .dir_path = dir_path,
             .source_ref = source_ref,
+            .llm_provider_arg = llm_provider_arg,
             .base_url = base_url,
             .api_key = api_key,
             .model = model,
+            .env_values = loaded_env.values,
             .sample_chars = sample_chars,
             .temperature = temperature,
             .max_tokens = max_tokens,
@@ -3469,12 +3584,16 @@ fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8) !vo
         break :blk buf;
     };
 
+    var loaded_env = try llm_provider.loadEnvValues(allocator, mindbrain.zig16_compat.io(), env_map);
+    defer loaded_env.deinit(allocator);
     const profile_json = try profileDocumentContent(allocator, .{
         .text = text,
         .source_ref = source_ref orelse content_file,
+        .llm_provider_arg = llm_provider_arg,
         .base_url = base_url,
         .api_key = api_key,
         .model = model,
+        .env_values = loaded_env.values,
         .sample_chars = sample_chars,
         .temperature = temperature,
         .max_tokens = max_tokens,
@@ -3488,9 +3607,11 @@ fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8) !vo
 const DocumentProfileOptions = struct {
     text: []const u8,
     source_ref: ?[]const u8,
+    llm_provider_arg: ?[]const u8,
     base_url: ?[]const u8,
     api_key: ?[]const u8,
     model: ?[]const u8,
+    env_values: llm_provider.EnvValues,
     sample_chars: usize,
     temperature: f32,
     max_tokens: u32,
@@ -3501,9 +3622,11 @@ const DocumentProfileOptions = struct {
 const DocumentProfileDirOptions = struct {
     dir_path: []const u8,
     source_ref: ?[]const u8,
+    llm_provider_arg: ?[]const u8,
     base_url: ?[]const u8,
     api_key: ?[]const u8,
     model: ?[]const u8,
+    env_values: llm_provider.EnvValues,
     sample_chars: usize,
     temperature: f32,
     max_tokens: u32,
@@ -3547,24 +3670,25 @@ fn profileDocumentContent(allocator: Allocator, opts: DocumentProfileOptions) ![
         return profile_json;
     }
 
-    if (opts.base_url == null or opts.model == null) return CliError.InvalidArguments;
-    const provider = llm.ProviderConfig{
-        .name = "default",
-        .kind = .openai_compatible,
-        .base_url = opts.base_url.?,
+    const resolved_provider = try llm_provider.resolve(.{
+        .provider = opts.llm_provider_arg,
+        .base_url = opts.base_url,
         .api_key = opts.api_key,
-        .model = opts.model.?,
-    };
+        .model = opts.model,
+    }, opts.env_values);
     const manager = llm.Manager.init(.{
-        .providers = &.{provider},
+        .providers = &.{resolved_provider.provider},
         .default_provider = "default",
     });
 
-    var response = try manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
         .temperature = opts.temperature,
         .max_tokens = opts.max_tokens,
         .json_mode = true,
-    });
+    }) catch |err| {
+        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
+        return err;
+    };
     defer response.deinit(allocator);
 
     var parsed = try corpus_profile.parseJson(allocator, response.content);
@@ -3714,11 +3838,12 @@ fn loadNormalizedSidecar(
     });
 }
 
-fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u8) !void {
+fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var db_path: ?[]const u8 = null;
     var queue_name: []const u8 = "document_profile";
     var visibility_timeout: i64 = 300;
     var limit: usize = 1;
+    var llm_provider_arg: ?[]const u8 = null;
     var base_url: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
@@ -3744,7 +3869,7 @@ fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u
         } else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
-        } else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--temperature")) {
+        } else if (std.mem.eql(u8, arg, "--llm-provider")) llm_provider_arg = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--base-url")) base_url = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--api-key")) api_key = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--temperature")) {
             const v = try requireArg(args, &index);
             temperature = std.fmt.parseFloat(f32, v) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
@@ -3774,8 +3899,8 @@ fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u
     }
 
     if (db_path == null) return CliError.InvalidArguments;
-    if (mock_profile_file == null and (base_url == null or model == null)) return CliError.InvalidArguments;
-    if (contextual_retrieval and (base_url == null or model == null)) return CliError.InvalidArguments;
+    var loaded_env = try llm_provider.loadEnvValues(allocator, mindbrain.zig16_compat.io(), env_map);
+    defer loaded_env.deinit(allocator);
     if (contextual_retrieval and (contextual_search_table_id == null or embedding_model == null)) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -3798,6 +3923,8 @@ fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u
             .base_url = base_url,
             .api_key = api_key,
             .model = model,
+            .llm_provider_arg = llm_provider_arg,
+            .env_values = loaded_env.values,
             .temperature = temperature,
             .max_tokens = max_tokens,
             .mock_profile_file = mock_profile_file,
@@ -3822,6 +3949,8 @@ const ProfileWorkerOptions = struct {
     base_url: ?[]const u8,
     api_key: ?[]const u8,
     model: ?[]const u8,
+    llm_provider_arg: ?[]const u8,
+    env_values: llm_provider.EnvValues,
     temperature: f32,
     max_tokens: u32,
     mock_profile_file: ?[]const u8,
@@ -3868,6 +3997,8 @@ fn processProfileQueueMessage(
         .base_url = opts.base_url,
         .api_key = opts.api_key,
         .model = opts.model,
+        .llm_provider_arg = opts.llm_provider_arg,
+        .env_values = opts.env_values,
         .sample_chars = job.sample_chars,
         .temperature = opts.temperature,
         .max_tokens = opts.max_tokens,
@@ -4730,9 +4861,11 @@ fn runDocumentProfileDirectory(allocator: Allocator, opts: DocumentProfileDirOpt
         const profile_json = profileDocumentContent(allocator, .{
             .text = text,
             .source_ref = source,
+            .llm_provider_arg = opts.llm_provider_arg,
             .base_url = opts.base_url,
             .api_key = opts.api_key,
             .model = opts.model,
+            .env_values = opts.env_values,
             .sample_chars = opts.sample_chars,
             .temperature = opts.temperature,
             .max_tokens = opts.max_tokens,

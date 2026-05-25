@@ -7,9 +7,9 @@ It is derived from the active entrypoints:
 - CLI: [`src/standalone/tool.zig`](../src/standalone/tool.zig)
 - Build wiring: [`build.zig`](../build.zig)
 
-MindBrain is SQLite-first in this repository. The native shared library is
-still built as `pg_mindbrain`, but the operational API that applications call in
-this checkout is the standalone SQLite CLI plus the local HTTP server.
+MindBrain is SQLite-first in this repository. The operational API that
+applications call in this checkout is the standalone SQLite CLI plus the local
+HTTP server.
 
 ## HTTP server
 
@@ -215,9 +215,9 @@ mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
 mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
-mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) (--base-url <url> --model <name> | --mock-profile-json <path> | --dry-run) [--api-key <key>] [--source-ref <ref>]
+mindbrain-standalone-tool document-profile (--content <text> | --content-file <path> | --content-dir <path>) ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-profile-json <path> | --dry-run) [--source-ref <ref>]
 mindbrain-standalone-tool document-profile-enqueue --db <sqlite_path> (--content-file <path> | --content-dir <path>) [--queue <name>] [--include-ext md,txt] [--workspace-id <id> --collection-id <id> (--doc-id <n> | --doc-id-start <n>)] [--language <lang>]
-mindbrain-standalone-tool document-profile-worker --db <sqlite_path> (--base-url <url> --model <name> | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--api-key <key>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
+mindbrain-standalone-tool document-profile-worker --db <sqlite_path> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-profile-json <path>) [--queue <name>] [--vt <sec>] [--limit <n>] [--archive-failures] [--contextual-retrieval] [--contextual-doc-chars <n>] [--contextual-max-tokens <n>] [--contextual-search-table-id <n>] [--embedding-base-url <url>] [--embedding-api-key <key>] [--embedding-model <name>]
 mindbrain-standalone-tool contextual-search --db <sqlite_path> --table-id <n> --query <text> [--base-url <url> --embedding-model <name> [--api-key <key>]] [--limit <n>] [--vector-weight <0..1>] [--rerank --rerank-base-url <url> --rerank-model <name> [--rerank-api-key <key>] [--rerank-candidates <n>] [--rerank-max-doc-chars <n>]]
 mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <n> --embedding-base-url <url> --embedding-model <name> [--embedding-api-key <key>] [--limit <n>] [--missing-only]
 mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
@@ -267,9 +267,8 @@ to bind vector blobs; it intentionally binds JSON strings/arrays as text.
 
 ## Native and SQL surfaces
 
-The Zig build also creates a dynamic library named `pg_mindbrain` from
-[`src/main.zig`](../src/main.zig). The SQLite install script in this repository
-is [`sql/sqlite_mindbrain--1.0.0.sql`](../sql/sqlite_mindbrain--1.0.0.sql).
+The SQLite install script in this repository is
+[`sql/sqlite_mindbrain--1.0.0.sql`](../sql/sqlite_mindbrain--1.0.0.sql).
 
 Function-level SQL behavior is documented in the topic pages:
 

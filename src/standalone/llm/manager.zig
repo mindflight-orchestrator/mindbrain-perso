@@ -6,6 +6,7 @@ const openai_responses = @import("openai_compat/responses.zig");
 const openai_embeddings = @import("openai_compat/embeddings.zig");
 const openai_audio = @import("openai_compat/audio.zig");
 const gemini = @import("gemini/client.zig");
+const anthropic = @import("anthropic/client.zig");
 
 pub const Manager = struct {
     config: types.ManagerConfig,
@@ -44,6 +45,12 @@ pub const Manager = struct {
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
+            }, request),
+            .anthropic => anthropic.chat(allocator, io, .{
+                .base_url = provider.base_url,
+                .api_key = provider.api_key,
+                .model = provider.model,
+                .version = provider.anthropic_version orelse "2023-06-01",
             }, request),
             else => openai_chat.chat(allocator, io, .{
                 .base_url = provider.base_url,
