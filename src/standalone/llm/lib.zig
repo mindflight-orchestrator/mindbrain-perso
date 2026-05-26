@@ -2,6 +2,7 @@ pub const types = @import("types.zig");
 pub const http_client = @import("http_client.zig");
 pub const openai_compat = @import("openai_compat/lib.zig");
 pub const gemini = @import("gemini/lib.zig");
+pub const anthropic = @import("anthropic/lib.zig");
 pub const manager = @import("manager.zig");
 
 pub const ProviderKind = types.ProviderKind;

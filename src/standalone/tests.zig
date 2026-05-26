@@ -34,9 +34,11 @@ comptime {
     _ = @import("legal_chunker.zig");
     _ = @import("linkml_interchange.zig");
     _ = @import("llm.zig");
+    _ = @import("llm/anthropic/client.zig");
     _ = @import("llm/gemini/client.zig");
     _ = @import("llm/openai_compat/responses.zig");
     _ = @import("llm_client.zig");
+    _ = @import("llm_provider.zig");
     _ = @import("nanoid.zig");
     _ = @import("chunker.zig");
     _ = @import("chunking_policy.zig");

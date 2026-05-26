@@ -37,10 +37,6 @@ pub fn build(
         \\Return only valid JSON matching the requested schema.
         \\Do not invent jurisdiction, authority, dates, references, or structure markers.
         \\If uncertain, use "unknown" and explain the risk in the risks array.
-    );
-
-    const user = try std.fmt.allocPrint(allocator,
-        \\Analyze this document sample and choose the best splitter.
         \\
         \\Return exactly one JSON object with these fields:
         \\- document_kind: one of technical, legal_text, legal_consolidated, legal_amendment, business_rule, policy, scanned_ocr, unknown
@@ -51,8 +47,8 @@ pub fn build(
         \\- reference_density: one of none, low, medium, high, unknown
         \\- temporal_model: one of static, versioned, amended, consolidated, repealed, effective_date, unknown
         \\- recommended_splitter: one of technical_structure, legal_article, legal_consolidated, legal_amendment, business_rule, fallback_recursive
-        \\- target_tokens: integer
-        \\- max_chars: integer
+        \\- target_tokens: integer, normally 256-768; never return 0
+        \\- max_chars: integer, must be at least 128; normally 2048-8192
         \\- risks: array of short strings
         \\- confidence: number between 0 and 1
         \\
@@ -61,6 +57,10 @@ pub fn build(
         \\- Technical markdown/code should prefer technical_structure.
         \\- Business rules should preserve condition/action/exception blocks.
         \\- The LLM recommends the splitter; deterministic code will do the actual split.
+    );
+
+    const user = try std.fmt.allocPrint(allocator,
+        \\Analyze this document sample and choose the best splitter.
         \\
         \\Source reference: {s}
         \\
@@ -113,7 +113,8 @@ test "build emits strict schema prompt" {
     var prompt = try build(std.testing.allocator, "Article 1. Operators must register.", "law.txt", 1024);
     defer prompt.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "recommended_splitter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.system, "recommended_splitter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.user, "recommended_splitter") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user, "law.txt") != null);
     const messages = prompt.messages();
     try std.testing.expectEqualStrings("system", messages[0].role);

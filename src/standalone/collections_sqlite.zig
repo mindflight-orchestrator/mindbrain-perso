@@ -629,6 +629,92 @@ pub fn upsertOntologyTriple(db: Database, spec: OntologyTripleSpec) !void {
     try facet_sqlite.stepDone(stmt);
 }
 
+pub fn nextOntologyTripleIndex(db: Database, ontology_id: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT COALESCE(MAX(triple_index), -1) + 1
+        \\FROM ontology_triples_raw
+        \\WHERE ontology_id = ?1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    const status = c.sqlite3_step(stmt);
+    if (status == c.SQLITE_DONE) return 0;
+    if (status != c.SQLITE_ROW) return error.StepFailed;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+pub const DatatypePropertySpec = struct {
+    ontology_id: []const u8,
+    property_uri: []const u8,
+    domain_uri: []const u8,
+    range_uri: []const u8,
+    triple_index: ?u64 = null,
+};
+
+pub fn ensureDatatypeProperty(db: Database, spec: DatatypePropertySpec) !u64 {
+    var index = spec.triple_index orelse try nextOntologyTripleIndex(db, spec.ontology_id);
+    const source_line = "studio:/ontology/property";
+    const rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const owl_datatype = "http://www.w3.org/2002/07/owl#DatatypeProperty";
+    const rdfs_domain = "http://www.w3.org/2000/01/rdf-schema#domain";
+    const rdfs_range = "http://www.w3.org/2000/01/rdf-schema#range";
+
+    try upsertOntologyTriple(db, .{
+        .ontology_id = spec.ontology_id,
+        .triple_index = index,
+        .subject_kind = "iri",
+        .subject = spec.property_uri,
+        .predicate = rdf_type,
+        .object_kind = "iri",
+        .object_value = owl_datatype,
+        .source_line = source_line,
+    });
+    index += 1;
+    try upsertOntologyTriple(db, .{
+        .ontology_id = spec.ontology_id,
+        .triple_index = index,
+        .subject_kind = "iri",
+        .subject = spec.property_uri,
+        .predicate = rdfs_domain,
+        .object_kind = "iri",
+        .object_value = spec.domain_uri,
+        .source_line = source_line,
+    });
+    index += 1;
+    try upsertOntologyTriple(db, .{
+        .ontology_id = spec.ontology_id,
+        .triple_index = index,
+        .subject_kind = "iri",
+        .subject = spec.property_uri,
+        .predicate = rdfs_range,
+        .object_kind = "iri",
+        .object_value = spec.range_uri,
+        .source_line = source_line,
+    });
+    return index + 1;
+}
+
+pub fn ensureSubClassOfTriple(
+    db: Database,
+    ontology_id: []const u8,
+    subject_uri: []const u8,
+    parent_uri: []const u8,
+    triple_index: ?u64,
+) !u64 {
+    const index = triple_index orelse try nextOntologyTripleIndex(db, ontology_id);
+    try upsertOntologyTriple(db, .{
+        .ontology_id = ontology_id,
+        .triple_index = index,
+        .subject_kind = "iri",
+        .subject = subject_uri,
+        .predicate = "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+        .object_kind = "iri",
+        .object_value = parent_uri,
+        .source_line = "studio:/ontology/entity-type",
+    });
+    return index + 1;
+}
+
 // ---- Ontology bundle ------------------------------------------------------
 
 pub const OntologyBundle = struct {
