@@ -70,8 +70,9 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/collections/facet-search`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
 | `GET /health`, static assets | Low | Basic liveness/static serving only. |
 
-Graph diagnostics add one write route, `POST /api/mindbrain/graph/gap-rules/import`,
-to load closed-world gap rules for an ontology or workspace. The read side is
+Graph diagnostics add write routes `POST /api/mindbrain/graph/gap-rules/import`
+and `POST /api/mindbrain/graph/gap-rules/delete`, to load or remove closed-world
+gap rules for an ontology or workspace. The read side is
 `GET /api/mindbrain/graph/gap-rules` for the configured rules and
 `GET /api/mindbrain/graph/diagnostics` for the current report.
 

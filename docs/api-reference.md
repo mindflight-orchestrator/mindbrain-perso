@@ -149,6 +149,7 @@ when the target ontology has `frozen=true`.
 | `POST` | `/api/mindbrain/ontology/property` | `{ "ontology_id", "name", "kind": "object"\|"datatype", "domain", "range", "label" optional, "required" optional, "metadata_json" optional }` | `{ "ok": true }` |
 | `POST` | `/api/mindbrain/ontology/triple` | full triple row (`triple_index`, `subject_kind`, `subject`, `predicate`, `object_kind`, `object_value`, optional datatype/language, `source_line` optional) | `{ "ok": true }` |
 | `POST` | `/api/mindbrain/graph/gap-rules/import` | `{ "ontology_id", "workspace_id" optional, "replace" optional, "rules": [...] }` | `{ "ok": true, "imported": n }` |
+| `POST` | `/api/mindbrain/graph/gap-rules/delete` | `{ "rule_ids": [...], "ontology_id" optional, "workspace_id" optional }` | `{ "ok": true, "deleted": n }` |
 
 Required string fields must be non-empty. `value_id` must be non-negative.
 

@@ -985,6 +985,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleGraphGapRulesImport(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules/delete")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGraphGapRulesDelete(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -2326,6 +2331,25 @@ pub const MindbrainHttpApp = struct {
         const imported = try graph_diagnostics.importRulesJson(self.writer_db, allocator, body);
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .imported = imported }));
+    }
+
+    fn handleGraphGapRulesDelete(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const deleted = try graph_diagnostics.deleteRulesJson(self.writer_db, allocator, body);
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .deleted = deleted }));
     }
 
     fn parseOntologyEntityTypeRequest(
@@ -3701,6 +3725,7 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/graph/diagnostics?workspace_id=...
         \\  GET /api/mindbrain/graph/gap-rules?workspace_id=...
         \\  POST /api/mindbrain/graph/gap-rules/import
+        \\  POST /api/mindbrain/graph/gap-rules/delete
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
         \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...

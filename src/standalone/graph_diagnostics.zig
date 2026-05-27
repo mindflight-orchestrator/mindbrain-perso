@@ -217,6 +217,129 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
     return imported;
 }
 
+const RuleDeleteEnvelope = struct {
+    rule_ids: []const []const u8,
+    ontology_id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
+};
+
+pub fn deleteRulesJson(db: Database, allocator: std.mem.Allocator, json: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(RuleDeleteEnvelope, allocator, json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+    const envelope = parsed.value;
+    if (envelope.rule_ids.len == 0) return 0;
+
+    var deleted: usize = 0;
+    for (envelope.rule_ids) |rule_id| {
+        if (rule_id.len == 0) return error.InvalidArguments;
+        const sql = if (envelope.ontology_id) |ontology_id| blk: {
+            if (envelope.workspace_id != null) {
+                break :blk "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND ontology_id = ?2 AND workspace_id = ?3";
+            }
+            _ = ontology_id;
+            break :blk "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND ontology_id = ?2 AND workspace_id IS NULL";
+        } else "DELETE FROM graph_gap_rules WHERE rule_id = ?1";
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, rule_id);
+        if (envelope.ontology_id) |ontology_id| {
+            try facet_sqlite.bindText(stmt, 2, ontology_id);
+            if (envelope.workspace_id) |workspace_id| {
+                try facet_sqlite.bindText(stmt, 3, workspace_id);
+            }
+        }
+        try facet_sqlite.stepDone(stmt);
+        if (c.sqlite3_changes(db.handle) > 0) deleted += 1;
+    }
+    return deleted;
+}
+
+fn metadataFieldString(allocator: std.mem.Allocator, metadata_json: []const u8, field: []const u8) !?[]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{
+        .allocate = .alloc_if_needed,
+    });
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return null;
+    const value = root.object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| try allocator.dupe(u8, text),
+        .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .bool => |flag| try allocator.dupe(u8, if (flag) "true" else "false"),
+        else => null,
+    };
+}
+
+fn stringInList(value: []const u8, list: []const std.json.Value) bool {
+    for (list) |item| {
+        switch (item) {
+            .string => |text| {
+                if (std.mem.eql(u8, value, text)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn fieldFilterMatches(allocator: std.mem.Allocator, entity_value: ?[]const u8, filter_value: std.json.Value) !bool {
+    if (filter_value != .object) return true;
+    const filter = filter_value.object;
+
+    if (filter.get("one_of")) |one_of| {
+        if (one_of != .array) return true;
+        if (entity_value == null) return false;
+        if (!stringInList(entity_value.?, one_of.array.items)) return false;
+    }
+
+    if (filter.get("not_one_of")) |not_one_of| {
+        if (not_one_of != .array) return true;
+        if (entity_value) |value| {
+            if (stringInList(value, not_one_of.array.items)) return false;
+        }
+    }
+
+    if (filter.get("eq")) |eq| {
+        const expected = switch (eq) {
+            .string => |text| try allocator.dupe(u8, text),
+            .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+            .float => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+            .bool => |flag| try allocator.dupe(u8, if (flag) "true" else "false"),
+            else => return true,
+        };
+        defer allocator.free(expected);
+        if (entity_value == null or !std.mem.eql(u8, entity_value.?, expected)) return false;
+    }
+
+    return true;
+}
+
+fn entityMatchesRuleFilter(allocator: std.mem.Allocator, entity_metadata_json: []const u8, rule_metadata_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rule_metadata_json, .{
+        .allocate = .alloc_if_needed,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return true;
+    const entity_filter = root.object.get("entity_filter") orelse return true;
+    if (entity_filter != .object) return true;
+    const metadata = entity_filter.object.get("metadata") orelse return true;
+    if (metadata != .object) return true;
+
+    var iterator = metadata.object.iterator();
+    while (iterator.next()) |entry| {
+        const field_value = try metadataFieldString(allocator, entity_metadata_json, entry.key_ptr.*);
+        defer if (field_value) |value| allocator.free(value);
+        if (!try fieldFilterMatches(allocator, field_value, entry.value_ptr.*)) return false;
+    }
+    return true;
+}
+
 pub fn rulesJson(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8, workspace_id: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -383,7 +506,7 @@ fn loadRules(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8
 fn evaluateRules(db: Database, allocator: std.mem.Allocator, options: DiagnosticsOptions, rules: []const GapRule, issues: *std.ArrayList(Issue), summary: *Summary) !void {
     for (rules) |rule| {
         const entity_stmt = try facet_sqlite.prepare(db,
-            \\SELECT entity_id
+            \\SELECT entity_id, metadata_json
             \\FROM graph_entity
             \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
             \\ORDER BY entity_id
@@ -393,6 +516,8 @@ fn evaluateRules(db: Database, allocator: std.mem.Allocator, options: Diagnostic
         try facet_sqlite.bindText(entity_stmt, 2, rule.entity_type);
         while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW and issues.items.len < options.limit) {
             const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
+            const entity_metadata = columnText(entity_stmt, 1);
+            if (!try entityMatchesRuleFilter(allocator, entity_metadata, rule.metadata_json)) continue;
             const observed = try countRuleRelations(db, options.workspace_id, entity_id, rule);
             if (observed < rule.min_count) {
                 try appendIssue(allocator, issues, .{
@@ -865,4 +990,53 @@ test "graph diagnostics report finds rule cardinality type evidence and componen
     try std.testing.expect(report.summary.isolated_entities >= 1);
     try std.testing.expect(report.summary.small_components >= 1);
     try std.testing.expect(report.summary.evidence_gaps >= 1);
+}
+
+test "entity_filter excludes vacant units from syndic rules" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_filter', 'ws_filter', 'Filter');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_filter::core', 'ws_filter', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_filter', 'ws_filter::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_filter::core', 'unit', 'Unit');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_filter::core', 'person', 'Person');
+        \\INSERT INTO ontology_edge_types(ontology_id, edge_type, source_entity_type, target_entity_type) VALUES ('ws_filter::core', 'owns', 'person', 'unit');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (1, 'ws_filter', 'unit', 'Vacant Works', '{"usage_status":"vacant_works"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (2, 'ws_filter', 'unit', 'Tenant Unit', '{"usage_status":"tenant_occupied"}');
+    );
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_filter::core","workspace_id":"ws_filter","rules":[{"rule_id":"unit-has-owner","entity_type":"unit","relation_type":"owns","direction":"in","min_count":1,"severity":"error","label":"Occupied unit must have owner","metadata_json":"{\"entity_filter\":{\"metadata\":{\"usage_status\":{\"not_one_of\":[\"vacant_works\",\"vacant\"]}}}}"}]}
+    );
+
+    var report = try buildReport(db, std.testing.allocator, .{
+        .workspace_id = "ws_filter",
+        .limit = 50,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), report.summary.missing_required_relations);
+    try std.testing.expectEqual(@as(?u64, 2), report.issues[0].entity_id);
+}
+
+test "deleteRulesJson removes selected rule ids" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_delete', 'ws_delete', 'Delete');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_delete::core', 'ws_delete', 'core');
+    );
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_delete::core","rules":[{"rule_id":"keep-me","entity_type":"unit","relation_type":"contains","direction":"in","label":"Keep"},{"rule_id":"drop-me","entity_type":"unit","relation_type":"owns","direction":"in","label":"Drop"}]}
+    );
+    const deleted = try deleteRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_delete::core","rule_ids":["drop-me"]}
+    );
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+    const rules_json = try rulesJson(db, std.testing.allocator, "ws_delete::core", null);
+    defer std.testing.allocator.free(rules_json);
+    try std.testing.expect(std.mem.indexOf(u8, rules_json, "keep-me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules_json, "drop-me") == null);
 }
