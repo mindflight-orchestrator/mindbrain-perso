@@ -148,6 +148,7 @@ when the target ontology has `frozen=true`.
 | `POST` | `/api/mindbrain/ontology/edge-type` | `{ "ontology_id", "edge_type", "source_entity_type" optional, "target_entity_type" optional, "directed" optional, "metadata_json" optional }` | `{ "ok": true }` |
 | `POST` | `/api/mindbrain/ontology/property` | `{ "ontology_id", "name", "kind": "object"\|"datatype", "domain", "range", "label" optional, "required" optional, "metadata_json" optional }` | `{ "ok": true }` |
 | `POST` | `/api/mindbrain/ontology/triple` | full triple row (`triple_index`, `subject_kind`, `subject`, `predicate`, `object_kind`, `object_value`, optional datatype/language, `source_line` optional) | `{ "ok": true }` |
+| `POST` | `/api/mindbrain/graph/gap-rules/import` | `{ "ontology_id", "workspace_id" optional, "replace" optional, "rules": [...] }` | `{ "ok": true, "imported": n }` |
 
 Required string fields must be non-empty. `value_id` must be non-negative.
 
@@ -170,6 +171,11 @@ Required string fields must be non-empty. `value_id` must be non-negative.
 | `GET`/`HEAD` | `/api/mindbrain/ontology/taxonomy` | `ontology_id`, `workspace_id` optional | JSON SKOS-style dimensions and values for one ontology |
 | `GET`/`HEAD` | `/api/mindbrain/workspace/list` | none | JSON workspace catalog with entity counts and default ontology ids |
 | `GET`/`HEAD` | `/api/mindbrain/graph/type-counts` | `workspace_id` | JSON per-type instance counts with ontology labels |
+| `GET`/`HEAD` | `/api/mindbrain/graph/diagnostics` | `workspace_id`, `ontology_id` optional, `limit` optional, `component_small_max` optional | JSON graph diagnostics report for gaps, anomalies, evidence, and coverage |
+
+See [methodology/graphing/immeuble-gap-diagnostics-demo.md](methodology/graphing/immeuble-gap-diagnostics-demo.md)
+for an immeuble walkthrough and remediation methodology.
+| `GET`/`HEAD` | `/api/mindbrain/graph/gap-rules` | `workspace_id` or `ontology_id` | JSON configured closed-world graph gap rules |
 | `GET`/`HEAD` | `/api/mindbrain/graph/entity` | `entity_id`, `workspace_id` optional | JSON graph entity detail with facets, incident relations, evidence links |
 | `GET`/`HEAD` | `/api/mindbrain/graph/relation` | `relation_id`, `workspace_id` optional | JSON graph relation detail with endpoints and properties |
 | `GET`/`HEAD` | `/api/mindbrain/graph-path` | `source`, `target`, repeated `edge_label` optional, `max_depth` optional | TOON shortest path |
@@ -227,6 +233,8 @@ mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <
 mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
 mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
+mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
+mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
 mindbrain-standalone-tool search-compact-info --db <sqlite_path>
 mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
 mindbrain-standalone-tool seed-demo --db <sqlite_path>
@@ -250,7 +258,7 @@ Command families:
 | Ontology | `ontology-register`, `ontology-attach`, `ontology-import`, `ontology-export`, `ontology-compile-linkml`, `ontology-export-linkml`, `coverage`, `coverage-by-domain` |
 | Documents and chunks | `document-ingest`, `document-by-nanoid`, `document-normalize`, `external-link-add` |
 | LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search`, `search-embedding-batch` |
-| Graph | `traverse`, `graph-path` |
+| Graph | `traverse`, `graph-path`, `graph-diagnostics`, `graph-gap-rules-import` |
 | Search and context | `search-compact-info`, `pack` |
 | Queue | `queue-send`, `queue-read`, `queue-archive`, `queue-delete` |
 | Demo and maintenance | `seed-demo`, `bootstrap-from-sql`, `benchmark-db`, `corpus-eval`, `simulate` |

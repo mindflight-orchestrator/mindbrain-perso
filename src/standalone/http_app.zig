@@ -1,6 +1,7 @@
 const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const facts_sqlite = @import("facts_sqlite.zig");
+const graph_diagnostics = @import("graph_diagnostics.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
 const helper_api = @import("helper_api.zig");
 const hybrid_search = @import("hybrid_search.zig");
@@ -979,6 +980,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleOntologyTriplePost(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules/import")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGraphGapRulesImport(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -1029,6 +1035,12 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/type-counts")) {
             return self.handleGraphTypeCounts(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/diagnostics")) {
+            return self.handleGraphDiagnostics(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules")) {
+            return self.handleGraphGapRules(allocator, query);
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/entity")) {
             return self.handleGraphEntityDetail(allocator, query);
@@ -2005,6 +2017,53 @@ pub const MindbrainHttpApp = struct {
         return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
     }
 
+    fn handleGraphDiagnostics(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            200;
+        const component_small_max = if (try queryValue(allocator, query, "component_small_max")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            2;
+
+        var report = try graph_diagnostics.buildReport(db, allocator, .{
+            .workspace_id = workspace_id,
+            .ontology_id = ontology_id,
+            .limit = limit,
+            .component_small_max = component_small_max,
+        });
+        defer report.deinit(allocator);
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.reportJson(allocator, report),
+        };
+    }
+
+    fn handleGraphGapRules(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const ontology_id_text = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
+        const ontology_id = if (ontology_id_text) |value| value else blk: {
+            const ws = workspace_id orelse return error.BadRequest;
+            break :blk try graph_diagnostics.resolveOntologyId(db, allocator, ws, null);
+        };
+        defer if (ontology_id_text == null) allocator.free(ontology_id);
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.rulesJson(db, allocator, ontology_id, workspace_id),
+        };
+    }
+
     fn handleOntologyTaxonomyDimensionPost(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -2248,6 +2307,25 @@ pub const MindbrainHttpApp = struct {
         });
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true }));
+    }
+
+    fn handleGraphGapRulesImport(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const imported = try graph_diagnostics.importRulesJson(self.writer_db, allocator, body);
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .imported = imported }));
     }
 
     fn parseOntologyEntityTypeRequest(
@@ -3620,6 +3698,9 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/workspace-export-by-domain?domain_or_workspace=...
         \\  GET /api/mindbrain/graph-path?source=...&target=...&max_depth=...
         \\  GET /api/mindbrain/graph/subgraph?seed_ids=1,2&hops=2&edge_types=requires
+        \\  GET /api/mindbrain/graph/diagnostics?workspace_id=...
+        \\  GET /api/mindbrain/graph/gap-rules?workspace_id=...
+        \\  POST /api/mindbrain/graph/gap-rules/import
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
         \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...
@@ -4287,6 +4368,53 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
     const frozen_resp = try app.ontologyFrozenResponse(arena);
     try std.testing.expect(frozen_resp.status == .conflict);
     try std.testing.expect(std.mem.indexOf(u8, frozen_resp.body, "ontology_frozen") != null);
+}
+
+test "graph diagnostics endpoints expose gap rules and report" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-graph-diagnostics-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_diag_api', 'ws_diag_api', 'Diagnostics API');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_diag_api::core', 'ws_diag_api', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_diag_api', 'ws_diag_api::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_diag_api::core', 'building', 'Building');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_diag_api::core', 'unit', 'Unit');
+        \\INSERT INTO ontology_edge_types(ontology_id, edge_type, source_entity_type, target_entity_type) VALUES ('ws_diag_api::core', 'part_of', 'unit', 'building');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (1, 'ws_diag_api', 'unit', 'A1', '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (2, 'ws_diag_api', 'building', 'Building A', '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (3, 'ws_diag_api', 'building', 'Building B', '{}');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id) VALUES (10, 'ws_diag_api', 'part_of', 1, 2);
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id) VALUES (11, 'ws_diag_api', 'part_of', 1, 3);
+    );
+    _ = try graph_diagnostics.importRulesJson(app.writer_db, std.testing.allocator,
+        \\{"ontology_id":"ws_diag_api::core","workspace_id":"ws_diag_api","rules":[{"rule_id":"unit-one-building","entity_type":"unit","relation_type":"part_of","direction":"out","target_entity_type":"building","min_count":1,"max_count":1,"severity":"error","label":"Unit must belong to one building"}]}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_diag_api");
+    try std.testing.expect(rules.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"kind\":\"graph_gap_rules\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"rule_id\":\"unit-one-building\"") != null);
+
+    const diagnostics = try app.handleGraphDiagnostics(arena, "workspace_id=ws_diag_api&limit=25&component_small_max=2");
+    try std.testing.expect(diagnostics.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"kind\":\"graph_diagnostics_report\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"too_many_relations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"rule_id\":\"unit-one-building\"") != null);
 }
 
 test "studio ontology schema write endpoints expose entity edge property and triple APIs" {

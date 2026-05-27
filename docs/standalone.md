@@ -70,6 +70,11 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/collections/facet-search`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
 | `GET /health`, static assets | Low | Basic liveness/static serving only. |
 
+Graph diagnostics add one write route, `POST /api/mindbrain/graph/gap-rules/import`,
+to load closed-world gap rules for an ontology or workspace. The read side is
+`GET /api/mindbrain/graph/gap-rules` for the configured rules and
+`GET /api/mindbrain/graph/diagnostics` for the current report.
+
 ## CLI: `mindbrain-standalone-tool`
 
 Usage strings from the tool:
@@ -95,6 +100,8 @@ mindbrain-standalone-tool search-embedding-batch --db <sqlite_path> --table-id <
 mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
 mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
+mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
+mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
 mindbrain-standalone-tool search-compact-info --db <sqlite_path>
 mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
 mindbrain-standalone-tool seed-demo --db <sqlite_path>
@@ -122,6 +129,10 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
   graph materialization with `--materialize-graph`, and export preserved
   N-Triples or a workspace taxonomies bundle.
 - **`graph-path`** — Path finding between named nodes.
+- **`graph-diagnostics` / `graph-gap-rules-import`** — Import closed-world gap
+  rules and emit a basic graph diagnostics report for missing required
+  relations, cardinality violations, isolated entities, small components,
+  ontology edge-type mismatches, evidence gaps, and ontology coverage gaps.
 - **`benchmark-db`** — Runs facet and graph query/mutation benchmarks against a SQLite database and returns JSON with embedded TOON payloads for the facet and graph query results.
 - **`graph/subgraph`** — SSE graph stream for browser clients (`seed_node`, `node`, `edge`, `done`).
 - **`coverage` / `coverage-by-domain`** — Emits a TOON `coverage_report` with a summary and per-gap rows for ontology or taxonomy nodes that are not currently covered by the graph.
@@ -170,6 +181,26 @@ Current `gaps` columns are:
 | `entity_type` | Facet entity type for the node. |
 | `criticality` | Optional facet criticality, defaulting to `normal`. |
 | `decayed_confidence` | Secondary confidence metric for the gap node, derived from the graph confidence-decay helper when a related graph entity can be identified. This is not the same thing as coverage ratio or raw node confidence. It can be `null` when no matching graph entity exists to decay against. |
+
+## Graph diagnostics shape
+
+`graph-diagnostics` emits TOON by default and JSON with `--format json`. The
+HTTP route always returns JSON. The report has:
+
+- `summary`: workspace, ontology, evaluated rule count, total issue count, and
+  counters per issue family.
+- `issues`: one row per gap or anomaly, with `kind`, `severity`, `label`,
+  `suggested_action`, and optional `entity_id`, `relation_id`, `rule_id`, and
+  observed/expected counts.
+
+The initial diagnostics are intentionally conservative: required relation and
+cardinality checks come from `graph_gap_rules`; type mismatches come from
+`ontology_edge_types`; graph evidence gaps look for graph entities or relations
+without linked chunk evidence; and coverage gaps reuse the existing ontology
+coverage report.
+
+Full walkthrough (immeuble demo, tools, remediation):
+[methodology/graphing/immeuble-gap-diagnostics-demo.md](methodology/graphing/immeuble-gap-diagnostics-demo.md).
 
 ## Library surface
 

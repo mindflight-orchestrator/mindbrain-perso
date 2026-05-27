@@ -317,6 +317,29 @@ CREATE TABLE IF NOT EXISTS graph_entity_degree (
     total_degree INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS graph_gap_rules (
+    rule_id TEXT PRIMARY KEY,
+    ontology_id TEXT NOT NULL,
+    workspace_id TEXT,
+    entity_type TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
+    target_entity_type TEXT,
+    min_count INTEGER NOT NULL DEFAULT 1,
+    max_count INTEGER,
+    severity TEXT NOT NULL DEFAULT 'warning',
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+);
+
+CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
+    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+
 CREATE TABLE IF NOT EXISTS facets (
     id TEXT PRIMARY KEY,
     schema_id TEXT NOT NULL,

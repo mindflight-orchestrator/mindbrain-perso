@@ -10,6 +10,7 @@ const corpus_profile = mindbrain.corpus_profile;
 const corpus_profile_prompt = mindbrain.corpus_profile_prompt;
 const document_normalize = mindbrain.document_normalize;
 const facet_sqlite = mindbrain.facet_sqlite;
+const graph_diagnostics = mindbrain.graph_diagnostics;
 const graph_sqlite = mindbrain.graph_sqlite;
 const interfaces = mindbrain.interfaces;
 const legal_chunker = mindbrain.legal_chunker;
@@ -182,6 +183,16 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "graph-path")) {
         try runGraphPathCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "graph-diagnostics")) {
+        try runGraphDiagnosticsCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "graph-gap-rules-import")) {
+        try runGraphGapRulesImportCommand(allocator, args[2..]);
         return;
     }
 
@@ -361,6 +372,8 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool corpus-eval [--fixtures <dir>] [--case <name>]
         \\  mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <id> --source-collection-id <id> --source-doc-id <n> --target-uri <uri> [--source-chunk-index <n>] [--edge-type <name>] [--weight <float>] [--link-id <n>] [--metadata-json <json>]
         \\  mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
+        \\  mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
+        \\  mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
         \\  mindbrain-standalone-tool search-compact-info --db <sqlite_path>
         \\  mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
         \\  mindbrain-standalone-tool seed-demo --db <sqlite_path>
@@ -599,6 +612,102 @@ fn runGraphPathCommand(allocator: Allocator, args: []const []const u8) !void {
     const stdout = &stdout_file_writer.interface;
     try stdout.print("{s}\n", .{toon});
     try stdout.flush();
+}
+
+fn runGraphDiagnosticsCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var limit: usize = 200;
+    var component_small_max: usize = 2;
+    var format: []const u8 = "toon";
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--workspace-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            workspace_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--ontology-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            ontology_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--component-small-max")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            component_small_max = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            format = args[index];
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+    if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "toon")) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var report = try graph_diagnostics.buildReport(db, allocator, .{
+        .workspace_id = workspace_id.?,
+        .ontology_id = ontology_id,
+        .limit = limit,
+        .component_small_max = component_small_max,
+    });
+    defer report.deinit(allocator);
+
+    const payload = if (std.mem.eql(u8, format, "json"))
+        try graph_diagnostics.reportJson(allocator, report)
+    else
+        try graph_diagnostics.reportToon(allocator, report);
+    defer allocator.free(payload);
+    try writeStdout("{s}\n", .{payload});
+}
+
+fn runGraphGapRulesImportCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--input")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            input_path = args[index];
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or input_path == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), input_path.?, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(json);
+
+    const imported = try graph_diagnostics.importRulesJson(db, allocator, json);
+    try writeStdout("{f}\n", .{std.json.fmt(.{ .ok = true, .imported = imported }, .{})});
 }
 
 fn runCoverageCommand(allocator: Allocator, args: []const []const u8, by_domain: bool) !void {

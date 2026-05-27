@@ -95,6 +95,104 @@ capability rather than by the original exploratory commit sequence.
 - Use the audit results to decide which models are safe defaults for document
   qualification and which require provider-specific prompt or response handling.
 
+### 9. Graph Gap Diagnostics For Studio And MCP
+
+- Keep the implementation in MindBrain first: Studio and GhostCrab MCP should
+  consume one shared backend contract instead of duplicating graph analysis.
+- Add a minimal `graph_gap_rules` table for closed-world business constraints
+  such as required relations and cardinality. This covers the practical gap
+  checks that ontology-only OWL semantics do not express safely.
+- Expose diagnostics for missing required relations, excessive relations,
+  isolated entities, small connected components, ontology edge-type mismatches,
+  missing graph evidence, and existing ontology coverage gaps.
+- Provide both HTTP and CLI entrypoints so Studio can build UI panels later and
+  MCP can wrap the same data without reaching into SQLite internals.
+- Defer heavier layers such as SHACL import/export, OWL reasoning, centrality,
+  community detection, graph embeddings, and link prediction until the basic
+  diagnostic loop is useful on real workspaces.
+
+**Status: delivered** — MindBrain standalone HTTP/CLI, `graph_gap_rules` table,
+and GhostCrab MCP tools `ghostcrab_graph_diagnostics`, `ghostcrab_graph_gap_rules`,
+`ghostcrab_graph_gap_rules_import`.
+
+Cross-cutting rules for graph intelligence work after §9:
+
+- MindBrain implements analysis; GhostCrab MCP wraps HTTP; Studio consumes the
+  same JSON contract.
+- **Violations** (rules, topology, motifs) belong in diagnostics reports.
+- **Suggestions** (link prediction) use separate read-only endpoints; writes stay
+  on `learn` / explicit upsert paths.
+- **Closed world** is explicit via `graph_gap_rules`; LinkML/OWL remain open world.
+- Validate each phase on the `immeuble-demo` workspace before generalizing.
+
+Recommended priority after §9: **§9b** (demo + Studio panel), **§11** (motifs),
+**§10** (topology), **§12** (SHACL compile), **§13–§14** (structure + suggest),
+**§15–§16** (batch ML and optional OWL bridge).
+
+### 9b. Immeuble Gap Demo And Studio Diagnostics Panel
+
+- Ship `examples/immeuble-demo/gap-rules.demo.json` and
+  `scripts/demo-immeuble-gaps.sh` for a reproducible baseline → rules → anomaly loop.
+- Document the demo in `examples/immeuble-demo/README.md`.
+- Add a Studio diagnostics panel that renders `GET /api/mindbrain/graph/diagnostics`
+  (`summary` counters, `issues` table, filters on `kind` / `severity` / `rule_id`).
+- Reuse existing MCP tools; no new graph analysis in TypeScript.
+
+**Done when:** a 15-minute immeuble demo passes on golden data with
+`rules_evaluated >= 3` and zero rule violations; Studio shows the same report as curl.
+
+### 10. Graph Topology Diagnostics
+
+- Add `GET /api/mindbrain/graph/degree-stats` and
+  `GET /api/mindbrain/graph/components` in MindBrain standalone.
+- Wrap with MCP read tools `ghostcrab_graph_degree_stats` and
+  `ghostcrab_graph_components`.
+- Optionally extend `graph_diagnostics` with `leaf_entity` and `hub_outlier` issues.
+- Validate on immeuble: 13 `unit` rows with coherent degree stats; finance/CODA
+  subgraphs identifiable as separate components when isolated.
+
+### 11. Business Motif And Path Rules
+
+- Add motif rule storage/import and `GET /api/mindbrain/graph/motif-diagnostics`.
+- Detect broken business chains (building → unit → occupant, lease → unit).
+- MCP: `ghostcrab_graph_motif_rules`, `ghostcrab_graph_motif_rules_import`,
+  `ghostcrab_graph_motif_diagnostics`.
+- Keep unary rules in `graph_gap_rules`; motifs express multi-hop paths only.
+
+### 12. SHACL Interchange And Rule Compilation
+
+- Import SHACL (LinkML `gen-shacl` pipeline) and compile to `graph_gap_rules`.
+- Export SHACL from stored rules + ontology edge metadata.
+- MCP: `ghostcrab_shacl_import`, `ghostcrab_shacl_export`.
+- Defer embedded OWL reasoners; optional external bridge lands in §16.
+
+### 13. Graph Centrality And Community Structure
+
+- Add centrality and community endpoints (`degree`, `betweenness`, `pagerank`;
+  `louvain` / `leiden`).
+- MCP: `ghostcrab_graph_centrality`, `ghostcrab_graph_communities`.
+- Accept batch or short sync compute on immeuble-scale graphs.
+
+### 14. Link Suggestion And Missing-Relation Heuristics
+
+- Add read-only `GET /api/mindbrain/graph/link-suggest` with topological scores
+  (common neighbors, Adamic-Adar, Jaccard).
+- MCP: `ghostcrab_link_suggest`.
+- Treat suggestions as hypotheses, not confirmed gaps.
+
+### 15. Graph Embeddings And Anomaly Scores (Batch)
+
+- Offline jobs write `graph_link_scores` / `graph_anomaly_scores` into SQLite.
+- MindBrain serves cached reads; MCP: `ghostcrab_link_scores`,
+  `ghostcrab_anomaly_scores`.
+- Defer until §9b–§11 are in regular use and graph volume justifies ML.
+
+### 16. OWL Reasoning Bridge (Optional)
+
+- Export RDF/TTL from the MindBrain ontology graph; call an external reasoner.
+- Surface `ontology_inconsistency` issues via MCP `ghostcrab_ontology_reason`.
+- Keep reasoning out of the embedded standalone hot path.
+
 ## Validation Commands
 
 ```sh

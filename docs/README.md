@@ -35,6 +35,7 @@ the SQLite MVP; follow-up work is tracked in
 | [dsl-rules.md](dsl-rules.md) | Proposition DSL line format (for `projection_type = 'proposition'`) |
 | [workspace.md](workspace.md) | `mindbrain.*` workspace and semantics tables |
 | [standalone.md](standalone.md) | SQLite engine, tests, benchmarks, `mindbrain-standalone-tool` |
+| [methodology/graphing/immeuble-gap-diagnostics-demo.md](methodology/graphing/immeuble-gap-diagnostics-demo.md) | Immeuble demo: gap tools, findings, remediation (reparse vs add facts) |
 | [document-profile.md](document-profile.md) | PDF/HTML normalization, LLM document profiling, chunking policy, queue worker, `corpus-eval` |
 | [demo-benchmark.md](demo-benchmark.md) | Demo seeding and IMDb/YAGO benchmark contract, including PostgreSQL-side implementation guidance |
 | [source/README.md](source/README.md) | Official OWL2 source references and local N-Triples fixtures used by ontology import tests |

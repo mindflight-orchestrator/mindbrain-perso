@@ -136,6 +136,7 @@ pub const Database = struct {
         try self.applyStandaloneStopwordsSeed();
         try self.applyGraphEntityWorkspaceMigration();
         try self.applyRawGraphAutoincrementMigration();
+        try self.applyGraphGapRulesMigration();
     }
 
     fn migrationApplied(self: Database, migration_id: []const u8) Error!bool {
@@ -455,6 +456,44 @@ pub const Database = struct {
         );
 
         try self.exec("PRAGMA foreign_key_check;");
+        try self.markMigrationApplied(applied_id);
+    }
+
+    fn applyGraphGapRulesMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-05-26-graph-gap-rules-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS graph_gap_rules (
+            \\    rule_id TEXT PRIMARY KEY,
+            \\    ontology_id TEXT NOT NULL,
+            \\    workspace_id TEXT,
+            \\    entity_type TEXT NOT NULL,
+            \\    relation_type TEXT NOT NULL,
+            \\    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
+            \\    target_entity_type TEXT,
+            \\    min_count INTEGER NOT NULL DEFAULT 1,
+            \\    max_count INTEGER,
+            \\    severity TEXT NOT NULL DEFAULT 'warning',
+            \\    label TEXT NOT NULL,
+            \\    enabled INTEGER NOT NULL DEFAULT 1,
+            \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
+            \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        );
+
         try self.markMigrationApplied(applied_id);
     }
 
