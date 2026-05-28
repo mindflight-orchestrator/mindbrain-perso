@@ -1926,14 +1926,12 @@ fn callQualificationLlm(allocator: Allocator, opts: LiveQualificationOptions, pr
         .providers = &.{opts.provider},
         .default_provider = "default",
     });
-    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+    var response = chatLlmWithTransientRetries(allocator, manager, &messages, .{
         .temperature = opts.temperature,
         .max_tokens = opts.max_tokens,
         .json_mode = true,
     }) catch |err| {
-        if (err == error.HttpRequestFailed) {
-            try writeLastLlmHttpFailure(allocator);
-        }
+        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
         return err;
     };
     defer response.deinit(allocator);
@@ -2929,14 +2927,51 @@ fn buildBusinessExtractionSystemPrompt(
     return try system.toOwnedSlice();
 }
 
+const llm_transient_http_retry_delay_ms: i64 = 20_000;
+const llm_transient_http_max_attempts: usize = 4;
+
 fn isRetryableLlmHttpStatus(status: u16) bool {
-    return status == 429 or status == 500 or status == 502 or status == 503;
+    return status == 429 or status == 500 or status == 502 or status == 503 or status == 529;
 }
 
 fn isRetryableLlmHttpError(err: anyerror) bool {
     if (err != error.HttpRequestFailed) return false;
     const status = llm.http_client.lastHttpStatus() orelse return true;
     return isRetryableLlmHttpStatus(status);
+}
+
+fn waitBeforeLlmHttpRetry(attempt: usize) void {
+    const status = llm.http_client.lastHttpStatus();
+    var detail_buf: [96]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "delay_s=20 attempt={d}/{d} status={?d}", .{
+        attempt,
+        llm_transient_http_max_attempts,
+        status,
+    }) catch "delay_s=20";
+    writeBusinessExtractProgress("llm_http_retry", 0, 0, 0, "", 0, detail) catch {};
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .fromMilliseconds(llm_transient_http_retry_delay_ms),
+        .clock = .awake,
+    }, mindbrain.zig16_compat.io()) catch {};
+}
+
+fn chatLlmWithTransientRetries(
+    allocator: Allocator,
+    manager: llm.Manager,
+    messages: []const llm.Message,
+    options: llm.ChatOptions,
+) !llm.ChatResponse {
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        const response = manager.chat(allocator, mindbrain.zig16_compat.io(), messages, options) catch |err| {
+            const retry = attempt < llm_transient_http_max_attempts and isRetryableLlmHttpError(err);
+            if (!retry) return err;
+            waitBeforeLlmHttpRetry(attempt);
+            continue;
+        };
+        return response;
+    }
 }
 
 fn freeExtractBatchJobParts(allocator: Allocator, jobs: []ExtractBatchJob) void {
@@ -2985,30 +3020,14 @@ fn callBusinessExtractLlm(
         .providers = &.{opts.provider},
         .default_provider = "default",
     });
-    const max_attempts: usize = 4;
-    var attempt: usize = 0;
-    var response: llm.ChatResponse = undefined;
-    while (true) {
-        attempt += 1;
-        response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
-            .temperature = opts.temperature,
-            .max_tokens = opts.max_tokens,
-            .json_mode = true,
-        }) catch |err| {
-            const retry = attempt < max_attempts and isRetryableLlmHttpError(err);
-            if (!retry) {
-                if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
-                return err;
-            }
-            const backoff_ms: u64 = 1000 * (@as(u64, 1) << @intCast(@min(attempt - 1, 3)));
-            std.Io.Clock.Duration.sleep(.{
-                .raw = .fromMilliseconds(@intCast(backoff_ms)),
-                .clock = .awake,
-            }, mindbrain.zig16_compat.io()) catch {};
-            continue;
-        };
-        break;
-    }
+    var response = chatLlmWithTransientRetries(allocator, manager, &messages, .{
+        .temperature = opts.temperature,
+        .max_tokens = opts.max_tokens,
+        .json_mode = true,
+    }) catch |err| {
+        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
+        return err;
+    };
     defer response.deinit(allocator);
 
     if (write_debug_outputs) {
