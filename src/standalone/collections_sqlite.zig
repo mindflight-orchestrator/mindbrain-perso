@@ -1426,8 +1426,10 @@ pub fn formatDefaultOntologyId(out_buf: []u8, workspace_id: []const u8) ![]const
     return std.fmt.bufPrint(out_buf, "{s}::default", .{workspace_id}) catch error.ValueOutOfRange;
 }
 
-/// Ensures the per-workspace default ontology exists, wires it as the
-/// workspace default, and bootstraps the built-in `source.*` namespace.
+/// Ensures the per-workspace auto ontology exists and bootstraps `source.*`.
+/// When workspace_settings.default_ontology_id is unset, wires `::default` as
+/// the workspace default. Otherwise preserves the explicit default and returns
+/// that id (e.g. `::core` after syndic compile).
 /// The returned slice is owned by `allocator`; the caller frees it.
 pub fn ensureDefaultOntology(
     db: Database,
@@ -1443,9 +1445,14 @@ pub fn ensureDefaultOntology(
         .name = "default",
         .source_kind = "auto",
     });
-    try setDefaultOntology(db, workspace_id, default_id_slice);
+    if (try defaultOntologyIsUnset(db, workspace_id)) {
+        try setDefaultOntology(db, workspace_id, default_id_slice);
+    }
     try ensureSourceNamespace(db, default_id_slice);
 
+    if (try defaultOntology(db, allocator, workspace_id)) |current| {
+        return current;
+    }
     return allocator.dupe(u8, default_id_slice);
 }
 
@@ -1480,6 +1487,23 @@ test "ensureWorkspace bootstraps the default ontology with the source.* namespac
     try facet_sqlite.bindText(stmt_dims, 1, default_id);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt_dims));
     try std.testing.expectEqual(@as(i64, source_dimensions.len), c.sqlite3_column_int64(stmt_dims, 0));
+}
+
+test "ensureDefaultOntology preserves explicit workspace default" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try ensureWorkspace(db, .{ .workspace_id = "wsZ" });
+    try setDefaultOntology(db, "wsZ", "wsZ::core");
+
+    const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsZ");
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("wsZ::core", resolved);
+
+    const default_id = (try defaultOntology(db, std.testing.allocator, "wsZ")) orelse
+        return error.MissingDefaultOntology;
+    defer std.testing.allocator.free(default_id);
+    try std.testing.expectEqualStrings("wsZ::core", default_id);
 }
 
 test "ensureDefaultOntology is idempotent and returns an owned id" {

@@ -27,6 +27,10 @@ test "syndic compile profile leaves core as default after ingest bootstrap" {
     // document-ingest / persistProfiledDocument calls ensureWorkspace again.
     try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-syndic-lab" });
 
+    const resolved = try collections_sqlite.ensureDefaultOntology(db, std.testing.allocator, "ws-syndic-lab");
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("ws-syndic-lab::core", resolved);
+
     const default_id = try collections_sqlite.defaultOntology(db, std.testing.allocator, "ws-syndic-lab");
     defer if (default_id) |id| std.testing.allocator.free(id);
     try std.testing.expect(default_id != null);
