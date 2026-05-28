@@ -2315,13 +2315,15 @@ fn mergeBusinessExtractionEnvelopes(allocator: Allocator, parts: []const []const
         parsed_parts.deinit(allocator);
     }
     for (parts, 0..) |json, batch_index| {
-        const normalized = try sanitizeBusinessExtractionJson(allocator, json);
-        defer allocator.free(normalized);
-        const parsed = std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, .{
+        const parse_opts = std.json.ParseOptions{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        }) catch |err| {
-            const detail = try std.fmt.allocPrint(allocator, "merge_parse_failed err={s}", .{@errorName(err)});
+        };
+        const parsed = parseBusinessExtractionEnvelopeJson(allocator, json, parse_opts) catch |err| {
+            const detail = try std.fmt.allocPrint(allocator, "merge_parse_failed err={s} json_chars={d}", .{
+                @errorName(err),
+                json.len,
+            });
             defer allocator.free(detail);
             try writeBusinessExtractProgress("merge_parse_failed", batch_index, parts.len, 0, "", 0, detail);
             return err;
@@ -2987,6 +2989,19 @@ fn callBusinessExtractLlm(
     };
     const normalized = try sanitizeBusinessExtractionJson(allocator, content);
     return normalized;
+}
+
+fn parseBusinessExtractionEnvelopeJson(
+    allocator: Allocator,
+    json: []const u8,
+    parse_opts: std.json.ParseOptions,
+) !std.json.Parsed(BusinessExtractionEnvelope) {
+    if (std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, json, parse_opts)) |parsed| {
+        return parsed;
+    } else |_| {}
+    const normalized = try sanitizeBusinessExtractionJson(allocator, json);
+    defer allocator.free(normalized);
+    return std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, parse_opts);
 }
 
 fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 {
