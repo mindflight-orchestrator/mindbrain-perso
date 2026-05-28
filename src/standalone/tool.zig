@@ -2320,9 +2320,16 @@ fn mergeBusinessExtractionEnvelopes(allocator: Allocator, parts: []const []const
             .ignore_unknown_fields = true,
         };
         const parsed = parseBusinessExtractionEnvelopeJson(allocator, json, parse_opts) catch |err| {
-            const detail = try std.fmt.allocPrint(allocator, "merge_parse_failed err={s} json_chars={d}", .{
+            const dump_path = try std.fmt.allocPrint(allocator, "/tmp/mindbrain-merge-fail-batch{d}.json", .{batch_index});
+            defer allocator.free(dump_path);
+            _ = std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+                .sub_path = dump_path,
+                .data = json,
+            }) catch {};
+            const detail = try std.fmt.allocPrint(allocator, "merge_parse_failed err={s} json_chars={d} dump={s}", .{
                 @errorName(err),
                 json.len,
+                dump_path,
             });
             defer allocator.free(detail);
             try writeBusinessExtractProgress("merge_parse_failed", batch_index, parts.len, 0, "", 0, detail);
@@ -3081,6 +3088,9 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 if (row_obj.getPtr("confidence")) |field| coerceJsonConfidence(field) else {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
                 }
+                if (row_obj.getPtr("metadata_json")) |field| {
+                    if (field.* != .object and field.* != .null) field.* = .null;
+                }
                 i += 1;
             }
         }
@@ -3120,6 +3130,11 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 }
                 if (row_obj.getPtr("confidence")) |field| coerceJsonConfidence(field) else {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
+                }
+                if (row_obj.getPtr("valid_from")) |field| try coerceJsonOptionalString(allocator, field);
+                if (row_obj.getPtr("valid_to")) |field| try coerceJsonOptionalString(allocator, field);
+                if (row_obj.getPtr("metadata_json")) |field| {
+                    if (field.* != .object and field.* != .null) field.* = .null;
                 }
                 i += 1;
             }
@@ -3180,6 +3195,25 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
             if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
             if (row_obj.getPtr("chunk_index")) |field| coerceJsonOptionalInteger(field);
         }
+    }
+}
+
+fn coerceJsonOptionalString(allocator: Allocator, value: *std.json.Value) !void {
+    switch (value.*) {
+        .string => {},
+        .null => {},
+        .integer => |n| {
+            const s = try std.fmt.allocPrint(allocator, "{d}", .{n});
+            value.* = .{ .string = s };
+        },
+        .float => |n| {
+            const s = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(n))});
+            value.* = .{ .string = s };
+        },
+        .bool => |b| {
+            value.* = .{ .string = if (b) "true" else "false" };
+        },
+        else => value.* = .null,
     }
 }
 
