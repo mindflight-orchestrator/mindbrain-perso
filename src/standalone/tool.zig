@@ -3013,9 +3013,11 @@ fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 
 }
 
 fn ensureEnvelopeArrayField(allocator: Allocator, obj: *std.json.ObjectMap, key: []const u8) !void {
-    const gop = try obj.getOrPut(allocator, key);
-    if (gop.found_existing and gop.value_ptr.* == .array) return;
-    gop.value_ptr.* = .{ .array = std.json.Array.init(allocator) };
+    if (obj.get(key)) |existing| {
+        if (existing == .array) return;
+        return;
+    }
+    try obj.put(allocator, key, .{ .array = std.json.Array.init(allocator) });
 }
 
 fn copyJsonFieldAlias(
@@ -3258,7 +3260,6 @@ const ExtractBatchJob = struct {
 };
 
 const LlmWorkerCtx = struct {
-    parent_allocator: Allocator,
     opts: *const LiveBusinessExtractOptions,
     job: *ExtractBatchJob,
     docs_rows: []const PromptDocumentRow,
@@ -3274,7 +3275,8 @@ fn businessExtractLlmWorker(ctx: *LlmWorkerCtx) void {
         return;
     };
     const part = ctx.job.part orelse return;
-    const owned = ctx.parent_allocator.dupe(u8, part) catch |err| {
+    // Thread-safe staging buffer; main thread copies into parent_allocator after join.
+    const owned = std.heap.smp_allocator.dupe(u8, part) catch |err| {
         ctx.job.llm_err = err;
         return;
     };
@@ -3331,7 +3333,6 @@ fn runExtractBatchLlmJobs(
             for (0..wave_len) |w| {
                 const job = &jobs[wave_start + w];
                 ctxs[w] = .{
-                    .parent_allocator = allocator,
                     .opts = opts,
                     .job = job,
                     .docs_rows = docs_rows,
@@ -3343,6 +3344,13 @@ fn runExtractBatchLlmJobs(
                 thread.join();
             }
             wave_start += wave_len;
+        }
+        for (jobs) |*job| {
+            if (job.llm_err) |err| return err;
+            const staged = job.part orelse return error.InvalidLlmBusinessExtractionResponse;
+            const owned = try allocator.dupe(u8, staged);
+            std.heap.smp_allocator.free(staged);
+            job.part = owned;
         }
     }
 
