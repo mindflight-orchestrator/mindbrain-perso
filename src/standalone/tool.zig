@@ -31,6 +31,8 @@ const workspace_sqlite = mindbrain.workspace_sqlite;
 const qualification_normalize = mindbrain.qualification_normalize;
 const qualification_apply = mindbrain.qualification_apply;
 const business_edge_normalize = mindbrain.business_edge_normalize;
+const business_entity_normalize = mindbrain.business_entity_normalize;
+const llm_context_budget = mindbrain.llm_context_budget;
 const syndic_profile_seed = mindbrain.syndic_profile_seed;
 
 const Allocator = std.mem.Allocator;
@@ -1771,6 +1773,7 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8, env
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var mock_qualification_file: ?[]const u8 = null;
+    var context_budget_json: ?[]const u8 = null;
     var dry_run = false;
     var limit: usize = 20;
     var target: []const u8 = "doc";
@@ -1789,6 +1792,8 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8, env
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             const v = try requireArg(args, &index);
             max_tokens = std.fmt.parseInt(u32, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--context-budget-json")) {
+            context_budget_json = try requireArg(args, &index);
         } else return CliError.InvalidArguments;
     }
     if (db_path == null or workspace_id == null or collection_id == null or taxonomy_filter == null or facet_filter == null) return CliError.InvalidArguments;
@@ -1822,6 +1827,7 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8, env
             .provider = resolved_provider.provider,
             .temperature = temperature,
             .max_tokens = max_tokens,
+            .context_budget_json = context_budget_json,
         });
     defer allocator.free(qualification_json);
 
@@ -1870,11 +1876,48 @@ const LiveQualificationOptions = struct {
     provider: llm.ProviderConfig,
     temperature: f32,
     max_tokens: ?u32,
+    context_budget_json: ?[]const u8 = null,
 };
 
-fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database, opts: LiveQualificationOptions) ![]u8 {
-    var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit);
-    defer prompt.deinit(allocator);
+fn budgetProviderName(provider: llm.ProviderConfig) []const u8 {
+    return switch (provider.kind) {
+        .openai => "openai",
+        else => provider.name,
+    };
+}
+
+fn buildQualificationSystemPrompt(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    facet_filter: []const u8,
+    target: []const u8,
+) ![]u8 {
+    var system: std.Io.Writer.Allocating = .init(allocator);
+    errdefer system.deinit();
+    try system.writer.print(
+        \\You qualify source documents against a controlled ontology.
+        \\Return JSON exactly as {{"assignments":[...]}}.
+        \\Each assignment requires target_kind, doc_id, namespace, dimension, value, weight.
+        \\Optional field ontology_id (separate from namespace): use "{s}" when needed.
+        \\namespace MUST be a facet namespace only: domain, source, or finance. DO NOT put ontology ids or "::" in namespace.
+        \\dimension MUST be a facet name only: building, document_type, unit, etc. DO NOT put "namespace.dimension" in dimension.
+        \\Example row: {{"target_kind":"doc","doc_id":1,"namespace":"domain","dimension":"building","value":"Résidence Les Tilleuls","weight":1}}
+        \\Allowed target: {s}.
+        \\Allowed facets (namespace.dimension): {s}.
+        \\Use the taxonomy and facet vocabulary below when choosing namespace, dimension, and value.
+        \\Only use values that are directly supported by the text. Do not invent facts.
+        \\
+        \\Vocabulary:
+        \\
+    , .{ ontology_id, target, facet_filter });
+    try appendQualificationVocabulary(&system.writer, allocator, db, workspace_id, collection_id, ontology_id, facet_filter);
+    return try system.toOwnedSlice();
+}
+
+fn callQualificationLlm(allocator: Allocator, opts: LiveQualificationOptions, prompt: PromptPair) ![]u8 {
     const messages = [_]llm.Message{
         .{ .role = "system", .content = prompt.system },
         .{ .role = "user", .content = prompt.user },
@@ -1916,6 +1959,80 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
         return error.InvalidLlmQualificationResponse;
     };
     return try allocator.dupe(u8, content);
+}
+
+fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database, opts: LiveQualificationOptions) ![]u8 {
+    const budget_ctx = PromptBudgetContext{
+        .provider = budgetProviderName(opts.provider),
+        .model = opts.provider.model,
+        .context_budget_json = opts.context_budget_json,
+    };
+    const user_prefix =
+        \\Classify the following MindBrain documents.
+        \\
+        \\Documents:
+        \\
+    ;
+
+    var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, null);
+    defer docs.deinit(allocator);
+    var system = try buildQualificationSystemPrompt(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target);
+    defer allocator.free(system);
+
+    const spec = try llm_context_budget.loadBudget(allocator, budget_ctx.provider, budget_ctx.model, budget_ctx.context_budget_json);
+    var doc_ids = try allocator.alloc(u64, docs.rows.len);
+    defer allocator.free(doc_ids);
+    var content_lengths = try allocator.alloc(usize, docs.rows.len);
+    defer allocator.free(content_lengths);
+    var metadata_total: usize = 0;
+    for (docs.rows, 0..) |row, i| {
+        doc_ids[i] = row.doc_id;
+        content_lengths[i] = row.content.len;
+        metadata_total += estimateQualificationDocMetadataChars(row);
+    }
+    var budget_report = try llm_context_budget.computeDocumentCharLimits(
+        allocator,
+        spec,
+        doc_ids,
+        content_lengths,
+        system.len,
+        user_prefix.len + metadata_total,
+    );
+    budget_report.provider = budget_ctx.provider;
+    budget_report.model = budget_ctx.model;
+    defer budget_report.deinit(allocator);
+    try llm_context_budget.writeContextBudgetReport(allocator, budget_report);
+
+    if (budget_report.needs_batch) {
+        const batches = try llm_context_budget.planBudgetBatches(allocator, spec, doc_ids, content_lengths, system.len, user_prefix.len + metadata_total);
+        defer {
+            for (batches) |batch| allocator.free(batch);
+            allocator.free(batches);
+        }
+        try llm_context_budget.writeContextBudgetBatchReport(allocator, batches);
+
+        var parts = std.ArrayList([]u8).empty;
+        errdefer {
+            for (parts.items) |part| allocator.free(part);
+            parts.deinit(allocator);
+        }
+        for (batches) |batch| {
+            var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit, .{
+                .provider = budget_ctx.provider,
+                .model = budget_ctx.model,
+                .context_budget_json = budget_ctx.context_budget_json,
+                .doc_ids = batch,
+            });
+            defer prompt.deinit(allocator);
+            const part = try callQualificationLlm(allocator, opts, prompt);
+            try parts.append(allocator, part);
+        }
+        return try mergeQualificationEnvelopes(allocator, parts.items);
+    }
+
+    var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit, budget_ctx);
+    defer prompt.deinit(allocator);
+    return try callQualificationLlm(allocator, opts, prompt);
 }
 
 fn writeLastLlmHttpFailure(allocator: Allocator) !void {
@@ -1962,7 +2079,7 @@ fn buildQualificationDryRunEnvelope(
     target: []const u8,
     limit: usize,
 ) ![]u8 {
-    var prompt = try buildQualificationPrompts(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target, limit);
+    var prompt = try buildQualificationPrompts(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target, limit, .{});
     defer prompt.deinit(allocator);
     return try std.json.Stringify.valueAlloc(allocator, .{
         .assignments = &[_]QualificationAssignmentRow{},
@@ -1981,6 +2098,322 @@ const PromptPair = struct {
     }
 };
 
+const PromptBudgetContext = struct {
+    provider: []const u8 = "openai",
+    model: []const u8 = "gpt-5-mini",
+    context_budget_json: ?[]const u8 = null,
+    doc_ids: ?[]const u64 = null,
+};
+
+const PromptDocumentRow = struct {
+    doc_id: u64,
+    source_ref: []const u8,
+    summary: []const u8,
+    content: []const u8,
+};
+
+const PromptDocumentList = struct {
+    rows: []PromptDocumentRow,
+    owned: []const []u8,
+
+    fn deinit(self: PromptDocumentList, allocator: Allocator) void {
+        for (self.owned) |owned| allocator.free(owned);
+        allocator.free(self.owned);
+        allocator.free(self.rows);
+    }
+};
+
+fn loadPromptDocuments(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    limit: usize,
+    doc_ids: ?[]const u64,
+) !PromptDocumentList {
+    const sql =
+        \\SELECT doc_id, source_ref, summary, content
+        \\FROM documents_raw
+        \\WHERE workspace_id = ?1 AND collection_id = ?2
+        \\ORDER BY doc_id
+        \\LIMIT ?3
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, collection_id);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(limit)));
+
+    var rows = std.ArrayList(PromptDocumentRow).empty;
+    errdefer rows.deinit(allocator);
+    var owned = std.ArrayList([]u8).empty;
+    errdefer {
+        for (owned.items) |item| allocator.free(item);
+        owned.deinit(allocator);
+    }
+
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        const doc_id = @as(u64, @intCast(c.sqlite3_column_int64(stmt, 0)));
+        if (doc_ids) |filter| {
+            var include = false;
+            for (filter) |wanted| {
+                if (wanted == doc_id) {
+                    include = true;
+                    break;
+                }
+            }
+            if (!include) continue;
+        }
+        const source_ref = try facet_sqlite.dupeColumnText(allocator, stmt, 1);
+        errdefer allocator.free(source_ref);
+        const summary = try facet_sqlite.dupeColumnText(allocator, stmt, 2);
+        errdefer allocator.free(summary);
+        const content = try facet_sqlite.dupeColumnText(allocator, stmt, 3);
+        try owned.append(allocator, source_ref);
+        try owned.append(allocator, summary);
+        try owned.append(allocator, content);
+        try rows.append(allocator, .{
+            .doc_id = doc_id,
+            .source_ref = source_ref,
+            .summary = summary,
+            .content = content,
+        });
+    }
+
+    return .{
+        .rows = try rows.toOwnedSlice(allocator),
+        .owned = try owned.toOwnedSlice(allocator),
+    };
+}
+
+fn estimateQualificationDocMetadataChars(row: PromptDocumentRow) usize {
+    return std.fmt.count("doc_id={d}\nsource_ref={s}\nsummary={s}\ncontent:\n\n---\n", .{
+        row.doc_id,
+        row.source_ref,
+        row.summary,
+    });
+}
+
+fn estimateBusinessExtractDocMetadataChars(row: PromptDocumentRow) usize {
+    return std.fmt.count("{{\"doc_id\":{},\"source_ref\":{f},\"content\":{f}}}", .{
+        row.doc_id,
+        std.json.fmt(row.source_ref, .{}),
+        std.json.fmt("", .{}),
+    });
+}
+
+fn appendQualificationDocumentsWithLimits(
+    writer: *std.Io.Writer,
+    docs: []const PromptDocumentRow,
+    limits: []const usize,
+) !void {
+    std.debug.assert(docs.len == limits.len);
+    for (docs, limits) |row, limit| {
+        const content = llm_context_budget.limitedContent(row.content, limit);
+        try writer.print("doc_id={d}\nsource_ref={s}\nsummary={s}\ncontent:\n{s}\n---\n", .{
+            row.doc_id,
+            row.source_ref,
+            row.summary,
+            content,
+        });
+    }
+}
+
+fn appendBusinessExtractionDocumentsJsonWithLimits(
+    writer: *std.Io.Writer,
+    docs: []const PromptDocumentRow,
+    limits: []const usize,
+) !void {
+    std.debug.assert(docs.len == limits.len);
+    try writer.writeAll("[");
+    var first = true;
+    for (docs, limits) |row, limit| {
+        const content = llm_context_budget.limitedContent(row.content, limit);
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writer.writeAll("{\"doc_id\":");
+        try writer.print("{}", .{row.doc_id});
+        try writer.writeAll(",\"source_ref\":");
+        try writer.print("{f}", .{std.json.fmt(row.source_ref, .{})});
+        try writer.writeAll(",\"content\":");
+        try writer.print("{f}", .{std.json.fmt(content, .{})});
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+}
+
+fn computePromptDocumentLimits(
+    allocator: Allocator,
+    budget_ctx: PromptBudgetContext,
+    docs: []const PromptDocumentRow,
+    system_chars: usize,
+    fixed_user_chars: usize,
+    metadata_chars_fn: *const fn (PromptDocumentRow) usize,
+) !struct { limits: []usize, report: llm_context_budget.PromptBudgetReport } {
+    const spec = try llm_context_budget.loadBudget(allocator, budget_ctx.provider, budget_ctx.model, budget_ctx.context_budget_json);
+    var doc_ids = try allocator.alloc(u64, docs.len);
+    errdefer allocator.free(doc_ids);
+    var content_lengths = try allocator.alloc(usize, docs.len);
+    errdefer allocator.free(content_lengths);
+    var metadata_total: usize = 0;
+    for (docs, 0..) |row, i| {
+        doc_ids[i] = row.doc_id;
+        content_lengths[i] = row.content.len;
+        metadata_total += metadata_chars_fn(row);
+    }
+    var report = try llm_context_budget.computeDocumentCharLimits(
+        allocator,
+        spec,
+        doc_ids,
+        content_lengths,
+        system_chars,
+        fixed_user_chars + metadata_total,
+    );
+    report.provider = budget_ctx.provider;
+    report.model = budget_ctx.model;
+    return .{ .limits = report.per_doc_limits, .report = report };
+}
+
+fn mergeQualificationEnvelopes(allocator: Allocator, parts: []const []const u8) ![]u8 {
+    var merged = std.ArrayList(QualificationAssignmentRow).empty;
+    errdefer merged.deinit(allocator);
+    for (parts) |json| {
+        var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        try merged.appendSlice(allocator, parsed.value.assignments);
+    }
+    return try std.json.Stringify.valueAlloc(allocator, .{ .assignments = merged.items }, .{});
+}
+
+fn mergeBusinessExtractionEnvelopes(allocator: Allocator, parts: []const []const u8) ![]u8 {
+    var entities = std.StringHashMap(BusinessEntityRow).init(allocator);
+    errdefer entities.deinit();
+    var relations = std.StringHashMap(BusinessRelationRow).init(allocator);
+    errdefer relations.deinit();
+    var aliases = std.ArrayList(BusinessAliasRow).empty;
+    errdefer aliases.deinit(allocator);
+    var entity_documents = std.ArrayList(BusinessEntityDocumentRow).empty;
+    errdefer entity_documents.deinit(allocator);
+    var entity_chunks = std.ArrayList(BusinessEntityChunkRow).empty;
+    errdefer entity_chunks.deinit(allocator);
+    var relation_properties = std.ArrayList(BusinessRelationPropertyRow).empty;
+    errdefer relation_properties.deinit(allocator);
+
+    for (parts) |json| {
+        var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        for (parsed.value.entities_raw) |row| {
+            try entities.put(row.external_id, row);
+        }
+        for (parsed.value.relations_raw) |row| {
+            try relations.put(row.external_id, row);
+        }
+        try aliases.appendSlice(allocator, parsed.value.entity_aliases_raw);
+        try entity_documents.appendSlice(allocator, parsed.value.entity_documents_raw);
+        try entity_chunks.appendSlice(allocator, parsed.value.entity_chunks_raw);
+        try relation_properties.appendSlice(allocator, parsed.value.relation_properties_raw);
+    }
+
+    var entity_values = try allocator.alloc(BusinessEntityRow, entities.count());
+    defer allocator.free(entity_values);
+    var entity_index: usize = 0;
+    var entity_iterator = entities.iterator();
+    while (entity_iterator.next()) |entry| : (entity_index += 1) {
+        entity_values[entity_index] = entry.value_ptr.*;
+    }
+
+    var relation_values = try allocator.alloc(BusinessRelationRow, relations.count());
+    defer allocator.free(relation_values);
+    var relation_index: usize = 0;
+    var relation_iterator = relations.iterator();
+    while (relation_iterator.next()) |entry| : (relation_index += 1) {
+        relation_values[relation_index] = entry.value_ptr.*;
+    }
+
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .entities_raw = entity_values,
+        .relations_raw = relation_values,
+        .entity_aliases_raw = aliases.items,
+        .entity_documents_raw = entity_documents.items,
+        .entity_chunks_raw = entity_chunks.items,
+        .relation_properties_raw = relation_properties.items,
+    }, .{});
+}
+
+fn writeCoverageGapReport(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    expected_json: []const u8,
+) !void {
+    var expected = try std.json.parseFromSlice(
+        struct {
+            counts: ?std.json.ObjectMap = null,
+        },
+        allocator,
+        expected_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer expected.deinit();
+    const counts = expected.value.counts orelse return;
+
+    const stmt = try facet_sqlite.prepare(
+        db,
+        "SELECT entity_type, COUNT(*) FROM entities_raw WHERE workspace_id = ?1 GROUP BY entity_type",
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+
+    var actual = std.StringHashMap(usize).init(allocator);
+    defer actual.deinit();
+    const c = facet_sqlite.c;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        const ptr = c.sqlite3_column_text(stmt, 0) orelse continue;
+        const entity_type = ptr[0..@intCast(c.sqlite3_column_bytes(stmt, 0))];
+        const count = @as(usize, @intCast(c.sqlite3_column_int64(stmt, 1)));
+        try actual.put(try allocator.dupe(u8, entity_type), count);
+    }
+
+    var gaps = std.json.ObjectMap.init(allocator);
+    defer gaps.deinit();
+    var iterator = counts.iterator();
+    while (iterator.next()) |entry| {
+        const expected_count: usize = switch (entry.value_ptr.*) {
+            .integer => |v| @intCast(v),
+            .float => |v| @intCast(@as(i64, @intFromFloat(v))),
+            else => continue,
+        };
+        const actual_count = actual.get(entry.key_ptr.*) orelse 0;
+        if (actual_count >= expected_count) continue;
+        var gap = std.json.ObjectMap.init(allocator);
+        try gap.put("expected", .{ .integer = @intCast(expected_count) });
+        try gap.put("actual", .{ .integer = @intCast(actual_count) });
+        try gaps.put(try allocator.dupe(u8, entry.key_ptr.*), .{ .object = gap });
+    }
+    if (gaps.count() == 0) return;
+
+    const payload = std.json.Value{ .object = gaps };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("COVERAGE_GAP_JSON={s}\n", .{json});
+    try stderr.flush();
+}
+
 fn buildQualificationPrompts(
     allocator: Allocator,
     db: facet_sqlite.Database,
@@ -1990,38 +2423,39 @@ fn buildQualificationPrompts(
     facet_filter: []const u8,
     target: []const u8,
     limit: usize,
+    budget_ctx: PromptBudgetContext,
 ) !PromptPair {
-    var system: std.Io.Writer.Allocating = .init(allocator);
-    errdefer system.deinit();
-    try system.writer.print(
-        \\You qualify source documents against a controlled ontology.
-        \\Return JSON exactly as {{"assignments":[...]}}.
-        \\Each assignment requires target_kind, doc_id, namespace, dimension, value, weight.
-        \\Optional field ontology_id (separate from namespace): use "{s}" when needed.
-        \\namespace MUST be a facet namespace only: domain, source, or finance. DO NOT put ontology ids or "::" in namespace.
-        \\dimension MUST be a facet name only: building, document_type, unit, etc. DO NOT put "namespace.dimension" in dimension.
-        \\Example row: {{"target_kind":"doc","doc_id":1,"namespace":"domain","dimension":"building","value":"Résidence Les Tilleuls","weight":1}}
-        \\Allowed target: {s}.
-        \\Allowed facets (namespace.dimension): {s}.
-        \\Use the taxonomy and facet vocabulary below when choosing namespace, dimension, and value.
-        \\Only use values that are directly supported by the text. Do not invent facts.
-        \\
-        \\Vocabulary:
-        \\
-    , .{ ontology_id, target, facet_filter });
-    try appendQualificationVocabulary(&system.writer, allocator, db, workspace_id, collection_id, ontology_id, facet_filter);
+    var system = try buildQualificationSystemPrompt(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target);
+    errdefer allocator.free(system);
 
-    var user: std.Io.Writer.Allocating = .init(allocator);
-    errdefer user.deinit();
-    try user.writer.writeAll(
+    const user_prefix =
         \\Classify the following MindBrain documents.
         \\
         \\Documents:
         \\
+    ;
+    var docs = try loadPromptDocuments(allocator, db, workspace_id, collection_id, limit, budget_ctx.doc_ids);
+    defer docs.deinit(allocator);
+
+    const budget = try computePromptDocumentLimits(
+        allocator,
+        budget_ctx,
+        docs.rows,
+        system.len,
+        user_prefix.len,
+        estimateQualificationDocMetadataChars,
     );
-    try appendQualificationDocuments(&user.writer, db, workspace_id, collection_id, limit);
+    defer budget.report.deinit(allocator);
+    if (budget_ctx.doc_ids == null) {
+        try llm_context_budget.writeContextBudgetReport(allocator, budget.report);
+    }
+
+    var user: std.Io.Writer.Allocating = .init(allocator);
+    errdefer user.deinit();
+    try user.writer.writeAll(user_prefix);
+    try appendQualificationDocumentsWithLimits(&user.writer, docs.rows, budget.limits);
     return .{
-        .system = try system.toOwnedSlice(),
+        .system = system,
         .user = try user.toOwnedSlice(),
     };
 }
@@ -2078,7 +2512,7 @@ test "qualification prompt keeps ontology vocabulary in system and documents in 
     try db.applyStandaloneSchema();
     try seedPromptSplitFixture(db);
 
-    var prompt = try buildQualificationPrompts(std.testing.allocator, db, "ws-prompt", "ws-prompt::docs", "ws-prompt::core", "topic.category", "doc", 1);
+    var prompt = try buildQualificationPrompts(std.testing.allocator, db, "ws-prompt", "ws-prompt::docs", "ws-prompt::core", "topic.category", "doc", 1, .{});
     defer prompt.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt.system, "\"taxonomies\"") != null);
@@ -2172,38 +2606,6 @@ fn writeQualificationEdgeTypesJson(
     }
 }
 
-fn appendQualificationDocuments(
-    writer: *std.Io.Writer,
-    db: facet_sqlite.Database,
-    workspace_id: []const u8,
-    collection_id: []const u8,
-    limit: usize,
-) !void {
-    const sql =
-        \\SELECT doc_id, source_ref, summary, substr(content, 1, 5000)
-        \\FROM documents_raw
-        \\WHERE workspace_id = ?1 AND collection_id = ?2
-        \\ORDER BY doc_id
-        \\LIMIT ?3
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, collection_id);
-    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(limit)));
-    const c = facet_sqlite.c;
-    while (true) {
-        const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
-        try writer.print("doc_id={d}\nsource_ref={s}\nsummary={s}\ncontent:\n{s}\n---\n", .{
-            c.sqlite3_column_int64(stmt, 0),
-            columnText(stmt, 1),
-            columnText(stmt, 2),
-            columnText(stmt, 3),
-        });
-    }
-}
 
 fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var db_path: ?[]const u8 = null;
@@ -2221,6 +2623,8 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var input_json_path: ?[]const u8 = null;
     var reindex_mode: BusinessReindexMode = .none;
     var limit: usize = 20;
+    var batch_size: usize = 0;
+    var context_budget_json: ?[]const u8 = null;
     var temperature: f32 = 0.0;
     var max_tokens: ?u32 = null;
 
@@ -2233,6 +2637,11 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         } else if (std.mem.eql(u8, arg, "--limit")) {
             const v = try requireArg(args, &index);
             limit = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            const v = try requireArg(args, &index);
+            batch_size = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--context-budget-json")) {
+            context_budget_json = try requireArg(args, &index);
         } else if (std.mem.eql(u8, arg, "--temperature")) {
             const v = try requireArg(args, &index);
             temperature = std.fmt.parseFloat(f32, v) catch return CliError.InvalidArguments;
@@ -2260,11 +2669,17 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         const content = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(content);
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        const expected_for_coverage = if (expected_path) |coverage_path|
+            try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), coverage_path, allocator, .limited(16 * 1024 * 1024))
+        else
+            null;
+        defer if (expected_for_coverage) |json| allocator.free(json);
         try applyAndWriteBusinessExtraction(allocator, db, .{
             .workspace_id = workspace_id.?,
             .collection_id = collection_id.?,
             .ontology_id = ontology_id.?,
             .json = trimmed,
+            .expected_json = expected_for_coverage,
         }, output_path, reindex_mode);
         return;
     }
@@ -2272,82 +2687,28 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     const expected_json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), expected_path.?, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(expected_json);
 
-    var prompt = try buildBusinessExtractionPrompts(allocator, db, .{
+    const content = try runLiveBusinessExtraction(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
         .ontology_id = ontology_id.?,
         .expected_json = expected_json,
         .limit = limit,
-    });
-    defer prompt.deinit(allocator);
-
-    const messages = [_]llm.Message{
-        .{ .role = "system", .content = prompt.system },
-        .{ .role = "user", .content = prompt.user },
-    };
-    if (request_output_path) |path| {
-        const request_json = try renderChatRequestForDebug(allocator, resolved_provider.provider, &messages, .{
-            .temperature = temperature,
-            .max_tokens = max_tokens,
-            .json_mode = true,
-        });
-        defer allocator.free(request_json);
-        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
-            .sub_path = path,
-            .data = request_json,
-            .flags = .{ .truncate = true },
-        });
-    }
-
-    const manager = llm.Manager.init(.{
-        .providers = &.{resolved_provider.provider},
-        .default_provider = "default",
-    });
-    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+        .batch_size = batch_size,
+        .provider = resolved_provider.provider,
         .temperature = temperature,
         .max_tokens = max_tokens,
-        .json_mode = true,
-    }) catch |err| {
-        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
-        return err;
-    };
-    defer response.deinit(allocator);
-
-    if (raw_output_path) |path| {
-        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
-            .sub_path = path,
-            .data = response.raw_json,
-            .flags = .{ .truncate = true },
-        });
-    }
-
-    const content = std.mem.trim(u8, response.content, " \t\r\n");
-    if (content.len == 0) {
-        try writeLlmBusinessExtractionFailure(allocator, .{
-            .reason = "empty_content",
-            .model = resolved_provider.provider.model,
-            .content = response.content,
-            .raw_json = response.raw_json,
-            .parse_error = null,
-        });
-        return error.InvalidLlmBusinessExtractionResponse;
-    }
-    validateJsonObject(allocator, content) catch |err| {
-        try writeLlmBusinessExtractionFailure(allocator, .{
-            .reason = "invalid_json",
-            .model = resolved_provider.provider.model,
-            .content = response.content,
-            .raw_json = response.raw_json,
-            .parse_error = @errorName(err),
-        });
-        return error.InvalidLlmBusinessExtractionResponse;
-    };
+        .context_budget_json = context_budget_json,
+        .request_output_path = request_output_path,
+        .raw_output_path = raw_output_path,
+    });
+    defer allocator.free(content);
 
     try applyAndWriteBusinessExtraction(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
         .ontology_id = ontology_id.?,
         .json = content,
+        .expected_json = expected_json,
     }, output_path, reindex_mode);
 }
 
@@ -2362,6 +2723,9 @@ fn applyAndWriteBusinessExtraction(
     if (reindex_mode == .graph) {
         _ = try reindex_http.reindexGraph(allocator, &db, opts.workspace_id, null);
     }
+    if (opts.expected_json) |expected_json| {
+        try writeCoverageGapReport(allocator, db, opts.workspace_id, expected_json);
+    }
     if (output_path) |path| {
         try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
             .sub_path = path,
@@ -2373,15 +2737,26 @@ fn applyAndWriteBusinessExtraction(
     }
 }
 
-const BusinessExtractionPromptOptions = struct {
+const LiveBusinessExtractOptions = struct {
     workspace_id: []const u8,
     collection_id: []const u8,
     ontology_id: []const u8,
     expected_json: []const u8,
     limit: usize,
+    batch_size: usize = 0,
+    provider: llm.ProviderConfig,
+    temperature: f32,
+    max_tokens: ?u32,
+    context_budget_json: ?[]const u8 = null,
+    request_output_path: ?[]const u8 = null,
+    raw_output_path: ?[]const u8 = null,
 };
 
-fn buildBusinessExtractionPrompts(allocator: Allocator, db: facet_sqlite.Database, opts: BusinessExtractionPromptOptions) !PromptPair {
+fn buildBusinessExtractionSystemPrompt(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionPromptOptions,
+) ![]u8 {
     var system: std.Io.Writer.Allocating = .init(allocator);
     errdefer system.deinit();
     try system.writer.print(
@@ -2409,19 +2784,227 @@ fn buildBusinessExtractionPrompts(allocator: Allocator, db: facet_sqlite.Databas
         \\
     , .{ opts.ontology_id, opts.workspace_id });
     try appendQualificationVocabulary(&system.writer, allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, "");
+    return try system.toOwnedSlice();
+}
+
+fn callBusinessExtractLlm(
+    allocator: Allocator,
+    opts: LiveBusinessExtractOptions,
+    prompt: PromptPair,
+    write_debug_outputs: bool,
+) ![]u8 {
+    const messages = [_]llm.Message{
+        .{ .role = "system", .content = prompt.system },
+        .{ .role = "user", .content = prompt.user },
+    };
+    if (write_debug_outputs) {
+        if (opts.request_output_path) |path| {
+            const request_json = try renderChatRequestForDebug(allocator, opts.provider, &messages, .{
+                .temperature = opts.temperature,
+                .max_tokens = opts.max_tokens,
+                .json_mode = true,
+            });
+            defer allocator.free(request_json);
+            try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+                .sub_path = path,
+                .data = request_json,
+                .flags = .{ .truncate = true },
+            });
+        }
+    }
+
+    const manager = llm.Manager.init(.{
+        .providers = &.{opts.provider},
+        .default_provider = "default",
+    });
+    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+        .temperature = opts.temperature,
+        .max_tokens = opts.max_tokens,
+        .json_mode = true,
+    }) catch |err| {
+        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
+        return err;
+    };
+    defer response.deinit(allocator);
+
+    if (write_debug_outputs) {
+        if (opts.raw_output_path) |path| {
+            try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+                .sub_path = path,
+                .data = response.raw_json,
+                .flags = .{ .truncate = true },
+            });
+        }
+    }
+
+    const content = std.mem.trim(u8, response.content, " \t\r\n");
+    if (content.len == 0) {
+        try writeLlmBusinessExtractionFailure(allocator, .{
+            .reason = "empty_content",
+            .model = opts.provider.model,
+            .content = response.content,
+            .raw_json = response.raw_json,
+            .parse_error = null,
+        });
+        return error.InvalidLlmBusinessExtractionResponse;
+    }
+    validateJsonObject(allocator, content) catch |err| {
+        try writeLlmBusinessExtractionFailure(allocator, .{
+            .reason = "invalid_json",
+            .model = opts.provider.model,
+            .content = response.content,
+            .raw_json = response.raw_json,
+            .parse_error = @errorName(err),
+        });
+        return error.InvalidLlmBusinessExtractionResponse;
+    };
+    return try allocator.dupe(u8, content);
+}
+
+fn splitDocIdBatches(allocator: Allocator, doc_ids: []const u64, batch_size: usize) ![][]u64 {
+    if (batch_size == 0 or doc_ids.len == 0) {
+        return try allocator.dupe([]u64, &.{try allocator.dupe(u64, doc_ids)});
+    }
+    var batches = std.ArrayList([]u64).empty;
+    errdefer {
+        for (batches.items) |batch| allocator.free(batch);
+        batches.deinit(allocator);
+    }
+    var start: usize = 0;
+    while (start < doc_ids.len) {
+        const end = @min(start + batch_size, doc_ids.len);
+        try batches.append(allocator, try allocator.dupe(u64, doc_ids[start..end]));
+        start = end;
+    }
+    return try batches.toOwnedSlice(allocator);
+}
+
+fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, opts: LiveBusinessExtractOptions) ![]u8 {
+    const budget_ctx = PromptBudgetContext{
+        .provider = budgetProviderName(opts.provider),
+        .model = opts.provider.model,
+        .context_budget_json = opts.context_budget_json,
+    };
+    const prompt_opts = BusinessExtractionPromptOptions{
+        .workspace_id = opts.workspace_id,
+        .collection_id = opts.collection_id,
+        .ontology_id = opts.ontology_id,
+        .expected_json = opts.expected_json,
+        .limit = opts.limit,
+    };
+
+    var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, null);
+    defer docs.deinit(allocator);
+    var doc_ids = try allocator.alloc(u64, docs.rows.len);
+    defer allocator.free(doc_ids);
+    for (docs.rows, 0..) |row, i| doc_ids[i] = row.doc_id;
+
+    var batches = if (opts.batch_size > 0)
+        try splitDocIdBatches(allocator, doc_ids, opts.batch_size)
+    else blk: {
+        var system = try buildBusinessExtractionSystemPrompt(allocator, db, prompt_opts);
+        defer allocator.free(system);
+        const user_prefix = try std.fmt.allocPrint(allocator, "Expected coverage contract (cover all listed documents):\n{s}\n\nSource documents:\n\n", .{opts.expected_json});
+        defer allocator.free(user_prefix);
+        var content_lengths = try allocator.alloc(usize, docs.rows.len);
+        defer allocator.free(content_lengths);
+        var metadata_total: usize = 0;
+        for (docs.rows, 0..) |row, i| {
+            content_lengths[i] = row.content.len;
+            metadata_total += estimateBusinessExtractDocMetadataChars(row);
+        }
+        const spec = try llm_context_budget.loadBudget(allocator, budget_ctx.provider, budget_ctx.model, budget_ctx.context_budget_json);
+        var budget_report = try llm_context_budget.computeDocumentCharLimits(
+            allocator,
+            spec,
+            doc_ids,
+            content_lengths,
+            system.len,
+            user_prefix.len + metadata_total,
+        );
+        budget_report.provider = budget_ctx.provider;
+        budget_report.model = budget_ctx.model;
+        defer budget_report.deinit(allocator);
+        try llm_context_budget.writeContextBudgetReport(allocator, budget_report);
+        if (budget_report.needs_batch) {
+            const planned = try llm_context_budget.planBudgetBatches(allocator, spec, doc_ids, content_lengths, system.len, user_prefix.len + metadata_total);
+            try llm_context_budget.writeContextBudgetBatchReport(allocator, planned);
+            break :blk planned;
+        }
+        break :blk try allocator.dupe([]u64, &.{try allocator.dupe(u64, doc_ids)});
+    };
+    defer {
+        for (batches) |batch| allocator.free(batch);
+        allocator.free(batches);
+    }
+
+    if (batches.len == 1 and batches[0].len == doc_ids.len) {
+        var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, budget_ctx);
+        defer prompt.deinit(allocator);
+        return try callBusinessExtractLlm(allocator, opts, prompt, true);
+    }
+
+    var parts = std.ArrayList([]u8).empty;
+    errdefer {
+        for (parts.items) |part| allocator.free(part);
+        parts.deinit(allocator);
+    }
+    for (batches, 0..) |batch, batch_index| {
+        var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
+            .provider = budget_ctx.provider,
+            .model = budget_ctx.model,
+            .context_budget_json = budget_ctx.context_budget_json,
+            .doc_ids = batch,
+        });
+        defer prompt.deinit(allocator);
+        const part = try callBusinessExtractLlm(allocator, opts, prompt, batch_index == 0);
+        try parts.append(allocator, part);
+    }
+    return try mergeBusinessExtractionEnvelopes(allocator, parts.items);
+}
+
+const BusinessExtractionPromptOptions = struct {
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    ontology_id: []const u8,
+    expected_json: []const u8,
+    limit: usize,
+};
+
+fn buildBusinessExtractionPrompts(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    opts: BusinessExtractionPromptOptions,
+    budget_ctx: PromptBudgetContext,
+) !PromptPair {
+    var system = try buildBusinessExtractionSystemPrompt(allocator, db, opts);
+    errdefer allocator.free(system);
+
+    const user_prefix = try std.fmt.allocPrint(allocator, "Expected coverage contract (cover all listed documents):\n{s}\n\nSource documents:\n\n", .{opts.expected_json});
+    defer allocator.free(user_prefix);
+
+    var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, budget_ctx.doc_ids);
+    defer docs.deinit(allocator);
+
+    const budget = try computePromptDocumentLimits(
+        allocator,
+        budget_ctx,
+        docs.rows,
+        system.len,
+        user_prefix.len,
+        estimateBusinessExtractDocMetadataChars,
+    );
+    defer budget.report.deinit(allocator);
+    if (budget_ctx.doc_ids == null) {
+        try llm_context_budget.writeContextBudgetReport(allocator, budget.report);
+    }
 
     var user: std.Io.Writer.Allocating = .init(allocator);
     errdefer user.deinit();
-    try user.writer.print(
-        \\Expected coverage contract (cover all listed documents):
-        \\{s}
-        \\
-        \\Source documents:
-        \\
-    , .{opts.expected_json});
-    try appendBusinessExtractionDocumentsJson(&user.writer, db, opts.workspace_id, opts.collection_id, opts.limit);
+    try user.writer.writeAll(user_prefix);
+    try appendBusinessExtractionDocumentsJsonWithLimits(&user.writer, docs.rows, budget.limits);
     return .{
-        .system = try system.toOwnedSlice(),
+        .system = system,
         .user = try user.toOwnedSlice(),
     };
 }
@@ -2438,7 +3021,7 @@ test "business extraction prompt keeps ontology vocabulary in system and coverag
         .ontology_id = "ws-prompt::core",
         .expected_json = "{\"must_cover\":[\"access-control\"]}",
         .limit = 1,
-    });
+    }, .{});
     defer prompt.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt.system, "\"taxonomies\"") != null);
@@ -2446,45 +3029,6 @@ test "business extraction prompt keeps ontology vocabulary in system and coverag
     try std.testing.expect(std.mem.indexOf(u8, prompt.user, "must_cover") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user, "Article 1. Operators") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt.user, "\"taxonomies\"") == null);
-}
-
-fn appendBusinessExtractionDocumentsJson(
-    writer: *std.Io.Writer,
-    db: facet_sqlite.Database,
-    workspace_id: []const u8,
-    collection_id: []const u8,
-    limit: usize,
-) !void {
-    const sql =
-        \\SELECT doc_id, source_ref, substr(content, 1, 7000)
-        \\FROM documents_raw
-        \\WHERE workspace_id = ?1 AND collection_id = ?2
-        \\ORDER BY doc_id
-        \\LIMIT ?3
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, collection_id);
-    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(limit)));
-    const c = facet_sqlite.c;
-    try writer.writeAll("[");
-    var first = true;
-    while (true) {
-        const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
-        if (!first) try writer.writeAll(",");
-        first = false;
-        try writer.writeAll("{\"doc_id\":");
-        try writer.print("{}", .{c.sqlite3_column_int64(stmt, 0)});
-        try writer.writeAll(",\"source_ref\":");
-        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 1), .{})});
-        try writer.writeAll(",\"content\":");
-        try writer.print("{f}", .{std.json.fmt(columnText(stmt, 2), .{})});
-        try writer.writeAll("}");
-    }
-    try writer.writeAll("]");
 }
 
 const BusinessExtractionEnvelope = struct {
@@ -2556,6 +3100,7 @@ const BusinessExtractionApplyOptions = struct {
     collection_id: []const u8,
     ontology_id: []const u8,
     json: []const u8,
+    expected_json: ?[]const u8 = null,
 };
 
 const BusinessExtractionApplySummary = struct {
@@ -2586,11 +3131,13 @@ fn applyBusinessExtractionEnvelope(allocator: Allocator, db: facet_sqlite.Databa
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
     const summary = applyBusinessExtractionEnvelopeImpl(allocator, db, opts) catch |err| {
-        try writeBusinessExtractionApplyFailure(allocator, .{
-            .reason = "apply_failed",
-            .error_name = @errorName(err),
-            .envelope_json = opts.json,
-        });
+        if (err != business_entity_normalize.NormalizeError.InvalidEntityType) {
+            try writeBusinessExtractionApplyFailure(allocator, .{
+                .reason = "apply_failed",
+                .error_name = @errorName(err),
+                .envelope_json = opts.json,
+            });
+        }
         return err;
     };
     try db.exec("COMMIT");
@@ -2604,6 +3151,13 @@ fn applyBusinessExtractionEnvelopeImpl(allocator: Allocator, db: facet_sqlite.Da
     });
     defer parsed.deinit();
 
+    var ontology_types = try business_entity_normalize.loadOntologyEntityTypes(allocator, db, opts.ontology_id);
+    defer {
+        var type_it = ontology_types.keyIterator();
+        while (type_it.next()) |key| allocator.free(key.*);
+        ontology_types.deinit();
+    }
+
     var entity_ids = std.StringHashMap(u64).init(allocator);
     defer entity_ids.deinit();
     var relation_ids = std.StringHashMap(u64).init(allocator);
@@ -2612,13 +3166,24 @@ fn applyBusinessExtractionEnvelopeImpl(allocator: Allocator, db: facet_sqlite.Da
 
     for (parsed.value.entities_raw) |row| {
         if (row.external_id.len == 0) return CliError.InvalidArguments;
+        const entity_type = business_entity_normalize.normalizeBusinessEntityType(allocator, &ontology_types, row.external_id, row.entity_type, row.name) catch |err| {
+            if (err == business_entity_normalize.NormalizeError.InvalidEntityType) {
+                try writeBusinessExtractionApplyFailure(allocator, .{
+                    .reason = "invalid_entity_type",
+                    .error_name = @errorName(err),
+                    .envelope_json = opts.json,
+                });
+            }
+            return err;
+        };
+        defer allocator.free(entity_type);
         const metadata_json = try jsonValueObjectString(allocator, row.metadata_json);
         defer allocator.free(metadata_json);
         const id = try collections_sqlite.upsertEntityRawAuto(db, .{
             .workspace_id = opts.workspace_id,
             .ontology_id = opts.ontology_id,
             .external_id = row.external_id,
-            .entity_type = row.entity_type,
+            .entity_type = entity_type,
             .name = row.name,
             .confidence = row.confidence,
             .metadata_json = metadata_json,
@@ -2870,6 +3435,8 @@ test "document business extraction applies symbolic external ids with sqlite-gen
         .source_entity_type = "person",
         .target_entity_type = "unit",
     });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-business::core", .entity_type = "person", .label = "Person" });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-business::core", .entity_type = "unit", .label = "Unit" });
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = "ws-business",
         .collection_id = "ws-business::docs",
@@ -2944,6 +3511,8 @@ test "applyBusinessExtractionEnvelope maps block_contains_unit alias" {
         .source_entity_type = "block",
         .target_entity_type = "unit",
     });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-alias::core", .entity_type = "block", .label = "Block" });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-alias::core", .entity_type = "unit", .label = "Unit" });
 
     const json =
         \\{
@@ -3000,6 +3569,68 @@ test "applyBusinessExtractionEnvelope surfaces apply failure and rolls back" {
     try facet_sqlite.bindText(stmt, 1, "ws-fail");
     try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
     try std.testing.expectEqual(@as(i64, 0), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
+}
+
+test "applyBusinessExtractionEnvelope normalizes shared_space external_id prefix" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-shared" });
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = "ws-shared::core",
+        .workspace_id = "ws-shared",
+        .name = "core",
+    });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-shared::core", .entity_type = "shared_space", .label = "Shared space" });
+    try collections_sqlite.ensureEntityType(db, .{ .ontology_id = "ws-shared::core", .entity_type = "shared_equipment", .label = "Shared equipment" });
+
+    const json =
+        \\{"entities_raw":[
+        \\  {"external_id":"shared_space_hall","entity_type":"entity","name":"Hall"},
+        \\  {"external_id":"shared_equipment_lift","entity_type":"entity","name":"Lift"}
+        \\],"relations_raw":[]}
+    ;
+
+    _ = try applyBusinessExtractionEnvelope(std.testing.allocator, db, .{
+        .workspace_id = "ws-shared",
+        .collection_id = "ws-shared::docs",
+        .ontology_id = "ws-shared::core",
+        .json = json,
+    });
+
+    const hall_stmt = try facet_sqlite.prepare(db, "SELECT entity_type FROM entities_raw WHERE workspace_id = ?1 AND external_id = ?2");
+    defer facet_sqlite.finalize(hall_stmt);
+    try facet_sqlite.bindText(hall_stmt, 1, "ws-shared");
+    try facet_sqlite.bindText(hall_stmt, 2, "shared_space_hall");
+    try std.testing.expect(facet_sqlite.c.sqlite3_step(hall_stmt) == facet_sqlite.c.SQLITE_ROW);
+    const hall_ptr = facet_sqlite.c.sqlite3_column_text(hall_stmt, 0) orelse return error.StepFailed;
+    const hall_type = hall_ptr[0..@intCast(facet_sqlite.c.sqlite3_column_bytes(hall_stmt, 0))];
+    try std.testing.expectEqualStrings("shared_space", hall_type);
+}
+
+test "mergeBusinessExtractionEnvelopes preserves entity_documents across doc ids" {
+    const parts = [_][]const u8{
+        \\{"entities_raw":[{"external_id":"entity:1","entity_type":"building","name":"One"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:1","doc_id":1}]}
+        \\{"entities_raw":[{"external_id":"entity:2","entity_type":"building","name":"Two"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:2","doc_id":2}]}
+        \\{"entities_raw":[{"external_id":"entity:3","entity_type":"building","name":"Three"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:3","doc_id":3}]}
+    };
+    const merged = try mergeBusinessExtractionEnvelopes(std.testing.allocator, &parts);
+    defer std.testing.allocator.free(merged);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, merged, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.entity_documents_raw.len);
+
+    var seen = [_]bool{ false, false, false };
+    for (parsed.value.entity_documents_raw) |row| {
+        const doc_id = @as(usize, @intCast(row.doc_id));
+        try std.testing.expect(doc_id >= 1 and doc_id <= 3);
+        seen[doc_id - 1] = true;
+    }
+    try std.testing.expect(seen[0] and seen[1] and seen[2]);
 }
 
 fn renderChatRequestForDebug(allocator: Allocator, provider: llm.ProviderConfig, messages: []const llm.Message, options: llm.ChatOptions) ![]u8 {

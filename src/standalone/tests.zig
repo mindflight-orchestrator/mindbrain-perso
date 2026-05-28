@@ -18,6 +18,8 @@ comptime {
     _ = @import("document_normalize.zig");
     _ = @import("document_qualify_test.zig");
     _ = @import("document_business_extract_test.zig");
+    _ = @import("llm_context_budget.zig");
+    _ = @import("business_entity_normalize.zig");
     _ = @import("facet_parity_test.zig");
     _ = @import("bm25_stopwords_sqlite.zig");
     _ = @import("bench.zig");

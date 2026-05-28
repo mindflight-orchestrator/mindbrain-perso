@@ -1,5 +1,6 @@
 const std = @import("std");
 const business_edge_normalize = @import("business_edge_normalize.zig");
+const business_entity_normalize = @import("business_entity_normalize.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
 
@@ -93,4 +94,31 @@ test "business extract apply failure leaves zero entities after rollback" {
     try facet_sqlite.bindText(stmt, 1, "ws-business-fail");
     try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
     try std.testing.expectEqual(@as(i64, 0), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
+}
+
+test "normalizeBusinessEntityType maps six shared_space fixtures" {
+    var types = std.StringHashMap(void).init(std.testing.allocator);
+    defer types.deinit();
+    try types.put("shared_space", {});
+    try types.put("shared_equipment", {});
+
+    const fixtures = [_]struct { []const u8, []const u8 }{
+        .{ "shared_space_hall", "shared_space" },
+        .{ "shared_space_garden", "shared_space" },
+        .{ "shared_space_parking", "shared_space" },
+        .{ "shared_equipment_lift", "shared_equipment" },
+        .{ "shared_equipment_boiler", "shared_equipment" },
+        .{ "shared_equipment_gate", "shared_equipment" },
+    };
+    for (fixtures) |fixture| {
+        const normalized = try business_entity_normalize.normalizeBusinessEntityType(
+            std.testing.allocator,
+            &types,
+            fixture[0],
+            "entity",
+            "Fixture",
+        );
+        defer std.testing.allocator.free(normalized);
+        try std.testing.expectEqualStrings(fixture[1], normalized);
+    }
 }
