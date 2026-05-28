@@ -342,8 +342,24 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
         .name = "default",
         .source_kind = "auto",
     });
-    try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+    // Only bootstrap default_ontology_id on first workspace creation. Later
+    // ensureWorkspace calls (e.g. document-ingest) must not clobber an explicit
+    // default such as ws::core set by ontology-compile-linkml.
+    if (try defaultOntologyIsUnset(db, spec.workspace_id)) {
+        try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+    }
     try ensureSourceNamespace(db, default_id_slice);
+}
+
+fn defaultOntologyIsUnset(db: Database, workspace_id: []const u8) !bool {
+    const sql = "SELECT default_ontology_id FROM workspace_settings WHERE workspace_id = ?1";
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    const status = c.sqlite3_step(stmt);
+    if (status == c.SQLITE_DONE) return true;
+    if (status != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL;
 }
 
 pub fn setDefaultOntology(db: Database, workspace_id: []const u8, ontology_id: []const u8) !void {
@@ -1447,6 +1463,13 @@ test "ensureWorkspace bootstraps the default ontology with the source.* namespac
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(default_id);
     try std.testing.expectEqualStrings("wsX::default", default_id);
+
+    try setDefaultOntology(db, "wsX", "wsX::core");
+    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
+    const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
+        return error.MissingDefaultOntology;
+    defer std.testing.allocator.free(explicit_default);
+    try std.testing.expectEqualStrings("wsX::core", explicit_default);
 
     const sql_dims =
         \\SELECT COUNT(*) FROM ontology_dimensions

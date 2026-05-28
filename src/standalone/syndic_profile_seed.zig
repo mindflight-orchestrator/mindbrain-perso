@@ -125,6 +125,7 @@ test "seedSyndicProfile sets workspace domain_profile and default ontology" {
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, "ws-syndic");
     try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
-    const profile = facet_sqlite.c.sqlite3_column_text(stmt, 0).?[0..@intCast(facet_sqlite.c.sqlite3_column_bytes(stmt, 0))];
+    const ptr = facet_sqlite.c.sqlite3_column_text(stmt, 0) orelse return error.StepFailed;
+    const profile = ptr[0..@intCast(facet_sqlite.c.sqlite3_column_bytes(stmt, 0))];
     try std.testing.expectEqualStrings("syndic", profile);
 }

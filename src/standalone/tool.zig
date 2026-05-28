@@ -3182,10 +3182,10 @@ fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u
             .domain_profile = if (profile != null) "syndic" else null,
         });
         try linkml_interchange.importCompiledBundle(db, allocator, result.bundle_json);
-        try collections_sqlite.setDefaultOntology(db, workspace_id.?, ontology_id.?);
         if (profile != null) {
             try syndic_profile_seed.seedSyndicProfile(db, workspace_id.?, ontology_id.?);
         }
+        try collections_sqlite.setDefaultOntology(db, workspace_id.?, ontology_id.?);
     }
 
     if (output_path != null) {
