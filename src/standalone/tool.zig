@@ -2314,13 +2314,19 @@ fn mergeBusinessExtractionEnvelopes(allocator: Allocator, parts: []const []const
         for (parsed_parts.items) |*parsed| parsed.deinit();
         parsed_parts.deinit(allocator);
     }
-    for (parts) |json| {
+    for (parts, 0..) |json, batch_index| {
         const normalized = try sanitizeBusinessExtractionJson(allocator, json);
         defer allocator.free(normalized);
-        try parsed_parts.append(allocator, try std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, .{
+        const parsed = std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        }));
+        }) catch |err| {
+            const detail = try std.fmt.allocPrint(allocator, "merge_parse_failed err={s}", .{@errorName(err)});
+            defer allocator.free(detail);
+            try writeBusinessExtractProgress("merge_parse_failed", batch_index, parts.len, 0, "", 0, detail);
+            return err;
+        };
+        try parsed_parts.append(allocator, parsed);
     }
 
     var entities = std.StringHashMap(BusinessEntityRow).init(allocator);
@@ -2731,6 +2737,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     var reindex_mode: BusinessReindexMode = .none;
     var limit: usize = 20;
     var batch_size: usize = 0;
+    var llm_parallel: usize = 1;
     var context_budget_json: ?[]const u8 = null;
     var temperature: f32 = 0.0;
     var max_tokens: ?u32 = null;
@@ -2747,6 +2754,10 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
             const v = try requireArg(args, &index);
             batch_size = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--llm-parallel")) {
+            const v = try requireArg(args, &index);
+            llm_parallel = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
+            if (llm_parallel == 0) return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--context-budget-json")) {
             context_budget_json = try requireArg(args, &index);
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -2803,6 +2814,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         .expected_json = expected_json,
         .limit = limit,
         .batch_size = batch_size,
+        .llm_parallel = llm_parallel,
         .provider = resolved_provider.provider,
         .temperature = temperature,
         .max_tokens = max_tokens,
@@ -2858,6 +2870,7 @@ const LiveBusinessExtractOptions = struct {
     expected_json: []const u8,
     limit: usize,
     batch_size: usize = 0,
+    llm_parallel: usize = 1,
     provider: llm.ProviderConfig,
     temperature: f32,
     max_tokens: ?u32,
@@ -2981,15 +2994,153 @@ fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
-    try sanitizeBusinessExtractionEnvelopeValue(&parsed.value);
+    try sanitizeBusinessExtractionEnvelopeValue(allocator, &parsed.value);
     const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
     parsed.deinit();
     return out;
 }
 
-fn sanitizeBusinessExtractionEnvelopeValue(value: *std.json.Value) !void {
-    if (value.* != .object) return;
+fn ensureEnvelopeArrayField(allocator: Allocator, obj: *std.json.ObjectMap, key: []const u8) void {
+    const v = obj.get(key);
+    if (v == null or v.? != .array) {
+        obj.put(allocator, key, .{ .array = std.json.Array.init(allocator) }) catch {};
+    }
+}
+
+fn copyJsonFieldAlias(
+    allocator: Allocator,
+    row_obj: *std.json.ObjectMap,
+    dest: []const u8,
+    aliases: []const []const u8,
+) !void {
+    if (row_obj.get(dest)) |_| return;
+    for (aliases) |alias| {
+        if (row_obj.get(alias)) |v| {
+            if (v == .string) {
+                try row_obj.put(allocator, dest, .{ .string = try allocator.dupe(u8, v.string) });
+                return;
+            }
+        }
+    }
+}
+
+fn jsonObjectHasNonEmptyString(obj: std.json.ObjectMap, key: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return v == .string and v.string.len > 0;
+}
+
+fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.json.Value) !void {
+    if (value.* != .object) {
+        value.* = .{ .object = .empty };
+        return;
+    }
     const obj = &value.object;
+
+    for (&[_][]const u8{
+        "entities_raw",
+        "relations_raw",
+        "entity_aliases_raw",
+        "entity_documents_raw",
+        "entity_chunks_raw",
+        "relation_properties_raw",
+    }) |key| {
+        ensureEnvelopeArrayField(allocator, obj, key);
+    }
+
+    if (obj.getPtr("entities_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            var kept = std.ArrayList(std.json.Value).empty;
+            defer kept.deinit(allocator);
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                if (!jsonObjectHasNonEmptyString(row_obj.*, "external_id")) continue;
+                try copyJsonFieldAlias(allocator, row_obj, "entity_type", &.{ "type", "kind" });
+                if (!jsonObjectHasNonEmptyString(row_obj.*, "entity_type")) {
+                    try row_obj.put(allocator, "entity_type", .{ .string = "entity" });
+                }
+                if (!jsonObjectHasNonEmptyString(row_obj.*, "name")) {
+                    const ext = row_obj.get("external_id").?.string;
+                    try row_obj.put(allocator, "name", .{ .string = ext });
+                }
+                if (row_obj.get("confidence") == null) {
+                    try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
+                }
+                try kept.append(allocator, row.*);
+            }
+            rows_ptr.* = .{ .array = std.json.Array.fromOwnedSlice(allocator, try kept.toOwnedSlice(allocator)) };
+        }
+    }
+
+    if (obj.getPtr("relations_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            var kept = std.ArrayList(std.json.Value).empty;
+            defer kept.deinit(allocator);
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                try copyJsonFieldAlias(allocator, row_obj, "source_external_id", &.{
+                    "source_entity_id", "source_id", "from_external_id", "from",
+                });
+                try copyJsonFieldAlias(allocator, row_obj, "target_external_id", &.{
+                    "target_entity_id", "target_id", "to_external_id", "to",
+                });
+                try copyJsonFieldAlias(allocator, row_obj, "edge_type", &.{ "relation_type", "type" });
+                if (!jsonObjectHasNonEmptyString(row_obj.*, "source_external_id") or
+                    !jsonObjectHasNonEmptyString(row_obj.*, "target_external_id") or
+                    !jsonObjectHasNonEmptyString(row_obj.*, "edge_type"))
+                {
+                    continue;
+                }
+                if (!jsonObjectHasNonEmptyString(row_obj.*, "external_id")) {
+                    const edge = row_obj.get("edge_type").?.string;
+                    const src = row_obj.get("source_external_id").?.string;
+                    const tgt = row_obj.get("target_external_id").?.string;
+                    const synth = try std.fmt.allocPrint(allocator, "{s}:{s}->{s}", .{ edge, src, tgt });
+                    defer allocator.free(synth);
+                    try row_obj.put(allocator, "external_id", .{ .string = synth });
+                }
+                if (row_obj.get("confidence") == null) {
+                    try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
+                }
+                try kept.append(allocator, row.*);
+            }
+            rows_ptr.* = .{ .array = std.json.Array.fromOwnedSlice(allocator, try kept.toOwnedSlice(allocator)) };
+        }
+    }
+
+    if (obj.getPtr("entity_aliases_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                try copyJsonFieldAlias(allocator, row_obj, "entity_external_id", &.{ "entity_id", "external_id" });
+            }
+        }
+    }
+
+    if (obj.getPtr("entity_documents_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                try copyJsonFieldAlias(allocator, row_obj, "entity_external_id", &.{ "entity_id", "external_id" });
+                if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
+            }
+        }
+    }
+
+    if (obj.getPtr("entity_chunks_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                try copyJsonFieldAlias(allocator, row_obj, "entity_external_id", &.{ "entity_id", "external_id" });
+                if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
+                if (row_obj.getPtr("chunk_index")) |field| coerceJsonOptionalInteger(field);
+            }
+        }
+    }
 
     if (obj.getPtr("relation_properties_raw")) |rows_ptr| {
         if (rows_ptr.* == .array) {
@@ -3067,6 +3218,109 @@ fn splitDocIdBatches(allocator: Allocator, doc_ids: []const u64, batch_size: usi
         start = end;
     }
     return try batches.toOwnedSlice(allocator);
+}
+
+const ExtractBatchJob = struct {
+    batch_index: usize,
+    batch: []const u64,
+    prompt: PromptPair,
+    part: ?[]u8 = null,
+    llm_err: ?anyerror = null,
+};
+
+const LlmWorkerCtx = struct {
+    parent_allocator: Allocator,
+    opts: *const LiveBusinessExtractOptions,
+    job: *ExtractBatchJob,
+    docs_rows: []const PromptDocumentRow,
+    batch_total: usize,
+};
+
+fn businessExtractLlmWorker(ctx: *LlmWorkerCtx) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const thread_alloc = arena.allocator();
+    runOneExtractBatchLlm(thread_alloc, ctx.opts, ctx.job, ctx.docs_rows, ctx.batch_total) catch |err| {
+        ctx.job.llm_err = err;
+        return;
+    };
+    const part = ctx.job.part orelse return;
+    const owned = ctx.parent_allocator.dupe(u8, part) catch |err| {
+        ctx.job.llm_err = err;
+        return;
+    };
+    ctx.job.part = owned;
+}
+
+fn runOneExtractBatchLlm(
+    allocator: Allocator,
+    opts: *const LiveBusinessExtractOptions,
+    job: *ExtractBatchJob,
+    docs_rows: []const PromptDocumentRow,
+    batch_total: usize,
+) !void {
+    try logBusinessExtractBatchDocs("llm_start", job.batch_index, batch_total, job.batch, docs_rows);
+    const part = try callBusinessExtractLlm(allocator, opts.*, job.prompt, job.batch_index == 0);
+    job.part = part;
+    const summary = summarizeBusinessExtractionEnvelope(part);
+    const done_detail = try std.fmt.allocPrint(
+        allocator,
+        "entities={d} relations={d} entity_documents={d} json_chars={d}",
+        .{ summary.entities, summary.relations, summary.entity_documents, part.len },
+    );
+    defer allocator.free(done_detail);
+    for (job.batch) |doc_id| {
+        const row = findPromptDocumentRow(docs_rows, doc_id) orelse continue;
+        try writeBusinessExtractProgress("llm_done", job.batch_index, batch_total, doc_id, row.source_ref, row.content.len, done_detail);
+    }
+}
+
+fn runExtractBatchLlmJobs(
+    allocator: Allocator,
+    opts: *const LiveBusinessExtractOptions,
+    jobs: []ExtractBatchJob,
+    docs_rows: []const PromptDocumentRow,
+) !void {
+    const parallel = @max(opts.llm_parallel, 1);
+    const parallel_detail = try std.fmt.allocPrint(allocator, "llm_parallel={d}", .{parallel});
+    defer allocator.free(parallel_detail);
+    try writeBusinessExtractProgress("llm_parallelism", 0, jobs.len, 0, "", 0, parallel_detail);
+
+    if (parallel == 1) {
+        for (jobs) |*job| {
+            try runOneExtractBatchLlm(allocator, opts, job, docs_rows, jobs.len);
+        }
+    } else {
+        var wave_start: usize = 0;
+        while (wave_start < jobs.len) {
+            const wave_len = @min(parallel, jobs.len - wave_start);
+            const ctxs = try allocator.alloc(LlmWorkerCtx, wave_len);
+            defer allocator.free(ctxs);
+            const threads = try allocator.alloc(std.Thread, wave_len);
+            defer allocator.free(threads);
+
+            for (0..wave_len) |w| {
+                const job = &jobs[wave_start + w];
+                ctxs[w] = .{
+                    .parent_allocator = allocator,
+                    .opts = opts,
+                    .job = job,
+                    .docs_rows = docs_rows,
+                    .batch_total = jobs.len,
+                };
+                threads[w] = try std.Thread.spawn(.{}, businessExtractLlmWorker, .{&ctxs[w]});
+            }
+            for (threads[0..wave_len]) |*thread| {
+                thread.join();
+            }
+            wave_start += wave_len;
+        }
+    }
+
+    for (jobs) |*job| {
+        if (job.llm_err) |err| return err;
+        if (job.part == null) return error.InvalidLlmBusinessExtractionResponse;
+    }
 }
 
 fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, opts: LiveBusinessExtractOptions) ![]u8 {
@@ -3156,30 +3410,31 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
         for (parts.items) |part| allocator.free(part);
         parts.deinit(allocator);
     }
+
+    var jobs = try allocator.alloc(ExtractBatchJob, batches.len);
+    defer {
+        for (jobs) |*job| job.prompt.deinit(allocator);
+        allocator.free(jobs);
+    }
     for (batches, 0..) |batch, batch_index| {
         try logBusinessExtractBatchDocs("prompt_build", batch_index, batches.len, batch, docs.rows);
-        var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
-            .provider = budget_ctx.provider,
-            .model = budget_ctx.model,
-            .context_budget_json = budget_ctx.context_budget_json,
-            .doc_ids = batch,
-            .write_budget_report = false,
-        });
-        defer prompt.deinit(allocator);
-        try logBusinessExtractBatchDocs("llm_start", batch_index, batches.len, batch, docs.rows);
-        const part = try callBusinessExtractLlm(allocator, opts, prompt, batch_index == 0);
-        const summary = summarizeBusinessExtractionEnvelope(part);
-        const done_detail = try std.fmt.allocPrint(
-            allocator,
-            "entities={d} relations={d} entity_documents={d} json_chars={d}",
-            .{ summary.entities, summary.relations, summary.entity_documents, part.len },
-        );
-        defer allocator.free(done_detail);
-        for (batch) |doc_id| {
-            const row = findPromptDocumentRow(docs.rows, doc_id) orelse continue;
-            try writeBusinessExtractProgress("llm_done", batch_index, batches.len, doc_id, row.source_ref, row.content.len, done_detail);
-        }
-        try parts.append(allocator, part);
+        jobs[batch_index] = .{
+            .batch_index = batch_index,
+            .batch = batch,
+            .prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
+                .provider = budget_ctx.provider,
+                .model = budget_ctx.model,
+                .context_budget_json = budget_ctx.context_budget_json,
+                .doc_ids = batch,
+                .write_budget_report = false,
+            }),
+        };
+    }
+
+    try runExtractBatchLlmJobs(allocator, &opts, jobs, docs.rows);
+    for (jobs) |*job| {
+        try parts.append(allocator, job.part.?);
+        job.part = null;
     }
     try writeBusinessExtractProgress("merge_start", 0, parts.items.len, 0, "", 0, "");
     const merged = try mergeBusinessExtractionEnvelopes(allocator, parts.items);
@@ -3837,6 +4092,22 @@ test "applyBusinessExtractionEnvelope normalizes shared_space external_id prefix
     const hall_ptr = facet_sqlite.c.sqlite3_column_text(hall_stmt, 0) orelse return error.StepFailed;
     const hall_type = hall_ptr[0..@intCast(facet_sqlite.c.sqlite3_column_bytes(hall_stmt, 0))];
     try std.testing.expectEqualStrings("shared_space", hall_type);
+}
+
+test "sanitizeBusinessExtractionJson fills missing relation fields" {
+    const raw =
+        \\{"entities_raw":[],"relations_raw":[{"edge_type":"contains","source_entity_id":"a","target_entity_id":"b"}]}
+    ;
+    const normalized = try sanitizeBusinessExtractionJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, normalized, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.relations_raw.len);
+    try std.testing.expectEqualStrings("a", parsed.value.relations_raw[0].source_external_id);
+    try std.testing.expectEqualStrings("b", parsed.value.relations_raw[0].target_external_id);
 }
 
 test "sanitizeBusinessExtractionJson coerces empty numeric strings" {
