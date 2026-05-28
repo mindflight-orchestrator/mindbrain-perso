@@ -2389,7 +2389,11 @@ fn writeCoverageGapReport(
     try facet_sqlite.bindText(stmt, 1, workspace_id);
 
     var actual = std.StringHashMap(usize).init(allocator);
-    defer actual.deinit();
+    defer {
+        var it = actual.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        actual.deinit();
+    }
     const c = facet_sqlite.c;
     while (true) {
         const rc = c.sqlite3_step(stmt);
