@@ -21,6 +21,9 @@ const http_config = @import("http_server_config.zig");
 const http = std.http;
 const log = std.log.scoped(.mindbrain_http);
 
+/// Standalone HTTP engine version exposed by GET /api/mindbrain/capabilities.
+const mindbrain_version = "1.6.1";
+
 fn unixTimestamp() i64 {
     return std.Io.Timestamp.now(zig16_compat.io(), .real).toSeconds();
 }
@@ -1003,6 +1006,10 @@ pub const MindbrainHttpApp = struct {
                 .content_type = "text/plain; charset=utf-8",
                 .body = try allocator.dupe(u8, "ok\n"),
             };
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/capabilities")) {
+            return self.handleCapabilities(allocator);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/simulate")) {
@@ -2629,6 +2636,33 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleCapabilities(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        _ = self;
+        const features = .{
+            .graph_diagnostics = @hasDecl(@This(), "handleGraphDiagnostics"),
+            .graph_gap_rules = @hasDecl(@This(), "handleGraphGapRules"),
+            .graph_gap_rules_import = @hasDecl(@This(), "handleGraphGapRulesImport"),
+            .graph_gap_rules_delete = @hasDecl(@This(), "handleGraphGapRulesDelete"),
+        };
+        const body = try std.fmt.allocPrint(
+            allocator,
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{}}}}}
+        ,
+            .{
+                mindbrain_version,
+                features.graph_diagnostics,
+                features.graph_gap_rules,
+                features.graph_gap_rules_import,
+                features.graph_gap_rules_delete,
+            },
+        );
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = body,
+        };
+    }
+
     fn handleCoverage(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8, by_domain: bool) !Response {
         var db = try self.openDb();
         defer db.close();
@@ -3712,6 +3746,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/reindex/graph
         \\  POST /api/mindbrain/reindex/all
         \\  GET /health
+        \\  GET /api/mindbrain/capabilities
         \\  GET /api/events  (SSE demo_firehose, long-lived)
         \\  GET /api/mindbrain/simulate
         \\  GET /api/mindbrain/events  (alias SSE)
@@ -4430,6 +4465,14 @@ test "graph diagnostics endpoints expose gap rules and report" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const capabilities = try app.handleCapabilities(arena);
+    try std.testing.expect(capabilities.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"kind\":\"mindbrain_capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_diagnostics\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_import\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_delete\":true") != null);
+
     const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_diag_api");
     try std.testing.expect(rules.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"kind\":\"graph_gap_rules\"") != null);
@@ -4440,6 +4483,52 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"kind\":\"graph_diagnostics_report\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"too_many_relations\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"rule_id\":\"unit-one-building\"") != null);
+}
+
+test "graph gap rules import and delete HTTP handlers accept contract payloads" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-graph-gap-rules-write-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_gap_write', 'ws_gap_write', 'Gap Write');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_gap_write::core', 'ws_gap_write', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_gap_write', 'ws_gap_write::core');
+    );
+
+    const import_body =
+        \\{"ontology_id":"ws_gap_write::core","workspace_id":"ws_gap_write","rules":[{"rule_id":"probe-rule","entity_type":"unit","relation_type":"part_of","direction":"out","target_entity_type":"building","min_count":1,"max_count":1,"severity":"error","label":"Probe"}]}
+    ;
+    const imported = try graph_diagnostics.importRulesJson(app.writer_db, std.testing.allocator, import_body);
+    try std.testing.expect(imported >= 1);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_gap_write");
+    try std.testing.expect(rules.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"rule_id\":\"probe-rule\"") != null);
+
+    const deleted = try graph_diagnostics.deleteRulesJson(
+        app.writer_db,
+        std.testing.allocator,
+        \\{"ontology_id":"ws_gap_write::core","workspace_id":"ws_gap_write","rule_ids":["probe-rule"]}
+    );
+    try std.testing.expect(deleted >= 1);
+
+    const rules_after = try app.handleGraphGapRules(arena, "workspace_id=ws_gap_write");
+    try std.testing.expect(rules_after.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, rules_after.body, "\"rule_id\":\"probe-rule\"") == null);
 }
 
 test "studio ontology schema write endpoints expose entity edge property and triple APIs" {

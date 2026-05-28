@@ -68,13 +68,17 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
 | `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get` | High | Retrieval/projection output can expose packed context, evidence, or operational projection rows. |
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/collections/facet-search`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
-| `GET /health`, static assets | Low | Basic liveness/static serving only. |
+| `GET /health`, `GET /api/mindbrain/capabilities`, static assets | Low | Basic liveness, runtime feature flags, and static serving only. |
 
 Graph diagnostics add write routes `POST /api/mindbrain/graph/gap-rules/import`
 and `POST /api/mindbrain/graph/gap-rules/delete`, to load or remove closed-world
 gap rules for an ontology or workspace. The read side is
 `GET /api/mindbrain/graph/gap-rules` for the configured rules and
 `GET /api/mindbrain/graph/diagnostics` for the current report.
+
+Downstream clients (GhostCrab MCP, smoke scripts) can probe
+`GET /api/mindbrain/capabilities` to detect stale binaries that still answer
+`/health` but lack graph diagnostics routes.
 
 ## CLI: `mindbrain-standalone-tool`
 

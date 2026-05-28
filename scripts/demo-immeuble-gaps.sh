@@ -77,6 +77,32 @@ backend_ready() {
 	curl -sf "${BACKEND_URL}/health" >/dev/null 2>&1
 }
 
+capabilities_http() {
+	curl -sf "${BACKEND_URL}/api/mindbrain/capabilities"
+}
+
+assert_graph_routes_http() {
+	echo "==> Probe backend capabilities"
+	local caps
+	caps="$(capabilities_http)"
+	if command -v jq >/dev/null 2>&1; then
+		echo "$caps" | jq '.features'
+		if [[ "$(echo "$caps" | jq -r '.features.graph_diagnostics // false')" != "true" ]]; then
+			echo "error: backend missing graph_diagnostics capability (stale binary? rebuild ghostcrab-backend)" >&2
+			exit 1
+		fi
+	else
+		echo "$caps"
+		case "$caps" in
+			*"\"graph_diagnostics\":true"*) ;;
+			*)
+				echo "error: backend missing graph_diagnostics capability (stale binary? rebuild ghostcrab-backend)" >&2
+				exit 1
+				;;
+		esac
+	fi
+}
+
 resolve_standalone_tool() {
 	if [[ -x "$PROJECT_ROOT/zig-out/bin/mindbrain-standalone-tool" ]]; then
 		echo "$PROJECT_ROOT/zig-out/bin/mindbrain-standalone-tool"
@@ -177,6 +203,8 @@ fi
 report_json=""
 if [[ "$USE_HTTP" == true ]] && backend_ready; then
 	echo "==> Backend: $BACKEND_URL"
+	assert_graph_routes_http
+	echo ""
 	echo "==> Import gap rules (HTTP)"
 	import_rules_http
 	echo ""

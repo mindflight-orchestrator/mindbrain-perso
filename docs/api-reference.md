@@ -158,6 +158,7 @@ Required string fields must be non-empty. `value_id` must be non-negative.
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
 | `GET`/`HEAD` | `/health` | none | `ok\n` |
+| `GET`/`HEAD` | `/api/mindbrain/capabilities` | none | JSON runtime feature flags: `mindbrain_version`, `features.graph_diagnostics`, gap-rules routes |
 | `GET`/`HEAD` | `/api/mindbrain/simulate` | none | JSON simulation event summary; also writes to `demo_firehose` |
 | `GET` | `/api/events` | none | Long-lived SSE stream reading `demo_firehose` |
 | `GET` | `/api/mindbrain/events` | none | Alias of `/api/events` |
