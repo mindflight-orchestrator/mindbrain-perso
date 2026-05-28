@@ -2446,6 +2446,69 @@ fn writeCoverageGapReport(
     try stderr.flush();
 }
 
+fn writeBusinessExtractProgress(
+    step: []const u8,
+    batch_index: usize,
+    batch_total: usize,
+    doc_id: u64,
+    source_ref: []const u8,
+    content_chars: usize,
+    detail: []const u8,
+) !void {
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print(
+        "BUSINESS_EXTRACT_PROGRESS step={s} batch={d}/{d} doc_id={d} source_ref={s} chars={d} {s}\n",
+        .{ step, batch_index + 1, batch_total, doc_id, source_ref, content_chars, detail },
+    );
+    try stderr.flush();
+}
+
+fn findPromptDocumentRow(rows: []const PromptDocumentRow, doc_id: u64) ?PromptDocumentRow {
+    for (rows) |row| {
+        if (row.doc_id == doc_id) return row;
+    }
+    return null;
+}
+
+fn logBusinessExtractBatchDocs(
+    step: []const u8,
+    batch_index: usize,
+    batch_total: usize,
+    batch: []const u64,
+    all_docs: []const PromptDocumentRow,
+) !void {
+    for (batch) |doc_id| {
+        if (findPromptDocumentRow(all_docs, doc_id)) |row| {
+            try writeBusinessExtractProgress(step, batch_index, batch_total, doc_id, row.source_ref, row.content.len, "");
+        } else {
+            try writeBusinessExtractProgress(step, batch_index, batch_total, doc_id, "?", 0, "doc_not_loaded");
+        }
+    }
+}
+
+fn summarizeBusinessExtractionEnvelope(json: []const u8) struct { entities: usize, relations: usize, entity_documents: usize } {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json, .{
+        .ignore_unknown_fields = true,
+    }) catch return .{ .entities = 0, .relations = 0, .entity_documents = 0 };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .entities = 0, .relations = 0, .entity_documents = 0 };
+    const obj = parsed.value.object;
+    return .{
+        .entities = arrayLen(obj.get("entities_raw")),
+        .relations = arrayLen(obj.get("relations_raw")),
+        .entity_documents = arrayLen(obj.get("entity_documents_raw")),
+    };
+}
+
+fn arrayLen(value: ?std.json.Value) usize {
+    const v = value orelse return 0;
+    return switch (v) {
+        .array => |arr| arr.items.len,
+        else => 0,
+    };
+}
+
 fn expectedKeyToEntityType(key: []const u8) []const u8 {
     if (std.mem.eql(u8, key, "buildings")) return "building";
     if (std.mem.eql(u8, key, "blocks")) return "block";
@@ -2731,6 +2794,8 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     const expected_json = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), expected_path.?, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(expected_json);
 
+    try writeBusinessExtractProgress("command_start", 0, 1, 0, "", 0, "live_extract");
+
     const content = try runLiveBusinessExtraction(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
@@ -2747,6 +2812,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
     });
     defer allocator.free(content);
 
+    try writeBusinessExtractProgress("apply_start", 0, 1, 0, "", 0, "db_apply");
     try applyAndWriteBusinessExtraction(allocator, db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
@@ -2754,6 +2820,7 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
         .json = content,
         .expected_json = expected_json,
     }, output_path, reindex_mode);
+    try writeBusinessExtractProgress("command_done", 0, 1, 0, "", 0, "ok");
 }
 
 fn applyAndWriteBusinessExtraction(
@@ -2764,8 +2831,11 @@ fn applyAndWriteBusinessExtraction(
     reindex_mode: BusinessReindexMode,
 ) !void {
     _ = try applyBusinessExtractionEnvelope(allocator, db, opts);
+    try writeBusinessExtractProgress("apply_done", 0, 1, 0, "", 0, "entities_committed");
     if (reindex_mode == .graph) {
+        try writeBusinessExtractProgress("reindex_start", 0, 1, 0, "", 0, "graph");
         _ = try reindex_http.reindexGraph(allocator, &db, opts.workspace_id, null);
+        try writeBusinessExtractProgress("reindex_done", 0, 1, 0, "", 0, "graph");
     }
     if (opts.expected_json) |expected_json| {
         try writeCoverageGapReport(allocator, db, opts.workspace_id, expected_json);
@@ -3019,6 +3089,14 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
     defer allocator.free(doc_ids);
     for (docs.rows, 0..) |row, i| doc_ids[i] = row.doc_id;
 
+    const batch_size = if (opts.batch_size > 0) opts.batch_size else docs.rows.len;
+    const batch_detail = try std.fmt.allocPrint(allocator, "doc_count={d} batch_size={d}", .{ docs.rows.len, batch_size });
+    defer allocator.free(batch_detail);
+    try writeBusinessExtractProgress("docs_loaded", 0, docs.rows.len, 0, "", 0, batch_detail);
+    for (docs.rows) |row| {
+        try writeBusinessExtractProgress("doc_inventory", 0, docs.rows.len, row.doc_id, row.source_ref, row.content.len, "");
+    }
+
     const batches = if (opts.batch_size > 0)
         try splitDocIdBatches(allocator, doc_ids, opts.batch_size)
     else blk: {
@@ -3058,6 +3136,10 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
         allocator.free(batches);
     }
 
+    const batches_detail = try std.fmt.allocPrint(allocator, "batch_count={d}", .{batches.len});
+    defer allocator.free(batches_detail);
+    try writeBusinessExtractProgress("batches_planned", 0, batches.len, 0, "", 0, batches_detail);
+
     if (batches.len == 1 and batches[0].len == doc_ids.len) {
         var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
             .provider = budget_ctx.provider,
@@ -3075,6 +3157,7 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
         parts.deinit(allocator);
     }
     for (batches, 0..) |batch, batch_index| {
+        try logBusinessExtractBatchDocs("prompt_build", batch_index, batches.len, batch, docs.rows);
         var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
             .provider = budget_ctx.provider,
             .model = budget_ctx.model,
@@ -3083,10 +3166,32 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
             .write_budget_report = false,
         });
         defer prompt.deinit(allocator);
+        try logBusinessExtractBatchDocs("llm_start", batch_index, batches.len, batch, docs.rows);
         const part = try callBusinessExtractLlm(allocator, opts, prompt, batch_index == 0);
+        const summary = summarizeBusinessExtractionEnvelope(part);
+        const done_detail = try std.fmt.allocPrint(
+            allocator,
+            "entities={d} relations={d} entity_documents={d} json_chars={d}",
+            .{ summary.entities, summary.relations, summary.entity_documents, part.len },
+        );
+        defer allocator.free(done_detail);
+        for (batch) |doc_id| {
+            const row = findPromptDocumentRow(docs.rows, doc_id) orelse continue;
+            try writeBusinessExtractProgress("llm_done", batch_index, batches.len, doc_id, row.source_ref, row.content.len, done_detail);
+        }
         try parts.append(allocator, part);
     }
-    return try mergeBusinessExtractionEnvelopes(allocator, parts.items);
+    try writeBusinessExtractProgress("merge_start", 0, parts.items.len, 0, "", 0, "");
+    const merged = try mergeBusinessExtractionEnvelopes(allocator, parts.items);
+    const merged_summary = summarizeBusinessExtractionEnvelope(merged);
+    const merge_detail = try std.fmt.allocPrint(
+        allocator,
+        "entities={d} relations={d} entity_documents={d} json_chars={d}",
+        .{ merged_summary.entities, merged_summary.relations, merged_summary.entity_documents, merged.len },
+    );
+    defer allocator.free(merge_detail);
+    try writeBusinessExtractProgress("merge_done", 0, parts.items.len, 0, "", 0, merge_detail);
+    return merged;
 }
 
 const BusinessExtractionPromptOptions = struct {
