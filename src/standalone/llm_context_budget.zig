@@ -43,7 +43,7 @@ const ModelEntry = struct {
 
 const BudgetFile = struct {
     default: BudgetSpec,
-    models: []ModelEntry,
+    models: []const ModelEntry,
 };
 
 pub fn estimateTokensFromChars(chars: usize, chars_per_token: u32) usize {
@@ -126,16 +126,71 @@ pub fn resolveBudgetSpec(file: BudgetFile, provider: []const u8, model: []const 
     return file.default;
 }
 
+const builtin_budget_file: BudgetFile = .{
+    .default = .{
+        .context_tokens = 128000,
+        .output_tokens = 16384,
+        .prompt_reserve_tokens = 8192,
+        .chars_per_token = 4,
+    },
+    .models = &.{
+        .{
+            .provider = "openai",
+            .model = "gpt-5-mini",
+            .match = .exact,
+            .spec = .{
+                .context_tokens = 400000,
+                .output_tokens = 128000,
+                .prompt_reserve_tokens = 32000,
+                .chars_per_token = 4,
+            },
+        },
+        .{
+            .provider = "openai",
+            .model = "gpt-5-nano",
+            .match = .exact,
+            .spec = .{
+                .context_tokens = 128000,
+                .output_tokens = 32768,
+                .prompt_reserve_tokens = 16384,
+                .chars_per_token = 4,
+            },
+        },
+        .{
+            .provider = "openai",
+            .model = "gpt-5*",
+            .match = .prefix,
+            .spec = .{
+                .context_tokens = 400000,
+                .output_tokens = 128000,
+                .prompt_reserve_tokens = 32000,
+                .chars_per_token = 4,
+            },
+        },
+    },
+};
+
 pub fn loadBudget(
     allocator: std.mem.Allocator,
     provider: []const u8,
     model: []const u8,
     json_path: ?[]const u8,
 ) !BudgetSpec {
-    const path = json_path orelse default_budget_json_path;
-    const json = try std.Io.Dir.cwd().readFileAlloc(zig16_compat.io(), path, allocator, .limited(1024 * 1024));
+    if (json_path) |path| {
+        const json = try std.Io.Dir.cwd().readFileAlloc(zig16_compat.io(), path, allocator, .limited(1024 * 1024));
+        defer allocator.free(json);
+        const file = try loadBudgetFromJson(allocator, json);
+        defer allocator.free(file.models);
+        return resolveBudgetSpec(file, provider, model);
+    }
+
+    const json = std.Io.Dir.cwd().readFileAlloc(zig16_compat.io(), default_budget_json_path, allocator, .limited(1024 * 1024)) catch {
+        return resolveBudgetSpec(builtin_budget_file, provider, model);
+    };
     defer allocator.free(json);
-    const file = try loadBudgetFromJson(allocator, json);
+    const file = loadBudgetFromJson(allocator, json) catch {
+        return resolveBudgetSpec(builtin_budget_file, provider, model);
+    };
     defer allocator.free(file.models);
     return resolveBudgetSpec(file, provider, model);
 }

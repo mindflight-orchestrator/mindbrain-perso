@@ -1976,7 +1976,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
 
     var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, null);
     defer docs.deinit(allocator);
-    var system = try buildQualificationSystemPrompt(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target);
+    const system = try buildQualificationSystemPrompt(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target);
     defer allocator.free(system);
 
     const spec = try llm_context_budget.loadBudget(allocator, budget_ctx.provider, budget_ctx.model, budget_ctx.context_budget_json);
@@ -2022,6 +2022,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
                 .model = budget_ctx.model,
                 .context_budget_json = budget_ctx.context_budget_json,
                 .doc_ids = batch,
+                .write_budget_report = false,
             });
             defer prompt.deinit(allocator);
             const part = try callQualificationLlm(allocator, opts, prompt);
@@ -2030,7 +2031,12 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
         return try mergeQualificationEnvelopes(allocator, parts.items);
     }
 
-    var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit, budget_ctx);
+    var prompt = try buildQualificationPrompts(allocator, db, opts.workspace_id, opts.collection_id, opts.ontology_id, opts.facet_filter, opts.target, opts.limit, .{
+        .provider = budget_ctx.provider,
+        .model = budget_ctx.model,
+        .context_budget_json = budget_ctx.context_budget_json,
+        .write_budget_report = false,
+    });
     defer prompt.deinit(allocator);
     return try callQualificationLlm(allocator, opts, prompt);
 }
@@ -2103,6 +2109,7 @@ const PromptBudgetContext = struct {
     model: []const u8 = "gpt-5-mini",
     context_budget_json: ?[]const u8 = null,
     doc_ids: ?[]const u64 = null,
+    write_budget_report: bool = true,
 };
 
 const PromptDocumentRow = struct {
@@ -2114,14 +2121,23 @@ const PromptDocumentRow = struct {
 
 const PromptDocumentList = struct {
     rows: []PromptDocumentRow,
-    owned: []const []u8,
 
     fn deinit(self: PromptDocumentList, allocator: Allocator) void {
-        for (self.owned) |owned| allocator.free(owned);
-        allocator.free(self.owned);
+        for (self.rows) |row| {
+            allocator.free(row.source_ref);
+            allocator.free(row.summary);
+            allocator.free(row.content);
+        }
         allocator.free(self.rows);
     }
 };
+
+fn dupeOptionalColumnText(allocator: Allocator, stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int) ![]const u8 {
+    if (facet_sqlite.c.sqlite3_column_type(stmt, index) == facet_sqlite.c.SQLITE_NULL) {
+        return try allocator.dupe(u8, "");
+    }
+    return try facet_sqlite.dupeColumnText(allocator, stmt, index);
+}
 
 fn loadPromptDocuments(
     allocator: Allocator,
@@ -2145,11 +2161,13 @@ fn loadPromptDocuments(
     try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(limit)));
 
     var rows = std.ArrayList(PromptDocumentRow).empty;
-    errdefer rows.deinit(allocator);
-    var owned = std.ArrayList([]u8).empty;
     errdefer {
-        for (owned.items) |item| allocator.free(item);
-        owned.deinit(allocator);
+        for (rows.items) |row| {
+            allocator.free(row.source_ref);
+            allocator.free(row.summary);
+            allocator.free(row.content);
+        }
+        rows.deinit(allocator);
     }
 
     const c = facet_sqlite.c;
@@ -2168,14 +2186,11 @@ fn loadPromptDocuments(
             }
             if (!include) continue;
         }
-        const source_ref = try facet_sqlite.dupeColumnText(allocator, stmt, 1);
+        const source_ref = try dupeOptionalColumnText(allocator, stmt, 1);
         errdefer allocator.free(source_ref);
-        const summary = try facet_sqlite.dupeColumnText(allocator, stmt, 2);
+        const summary = try dupeOptionalColumnText(allocator, stmt, 2);
         errdefer allocator.free(summary);
         const content = try facet_sqlite.dupeColumnText(allocator, stmt, 3);
-        try owned.append(allocator, source_ref);
-        try owned.append(allocator, summary);
-        try owned.append(allocator, content);
         try rows.append(allocator, .{
             .doc_id = doc_id,
             .source_ref = source_ref,
@@ -2186,7 +2201,6 @@ fn loadPromptDocuments(
 
     return .{
         .rows = try rows.toOwnedSlice(allocator),
-        .owned = try owned.toOwnedSlice(allocator),
     };
 }
 
@@ -2273,6 +2287,8 @@ fn computePromptDocumentLimits(
         system_chars,
         fixed_user_chars + metadata_total,
     );
+    allocator.free(doc_ids);
+    allocator.free(content_lengths);
     report.provider = budget_ctx.provider;
     report.model = budget_ctx.model;
     return .{ .limits = report.per_doc_limits, .report = report };
@@ -2356,16 +2372,14 @@ fn writeCoverageGapReport(
     workspace_id: []const u8,
     expected_json: []const u8,
 ) !void {
-    var expected = try std.json.parseFromSlice(
-        struct {
-            counts: ?std.json.ObjectMap = null,
-        },
-        allocator,
-        expected_json,
-        .{ .ignore_unknown_fields = true },
-    );
-    defer expected.deinit();
-    const counts = expected.value.counts orelse return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, expected_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const counts_val = parsed.value.object.get("counts") orelse return;
+    if (counts_val != .object) return;
+    const counts = counts_val.object;
 
     const stmt = try facet_sqlite.prepare(
         db,
@@ -2387,8 +2401,10 @@ fn writeCoverageGapReport(
         try actual.put(try allocator.dupe(u8, entity_type), count);
     }
 
-    var gaps = std.json.ObjectMap.init(allocator);
-    defer gaps.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{");
+    var first = true;
     var iterator = counts.iterator();
     while (iterator.next()) |entry| {
         const expected_count: usize = switch (entry.value_ptr.*) {
@@ -2396,22 +2412,37 @@ fn writeCoverageGapReport(
             .float => |v| @intCast(@as(i64, @intFromFloat(v))),
             else => continue,
         };
-        const actual_count = actual.get(entry.key_ptr.*) orelse 0;
+        const mapped_type = expectedKeyToEntityType(entry.key_ptr.*);
+        const actual_count = actual.get(mapped_type) orelse actual.get(entry.key_ptr.*) orelse 0;
         if (actual_count >= expected_count) continue;
-        var gap = std.json.ObjectMap.init(allocator);
-        try gap.put("expected", .{ .integer = @intCast(expected_count) });
-        try gap.put("actual", .{ .integer = @intCast(actual_count) });
-        try gaps.put(try allocator.dupe(u8, entry.key_ptr.*), .{ .object = gap });
+        if (!first) try out.writer.writeAll(",");
+        first = false;
+        try out.writer.print(
+            "{f}:{{\"expected\":{},\"actual\":{}}}",
+            .{ std.json.fmt(entry.key_ptr.*, .{}), expected_count, actual_count },
+        );
     }
-    if (gaps.count() == 0) return;
+    if (first) return;
+    try out.writer.writeAll("}");
 
-    const payload = std.json.Value{ .object = gaps };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    const json = try out.toOwnedSlice();
     defer allocator.free(json);
     var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
     const stderr = &stderr_file_writer.interface;
     try stderr.print("COVERAGE_GAP_JSON={s}\n", .{json});
     try stderr.flush();
+}
+
+fn expectedKeyToEntityType(key: []const u8) []const u8 {
+    if (std.mem.eql(u8, key, "buildings")) return "building";
+    if (std.mem.eql(u8, key, "blocks")) return "block";
+    if (std.mem.eql(u8, key, "units")) return "unit";
+    if (std.mem.eql(u8, key, "households")) return "household";
+    if (std.mem.eql(u8, key, "cellars")) return "cellar";
+    if (std.mem.eql(u8, key, "private_gardens")) return "private_garden";
+    if (std.mem.eql(u8, key, "lease_contracts")) return "lease_contract";
+    if (std.mem.eql(u8, key, "coda_entries")) return "coda_entry";
+    return key;
 }
 
 fn buildQualificationPrompts(
@@ -2425,7 +2456,7 @@ fn buildQualificationPrompts(
     limit: usize,
     budget_ctx: PromptBudgetContext,
 ) !PromptPair {
-    var system = try buildQualificationSystemPrompt(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target);
+    const system = try buildQualificationSystemPrompt(allocator, db, workspace_id, collection_id, ontology_id, facet_filter, target);
     errdefer allocator.free(system);
 
     const user_prefix =
@@ -2437,7 +2468,7 @@ fn buildQualificationPrompts(
     var docs = try loadPromptDocuments(allocator, db, workspace_id, collection_id, limit, budget_ctx.doc_ids);
     defer docs.deinit(allocator);
 
-    const budget = try computePromptDocumentLimits(
+    var budget = try computePromptDocumentLimits(
         allocator,
         budget_ctx,
         docs.rows,
@@ -2446,7 +2477,7 @@ fn buildQualificationPrompts(
         estimateQualificationDocMetadataChars,
     );
     defer budget.report.deinit(allocator);
-    if (budget_ctx.doc_ids == null) {
+    if (budget_ctx.write_budget_report and budget_ctx.doc_ids == null) {
         try llm_context_budget.writeContextBudgetReport(allocator, budget.report);
     }
 
@@ -2899,10 +2930,10 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
     defer allocator.free(doc_ids);
     for (docs.rows, 0..) |row, i| doc_ids[i] = row.doc_id;
 
-    var batches = if (opts.batch_size > 0)
+    const batches = if (opts.batch_size > 0)
         try splitDocIdBatches(allocator, doc_ids, opts.batch_size)
     else blk: {
-        var system = try buildBusinessExtractionSystemPrompt(allocator, db, prompt_opts);
+        const system = try buildBusinessExtractionSystemPrompt(allocator, db, prompt_opts);
         defer allocator.free(system);
         const user_prefix = try std.fmt.allocPrint(allocator, "Expected coverage contract (cover all listed documents):\n{s}\n\nSource documents:\n\n", .{opts.expected_json});
         defer allocator.free(user_prefix);
@@ -2939,7 +2970,12 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
     }
 
     if (batches.len == 1 and batches[0].len == doc_ids.len) {
-        var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, budget_ctx);
+        var prompt = try buildBusinessExtractionPrompts(allocator, db, prompt_opts, .{
+            .provider = budget_ctx.provider,
+            .model = budget_ctx.model,
+            .context_budget_json = budget_ctx.context_budget_json,
+            .write_budget_report = false,
+        });
         defer prompt.deinit(allocator);
         return try callBusinessExtractLlm(allocator, opts, prompt, true);
     }
@@ -2955,6 +2991,7 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
             .model = budget_ctx.model,
             .context_budget_json = budget_ctx.context_budget_json,
             .doc_ids = batch,
+            .write_budget_report = false,
         });
         defer prompt.deinit(allocator);
         const part = try callBusinessExtractLlm(allocator, opts, prompt, batch_index == 0);
@@ -2977,7 +3014,7 @@ fn buildBusinessExtractionPrompts(
     opts: BusinessExtractionPromptOptions,
     budget_ctx: PromptBudgetContext,
 ) !PromptPair {
-    var system = try buildBusinessExtractionSystemPrompt(allocator, db, opts);
+    const system = try buildBusinessExtractionSystemPrompt(allocator, db, opts);
     errdefer allocator.free(system);
 
     const user_prefix = try std.fmt.allocPrint(allocator, "Expected coverage contract (cover all listed documents):\n{s}\n\nSource documents:\n\n", .{opts.expected_json});
@@ -2986,7 +3023,7 @@ fn buildBusinessExtractionPrompts(
     var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, budget_ctx.doc_ids);
     defer docs.deinit(allocator);
 
-    const budget = try computePromptDocumentLimits(
+    var budget = try computePromptDocumentLimits(
         allocator,
         budget_ctx,
         docs.rows,
@@ -2995,7 +3032,7 @@ fn buildBusinessExtractionPrompts(
         estimateBusinessExtractDocMetadataChars,
     );
     defer budget.report.deinit(allocator);
-    if (budget_ctx.doc_ids == null) {
+    if (budget_ctx.write_budget_report and budget_ctx.doc_ids == null) {
         try llm_context_budget.writeContextBudgetReport(allocator, budget.report);
     }
 
