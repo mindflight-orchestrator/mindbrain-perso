@@ -1,0 +1,29 @@
+{
+  "assignments": [
+    {"target_kind": "doc", "doc_id": 1, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "statuts_copropriete", "weight": 1},
+    {"target_kind": "doc", "doc_id": 1, "namespace": "ws-qualify::core", "dimension": "domain.building", "value": "Résidence Les Tilleuls", "weight": 1},
+    {"target_kind": "doc", "doc_id": 1, "namespace": "ws-qualify::core", "dimension": "domain.unit", "value": "A1", "weight": 1},
+    {"target_kind": "doc", "doc_id": 2, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "registre_coproprietaires", "weight": 1},
+    {"target_kind": "doc", "doc_id": 2, "namespace": "ws-qualify::core", "dimension": "domain.building", "value": "Résidence Les Tilleuls", "weight": 1},
+    {"target_kind": "doc", "doc_id": 2, "namespace": "ws-qualify::core", "dimension": "domain.role", "value": "owner", "weight": 1},
+    {"target_kind": "doc", "doc_id": 3, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "composition_menage", "weight": 1},
+    {"target_kind": "doc", "doc_id": 3, "namespace": "ws-qualify::core", "dimension": "domain.scenario", "value": "household_change", "weight": 1},
+    {"target_kind": "doc", "doc_id": 4, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "bail", "weight": 1},
+    {"target_kind": "doc", "doc_id": 4, "namespace": "ws-qualify::core", "dimension": "domain.unit", "value": "B2", "weight": 1},
+    {"target_kind": "doc", "doc_id": 5, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "pv_ag", "weight": 1},
+    {"target_kind": "doc", "doc_id": 5, "namespace": "ws-qualify::core", "dimension": "domain.decision", "value": "works_approval", "weight": 1},
+    {"target_kind": "doc", "doc_id": 6, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "extrait_coda", "weight": 1},
+    {"target_kind": "doc", "doc_id": 6, "namespace": "ws-qualify::core", "dimension": "finance.payment_status", "value": "paid", "weight": 1},
+    {"target_kind": "doc", "doc_id": 7, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "annexe_lot", "weight": 1},
+    {"target_kind": "doc", "doc_id": 7, "namespace": "ws-qualify::core", "dimension": "domain.unit", "value": "C3", "weight": 1},
+    {"target_kind": "doc", "doc_id": 8, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "registre_facturation", "weight": 1},
+    {"target_kind": "doc", "doc_id": 8, "namespace": "ws-qualify::core", "dimension": "finance.payment_status", "value": "pending", "weight": 1},
+    {"target_kind": "doc", "doc_id": 9, "namespace": "ws-qualify::core", "dimension": "source.document_type", "value": "registre_facturation", "weight": 1},
+    {"target_kind": "doc", "doc_id": 9, "namespace": "ws-qualify::core", "dimension": "domain.building", "value": "Résidence Les Tilleuls", "weight": 1},
+    {"target_kind": "doc", "doc_id": 9, "namespace": "ws-qualify::core", "dimension": "domain.decision", "value": "billing_group", "weight": 1},
+    {"target_kind": "doc", "doc_id": 1, "namespace": "ws-qualify::core", "dimension": "domain.scenario", "value": "copro_statutes", "weight": 1},
+    {"target_kind": "doc", "doc_id": 2, "namespace": "ws-qualify::core", "dimension": "domain.unit", "value": "A1", "weight": 1},
+    {"target_kind": "doc", "doc_id": 3, "namespace": "ws-qualify::core", "dimension": "domain.building", "value": "Résidence Les Tilleuls", "weight": 1},
+    {"target_kind": "doc", "doc_id": 4, "namespace": "ws-qualify::core", "dimension": "domain.role", "value": "tenant", "weight": 1}
+  ]
+}

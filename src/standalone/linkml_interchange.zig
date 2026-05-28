@@ -1,5 +1,6 @@
 const std = @import("std");
 const collections_io = @import("collections_io.zig");
+const collections_sqlite = @import("collections_sqlite.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
 const zig16_compat = @import("zig16_compat.zig");
 
@@ -1279,4 +1280,46 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         rest = rest[index + needle.len ..];
     }
     return count;
+}
+
+test "compile import sets default_ontology_id" {
+    var result = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = "ontologies/immeuble-demo/core.yaml",
+        .workspace_id = "ws-compile",
+        .ontology_id = "ws-compile::core",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-compile" });
+    try importCompiledBundle(db, std.testing.allocator, result.bundle_json);
+    try collections_sqlite.setDefaultOntology(db, "ws-compile", "ws-compile::core");
+
+    const default_id = try collections_sqlite.defaultOntology(db, std.testing.allocator, "ws-compile");
+    defer if (default_id) |id| std.testing.allocator.free(id);
+    try std.testing.expect(default_id != null);
+    try std.testing.expectEqualStrings("ws-compile::core", default_id.?);
+}
+
+test "compile import ensures workspace row exists for target workspace" {
+    var result = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = "ontologies/immeuble-demo/core.yaml",
+        .workspace_id = "ws-only",
+        .ontology_id = "ws-only::core",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-only" });
+    try importCompiledBundle(db, std.testing.allocator, result.bundle_json);
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, "ws-only");
+    try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
+    try std.testing.expectEqual(@as(i64, 1), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
 }

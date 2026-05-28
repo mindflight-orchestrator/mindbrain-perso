@@ -16,6 +16,8 @@ comptime {
     _ = @import("data_sources_test.zig");
     _ = @import("db_benchmark.zig");
     _ = @import("document_normalize.zig");
+    _ = @import("document_qualify_test.zig");
+    _ = @import("document_business_extract_test.zig");
     _ = @import("facet_parity_test.zig");
     _ = @import("bm25_stopwords_sqlite.zig");
     _ = @import("bench.zig");
