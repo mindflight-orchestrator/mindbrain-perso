@@ -3048,12 +3048,14 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
 
     if (obj.getPtr("entities_raw")) |rows_ptr| {
         if (rows_ptr.* == .array) {
-            var kept = std.ArrayList(std.json.Value).empty;
-            defer kept.deinit(allocator);
-            for (rows_ptr.array.items) |*row| {
-                if (row.* != .object) continue;
+            var i: usize = 0;
+            while (i < rows_ptr.array.items.len) {
+                const row = &rows_ptr.array.items[i];
+                if (row.* != .object or !jsonObjectHasNonEmptyString(row.object, "external_id")) {
+                    _ = rows_ptr.array.swapRemove(i);
+                    continue;
+                }
                 const row_obj = &row.object;
-                if (!jsonObjectHasNonEmptyString(row_obj.*, "external_id")) continue;
                 try copyJsonFieldAlias(allocator, row_obj, "entity_type", &.{ "type", "kind" });
                 if (!jsonObjectHasNonEmptyString(row_obj.*, "entity_type")) {
                     try row_obj.put(allocator, "entity_type", .{ .string = "entity" });
@@ -3065,18 +3067,20 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 if (row_obj.get("confidence") == null) {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
                 }
-                try kept.append(allocator, row.*);
+                i += 1;
             }
-            rows_ptr.* = .{ .array = std.json.Array.fromOwnedSlice(allocator, try kept.toOwnedSlice(allocator)) };
         }
     }
 
     if (obj.getPtr("relations_raw")) |rows_ptr| {
         if (rows_ptr.* == .array) {
-            var kept = std.ArrayList(std.json.Value).empty;
-            defer kept.deinit(allocator);
-            for (rows_ptr.array.items) |*row| {
-                if (row.* != .object) continue;
+            var i: usize = 0;
+            while (i < rows_ptr.array.items.len) {
+                const row = &rows_ptr.array.items[i];
+                if (row.* != .object) {
+                    _ = rows_ptr.array.swapRemove(i);
+                    continue;
+                }
                 const row_obj = &row.object;
                 try copyJsonFieldAlias(allocator, row_obj, "source_external_id", &.{
                     "source_entity_id", "source_id", "from_external_id", "from",
@@ -3089,6 +3093,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                     !jsonObjectHasNonEmptyString(row_obj.*, "target_external_id") or
                     !jsonObjectHasNonEmptyString(row_obj.*, "edge_type"))
                 {
+                    _ = rows_ptr.array.swapRemove(i);
                     continue;
                 }
                 if (!jsonObjectHasNonEmptyString(row_obj.*, "external_id")) {
@@ -3102,9 +3107,8 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 if (row_obj.get("confidence") == null) {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
                 }
-                try kept.append(allocator, row.*);
+                i += 1;
             }
-            rows_ptr.* = .{ .array = std.json.Array.fromOwnedSlice(allocator, try kept.toOwnedSlice(allocator)) };
         }
     }
 
