@@ -3000,11 +3000,10 @@ fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 
     return out;
 }
 
-fn ensureEnvelopeArrayField(allocator: Allocator, obj: *std.json.ObjectMap, key: []const u8) void {
-    const v = obj.get(key);
-    if (v == null or v.? != .array) {
-        obj.put(allocator, key, .{ .array = std.json.Array.init(allocator) }) catch {};
-    }
+fn ensureEnvelopeArrayField(allocator: Allocator, obj: *std.json.ObjectMap, key: []const u8) !void {
+    const gop = try obj.getOrPut(allocator, key);
+    if (gop.found_existing and gop.value_ptr.* == .array) return;
+    gop.value_ptr.* = .{ .array = std.json.Array.init(allocator) };
 }
 
 fn copyJsonFieldAlias(
@@ -3044,7 +3043,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
         "entity_chunks_raw",
         "relation_properties_raw",
     }) |key| {
-        ensureEnvelopeArrayField(allocator, obj, key);
+        try ensureEnvelopeArrayField(allocator, obj, key);
     }
 
     if (obj.getPtr("entities_raw")) |rows_ptr| {
