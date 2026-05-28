@@ -2309,25 +2309,34 @@ fn mergeQualificationEnvelopes(allocator: Allocator, parts: []const []const u8) 
 }
 
 fn mergeBusinessExtractionEnvelopes(allocator: Allocator, parts: []const []const u8) ![]u8 {
-    var entities = std.StringHashMap(BusinessEntityRow).init(allocator);
-    errdefer entities.deinit();
-    var relations = std.StringHashMap(BusinessRelationRow).init(allocator);
-    errdefer relations.deinit();
-    var aliases = std.ArrayList(BusinessAliasRow).empty;
-    errdefer aliases.deinit(allocator);
-    var entity_documents = std.ArrayList(BusinessEntityDocumentRow).empty;
-    errdefer entity_documents.deinit(allocator);
-    var entity_chunks = std.ArrayList(BusinessEntityChunkRow).empty;
-    errdefer entity_chunks.deinit(allocator);
-    var relation_properties = std.ArrayList(BusinessRelationPropertyRow).empty;
-    errdefer relation_properties.deinit(allocator);
-
+    var parsed_parts = std.ArrayList(std.json.Parsed(BusinessExtractionEnvelope)).empty;
+    defer {
+        for (parsed_parts.items) |*parsed| parsed.deinit();
+        parsed_parts.deinit(allocator);
+    }
     for (parts) |json| {
-        var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, json, .{
+        const normalized = try sanitizeBusinessExtractionJson(allocator, json);
+        defer allocator.free(normalized);
+        try parsed_parts.append(allocator, try std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
+        }));
+    }
+
+    var entities = std.StringHashMap(BusinessEntityRow).init(allocator);
+    defer entities.deinit();
+    var relations = std.StringHashMap(BusinessRelationRow).init(allocator);
+    defer relations.deinit();
+    var aliases = std.ArrayList(BusinessAliasRow).empty;
+    defer aliases.deinit(allocator);
+    var entity_documents = std.ArrayList(BusinessEntityDocumentRow).empty;
+    defer entity_documents.deinit(allocator);
+    var entity_chunks = std.ArrayList(BusinessEntityChunkRow).empty;
+    defer entity_chunks.deinit(allocator);
+    var relation_properties = std.ArrayList(BusinessRelationPropertyRow).empty;
+    defer relation_properties.deinit(allocator);
+
+    for (parsed_parts.items) |parsed| {
         for (parsed.value.entities_raw) |row| {
             try entities.put(row.external_id, row);
         }
@@ -2893,7 +2902,83 @@ fn callBusinessExtractLlm(
         });
         return error.InvalidLlmBusinessExtractionResponse;
     };
-    return try allocator.dupe(u8, content);
+    const normalized = try sanitizeBusinessExtractionJson(allocator, content);
+    return normalized;
+}
+
+fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer parsed.deinit();
+    try sanitizeBusinessExtractionEnvelopeValue(&parsed.value);
+    const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    parsed.deinit();
+    return out;
+}
+
+fn sanitizeBusinessExtractionEnvelopeValue(value: *std.json.Value) !void {
+    if (value.* != .object) return;
+    const obj = &value.object;
+
+    if (obj.getPtr("relation_properties_raw")) |rows_ptr| {
+        if (rows_ptr.* == .array) {
+            for (rows_ptr.array.items) |*row| {
+                if (row.* != .object) continue;
+                const row_obj = &row.object;
+                if (row_obj.getPtr("value_integer")) |field| coerceJsonOptionalInteger(field);
+                if (row_obj.getPtr("ref_doc_id")) |field| coerceJsonOptionalInteger(field);
+                if (row_obj.getPtr("value_number")) |field| coerceJsonOptionalFloat(field);
+            }
+        }
+    }
+
+    for (&[_][]const u8{ "entity_documents_raw", "entity_chunks_raw" }) |key| {
+        const rows_ptr = obj.getPtr(key) orelse continue;
+        if (rows_ptr.* != .array) continue;
+        for (rows_ptr.array.items) |*row| {
+            if (row.* != .object) continue;
+            const row_obj = &row.object;
+            if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
+            if (row_obj.getPtr("chunk_index")) |field| coerceJsonOptionalInteger(field);
+        }
+    }
+}
+
+fn coerceJsonOptionalInteger(value: *std.json.Value) void {
+    switch (value.*) {
+        .integer => {},
+        .float => |f| value.* = .{ .integer = @intFromFloat(f) },
+        .string => |s| {
+            if (s.len == 0) {
+                value.* = .null;
+            } else if (std.fmt.parseInt(i64, s, 10)) |n| {
+                value.* = .{ .integer = n };
+            } else |_| {
+                value.* = .null;
+            }
+        },
+        .null => {},
+        else => value.* = .null,
+    }
+}
+
+fn coerceJsonOptionalFloat(value: *std.json.Value) void {
+    switch (value.*) {
+        .float => {},
+        .integer => |n| value.* = .{ .float = @floatFromInt(n) },
+        .string => |s| {
+            if (s.len == 0) {
+                value.* = .null;
+            } else if (std.fmt.parseFloat(f64, s)) |n| {
+                value.* = .{ .float = n };
+            } else |_| {
+                value.* = .null;
+            }
+        },
+        .null => {},
+        else => value.* = .null,
+    }
 }
 
 fn splitDocIdBatches(allocator: Allocator, doc_ids: []const u64, batch_size: usize) ![][]u64 {
@@ -3647,6 +3732,23 @@ test "applyBusinessExtractionEnvelope normalizes shared_space external_id prefix
     const hall_ptr = facet_sqlite.c.sqlite3_column_text(hall_stmt, 0) orelse return error.StepFailed;
     const hall_type = hall_ptr[0..@intCast(facet_sqlite.c.sqlite3_column_bytes(hall_stmt, 0))];
     try std.testing.expectEqualStrings("shared_space", hall_type);
+}
+
+test "sanitizeBusinessExtractionJson coerces empty numeric strings" {
+    const raw =
+        \\{"entities_raw":[],"relations_raw":[],"relation_properties_raw":[{"relation_external_id":"r1","value_integer":"","value_number":"","ref_doc_id":1}]}
+    ;
+    const normalized = try sanitizeBusinessExtractionJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, normalized, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.relation_properties_raw.len);
+    try std.testing.expect(parsed.value.relation_properties_raw[0].value_integer == null);
+    try std.testing.expect(parsed.value.relation_properties_raw[0].value_number == null);
+    try std.testing.expectEqual(@as(?i64, 1), parsed.value.relation_properties_raw[0].ref_doc_id);
 }
 
 test "mergeBusinessExtractionEnvelopes preserves entity_documents across doc ids" {
