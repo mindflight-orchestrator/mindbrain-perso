@@ -3116,6 +3116,35 @@ fn jsonObjectHasNonEmptyString(obj: std.json.ObjectMap, key: []const u8) bool {
     return v == .string and v.string.len > 0;
 }
 
+fn jsonValueIsNonNullInteger(value: std.json.Value) bool {
+    return switch (value) {
+        .integer, .float => true,
+        else => false,
+    };
+}
+
+fn filterEntityLinkRowsMissingDocId(rows_ptr: *std.json.Value) void {
+    if (rows_ptr.* != .array) return;
+    var i: usize = 0;
+    while (i < rows_ptr.array.items.len) {
+        const row = &rows_ptr.array.items[i];
+        if (row.* != .object) {
+            _ = rows_ptr.array.swapRemove(i);
+            continue;
+        }
+        const row_obj = &row.object;
+        const doc_id = row_obj.get("doc_id") orelse {
+            _ = rows_ptr.array.swapRemove(i);
+            continue;
+        };
+        if (!jsonValueIsNonNullInteger(doc_id)) {
+            _ = rows_ptr.array.swapRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.json.Value) !void {
     if (value.* != .object) {
         value.* = .{ .object = .empty };
@@ -3226,6 +3255,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 try copyJsonFieldAlias(allocator, row_obj, "entity_external_id", &.{ "entity_id", "external_id" });
                 if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
             }
+            filterEntityLinkRowsMissingDocId(rows_ptr);
         }
     }
 
@@ -3238,6 +3268,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                 if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
                 if (row_obj.getPtr("chunk_index")) |field| coerceJsonOptionalInteger(field);
             }
+            filterEntityLinkRowsMissingDocId(rows_ptr);
         }
     }
 
@@ -4245,6 +4276,20 @@ test "sanitizeBusinessExtractionJson fills missing relation fields" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.relations_raw.len);
     try std.testing.expectEqualStrings("a", parsed.value.relations_raw[0].source_external_id);
     try std.testing.expectEqualStrings("b", parsed.value.relations_raw[0].target_external_id);
+}
+
+test "sanitizeBusinessExtractionJson drops entity_documents without doc_id" {
+    const raw =
+        \\{"entities_raw":[],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"e1","doc_id":null,"confidence":0.9}]}
+    ;
+    const normalized = try sanitizeBusinessExtractionJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, normalized, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.entity_documents_raw.len);
 }
 
 test "sanitizeBusinessExtractionJson coerces string confidence" {
