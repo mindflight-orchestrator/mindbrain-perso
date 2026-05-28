@@ -2461,6 +2461,8 @@ fn writeCoverageGapReport(
     try stderr.flush();
 }
 
+var business_extract_progress_mutex: std.atomic.Mutex = .unlocked;
+
 fn writeBusinessExtractProgress(
     step: []const u8,
     batch_index: usize,
@@ -2470,6 +2472,10 @@ fn writeBusinessExtractProgress(
     content_chars: usize,
     detail: []const u8,
 ) !void {
+    while (!business_extract_progress_mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+    defer business_extract_progress_mutex.unlock();
     var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
     const stderr = &stderr_file_writer.interface;
     try stderr.print(
@@ -2923,6 +2929,32 @@ fn buildBusinessExtractionSystemPrompt(
     return try system.toOwnedSlice();
 }
 
+fn isRetryableLlmHttpStatus(status: u16) bool {
+    return status == 429 or status == 500 or status == 502 or status == 503;
+}
+
+fn isRetryableLlmHttpError(err: anyerror) bool {
+    if (err != error.HttpRequestFailed) return false;
+    const status = llm.http_client.lastHttpStatus() orelse return true;
+    return isRetryableLlmHttpStatus(status);
+}
+
+fn freeExtractBatchJobParts(allocator: Allocator, jobs: []ExtractBatchJob) void {
+    for (jobs) |*job| {
+        if (job.part) |part| {
+            allocator.free(part);
+            job.part = null;
+        }
+    }
+}
+
+fn transferExtractBatchJobPart(allocator: Allocator, job: *ExtractBatchJob) !void {
+    const staged = job.part orelse return error.InvalidLlmBusinessExtractionResponse;
+    const owned = try allocator.dupe(u8, staged);
+    std.heap.smp_allocator.free(staged);
+    job.part = owned;
+}
+
 fn callBusinessExtractLlm(
     allocator: Allocator,
     opts: LiveBusinessExtractOptions,
@@ -2953,14 +2985,30 @@ fn callBusinessExtractLlm(
         .providers = &.{opts.provider},
         .default_provider = "default",
     });
-    var response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
-        .temperature = opts.temperature,
-        .max_tokens = opts.max_tokens,
-        .json_mode = true,
-    }) catch |err| {
-        if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
-        return err;
-    };
+    const max_attempts: usize = 4;
+    var attempt: usize = 0;
+    var response: llm.ChatResponse = undefined;
+    while (true) {
+        attempt += 1;
+        response = manager.chat(allocator, mindbrain.zig16_compat.io(), &messages, .{
+            .temperature = opts.temperature,
+            .max_tokens = opts.max_tokens,
+            .json_mode = true,
+        }) catch |err| {
+            const retry = attempt < max_attempts and isRetryableLlmHttpError(err);
+            if (!retry) {
+                if (err == error.HttpRequestFailed) try writeLastLlmHttpFailure(allocator);
+                return err;
+            }
+            const backoff_ms: u64 = 1000 * (@as(u64, 1) << @intCast(@min(attempt - 1, 3)));
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .fromMilliseconds(@intCast(backoff_ms)),
+                .clock = .awake,
+            }, mindbrain.zig16_compat.io()) catch {};
+            continue;
+        };
+        break;
+    }
     defer response.deinit(allocator);
 
     if (write_debug_outputs) {
@@ -3356,6 +3404,7 @@ fn runExtractBatchLlmJobs(
             try runOneExtractBatchLlm(allocator, opts, job, docs_rows, jobs.len);
         }
     } else {
+        errdefer freeExtractBatchJobParts(allocator, jobs);
         var wave_start: usize = 0;
         while (wave_start < jobs.len) {
             const wave_len = @min(parallel, jobs.len - wave_start);
@@ -3377,14 +3426,12 @@ fn runExtractBatchLlmJobs(
             for (threads[0..wave_len]) |*thread| {
                 thread.join();
             }
+            for (0..wave_len) |w| {
+                const job = &jobs[wave_start + w];
+                if (job.llm_err) |err| return err;
+                try transferExtractBatchJobPart(allocator, job);
+            }
             wave_start += wave_len;
-        }
-        for (jobs) |*job| {
-            if (job.llm_err) |err| return err;
-            const staged = job.part orelse return error.InvalidLlmBusinessExtractionResponse;
-            const owned = try allocator.dupe(u8, staged);
-            std.heap.smp_allocator.free(staged);
-            job.part = owned;
         }
     }
 

@@ -17,6 +17,10 @@ threadlocal var last_http_status: ?u16 = null;
 threadlocal var last_http_body: ?[]u8 = null;
 threadlocal var last_http_allocator: ?std.mem.Allocator = null;
 
+pub fn lastHttpStatus() ?u16 {
+    return last_http_status;
+}
+
 pub fn clearLastHttpFailure() void {
     if (last_http_body) |body| {
         if (last_http_allocator) |allocator| allocator.free(body);
