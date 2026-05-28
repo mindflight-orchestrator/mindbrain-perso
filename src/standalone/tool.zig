@@ -2996,9 +2996,6 @@ fn parseBusinessExtractionEnvelopeJson(
     json: []const u8,
     parse_opts: std.json.ParseOptions,
 ) !std.json.Parsed(BusinessExtractionEnvelope) {
-    if (std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, json, parse_opts)) |parsed| {
-        return parsed;
-    } else |_| {}
     const normalized = try sanitizeBusinessExtractionJson(allocator, json);
     defer allocator.free(normalized);
     return std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, parse_opts);
@@ -3079,7 +3076,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                     const ext = row_obj.get("external_id").?.string;
                     try row_obj.put(allocator, "name", .{ .string = ext });
                 }
-                if (row_obj.get("confidence") == null) {
+                if (row_obj.getPtr("confidence")) |field| coerceJsonConfidence(field) else {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
                 }
                 i += 1;
@@ -3119,7 +3116,7 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                     defer allocator.free(synth);
                     try row_obj.put(allocator, "external_id", .{ .string = synth });
                 }
-                if (row_obj.get("confidence") == null) {
+                if (row_obj.getPtr("confidence")) |field| coerceJsonConfidence(field) else {
                     try row_obj.put(allocator, "confidence", .{ .float = 1.0 });
                 }
                 i += 1;
@@ -3181,6 +3178,20 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
             if (row_obj.getPtr("doc_id")) |field| coerceJsonOptionalInteger(field);
             if (row_obj.getPtr("chunk_index")) |field| coerceJsonOptionalInteger(field);
         }
+    }
+}
+
+fn coerceJsonConfidence(value: *std.json.Value) void {
+    switch (value.*) {
+        .float, .integer => {},
+        .string => |s| {
+            if (std.fmt.parseFloat(f64, s)) |n| {
+                value.* = .{ .float = n };
+            } else |_| {
+                value.* = .{ .float = 1.0 };
+            }
+        },
+        else => value.* = .{ .float = 1.0 },
     }
 }
 
@@ -4126,6 +4137,20 @@ test "sanitizeBusinessExtractionJson fills missing relation fields" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.relations_raw.len);
     try std.testing.expectEqualStrings("a", parsed.value.relations_raw[0].source_external_id);
     try std.testing.expectEqualStrings("b", parsed.value.relations_raw[0].target_external_id);
+}
+
+test "sanitizeBusinessExtractionJson coerces string confidence" {
+    const raw =
+        \\{"entities_raw":[{"external_id":"e1","entity_type":"unit","name":"U1","confidence":"0.8"}],"relations_raw":[]}
+    ;
+    const normalized = try sanitizeBusinessExtractionJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, normalized, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), parsed.value.entities_raw[0].confidence, 0.001);
 }
 
 test "sanitizeBusinessExtractionJson coerces empty numeric strings" {
