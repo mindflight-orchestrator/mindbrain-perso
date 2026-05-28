@@ -80,6 +80,14 @@ when a node has a larger fanout.
 
 Commented examples in the SQL file (search for `Example usage`) show insert → rebuild → `k_hops_filtered` → `graph.entity_docs`.
 
+## Graph Pattern Query
+
+[queries/graph-pattern-query.md](queries/graph-pattern-query.md) documents the
+planned read-only Graph Pattern Query syntax shared by the standalone SQLite
+backend and the `pg_mindbrain` PostgreSQL extension. GPQ is intended for dynamic
+node/relation/property queries; it is separate from GhostCrab working-memory
+projections and projection bundles.
+
 ## Workspace isolation
 
 `graph.entity` and `graph.relation` include **`workspace_id`** (default `'default'`) aligned with **`mindbrain.workspaces`**. Filter by workspace in application queries when serving multiple tenants.
