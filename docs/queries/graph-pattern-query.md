@@ -9,6 +9,21 @@ Graph Pattern Query (GPQ) is a small read-only query language for MindBrain grap
 
 The syntax is shared; each backend compiles it to the most efficient native execution path.
 
+## PostgreSQL backend (pg_mindbrain)
+
+MindBrain owns the **text parser** (`graph_pattern.parse` / `parseToJsonAst` in `src/standalone/graph_pattern.zig`). PostgreSQL owns **execution only**:
+
+```text
+GPQ text  →  parseToJsonAst()  →  graph.pattern_query_ast(jsonb)  →  graph.entity / graph.relation / …
+```
+
+- The AST is passed as **jsonb**; it is not stored as the graph.
+- Graph data stays in relational tables (`graph.entity`, `graph.relation`, `graph.relation_property`, `graph.lj_out`).
+- `graph.pattern_query(text)` inside PostgreSQL is intentionally **not** implemented (raises with a pointer to MindBrain parsing).
+
+HTTP proxy (standalone): `POST /api/mindbrain/graph/pattern-query` with body `{"query":"<GPQ text>","backend":"sqlite"|"postgres"}`.  
+`backend=postgres` requires `psql` and `PG*` env vars pointing at a database with `pg_mindbrain` installed.
+
 ## What GPQ Queries
 
 GPQ queries graph entities, directed graph relations, metadata, and typed relation properties.

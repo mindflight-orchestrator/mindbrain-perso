@@ -2,6 +2,7 @@ const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const facts_sqlite = @import("facts_sqlite.zig");
 const graph_diagnostics = @import("graph_diagnostics.zig");
+const graph_pattern_bridge = @import("graph_pattern_bridge.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
 const helper_api = @import("helper_api.zig");
 const hybrid_search = @import("hybrid_search.zig");
@@ -991,6 +992,11 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules/delete")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleGraphGapRulesDelete(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/pattern-query")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGraphPatternQuery(allocator, request, body_buffer);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
@@ -2359,6 +2365,71 @@ pub const MindbrainHttpApp = struct {
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .deleted = deleted }));
     }
 
+    const GraphPatternQueryRequest = struct {
+        query: []const u8,
+        backend: []const u8 = "sqlite",
+        options: ?std.json.Value = null,
+        debug: bool = false,
+    };
+
+    fn parseGraphPatternBackend(text: []const u8) ?graph_pattern_bridge.Backend {
+        if (std.ascii.eqlIgnoreCase(text, "postgres")) return .postgres;
+        if (std.ascii.eqlIgnoreCase(text, "sqlite")) return .sqlite;
+        return null;
+    }
+
+    fn handleGraphPatternQuery(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        const req = try std.json.parseFromSliceLeaky(
+            GraphPatternQueryRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+        );
+        const backend = parseGraphPatternBackend(req.backend) orelse return error.BadRequest;
+
+        var options_json: []const u8 = "{}";
+        var options_owned: ?[]u8 = null;
+        defer if (options_owned) |value| allocator.free(value);
+        if (req.options) |value| {
+            options_owned = try std.json.stringifyAlloc(allocator, value, .{});
+            options_json = options_owned.?;
+        }
+
+        var db = try self.openDb();
+        defer db.close();
+
+        const payload = graph_pattern_bridge.execute(allocator, db, .{
+            .query = req.query,
+            .backend = backend,
+            .options_json = options_json,
+            .debug = req.debug,
+        }) catch |err| switch (err) {
+            error.PostgresUnavailable, error.PostgresExecutionFailed => return .{
+                .status = .service_unavailable,
+                .content_type = "application/json; charset=utf-8",
+                .body = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"postgres_backend_unavailable\",\"message\":\"{s}\"}}",
+                    .{@errorName(err)},
+                ),
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(payload);
+
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try allocator.dupe(u8, payload),
+        };
+    }
+
     fn parseOntologyEntityTypeRequest(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -2643,10 +2714,11 @@ pub const MindbrainHttpApp = struct {
             .graph_gap_rules = @hasDecl(@This(), "handleGraphGapRules"),
             .graph_gap_rules_import = @hasDecl(@This(), "handleGraphGapRulesImport"),
             .graph_gap_rules_delete = @hasDecl(@This(), "handleGraphGapRulesDelete"),
+            .graph_pattern_query = @hasDecl(@This(), "handleGraphPatternQuery"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{}}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{}}}}}
         ,
             .{
                 mindbrain_version,
@@ -2654,6 +2726,7 @@ pub const MindbrainHttpApp = struct {
                 features.graph_gap_rules,
                 features.graph_gap_rules_import,
                 features.graph_gap_rules_delete,
+                features.graph_pattern_query,
             },
         );
         return .{

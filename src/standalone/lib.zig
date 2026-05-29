@@ -14,6 +14,7 @@ pub const fixture_loader = @import("fixture_loader.zig");
 pub const fixture_repositories = @import("fixture_repositories.zig");
 pub const graph_diagnostics = @import("graph_diagnostics.zig");
 pub const graph_pattern = @import("graph_pattern.zig");
+pub const graph_pattern_bridge = @import("graph_pattern_bridge.zig");
 pub const graph_sqlite = @import("graph_sqlite.zig");
 pub const graph_store = @import("graph_store.zig");
 pub const hybrid_search = @import("hybrid_search.zig");

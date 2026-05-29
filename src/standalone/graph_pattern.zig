@@ -190,6 +190,162 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !Query {
     };
 }
 
+/// Serialize a parsed GPQ `Query` to the canonical jsonb AST consumed by `graph.pattern_query_ast`.
+pub fn queryToJsonAst(allocator: std.mem.Allocator, query: Query) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.writeAll("{\"workspace_id\":");
+    try writeJsonString(&out.writer, query.workspace_id);
+    try out.writer.writeAll(",\"match\":");
+    try writeMatchJson(&out.writer, query.match);
+    try out.writer.writeAll(",\"where\":");
+    try writePredicatesJson(&out.writer, query.predicates);
+    try out.writer.writeAll(",\"project\":");
+    try writeProjectJson(&out.writer, query.project);
+    try out.writer.print(",\"limit\":{d}", .{query.limit});
+    if (query.hops) |hops| {
+        try out.writer.print(",\"hops\":{{\"min\":{d},\"max\":{d}}}", .{ hops.min, hops.max });
+    }
+    try out.writer.writeAll("}");
+
+    return out.toOwnedSlice();
+}
+
+/// Parse GPQ text and return the canonical Postgres jsonb AST string.
+pub fn parseToJsonAst(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var query = try parse(allocator, text);
+    defer query.deinit(allocator);
+    try validateQuery(query);
+    return queryToJsonAst(allocator, query);
+}
+
+fn writeJsonString(writer: anytype, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writeNodePatternJson(writer: anytype, node: NodePattern) !void {
+    try writer.writeAll("{\"kind\":\"node\",\"var\":");
+    try writeJsonString(writer, node.variable);
+    try writer.writeAll(",\"type\":");
+    try writeJsonString(writer, node.entity_type);
+    if (node.inline_name) |name| {
+        try writer.writeAll(",\"name\":");
+        try writeJsonString(writer, name);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeMatchJson(writer: anytype, match: Match) !void {
+    switch (match) {
+        .node => |node| {
+            try writer.writeByte('[');
+            try writeNodePatternJson(writer, node);
+            try writer.writeByte(']');
+        },
+        .edge => |edge| {
+            try writer.writeByte('[');
+            try writeNodePatternJson(writer, edge.source);
+            try writer.writeAll(",{\"kind\":\"edge\",\"var\":");
+            try writeJsonString(writer, edge.relation_variable);
+            try writer.writeAll(",\"type\":");
+            try writeJsonString(writer, edge.relation_type);
+            try writer.writeAll(",\"direction\":\"out\"},");
+            try writeNodePatternJson(writer, edge.target);
+            try writer.writeByte(']');
+        },
+    }
+}
+
+fn predicateOpToken(op: Predicate.Op) []const u8 {
+    return switch (op) {
+        .eq => "=",
+        .gt => ">",
+        .gte => ">=",
+        .lt => "<",
+        .lte => "<=",
+        .in => "IN",
+    };
+}
+
+fn numberIsInteger(value: f64) bool {
+    const rounded = @round(value);
+    if (@abs(value - rounded) > 1e-9) return false;
+    const min_f = @as(f64, @floatFromInt(std.math.minInt(i64)));
+    const max_f = @as(f64, @floatFromInt(std.math.maxInt(i64)));
+    return rounded >= min_f and rounded <= max_f;
+}
+
+fn writePredicateValueJson(writer: anytype, value: Predicate.Value) !void {
+    switch (value) {
+        .text => |text| {
+            try writer.writeAll(",\"value\":");
+            try writeJsonString(writer, text);
+        },
+        .number => |number| {
+            if (numberIsInteger(number)) {
+                try writer.print(",\"value_integer\":{d}", .{@as(i64, @intFromFloat(@round(number)))});
+            } else {
+                try writer.print(",\"value_number\":{d}", .{number});
+            }
+        },
+        .list_text => |values| {
+            try writer.writeAll(",\"value_list\":");
+            try writer.writeByte('[');
+            for (values, 0..) |list_value, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeJsonString(writer, list_value);
+            }
+            try writer.writeByte(']');
+        },
+    }
+}
+
+fn writePredicatesJson(writer: anytype, predicates: []const Predicate) !void {
+    try writer.writeByte('[');
+    for (predicates, 0..) |predicate, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"path\":");
+        try writeJsonString(writer, predicate.path);
+        try writer.writeAll(",\"op\":");
+        try writeJsonString(writer, predicateOpToken(predicate.op));
+        try writePredicateValueJson(writer, predicate.value);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeProjectJson(writer: anytype, project: Project) !void {
+    switch (project) {
+        .bundle_projection_get => try writer.writeAll("{\"bundle\":\"projection_get\"}"),
+        .fields => |fields| {
+            try writer.writeByte('[');
+            for (fields, 0..) |field, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeJsonString(writer, field);
+            }
+            try writer.writeByte(']');
+        },
+    }
+}
+
 fn appendPredicateLine(allocator: std.mem.Allocator, predicates: *std.ArrayList(Predicate), line: []const u8) !void {
     var rest = line;
     while (true) {
@@ -1081,6 +1237,50 @@ test "graph pattern parser covers documented node edge hops and bundle syntax" {
     );
     defer bundle.deinit(allocator);
     try std.testing.expect(bundle.project == .bundle_projection_get);
+}
+
+test "graph pattern queryToJsonAst matches postgres canonical shape" {
+    const allocator = std.testing.allocator;
+
+    const edge_ast = try parseToJsonAst(allocator,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (p:person)-[o:owns]->(u:unit)
+        \\WHERE o.prop.quote_part >= 0.5
+        \\PROJECT p.name, u.name, o.relation_id, o.prop.quote_part
+        \\LIMIT 20
+    );
+    defer allocator.free(edge_ast);
+
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"workspace_id\":\"immeuble-demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"kind\":\"edge\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"direction\":\"out\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"path\":\"o.prop.quote_part\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"op\":\">=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"value_number\":0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_ast, "\"limit\":20") != null);
+
+    const inline_ast = try parseToJsonAst(allocator,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (p:person {name: 'Nicolas Dupont'})-[o:owns]->(u:unit {name: 'Tilleuls Appartement A3'})
+        \\WHERE p.metadata.age_band = '45-54' AND u.metadata.lot = 'A3' AND o.prop.quote_part >= 0.5
+        \\PROJECT p.name, u.name, o.relation_id, o.prop.quote_part
+        \\LIMIT 20
+    );
+    defer allocator.free(inline_ast);
+
+    try std.testing.expect(std.mem.indexOf(u8, inline_ast, "\"name\":\"Nicolas Dupont\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_ast, "\"name\":\"Tilleuls Appartement A3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_ast, "\"path\":\"p.metadata.age_band\"") != null);
+}
+
+test "graph pattern parseToJsonAst rejects unsafe dynamic path fragments before export" {
+    try std.testing.expectError(Error.InvalidPredicate, parseToJsonAst(std.testing.allocator,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (p:person)-[o:owns]->(u:unit)
+        \\WHERE o.prop.quote_part' = 0.5
+        \\PROJECT p.name, u.name
+        \\LIMIT 20
+    ));
 }
 
 fn setupGraphPatternFixture(db: facet_sqlite.Database) !void {

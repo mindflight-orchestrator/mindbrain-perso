@@ -30,6 +30,7 @@ comptime {
     _ = @import("fixture_repositories.zig");
     _ = @import("graph_diagnostics.zig");
     _ = @import("graph_pattern.zig");
+    _ = @import("graph_pattern_bridge.zig");
     _ = @import("graph_sqlite.zig");
     _ = @import("graph_store.zig");
     _ = @import("helper_api.zig");
