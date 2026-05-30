@@ -6,11 +6,11 @@ SQLite-first knowledge runtime and native library for **faceted search** (Roarin
 
 All user-facing documentation lives under **[docs/](docs/README.md)**:
 
-- [docs/overview.md](docs/overview.md) — architecture and scope  
+- [docs/overview.md](docs/overview.md) — architecture and scope
 - [docs/installation.md](docs/installation.md) — build, native install notes, and standalone runtime prerequisites
 - [docs/api-reference.md](docs/api-reference.md) — current HTTP routes and CLI commands
-- [docs/facets.md](docs/facets.md) · [docs/graph.md](docs/graph.md) · [docs/pragma.md](docs/pragma.md)  
-- [docs/workspace.md](docs/workspace.md) · [docs/standalone.md](docs/standalone.md) · [docs/demo-benchmark.md](docs/demo-benchmark.md)  
+- [docs/facets/README.md](docs/facets/README.md) · [docs/graphs/README.md](docs/graphs/README.md) · [docs/pragma/README.md](docs/pragma/README.md) · [docs/ontology/README.md](docs/ontology/README.md)
+- [docs/workspace.md](docs/workspace.md) · [docs/standalone.md](docs/standalone.md) · [docs/demo-benchmark.md](docs/demo-benchmark.md)
 - [docs/native-reference.md](docs/native-reference.md) · [docs/third-party.md](docs/third-party.md)
 
 ## Quick build

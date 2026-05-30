@@ -1,45 +1,35 @@
-# Pragma (memory projections)
+# Pragma
 
-The pragma section of this repository adds SQL functions for retrieving and ranking **memory projections** in applications that use the **`memory-server`** schema pattern (tables such as `memory_items`, `memory_projections`, `memory_edges`).
+The canonical Pragma documentation now lives in [pragma/README.md](pragma/README.md).
 
-Everything below is defined in the SQL install script (search for the pragma comments).
+Pragma is MindBrain's context-packing layer for agent memory and projections. It
+covers:
 
-## Assumed tables
+- memory raw rows: `memory_items`, `memory_projections`, `memory_edges`;
+- durable projection rows: `projections`, `projection_types`, `agent_state`;
+- proposition DSL parsing;
+- scoped context packing;
+- next-hop suggestions;
+- CLI and HTTP pack routes.
 
-The SQL references qualified names such as **`"memory-server".memory_projections`**. Your database must create those tables (and indexes, `tsvector` columns, etc.) according to your application migrations; the runtime supplies **functions**, not the full memory-server schema.
+## Start Here
 
-## Proposition DSL
+| Document | Contents |
+|----------|----------|
+| [pragma/README.md](pragma/README.md) | Overview and source anchors. |
+| [pragma/model-and-storage.md](pragma/model-and-storage.md) | Tables and row contracts. |
+| [pragma/raw-layer.md](pragma/raw-layer.md) | Source-of-truth boundaries and projection meanings. |
+| [pragma/proposition-dsl.md](pragma/proposition-dsl.md) | Structured `fact|...` line format. |
+| [pragma/context-packing.md](pragma/context-packing.md) | Ranking, scope, pack priority, next hops. |
+| [pragma/queries-and-apis.md](pragma/queries-and-apis.md) | SQL, CLI, HTTP, and GhostCrab-compatible routes. |
+| [pragma/examples-immeuble-demo.md](pragma/examples-immeuble-demo.md) | Current `immeuble-demo` snapshot. |
 
-Structured proposition text should follow [dsl-rules.md](dsl-rules.md). Parse a single line in SQL:
-
-```sql
-SELECT pragma_parse_proposition_line('fact|subject=a|predicate=p|object=o|conf=0.9');
-```
-
-- **`pragma_parse_proposition_line_native(text)`** returns JSON as **text** (C/Zig).
-- **`pragma_parse_proposition_line(text)`** wraps it as **jsonb**.
-
-## Candidate sets and ranking
-
-| Function | Role |
-|----------|------|
-| **`pragma_candidate_bitmap(user_id, query, projection_types)`** | SQL-only prefilter using `tsvector` and `ILIKE`; returns a **`roaringbitmap`** of candidate row ordinals |
-| **`pragma_rank_native(...)`** | Intended native scorer over candidates — **stub: returns empty set** in current Zig ([src/mb_pragma/main.zig](../src/mb_pragma/main.zig)) |
-| **`pragma_next_hops_native(...)`** | Intended next-hop helper from propositions / edges — **stub: returns empty set** |
-
-## Context packing
-
-| Function | Role |
-|----------|------|
-| **`pragma_pack_context(user_id, query, limit_n)`** | Returns a ranked mix of `canonical`, `proposition`, and `raw` projections |
-| **`pragma_pack_context_scoped(user_id, query, scope, limit_n)`** | Same with **scope** filtering (`player:...` prefix and JSON `metadata` / `facets` keys) |
-
-## Native implementation status
+## Native Status
 
 | Symbol | Status |
 |--------|--------|
-| `pragma_parse_proposition_line` | Implemented (Zig) |
-| `pragma_rank_native` | Stub |
-| `pragma_next_hops_native` | Stub |
+| `pragma_parse_proposition_line` | Implemented in Zig. |
+| `pragma_rank_native` / `pragma_rank_zig` | Stub, returns empty set. |
+| `pragma_next_hops_native` / `pragma_next_hops_zig` | Stub, returns empty set. |
 
-See [native-reference.md](native-reference.md) for the full wiring table.
+See [native-reference.md](native-reference.md) for exported native symbols.

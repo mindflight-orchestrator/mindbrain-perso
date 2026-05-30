@@ -4,9 +4,9 @@
 
 1. **Facets** — Roaring Bitmap–backed faceting, hierarchical facets, document search, and BM25 full-text support under the **`facets`** schema.
 2. **Graph** — Typed entities, relations, alias resolution, and k-hop / shortest-path traversal using materialized bitmap adjacency indexes under the **`graph`** schema.
-3. **Pragma** — SQL helpers for typed memory retrieval over `memory_projections` and related tables, plus a native Zig parser for proposition lines.
+3. **Pragma** — Context packing over `memory_projections` and durable `projections`, plus proposition DSL parsing and standalone rank/pack helpers.
 4. **Workspace registry** — Tables under **`mindbrain`** for workspaces, pending DDL, semantics, and integration with facet/graph rows via `workspace_id`.
-5. **Ontology layer** — Functions in **`mb_ontology`** that join facets, graph, and projections for coverage and marketplace-style search when the optional `public.*` tables exist.
+5. **Ontology layer** — Workspace-scoped vocabulary tables, raw RDF preservation, LinkML/OWL2 import/export, taxonomy APIs, coverage, and projection relevance helpers.
 
 The same Zig codebase also builds a **standalone SQLite** stack (see [standalone.md](standalone.md)) for portability and tooling.
 As of `v1.4.0`, the standalone search and graph stores maintain their hot
@@ -43,8 +43,8 @@ flowchart LR
   SQL --> facetsSch[facets schema]
   SQL --> graphSch[graph schema]
   SQL --> mindbrainSch[mindbrain schema]
-  SQL --> pragmaFn[pragma SQL functions]
-  SQL --> ontoSch[mb_ontology functions]
+  SQL --> pragmaFn[pragma and projection tables]
+  SQL --> ontoSch[ontology tables]
   SQL --> rawOnt[collections raw ontology tables]
   Zig --> facetsSch
   Zig --> graphSch
@@ -59,7 +59,15 @@ flowchart LR
 | [src/mb_facets/main.zig](../src/mb_facets/main.zig) | Native facet merge, filter bitmaps, facet counts, document search, BM25 indexing and search |
 | [src/mb_graph/main.zig](../src/mb_graph/main.zig) | `k_hops_filtered_native`, `shortest_path_filtered_native` |
 | [src/mb_pragma/main.zig](../src/mb_pragma/main.zig) | `pragma_parse_proposition_line`; stubs for `pragma_rank_native`, `pragma_next_hops_native` |
-| [src/standalone/](../src/standalone/) | SQLite stores, hybrid search, graph streaming, CLI and HTTP tools |
+| [src/mb_ontology/main.zig](../src/mb_ontology/main.zig) | Native `json_text_to_toon_native` symbol; the rich ontology implementation lives in standalone modules |
+| [src/standalone/](../src/standalone/) | SQLite stores, ontology import/export, pragma pack, hybrid search, graph streaming, CLI and HTTP tools |
+
+## Topic Documentation
+
+- [facets/README.md](facets/README.md)
+- [graphs/README.md](graphs/README.md)
+- [pragma/README.md](pragma/README.md)
+- [ontology/README.md](ontology/README.md)
 
 ## Version
 

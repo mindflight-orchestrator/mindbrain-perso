@@ -5,6 +5,13 @@ primary source of truth. They are compact, scoped, ranked statements that
 make the underlying ontology, facets, graph, memory, or program state
 usable by an LLM or another agent.
 
+For subsystem-specific details, see:
+
+- [pragma/README.md](pragma/README.md) for memory projections, proposition DSL,
+  context packing, and pack APIs;
+- [ontology/coverage-and-projections.md](ontology/coverage-and-projections.md)
+  for ontology coverage, taxonomy projections, and projection relevance.
+
 In this project, projections sit next to the other ontology surfaces:
 
 - **Ontologies** define the vocabulary: entity types, relation types,

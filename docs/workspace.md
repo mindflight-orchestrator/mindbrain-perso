@@ -38,3 +38,6 @@ For signatures and return types, use the SQL file (search for `CREATE OR REPLACE
 ## Standalone parity
 
 The SQLite **standalone tool** can export workspace models and run coverage-style flows; see [standalone.md](standalone.md).
+
+For the complete SQLite ontology table and API reference, see
+[ontology/README.md](ontology/README.md).

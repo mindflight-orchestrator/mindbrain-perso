@@ -28,10 +28,14 @@ the SQLite MVP; follow-up work is tracked in
 | [installation.md](installation.md) | Dependencies, build, and installing the runtime |
 | [api-reference.md](api-reference.md) | Current HTTP routes, CLI commands, and native/SQL surface boundaries |
 | [comparison/README.md](comparison/README.md) | API and SQL migration comparison with the sibling `pg_mindbrain` PostgreSQL extension |
-| [facets.md](facets.md) | `facets` schema: faceting, search, BM25 |
-| [faceted-hybrid-search.md](faceted-hybrid-search.md) | Process view for facets, FTS5 BM25, indexed embeddings, hybrid search, and optional reranking |
-| [graph.md](graph.md) | `graph` schema: entities, relations, native traversal |
-| [pragma.md](pragma.md) | Memory projection helpers and `pragma_*` SQL functions |
+| [facets/README.md](facets/README.md) | Complete facets documentation: raw assignments, bitmap storage, BM25/FTS5, hybrid search, APIs |
+| [facets.md](facets.md) | Legacy facets pointer kept for existing links |
+| [faceted-hybrid-search.md](faceted-hybrid-search.md) | Legacy process view for facets, FTS5 BM25, indexed embeddings, hybrid search, and optional reranking |
+| [graphs/README.md](graphs/README.md) | Complete graph documentation: raw data, derived storage, queries, APIs, diagnostics |
+| [graph.md](graph.md) | Legacy graph overview and pointer to the canonical graph docs |
+| [pragma/README.md](pragma/README.md) | Complete pragma documentation: memory projections, DSL, context packing, SQL/CLI/HTTP APIs |
+| [pragma.md](pragma.md) | Legacy pragma pointer kept for existing links |
+| [ontology/README.md](ontology/README.md) | Complete ontology documentation: raw triples, taxonomy, LinkML/OWL2, APIs, coverage |
 | [dsl-rules.md](dsl-rules.md) | Proposition DSL line format (for `projection_type = 'proposition'`) |
 | [workspace.md](workspace.md) | `mindbrain.*` workspace and semantics tables |
 | [standalone.md](standalone.md) | SQLite engine, tests, benchmarks, `mindbrain-standalone-tool` |
@@ -49,7 +53,7 @@ the SQLite MVP; follow-up work is tracked in
 ## Source of truth
 
 - SQL objects: [../sql/sqlite_mindbrain--1.0.0.sql](../sql/sqlite_mindbrain--1.0.0.sql)
-- Zig sources: [src/](../src/) (`mb_facets`, `mb_graph`, `mb_pragma`, `standalone`)
+- Zig sources: [src/](../src/) (`mb_facets`, `mb_graph`, `mb_pragma`, `mb_ontology`, `standalone`)
 - Runtime entrypoints: [../src/standalone/tool.zig](../src/standalone/tool.zig), [../src/standalone/http_server.zig](../src/standalone/http_server.zig), [../build.zig](../build.zig)
 
 This project is **not** the GhostCrab MCP server; it is the SQLite runtime and supporting library those applications may call into.

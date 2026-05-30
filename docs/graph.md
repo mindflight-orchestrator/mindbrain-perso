@@ -1,5 +1,9 @@
 # Graph
 
+The complete graph reference now lives in [graphs/README.md](graphs/README.md).
+Use that directory for raw data contracts, derived storage, ingestion/reindex,
+query APIs, diagnostics, and the `immeuble-demo` data snapshot.
+
 The active implementation in this repo is **SQLite-first** and lives in [src/standalone/graph_sqlite.zig](../src/standalone/graph_sqlite.zig). The graph model still mirrors the same conceptual entity/relation tables, but the runtime surface is exposed through Zig helpers.
 
 The graph stores a typed knowledge graph alongside facet-indexed documents. Native traversal uses **Roaring Bitmaps** of relation IDs per entity (`graph.lj_out` / `graph.lj_in`), rebuilt from `graph.relation`.

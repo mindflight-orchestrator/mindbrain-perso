@@ -174,9 +174,6 @@ Required string fields must be non-empty. `value_id` must be non-negative.
 | `GET`/`HEAD` | `/api/mindbrain/workspace/list` | none | JSON workspace catalog with entity counts and default ontology ids |
 | `GET`/`HEAD` | `/api/mindbrain/graph/type-counts` | `workspace_id` | JSON per-type instance counts with ontology labels |
 | `GET`/`HEAD` | `/api/mindbrain/graph/diagnostics` | `workspace_id`, `ontology_id` optional, `limit` optional, `component_small_max` optional | JSON graph diagnostics report for gaps, anomalies, evidence, and coverage |
-
-See [methodology/graphing/immeuble-gap-diagnostics-demo.md](methodology/graphing/immeuble-gap-diagnostics-demo.md)
-for an immeuble walkthrough and remediation methodology.
 | `GET`/`HEAD` | `/api/mindbrain/graph/gap-rules` | `workspace_id` or `ontology_id` | JSON configured closed-world graph gap rules |
 | `GET`/`HEAD` | `/api/mindbrain/graph/entity` | `entity_id`, `workspace_id` optional | JSON graph entity detail with facets, incident relations, evidence links |
 | `GET`/`HEAD` | `/api/mindbrain/graph/relation` | `relation_id`, `workspace_id` optional | JSON graph relation detail with endpoints and properties |
@@ -185,6 +182,9 @@ for an immeuble walkthrough and remediation methodology.
 | `GET`/`HEAD` | `/api/mindbrain/traverse` | `start`, `direction`, `depth`, `target` optional, repeated `edge_label` optional | JSON graph traversal result |
 | `GET`/`HEAD` | `/api/mindbrain/collections/facet-search` | `workspace_id`, `collection_id`, `table_id` optional, `namespace` optional, `dimension` optional, `value` optional, `limit` optional | JSON facet matches from derived postings or raw fallback |
 | `GET`/`HEAD` | `/api/mindbrain/pack` | `user_id`, `query`, `scope` optional, `limit` optional | TOON packed context |
+
+See [methodology/graphing/immeuble-gap-diagnostics-demo.md](methodology/graphing/immeuble-gap-diagnostics-demo.md)
+for an immeuble walkthrough and remediation methodology.
 
 ### GhostCrab compatibility endpoints
 
@@ -286,9 +286,10 @@ The SQLite install script in this repository is
 
 Function-level SQL behavior is documented in the topic pages:
 
-- [facets.md](facets.md)
-- [graph.md](graph.md)
-- [pragma.md](pragma.md)
+- [facets/README.md](facets/README.md)
+- [graphs/README.md](graphs/README.md)
+- [pragma/README.md](pragma/README.md)
+- [ontology/README.md](ontology/README.md)
 - [workspace.md](workspace.md)
 - [collections.md](collections.md)
 - [projections.md](projections.md)

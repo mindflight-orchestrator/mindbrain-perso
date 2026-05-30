@@ -6,6 +6,10 @@ Sources live under [src/standalone/](../src/standalone/). The reusable library s
 
 For **LLM-assisted document profiling**, durable queue jobs, and offline corpus evaluation, see [document-profile.md](document-profile.md).
 
+For focused subsystem documentation, see [graphs/README.md](graphs/README.md),
+[facets/README.md](facets/README.md), [pragma/README.md](pragma/README.md),
+and [ontology/README.md](ontology/README.md).
+
 ## v1.4.0 Runtime Notes
 
 `v1.4.0` keeps the standalone CLI and HTTP surface stable, but changes the
@@ -133,6 +137,9 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
   N-Triples into `ontology_triples_raw`, project simple ontology facts, optional
   graph materialization with `--materialize-graph`, and export preserved
   N-Triples or a workspace taxonomies bundle.
+- **`ontology-compile-linkml` / `ontology-export-linkml`** — Compile LinkML
+  schemas into native ontology bundles or export native ontology rows back to
+  LinkML. See [ontology/linkml-and-owl2.md](ontology/linkml-and-owl2.md).
 - **`graph-path`** — Path finding between named nodes.
 - **`graph-diagnostics` / `graph-gap-rules-import`** — Import closed-world gap
   rules and emit a basic graph diagnostics report for missing required

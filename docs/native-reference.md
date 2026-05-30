@@ -44,12 +44,21 @@ Exact argument lists and overloads: search the SQL install script for each symbo
 | `pragma_rank_native` | `pragma_rank_native` | **Stub** (empty result) |
 | `pragma_next_hops_native` | `pragma_next_hops_native` | **Stub** (empty result) |
 
+## Ontology (`src/mb_ontology/main.zig`)
+
+| C symbol | SQL function | Status |
+|----------|--------------|--------|
+| `json_text_to_toon_native` | `mb_ontology.json_text_to_toon_native` | Implemented; invalid JSON is returned unchanged instead of SQL NULL |
+
+The richer ontology runtime is in the standalone SQLite modules documented in
+[ontology/README.md](ontology/README.md), not in exported C symbols.
+
 ## Regenerating this list
 
 From the repo root:
 
 ```bash
-rg '^export fn ' src/mb_facets/main.zig src/mb_graph/main.zig src/mb_pragma/main.zig
+rg '^export fn ' src/mb_facets/main.zig src/mb_graph/main.zig src/mb_pragma/main.zig src/mb_ontology/main.zig
 ```
 
 ## Standalone repository interfaces
