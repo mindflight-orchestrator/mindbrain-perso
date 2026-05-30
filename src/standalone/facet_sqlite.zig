@@ -137,6 +137,7 @@ pub const Database = struct {
         try self.applyGraphEntityWorkspaceMigration();
         try self.applyRawGraphAutoincrementMigration();
         try self.applyGraphGapRulesMigration();
+        try self.applyAgentFactsTableRenameMigration();
     }
 
     fn migrationApplied(self: Database, migration_id: []const u8) Error!bool {
@@ -492,6 +493,77 @@ pub const Database = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
             \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        );
+
+        try self.markMigrationApplied(applied_id);
+    }
+
+    fn sqliteTableExists(self: Database, table_name: []const u8) Error!bool {
+        const stmt = try prepare(
+            self,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        );
+        defer finalize(stmt);
+        try bindText(stmt, 1, table_name);
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    fn applyAgentFactsTableRenameMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-05-30-facets-to-agent-facts-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        if (try self.sqliteTableExists("agent_facts")) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        if (!(try self.sqliteTableExists("facets"))) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        try self.exec(
+            \\DROP TRIGGER IF EXISTS trg_sync_facets_compat_after_insert;
+            \\DROP TRIGGER IF EXISTS trg_sync_facets_compat_after_update;
+            \\ALTER TABLE facets RENAME TO agent_facts;
+            \\DROP INDEX IF EXISTS facets_workspace_id_idx;
+            \\DROP INDEX IF EXISTS facets_source_ref_idx;
+            \\DROP INDEX IF EXISTS facets_source_ref_workspace_uniq;
+            \\DROP INDEX IF EXISTS idx_facets_source_ref_workspace;
+            \\CREATE INDEX IF NOT EXISTS agent_facts_workspace_id_idx ON agent_facts(workspace_id);
+            \\CREATE INDEX IF NOT EXISTS agent_facts_source_ref_idx ON agent_facts(source_ref) WHERE source_ref IS NOT NULL;
+            \\CREATE UNIQUE INDEX IF NOT EXISTS agent_facts_source_ref_workspace_uniq ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
+            \\CREATE INDEX IF NOT EXISTS idx_agent_facts_source_ref_workspace ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
+            \\CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_insert
+            \\AFTER INSERT ON agent_facts
+            \\BEGIN
+            \\    UPDATE agent_facts
+            \\    SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
+            \\        facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
+            \\        embedding = COALESCE(NEW.embedding, embedding),
+            \\        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts WHERE rowid <> NEW.rowid)),
+            \\        updated_at = CURRENT_TIMESTAMP
+            \\    WHERE rowid = NEW.rowid;
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_update
+            \\AFTER UPDATE ON agent_facts
+            \\BEGIN
+            \\    UPDATE agent_facts
+            \\    SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
+            \\        facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
+            \\        embedding = COALESCE(NEW.embedding, embedding),
+            \\        updated_at = CURRENT_TIMESTAMP
+            \\    WHERE id = NEW.id;
+            \\END;
+            \\UPDATE table_semantics SET table_name = 'agent_facts' WHERE table_name = 'facets';
+            \\UPDATE facet_tables SET table_name = 'agent_facts' WHERE table_name = 'facets';
         );
 
         try self.markMigrationApplied(applied_id);

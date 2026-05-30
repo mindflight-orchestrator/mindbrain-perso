@@ -23,7 +23,7 @@ WHERE entity_id IN (
   SELECT id FROM graph.entity WHERE workspace_id = 'ontology-test'
 );
 DELETE FROM graph.entity WHERE workspace_id = 'ontology-test';
-DELETE FROM facets WHERE workspace_id = 'ontology-test';
+DELETE FROM agent_facts WHERE workspace_id = 'ontology-test';
 
 DROP TABLE IF EXISTS public.test_source;
 CREATE TABLE public.test_source (
@@ -69,7 +69,7 @@ VALUES
     '{"relation_role":"depends_on","graph_label":"DEPENDS_ON","target_column":"id"}'::jsonb
   );
 
-INSERT INTO facets (schema_id, content, facets, workspace_id)
+INSERT INTO agent_facts (schema_id, content, facets, workspace_id)
 VALUES
   (
     'mindbrain:ontology',

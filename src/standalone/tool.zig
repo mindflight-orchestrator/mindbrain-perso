@@ -1097,7 +1097,7 @@ fn runBootstrapFromSqlCommand(allocator: Allocator, args: []const []const u8) !v
     const payload = .{
         .graph_entities = try countRows(db, "graph_entity"),
         .graph_relations = try countRows(db, "graph_relation"),
-        .facet_rows = try countRows(db, "facets"),
+        .facet_rows = try countRows(db, "agent_facts"),
         .search_documents = try countRows(db, "search_documents"),
         .queues = try countRows(db, "queue_registry"),
     };

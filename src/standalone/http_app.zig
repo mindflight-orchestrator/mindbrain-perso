@@ -4096,7 +4096,7 @@ fn writeEntityFacets(allocator: std.mem.Allocator, db: facet_sqlite.Database, wo
     defer allocator.free(entity_text);
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT id, schema_id, content, facets_json, source_ref, doc_id
-        \\FROM facets
+        \\FROM agent_facts
         \\WHERE workspace_id = ?1
         \\  AND (source_ref = ?2 OR CAST(doc_id AS TEXT) = ?2 OR json_extract(facets_json, '$.entity_id') = ?2)
         \\ORDER BY updated_at_unix DESC, created_at_unix DESC
@@ -4395,7 +4395,7 @@ test "graph explorer backend endpoints expose ontology and workspace scoped grap
         \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence, metadata_json) VALUES (11, 'ws_other', 'owns', 1, 3, 0.9, '{}');
         \\INSERT INTO graph_relation_property(relation_id, property_key, value_type, value_integer, ref_doc_id) VALUES (10, 'share_bp', 'percentage_bp', 10000, 42);
         \\INSERT INTO graph_entity_chunk(entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json) VALUES (1, 'ws_api', 'registry', 42, 0, 'mention', 0.8, '{"quote":"Ada owns Unit 1"}');
-        \\INSERT INTO facets(id, schema_id, content, facets_json, workspace_id, source_ref, doc_id) VALUES ('facet-1', 'ownership', 'Ada owns Unit 1', '{"entity_id":"1","status":"active"}', 'ws_api', '1', 42);
+        \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, source_ref, doc_id) VALUES ('facet-1', 'ownership', 'Ada owns Unit 1', '{"entity_id":"1","status":"active"}', 'ws_api', '1', 42);
     );
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4677,7 +4677,7 @@ test "http sql writer lane classifier separates reads from writes" {
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane(" -- inspect\nPRAGMA table_info(workspaces)", &.{}));
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("/* inspect */\nselect 1", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("WITH rows AS (SELECT 1) SELECT * FROM rows", &.{}));
-    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("WITH row AS (SELECT 1) INSERT INTO facets(schema_id, content, facets, workspace_id) SELECT 's', 'c', '{}', 'default' FROM row", &.{}));
+    try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("WITH row AS (SELECT 1) INSERT INTO agent_facts(schema_id, content, facets, workspace_id) SELECT 's', 'c', '{}', 'default' FROM row", &.{}));
     try std.testing.expect(!MindbrainHttpApp.shouldUseWriterLane("PRAGMA main.table_xinfo(workspaces)", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA busy_timeout=1", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("PRAGMA journal_mode", &.{}));

@@ -73,7 +73,7 @@ pub const TaxonomyNodeImport = struct {
 };
 
 pub fn upsertFacet(db: Database, record: FacetRecord) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO facets(id, schema_id, content, facets_json, workspace_id, doc_id, source_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+    const stmt = try prepare(db, "INSERT OR REPLACE INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id, source_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
     defer finalize(stmt);
     try bindText(stmt, 1, record.id);
     try bindText(stmt, 2, record.schema_id);
@@ -147,7 +147,7 @@ pub fn loadTaxonomyFacetRows(
     allocator: std.mem.Allocator,
     workspace_id: []const u8,
 ) ![]FacetRecord {
-    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM facets WHERE workspace_id = ?1 AND schema_id = 'ghostcrab:taxonomy' ORDER BY doc_id");
+    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM agent_facts WHERE workspace_id = ?1 AND schema_id = 'ghostcrab:taxonomy' ORDER BY doc_id");
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
 
@@ -680,7 +680,7 @@ fn loadAllProjections(db: Database, allocator: std.mem.Allocator) ![]ProjectionR
 }
 
 fn loadWorkspaceFacets(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) ![]FacetRecord {
-    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM facets WHERE workspace_id = ?1");
+    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM agent_facts WHERE workspace_id = ?1");
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     var rows = std.ArrayList(FacetRecord).empty;

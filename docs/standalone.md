@@ -233,7 +233,7 @@ applies it via helpers like `applyStandaloneSchema()` where used. SQLite schema
 changes should be folded into the canonical file, not added as separate
 table-mutation migration files.
 
-The standalone fact-store contract uses the `facets` table as the durable fact
+The standalone fact-store contract uses the `agent_facts` table as the durable fact
 row table. MindBrain allocates `facets.doc_id` transactionally in
 `POST /api/mindbrain/facts/write`, appends rows when `source_ref` is absent, and
 upserts synchronized rows by `(workspace_id, source_ref)` when `source_ref` is

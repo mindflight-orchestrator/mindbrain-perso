@@ -95,7 +95,7 @@ fn commitTransaction(db: facet_sqlite.Database, transaction_active: *bool) !void
 
 fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref: []const u8) !bool {
     const sql =
-        \\UPDATE facets
+        \\UPDATE agent_facts
         \\SET schema_id = ?1,
         \\    content = ?2,
         \\    facets = ?3,
@@ -121,7 +121,7 @@ fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref
 
 fn insertFact(db: facet_sqlite.Database, write: FactWrite, id: []const u8) !void {
     const sql =
-        \\INSERT INTO facets(
+        \\INSERT INTO agent_facts(
         \\    id,
         \\    schema_id,
         \\    content,
@@ -151,7 +151,7 @@ fn insertFact(db: facet_sqlite.Database, write: FactWrite, id: []const u8) !void
         \\    ?8,
         \\    ?9,
         \\    ?10,
-        \\    (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM facets)
+        \\    (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts)
         \\)
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -217,7 +217,7 @@ fn selectFactBySourceRef(
 ) !SelectedFact {
     const sql =
         \\SELECT id, doc_id
-        \\FROM facets
+        \\FROM agent_facts
         \\WHERE workspace_id = ?1 AND source_ref = ?2
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -234,7 +234,7 @@ fn selectFactBySourceRef(
 }
 
 fn selectDocIdById(db: facet_sqlite.Database, id: []const u8) !u64 {
-    const sql = "SELECT doc_id FROM facets WHERE id = ?1";
+    const sql = "SELECT doc_id FROM agent_facts WHERE id = ?1";
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
 
@@ -393,8 +393,8 @@ test "standalone schema allocates legacy facets doc_id and has source_ref indexe
     try db.applyStandaloneSchema();
 
     {
-        try db.exec("INSERT INTO facets (schema_id, content, facets, workspace_id) VALUES ('legacy:test', 'legacy raw insert', '{}', 'default')");
-        const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM facets WHERE schema_id = 'legacy:test' AND doc_id IS NOT NULL");
+        try db.exec("INSERT INTO agent_facts (schema_id, content, facets, workspace_id) VALUES ('legacy:test', 'legacy raw insert', '{}', 'default')");
+        const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM agent_facts WHERE schema_id = 'legacy:test' AND doc_id IS NOT NULL");
         defer facet_sqlite.finalize(stmt);
 
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;

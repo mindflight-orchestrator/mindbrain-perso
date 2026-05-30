@@ -246,7 +246,7 @@ fn loadSourceRefsForDocs(
 
         const sql = try std.fmt.allocPrint(
             allocator,
-            "SELECT COALESCE(source_ref, id) FROM facets WHERE workspace_id = ?1 AND doc_id IN ({s})",
+            "SELECT COALESCE(source_ref, id) FROM agent_facts WHERE workspace_id = ?1 AND doc_id IN ({s})",
             .{placeholders.items},
         );
         defer allocator.free(sql);

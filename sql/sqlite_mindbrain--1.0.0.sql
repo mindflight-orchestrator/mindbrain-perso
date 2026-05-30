@@ -340,7 +340,7 @@ CREATE TABLE IF NOT EXISTS graph_gap_rules (
 CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
     ON graph_gap_rules(ontology_id, workspace_id, enabled);
 
-CREATE TABLE IF NOT EXISTS facets (
+CREATE TABLE IF NOT EXISTS agent_facts (
     id TEXT PRIMARY KEY,
     schema_id TEXT NOT NULL,
     content TEXT NOT NULL,
@@ -362,19 +362,19 @@ CREATE TABLE IF NOT EXISTS facets (
     doc_id INTEGER UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS facets_workspace_id_idx
-    ON facets(workspace_id);
+CREATE INDEX IF NOT EXISTS agent_facts_workspace_id_idx
+    ON agent_facts(workspace_id);
 
-CREATE INDEX IF NOT EXISTS facets_source_ref_idx
-    ON facets(source_ref)
+CREATE INDEX IF NOT EXISTS agent_facts_source_ref_idx
+    ON agent_facts(source_ref)
     WHERE source_ref IS NOT NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS facets_source_ref_workspace_uniq
-    ON facets(source_ref, workspace_id)
+CREATE UNIQUE INDEX IF NOT EXISTS agent_facts_source_ref_workspace_uniq
+    ON agent_facts(source_ref, workspace_id)
     WHERE source_ref IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_facets_source_ref_workspace
-    ON facets(source_ref, workspace_id)
+CREATE INDEX IF NOT EXISTS idx_agent_facts_source_ref_workspace
+    ON agent_facts(source_ref, workspace_id)
     WHERE source_ref IS NOT NULL;
 
 CREATE TRIGGER IF NOT EXISTS trg_sync_workspace_compat_after_insert
@@ -399,22 +399,22 @@ BEGIN
     WHERE id = NEW.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_sync_facets_compat_after_insert
-AFTER INSERT ON facets
+CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_insert
+AFTER INSERT ON agent_facts
 BEGIN
-    UPDATE facets
+    UPDATE agent_facts
     SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
         facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
         embedding = COALESCE(NEW.embedding, embedding),
-        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM facets WHERE rowid <> NEW.rowid)),
+        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts WHERE rowid <> NEW.rowid)),
         updated_at = CURRENT_TIMESTAMP
     WHERE rowid = NEW.rowid;
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_sync_facets_compat_after_update
-AFTER UPDATE ON facets
+CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_update
+AFTER UPDATE ON agent_facts
 BEGIN
-    UPDATE facets
+    UPDATE agent_facts
     SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
         facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
         embedding = COALESCE(NEW.embedding, embedding),
