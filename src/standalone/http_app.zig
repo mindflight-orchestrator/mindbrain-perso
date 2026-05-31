@@ -2424,7 +2424,7 @@ pub const MindbrainHttpApp = struct {
             .options_json = options_json,
             .debug = req.debug,
         }) catch |err| switch (err) {
-            error.PostgresUnavailable, error.PostgresExecutionFailed => return .{
+            error.PostgresExecutionFailed => return .{
                 .status = .service_unavailable,
                 .content_type = "application/json; charset=utf-8",
                 .body = try std.fmt.allocPrint(

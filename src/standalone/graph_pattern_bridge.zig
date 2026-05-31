@@ -1,6 +1,7 @@
 const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const graph_pattern = @import("graph_pattern.zig");
+const zig16_compat = @import("zig16_compat.zig");
 
 pub const Backend = enum {
     sqlite,
@@ -96,11 +97,12 @@ fn normalizeOptionsJson(allocator: std.mem.Allocator, options_json: []const u8, 
     );
     defer parsed.deinit();
 
-    const root = switch (parsed.value) {
-        .object => |obj| obj,
+    switch (parsed.value) {
+        .object => {
+            try parsed.value.object.put(allocator, "debug", .{ .bool = true });
+        },
         else => return error.InvalidRequest,
-    };
-    try root.put(allocator, "debug", .bool(true));
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.print("{f}", .{std.json.fmt(parsed.value, .{})});
@@ -111,40 +113,53 @@ fn runPsqlScalarJson(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     const psql = try psqlPath(allocator);
     defer allocator.free(psql);
 
-    var child = std.process.Child.init(&.{
-        psql,
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-t",
-        "-A",
-        "-c",
-        sql,
-    }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    const io = zig16_compat.io();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ psql, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    errdefer child.kill(io);
 
-    try child.spawn();
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 16 * 1024 * 1024);
+    const stdout_file = child.stdout orelse return error.PostgresExecutionFailed;
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_reader = stdout_file.reader(io, &stdout_buffer);
+    const stdout = try stdout_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
     errdefer allocator.free(stdout);
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(stderr);
 
-    const term = try child.wait();
+    const stderr_file = child.stderr orelse return error.PostgresExecutionFailed;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_reader = stderr_file.reader(io, &stderr_buffer);
+    const stderr_bytes = try stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    defer allocator.free(stderr_bytes);
+
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.PostgresExecutionFailed;
         },
         else => return error.PostgresExecutionFailed,
     }
 
     const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.PostgresExecutionFailed;
-    return allocator.dupe(u8, trimmed);
+    if (trimmed.len == 0) {
+        allocator.free(stdout);
+        return error.PostgresExecutionFailed;
+    }
+    const owned = try allocator.dupe(u8, trimmed);
+    allocator.free(stdout);
+    return owned;
 }
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
+
 fn psqlPath(allocator: std.mem.Allocator) ![]const u8 {
-    return std.process.getEnvVarOwned(allocator, "PSQL") catch return allocator.dupe(u8, "psql");
+    if (getenv("PSQL")) |ptr| {
+        const path = std.mem.span(ptr);
+        if (path.len > 0) return allocator.dupe(u8, path);
+    }
+    return allocator.dupe(u8, "psql");
 }
 
 test "graph pattern bridge exports postgres-shaped AST for node query" {
