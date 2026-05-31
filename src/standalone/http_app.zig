@@ -184,6 +184,10 @@ pub const MindbrainHttpOptions = struct {
     sqlite_busy_timeout_ms: u32 = http_config.default_sqlite_busy_timeout_ms,
     service_name: []const u8 = "mindbrain-http",
     warn_on_empty_graph: bool = true,
+    /// When false (default), lab-only routes (`/api/events`, `/api/mindbrain/simulate`)
+    /// and the demo queue are not exposed. MindBrain standalone HTTP enables this;
+    /// ghostcrab-backend leaves it disabled.
+    enable_lab_routes: bool = false,
     default_workspace: DefaultWorkspaceOptions = .{},
 };
 
@@ -199,6 +203,7 @@ pub const MindbrainHttpApp = struct {
     max_body_bytes: usize,
     max_connections: u32,
     warn_on_empty_graph: bool,
+    enable_lab_routes: bool,
     db_path_owned: []u8,
     static_dir_owned: []u8,
     listen_addr_text_owned: []u8,
@@ -254,6 +259,7 @@ pub const MindbrainHttpApp = struct {
             .max_body_bytes = options.max_body_bytes,
             .max_connections = options.max_connections,
             .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
+            .enable_lab_routes = true,
         });
     }
 
@@ -307,6 +313,7 @@ pub const MindbrainHttpApp = struct {
             .max_body_bytes = options.max_body_bytes,
             .max_connections = options.max_connections,
             .warn_on_empty_graph = options.warn_on_empty_graph,
+            .enable_lab_routes = options.enable_lab_routes,
             .db_path_owned = db_path_owned,
             .static_dir_owned = static_dir_owned,
             .listen_addr_text_owned = listen_addr_text_owned,
@@ -859,8 +866,9 @@ pub const MindbrainHttpApp = struct {
                 continue;
             };
 
-            if (std.mem.eql(u8, parsed.path, "/api/mindbrain/events") or
-                std.mem.eql(u8, parsed.path, "/api/events"))
+            if (self.enable_lab_routes and
+                (std.mem.eql(u8, parsed.path, "/api/mindbrain/events") or
+                    std.mem.eql(u8, parsed.path, "/api/events")))
             {
                 self.handleEventStream(&request) catch |err| {
                     if (err != error.ConnectionResetByPeer and err != error.BrokenPipe) {
@@ -1021,6 +1029,7 @@ pub const MindbrainHttpApp = struct {
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/simulate")) {
+            if (!self.enable_lab_routes) return error.NotFound;
             return self.handleSimulate(allocator);
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/search-compact-info")) {
@@ -1273,10 +1282,11 @@ pub const MindbrainHttpApp = struct {
         }
 
         var queue = queue_sqlite.QueueStore.init(self.writer_db, allocator);
+        const lab_queue = queue_sqlite.lab_demo_event_queue_name;
         const event = .{
             .type = "simulation",
             .event = "manual-trigger",
-            .stream = "demo_firehose",
+            .stream = lab_queue,
             .source = "mindbrain-http",
             .ts_unix = unixTimestamp(),
             .graph_entities = try self.countRows(self.writer_db, "graph_entity"),
@@ -1284,7 +1294,7 @@ pub const MindbrainHttpApp = struct {
             .search_documents = try self.countRows(self.writer_db, "search_documents"),
             .registered_queues = try self.countRows(self.writer_db, "queue_registry"),
         };
-        const msg_id = try queue.sendJson("demo_firehose", event);
+        const msg_id = try queue.sendJson(lab_queue, event);
         self.writer_completed += 1;
 
         const summary = .{
@@ -2662,11 +2672,23 @@ pub const MindbrainHttpApp = struct {
         return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
     }
 
+    fn archiveLabQueueMessage(queue: *queue_sqlite.QueueStore, queue_name: []const u8, msg_id: i64) void {
+        _ = queue.archive(queue_name, msg_id) catch |err| {
+            log.warn("lab queue archive failed for {s} msg_id={d}: {s}", .{
+                queue_name,
+                msg_id,
+                @errorName(err),
+            });
+            return false;
+        };
+    }
+
     fn handleEventStream(self: *MindbrainHttpApp, request: *http.Server.Request) !void {
         var db = try self.openDb();
         defer db.close();
 
         var queue = queue_sqlite.QueueStore.init(db, self.allocator);
+        const lab_queue = queue_sqlite.lab_demo_event_queue_name;
         var send_buffer: [8192]u8 = undefined;
         var response = try request.respondStreaming(&send_buffer, .{
             .respond_options = .{
@@ -2686,7 +2708,7 @@ pub const MindbrainHttpApp = struct {
 
         var last_heartbeat_ms: i64 = milliTimestamp();
         while (true) {
-            const messages = try queue.read("demo_firehose", 5, 15);
+            const messages = try queue.read(lab_queue, 5, 15);
             defer {
                 for (messages) |message| self.allocator.free(message.message);
                 self.allocator.free(messages);
@@ -2705,9 +2727,7 @@ pub const MindbrainHttpApp = struct {
 
             for (messages) |message| {
                 response.writer.print("data: {s}\n\n", .{message.message}) catch return;
-                queue.archive("demo_firehose", message.msg_id) catch |archive_err| {
-                    log.warn("demo firehose queue archive failed: {s}", .{@errorName(archive_err)});
-                };
+                archiveLabQueueMessage(&queue, lab_queue, message.msg_id);
             }
             response.flush() catch return;
         }
@@ -3845,7 +3865,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/reindex/all
         \\  GET /health
         \\  GET /api/mindbrain/capabilities
-        \\  GET /api/events  (SSE demo_firehose, long-lived)
+        \\  GET /api/events  (SSE lab queue, long-lived; requires enable_lab_routes)
         \\  GET /api/mindbrain/simulate
         \\  GET /api/mindbrain/events  (alias SSE)
         \\  GET /api/mindbrain/search-compact-info
@@ -4730,4 +4750,20 @@ test "http search embedding request rejects malformed JSON bodies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.BadRequest, parseSearchEmbeddingUpsertBody(arena.allocator(), "{\"table_id\":1,\"doc_id\":2,\"embedding\":[0.1],\"extra\":true}"));
+}
+
+test "production embedders disable lab-only SSE and simulate routes by default" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-lab-routes-default-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+    try std.testing.expect(app.enable_lab_routes == false);
 }

@@ -22,6 +22,12 @@ pub const Message = struct {
     message: []const u8,
 };
 
+/// Queue name for optional lab HTTP routes only (`/api/events`, `/api/mindbrain/simulate`).
+/// Production embedders (e.g. ghostcrab-backend) should keep `enable_lab_routes` false.
+/// Queue send/read/archive behaviour is covered by `queue_sqlite` unit tests and
+/// `tool.runStandaloneSimulation` (`simulation_firehose`), not by hard-coded prod paths.
+pub const lab_demo_event_queue_name = "demo_firehose";
+
 pub const QueueStore = struct {
     db: Database,
     allocator: std.mem.Allocator,
