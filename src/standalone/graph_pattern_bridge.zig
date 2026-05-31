@@ -100,10 +100,10 @@ fn normalizeOptionsJson(allocator: std.mem.Allocator, options_json: []const u8, 
         .object => |obj| obj,
         else => return error.InvalidRequest,
     };
-    try root.put("debug", .bool(true));
+    try root.put(allocator, "debug", .bool(true));
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try std.json.stringify(parsed.value, .{}, out.writer());
+    try out.writer.print("{f}", .{std.json.fmt(parsed.value, .{})});
     return out.toOwnedSlice();
 }
 
