@@ -175,6 +175,17 @@ CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
 CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx
     ON graph_entity(workspace_id);
 
+-- Type B projection lookups (ghostcrab_projection_get) filter graph_entity by
+-- workspace_id + entity_type + a literal metadata JSON key. These expression
+-- indexes let those point lookups avoid scanning every workspace entity.
+CREATE INDEX IF NOT EXISTS graph_entity_projection_id_idx
+    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.projection_id'))
+    WHERE json_extract(metadata_json, '$.projection_id') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS graph_entity_metric_idx
+    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.metric'))
+    WHERE json_extract(metadata_json, '$.metric') IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS graph_entity_alias (
     term TEXT NOT NULL,
     entity_id INTEGER NOT NULL,

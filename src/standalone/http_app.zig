@@ -1164,6 +1164,17 @@ pub const MindbrainHttpApp = struct {
             };
         }
 
+        // Keep the BM25/FTS surface warm on the write path so a freshly written
+        // fact is immediately searchable, instead of relying on the best-effort
+        // per-search catch-up in the MCP layer. table_id 1 is the agent_facts
+        // search table (FACETS_SEARCH_TABLE_ID). No-op unless the bm25 sync
+        // trigger for table_id 1 is registered. The fact is already committed;
+        // a sync error is logged but does not fail the response.
+        search_sqlite.syncSearchDocumentIfTriggered(self.writer_db, allocator, 1, result.doc_id, content, "english") catch |err| {
+            self.writer_failed += 1;
+            self.recordWriterError(self.writer_db, "facts.write.fts_sync", err);
+        };
+
         return toResponse(
             try helper_api.jsonResponse(allocator, .{
                 .ok = true,
@@ -1533,7 +1544,7 @@ pub const MindbrainHttpApp = struct {
             .workspace_id = reindex_request.workspace_id,
             .projected_count = result.projected_count,
             .document_table_id = result.document_table_id,
-            .adjacency_rebuilt = true,
+            .adjacency_rebuilt = result.adjacency_rebuilt,
         };
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
@@ -3641,24 +3652,31 @@ fn loadGhostcrabProjectionEntities(
     entity_type: []const u8,
     metadata_key: []const u8,
 ) ![]GhostcrabProjectionEntityRow {
-    const sql =
+    // metadata_key is a trusted internal constant ("projection_id" / "metric").
+    // Validate it defensively, then inline it as a literal JSON path so the
+    // query planner can use the graph_entity expression indexes; a bound
+    // '$.' || ? path is opaque to the planner and forces a full workspace scan.
+    for (metadata_key) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return error.BadRequest;
+    }
+    const sql = try std.fmt.allocPrint(allocator,
         \\SELECT entity_id, entity_type, name, confidence, metadata_json
         \\FROM graph_entity
         \\WHERE workspace_id = ?1
         \\  AND entity_type = ?2
-        \\  AND json_extract(metadata_json, '$.' || ?3) = ?4
-        \\  AND (?5 IS NULL OR json_extract(metadata_json, '$.collection_id') = ?5)
+        \\  AND json_extract(metadata_json, '$.{s}') = ?3
+        \\  AND (?4 IS NULL OR json_extract(metadata_json, '$.collection_id') = ?4)
         \\  AND deprecated_at IS NULL
         \\ORDER BY confidence DESC, entity_id ASC
-    ;
+    , .{metadata_key});
+    defer allocator.free(sql);
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
 
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, entity_type);
-    try facet_sqlite.bindText(stmt, 3, metadata_key);
-    try facet_sqlite.bindText(stmt, 4, projection_id);
-    try bindOptionalText(stmt, 5, collection_id);
+    try facet_sqlite.bindText(stmt, 3, projection_id);
+    try bindOptionalText(stmt, 4, collection_id);
 
     var rows = std.ArrayList(GhostcrabProjectionEntityRow).empty;
     errdefer {

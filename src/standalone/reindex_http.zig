@@ -16,6 +16,10 @@ const Database = facet_sqlite.Database;
 pub const ReindexGraphResult = struct {
     projected_count: u64,
     document_table_id: ?u64 = null,
+    /// True when Roaring adjacency (graph_lj_out/in) was rebuilt as part of this
+    /// reindex. The native pipeline always rebuilds it; only the GhostCrab SQL
+    /// fallback path leaves it stale.
+    adjacency_rebuilt: bool = true,
 };
 
 pub const ReindexAllResult = struct {
@@ -83,6 +87,7 @@ pub fn reindexGraph(
     return .{
         .projected_count = projected,
         .document_table_id = document_table_id,
+        .adjacency_rebuilt = true,
     };
 }
 

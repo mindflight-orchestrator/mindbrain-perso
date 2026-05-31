@@ -675,12 +675,47 @@ pub const Pipeline = struct {
         return try self.reindexGraphWithDocumentTable(workspace_id, null);
     }
 
+    /// Strict rebuild precondition: drop the workspace's derived graph rows so a
+    /// reindex reflects deletions/edits in the raw layer instead of only adding
+    /// to a stale runtime. Children are removed before parents so this stays
+    /// correct regardless of foreign_key enforcement. Adjacency
+    /// (graph_lj_out/in) is dropped here for this workspace's entities and then
+    /// fully rebuilt from graph_relation at the end of the reindex.
+    fn purgeWorkspaceGraph(self: *Pipeline, workspace_id: []const u8) !void {
+        const statements = [_][]const u8{
+            \\DELETE FROM graph_lj_out
+            \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+            ,
+            \\DELETE FROM graph_lj_in
+            \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+            ,
+            \\DELETE FROM graph_entity_alias
+            \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+            ,
+            \\DELETE FROM graph_relation_property
+            \\WHERE relation_id IN (SELECT relation_id FROM graph_relation WHERE workspace_id = ?1)
+            ,
+            "DELETE FROM graph_relation WHERE workspace_id = ?1",
+            "DELETE FROM graph_entity WHERE workspace_id = ?1",
+        };
+        for (statements) |sql| {
+            const stmt = try facet_sqlite.prepare(self.db.*, sql);
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, workspace_id);
+            try facet_sqlite.stepDone(stmt);
+        }
+    }
+
     /// Replays the raw graph layer into the derived graph tables. When
     /// `document_table_id` is provided, raw entity-document links are projected
     /// into `graph_entity_document`; chunk links are always projected into
     /// `graph_entity_chunk`.
     pub fn reindexGraphWithDocumentTable(self: *Pipeline, workspace_id: []const u8, document_table_id: ?u64) !u64 {
         var projected_count: u64 = 0;
+
+        // Strict rebuild: clear the workspace's derived graph rows before
+        // replaying *_raw so removed entities/relations do not linger.
+        try self.purgeWorkspaceGraph(workspace_id);
 
         // Entities first so relations can reference them.
         {
@@ -862,6 +897,11 @@ pub const Pipeline = struct {
             try graph_sqlite.upsertEntityChunk(self.db.*, eid, workspace_id, collection_id, doc_id, chunk_index, role, confidence, "{}");
             projected_count += 1;
         }
+
+        // Rebuild Roaring adjacency from the (now strictly rebuilt) graph_relation
+        // so graph_path / graph_subgraph reflect the current relation set, not a
+        // stale append-only accumulation.
+        try graph_sqlite.rebuildAdjacency(self.db.*, self.allocator);
 
         return projected_count;
     }
