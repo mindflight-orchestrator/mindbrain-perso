@@ -1090,6 +1090,7 @@ pub fn registerAliases(db: Database, entity_id: u32, terms: []const []const u8, 
 pub fn resolveTerms(
     db: Database,
     allocator: std.mem.Allocator,
+    workspace_id: []const u8,
     terms: []const []const u8,
     min_confidence: f32,
 ) !roaring.Bitmap {
@@ -1098,7 +1099,7 @@ pub fn resolveTerms(
 
     const stmt = try prepare(
         db,
-        "SELECT entity_id FROM graph_entity_alias WHERE term = ?1 AND confidence >= ?2 ORDER BY confidence DESC, entity_id ASC",
+        "SELECT a.entity_id FROM graph_entity_alias a JOIN graph_entity e ON e.entity_id = a.entity_id WHERE a.term = ?1 AND a.confidence >= ?2 AND e.workspace_id = ?3 ORDER BY a.confidence DESC, a.entity_id ASC",
     );
     defer finalize(stmt);
 
@@ -1106,6 +1107,7 @@ pub fn resolveTerms(
         try resetStatement(stmt);
         try bindText(stmt, 1, term);
         if (c.sqlite3_bind_double(stmt, 2, min_confidence) != c.SQLITE_OK) return error.BindFailed;
+        try bindText(stmt, 3, workspace_id);
 
         while (true) {
             const rc = c.sqlite3_step(stmt);
@@ -1182,6 +1184,16 @@ pub fn loadEntityFull(
         .deprecated_at_unix = columnOptionalI64(stmt, 5),
         .created_at_unix = @intCast(c.sqlite3_column_int64(stmt, 6)),
     };
+}
+
+pub fn assertRelationEndpointsInWorkspace(
+    db: Database,
+    workspace_id: []const u8,
+    source_id: u32,
+    target_id: u32,
+) !void {
+    if (!try entityInWorkspace(db, source_id, workspace_id)) return error.CrossWorkspaceRelation;
+    if (!try entityInWorkspace(db, target_id, workspace_id)) return error.CrossWorkspaceRelation;
 }
 
 fn entityInWorkspace(db: Database, entity_id: u32, workspace_id: []const u8) !bool {
@@ -1843,7 +1855,7 @@ pub fn learnFromRun(
 
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
-    try rebuildLjForEntitiesNoTransaction(db, touched_ids, allocator);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, null, allocator);
     return run_id;
 }
 
@@ -1948,7 +1960,7 @@ pub fn applyKnowledgePatch(
 
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
-    try rebuildLjForEntitiesNoTransaction(db, touched_ids, allocator);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, null, allocator);
     return applied_count;
 }
 
@@ -2022,6 +2034,13 @@ pub fn deleteRelation(db: Database, relation_id: u32) !void {
 }
 
 pub fn rebuildAdjacency(db: Database, allocator: std.mem.Allocator) !void {
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer {
+        db.exec("ROLLBACK") catch |rollback_err| {
+            std.log.warn("graph adjacency global rebuild rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+    }
+
     try db.exec("DELETE FROM graph_lj_out");
     try db.exec("DELETE FROM graph_lj_in");
 
@@ -2071,22 +2090,50 @@ pub fn rebuildAdjacency(db: Database, allocator: std.mem.Allocator) !void {
     }
 
     try refreshEntityDegree(db);
+    try db.exec("COMMIT");
 }
 
 pub fn rebuildLjRelations(db: Database, allocator: std.mem.Allocator) !void {
     try rebuildAdjacency(db, allocator);
 }
 
+pub fn rebuildAdjacencyForWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    entity_ids: []const u32,
+) !void {
+    try rebuildLjForEntitiesInWorkspace(db, entity_ids, workspace_id, allocator);
+}
+
 pub fn rebuildLjForEntities(db: Database, entity_ids: []const u32, allocator: std.mem.Allocator) !void {
+    try rebuildLjForEntitiesInWorkspace(db, entity_ids, null, allocator);
+}
+
+fn rebuildLjForEntitiesInWorkspace(
+    db: Database,
+    entity_ids: []const u32,
+    workspace_id: ?[]const u8,
+    allocator: std.mem.Allocator,
+) !void {
     if (entity_ids.len == 0) return;
 
     try db.exec("BEGIN IMMEDIATE");
-    errdefer _ = db.exec("ROLLBACK") catch {};
-    try rebuildLjForEntitiesNoTransaction(db, entity_ids, allocator);
+    errdefer {
+        db.exec("ROLLBACK") catch |rollback_err| {
+            std.log.warn("graph adjacency scoped rebuild rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+    }
+    try rebuildLjForEntitiesNoTransaction(db, entity_ids, workspace_id, allocator);
     try db.exec("COMMIT");
 }
 
-fn rebuildLjForEntitiesNoTransaction(db: Database, entity_ids: []const u32, allocator: std.mem.Allocator) !void {
+fn rebuildLjForEntitiesNoTransaction(
+    db: Database,
+    entity_ids: []const u32,
+    workspace_id: ?[]const u8,
+    allocator: std.mem.Allocator,
+) !void {
     if (entity_ids.len == 0) return;
 
     const out_stmt = try prepare(db, "DELETE FROM graph_lj_out WHERE entity_id = ?1");
@@ -2094,8 +2141,13 @@ fn rebuildLjForEntitiesNoTransaction(db: Database, entity_ids: []const u32, allo
     const in_stmt = try prepare(db, "DELETE FROM graph_lj_in WHERE entity_id = ?1");
     defer finalize(in_stmt);
 
-    const rel_stmt = try prepare(db, "SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL ORDER BY relation_id");
+    const rel_sql = if (workspace_id != null)
+        "SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL AND workspace_id = ?1 ORDER BY relation_id"
+    else
+        "SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL ORDER BY relation_id";
+    const rel_stmt = try prepare(db, rel_sql);
     defer finalize(rel_stmt);
+    if (workspace_id) |ws| try bindText(rel_stmt, 1, ws);
 
     var outgoing = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator);
     defer {
@@ -2696,11 +2748,13 @@ fn buildSkillDependencyRows(allocator: std.mem.Allocator, results: []const Skill
 pub fn resolveAlias(
     db: Database,
     allocator: std.mem.Allocator,
+    workspace_id: []const u8,
     term: []const u8,
 ) ![]EntityAliasMatch {
-    const stmt = try prepare(db, "SELECT a.entity_id, e.name, e.entity_type, a.confidence FROM graph_entity_alias a JOIN graph_entity e ON e.entity_id = a.entity_id WHERE a.term = ?1 ORDER BY a.confidence DESC, e.name ASC");
+    const stmt = try prepare(db, "SELECT a.entity_id, e.name, e.entity_type, a.confidence FROM graph_entity_alias a JOIN graph_entity e ON e.entity_id = a.entity_id WHERE a.term = ?1 AND e.workspace_id = ?2 ORDER BY a.confidence DESC, e.name ASC");
     defer finalize(stmt);
     try bindText(stmt, 1, term);
+    try bindText(stmt, 2, workspace_id);
 
     var matches = std.ArrayList(EntityAliasMatch).empty;
     defer {
@@ -4444,7 +4498,7 @@ test "sqlite graph canonical tables support alias resolution and entity-document
     try insertEntityDocument(db, 1, 42, 9001, "author", 0.9);
     try insertEntityDocument(db, 1, 43, 9001, "subject", 0.8);
 
-    const matches = try resolveAlias(db, std.testing.allocator, "ada");
+    const matches = try resolveAlias(db, std.testing.allocator, "default", "ada");
     defer {
         for (matches) |match| {
             std.testing.allocator.free(match.name);

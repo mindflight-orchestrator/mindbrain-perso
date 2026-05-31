@@ -50,7 +50,9 @@ pub fn writeFact(
     try db.exec("BEGIN IMMEDIATE");
     var transaction_active = true;
     errdefer if (transaction_active) {
-        db.exec("ROLLBACK") catch {};
+        db.exec("ROLLBACK") catch |rollback_err| {
+            std.log.warn("facts write rollback failed: {s}", .{@errorName(rollback_err)});
+        };
     };
 
     if (write.source_ref) |source_ref| {
@@ -86,7 +88,9 @@ pub fn writeFact(
 
 fn commitTransaction(db: facet_sqlite.Database, transaction_active: *bool) !void {
     db.exec("COMMIT") catch |commit_err| {
-        db.exec("ROLLBACK") catch {};
+        db.exec("ROLLBACK") catch |rollback_err| {
+            std.log.warn("facts write commit rollback failed: {s}", .{@errorName(rollback_err)});
+        };
         transaction_active.* = false;
         return commit_err;
     };

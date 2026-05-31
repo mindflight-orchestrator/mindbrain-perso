@@ -497,7 +497,9 @@ pub const MindbrainHttpApp = struct {
         defer self.sql_sessions_mutex.unlock(self.io);
 
         if (self.writer_active_session_id != null) {
-            _ = self.writer_db.exec("ROLLBACK") catch {};
+            self.writer_db.exec("ROLLBACK") catch |rollback_err| {
+                log.warn("writer session rollback failed: {s}", .{@errorName(rollback_err)});
+            };
             self.writer_active_session_id = null;
         }
         var it = self.sql_sessions.iterator();
@@ -2703,7 +2705,9 @@ pub const MindbrainHttpApp = struct {
 
             for (messages) |message| {
                 response.writer.print("data: {s}\n\n", .{message.message}) catch return;
-                _ = queue.archive("demo_firehose", message.msg_id) catch {};
+                queue.archive("demo_firehose", message.msg_id) catch |archive_err| {
+                    log.warn("demo firehose queue archive failed: {s}", .{@errorName(archive_err)});
+                };
             }
             response.flush() catch return;
         }

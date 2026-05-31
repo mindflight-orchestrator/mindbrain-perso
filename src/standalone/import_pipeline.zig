@@ -291,8 +291,12 @@ pub const Pipeline = struct {
     pub fn addRelationProperty(self: *Pipeline, spec: collections_sqlite.RelationPropertyRawSpec) !void {
         try self.db.exec("SAVEPOINT add_relation_property");
         errdefer {
-            _ = self.db.exec("ROLLBACK TO SAVEPOINT add_relation_property") catch {};
-            _ = self.db.exec("RELEASE SAVEPOINT add_relation_property") catch {};
+            self.db.exec("ROLLBACK TO SAVEPOINT add_relation_property") catch |rollback_err| {
+                std.log.warn("addRelationProperty savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+            self.db.exec("RELEASE SAVEPOINT add_relation_property") catch |release_err| {
+                std.log.warn("addRelationProperty savepoint release failed: {s}", .{@errorName(release_err)});
+            };
         }
         try collections_sqlite.upsertRelationPropertyRaw(self.db.*, spec);
         const rid: u32 = std.math.cast(u32, spec.relation_id) orelse return error.ValueOutOfRange;
@@ -712,6 +716,8 @@ pub const Pipeline = struct {
     /// `graph_entity_chunk`.
     pub fn reindexGraphWithDocumentTable(self: *Pipeline, workspace_id: []const u8, document_table_id: ?u64) !u64 {
         var projected_count: u64 = 0;
+        var workspace_entity_ids = std.ArrayList(u32).empty;
+        defer workspace_entity_ids.deinit(self.allocator);
 
         // Strict rebuild: clear the workspace's derived graph rows before
         // replaying *_raw so removed entities/relations do not linger.
@@ -743,6 +749,7 @@ pub const Pipeline = struct {
                 const metadata_json = try facet_sqlite.dupeColumnText(self.allocator, stmt, 4);
                 defer self.allocator.free(metadata_json);
                 try graph_sqlite.upsertEntityFull(self.db.*, eid32, workspace_id, etype, name, confidence, metadata_json);
+                try workspace_entity_ids.append(self.allocator, eid32);
                 projected_count += 1;
             }
         }
@@ -800,6 +807,7 @@ pub const Pipeline = struct {
             const metadata_json = try facet_sqlite.dupeColumnText(self.allocator, stmt, 7);
             defer self.allocator.free(metadata_json);
 
+            try graph_sqlite.assertRelationEndpointsInWorkspace(self.db.*, workspace_id, src, tgt);
             try self.addRelation(.{
                 .relation_id = rid,
                 .source_id = src,
@@ -898,10 +906,10 @@ pub const Pipeline = struct {
             projected_count += 1;
         }
 
-        // Rebuild Roaring adjacency from the (now strictly rebuilt) graph_relation
-        // so graph_path / graph_subgraph reflect the current relation set, not a
-        // stale append-only accumulation.
-        try graph_sqlite.rebuildAdjacency(self.db.*, self.allocator);
+        // Rebuild Roaring adjacency only for this workspace's entities so
+        // graph_path / graph_subgraph reflect the current relation set without
+        // paying for a whole-graph wipe/rebuild on every tenant reindex.
+        try graph_sqlite.rebuildAdjacencyForWorkspace(self.db.*, self.allocator, workspace_id, workspace_entity_ids.items);
 
         return projected_count;
     }
@@ -1855,4 +1863,155 @@ test "addRelationPropertiesBatch stages raw rows then projectRelationPropertiesF
         }
     }
     try std.testing.expect(found_pleine);
+}
+
+fn expectRelationExists(db: facet_sqlite.Database, relation_id: u32) !void {
+    const stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM graph_relation WHERE relation_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, relation_id);
+    try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
+}
+
+fn expectRelationMissing(db: facet_sqlite.Database, relation_id: u32) !void {
+    const stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM graph_relation WHERE relation_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, relation_id);
+    try std.testing.expectEqual(facet_sqlite.c.SQLITE_DONE, facet_sqlite.c.sqlite3_step(stmt));
+}
+
+fn seedWorkspaceGraph(
+    pipeline: *Pipeline,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    source_entity_id: u64,
+    target_entity_id: u64,
+    relation_id: u64,
+) !void {
+    try pipeline.createWorkspace(.{ .workspace_id = workspace_id, .label = workspace_id });
+    try pipeline.registerOntology(.{
+        .header = .{
+            .ontology_id = ontology_id,
+            .workspace_id = workspace_id,
+            .name = "core",
+        },
+        .entity_types = &.{.{ .ontology_id = ontology_id, .entity_type = "person" }},
+        .edge_types = &.{.{ .ontology_id = ontology_id, .edge_type = "works_for" }},
+    });
+    try pipeline.upsertEntityFull(.{
+        .workspace_id = workspace_id,
+        .ontology_id = ontology_id,
+        .entity_id = source_entity_id,
+        .entity_type = "person",
+        .name = if (source_entity_id == 1 or source_entity_id == 3) "Source" else "Target",
+        .confidence = 0.9,
+    });
+    try pipeline.upsertEntityFull(.{
+        .workspace_id = workspace_id,
+        .ontology_id = ontology_id,
+        .entity_id = target_entity_id,
+        .entity_type = "person",
+        .name = if (target_entity_id == 2 or target_entity_id == 4) "Target" else "Source",
+        .confidence = 0.9,
+    });
+    try pipeline.addRelationFull(.{
+        .workspace_id = workspace_id,
+        .ontology_id = ontology_id,
+        .relation_id = relation_id,
+        .edge_type = "works_for",
+        .source_entity_id = source_entity_id,
+        .target_entity_id = target_entity_id,
+        .confidence = 0.9,
+    });
+}
+
+test "strict graph reindex removes deleted raw relations and preserves other workspaces" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var search = search_store.Store.init(std.testing.allocator);
+    defer search.deinit();
+    var facets = facet_store.Store.init(std.testing.allocator);
+    defer facets.deinit();
+    var graph = graph_store.Store.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var pipeline = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph,
+    };
+
+    try seedWorkspaceGraph(&pipeline, "ws_a", "ws_a::core", 1, 2, 100);
+    try seedWorkspaceGraph(&pipeline, "ws_b", "ws_b::core", 3, 4, 200);
+
+    _ = try pipeline.reindexGraph("ws_a");
+    _ = try pipeline.reindexGraph("ws_b");
+
+    try expectRelationExists(db, 100);
+    try expectRelationExists(db, 200);
+
+    var runtime_before = try graph_sqlite.loadRuntime(db, std.testing.allocator);
+    defer runtime_before.deinit();
+    try std.testing.expectEqual(@as(?usize, 1), try runtime_before.shortestPathHops(std.testing.allocator, 1, 2, .{}, 2));
+    try std.testing.expectEqual(@as(?usize, 1), try runtime_before.shortestPathHops(std.testing.allocator, 3, 4, .{}, 2));
+
+    {
+        const sql = "DELETE FROM relations_raw WHERE workspace_id = ?1 AND relation_id = ?2";
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, "ws_a");
+        try facet_sqlite.bindInt64(stmt, 2, 100);
+        try facet_sqlite.stepDone(stmt);
+    }
+
+    _ = try pipeline.reindexGraph("ws_a");
+
+    try expectRelationMissing(db, 100);
+    try expectRelationExists(db, 200);
+
+    var runtime_after = try graph_sqlite.loadRuntime(db, std.testing.allocator);
+    defer runtime_after.deinit();
+    try std.testing.expectEqual(@as(?usize, null), try runtime_after.shortestPathHops(std.testing.allocator, 1, 2, .{}, 2));
+    try std.testing.expectEqual(@as(?usize, 1), try runtime_after.shortestPathHops(std.testing.allocator, 3, 4, .{}, 2));
+}
+
+test "resolveAlias and resolveTerms stay scoped to the requested workspace" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try graph_sqlite.upsertEntityFull(db, 1, "ws_a", "person", "Alice", 0.95, "{}");
+    try graph_sqlite.upsertEntityFull(db, 2, "ws_b", "person", "Bob", 0.95, "{}");
+    try graph_sqlite.insertEntityAlias(db, "shared-term", 1, 0.95);
+    try graph_sqlite.insertEntityAlias(db, "shared-term", 2, 0.90);
+
+    const ws_a_matches = try graph_sqlite.resolveAlias(db, std.testing.allocator, "ws_a", "shared-term");
+    defer {
+        for (ws_a_matches) |match| {
+            std.testing.allocator.free(match.name);
+            std.testing.allocator.free(match.entity_type);
+        }
+        std.testing.allocator.free(ws_a_matches);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ws_a_matches.len);
+    try std.testing.expectEqual(@as(u32, 1), ws_a_matches[0].entity_id);
+
+    const ws_b_matches = try graph_sqlite.resolveAlias(db, std.testing.allocator, "ws_b", "shared-term");
+    defer {
+        for (ws_b_matches) |match| {
+            std.testing.allocator.free(match.name);
+            std.testing.allocator.free(match.entity_type);
+        }
+        std.testing.allocator.free(ws_b_matches);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ws_b_matches.len);
+    try std.testing.expectEqual(@as(u32, 2), ws_b_matches[0].entity_id);
+
+    var ws_a_terms = try graph_sqlite.resolveTerms(db, std.testing.allocator, "ws_a", &.{"shared-term"}, 0.5);
+    defer ws_a_terms.deinit();
+    try std.testing.expect(ws_a_terms.contains(1));
+    try std.testing.expect(!ws_a_terms.contains(2));
 }

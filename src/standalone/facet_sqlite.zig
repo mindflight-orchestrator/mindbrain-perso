@@ -978,15 +978,21 @@ pub fn mergeDeltasSafe(
     try db.exec("SAVEPOINT facet_merge_deltas_safe");
 
     const result = applyDeltas(db, table_id, facet_id) catch |err| {
-        _ = db.exec("ROLLBACK TO SAVEPOINT facet_merge_deltas_safe") catch {};
-        _ = db.exec("RELEASE SAVEPOINT facet_merge_deltas_safe") catch {};
+        db.exec("ROLLBACK TO SAVEPOINT facet_merge_deltas_safe") catch |rollback_err| {
+            std.log.warn("facet merge savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+        db.exec("RELEASE SAVEPOINT facet_merge_deltas_safe") catch |release_err| {
+            std.log.warn("facet merge savepoint release failed: {s}", .{@errorName(release_err)});
+        };
         return err;
     };
 
     if (db.exec("RELEASE SAVEPOINT facet_merge_deltas_safe")) |_| {
         return result;
     } else |_| {
-        _ = db.exec("ROLLBACK TO SAVEPOINT facet_merge_deltas_safe") catch {};
+        db.exec("ROLLBACK TO SAVEPOINT facet_merge_deltas_safe") catch |rollback_err| {
+            std.log.warn("facet merge savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+        };
         return error.ExecFailed;
     }
 }

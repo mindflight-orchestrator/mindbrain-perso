@@ -203,7 +203,9 @@ fn commit(db: Database) !void {
 }
 
 fn rollback(db: Database) void {
-    _ = db.exec("ROLLBACK") catch {};
+    db.exec("ROLLBACK") catch |rollback_err| {
+        std.log.warn("queue rollback failed: {s}", .{@errorName(rollback_err)});
+    };
 }
 
 fn prepare(db: Database, sql: []const u8) !*c.sqlite3_stmt {

@@ -448,7 +448,9 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     const bundle = parsed.value;
 
     try db.exec("BEGIN");
-    errdefer db.exec("ROLLBACK") catch {};
+    errdefer db.exec("ROLLBACK") catch |rollback_err| {
+        std.log.warn("collections import rollback failed: {s}", .{@errorName(rollback_err)});
+    };
 
     for (bundle.workspaces) |row| {
         try collections_sqlite.ensureWorkspace(db, .{
