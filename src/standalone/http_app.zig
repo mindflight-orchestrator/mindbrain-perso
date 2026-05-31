@@ -2410,7 +2410,7 @@ pub const MindbrainHttpApp = struct {
         if (req.options) |value| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            try std.json.stringify(value, .{}, out.writer());
+            try out.writer.print("{f}", .{std.json.fmt(value, .{})});
             options_owned = try out.toOwnedSlice();
             options_json = options_owned.?;
         }
