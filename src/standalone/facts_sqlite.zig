@@ -387,7 +387,7 @@ test "writeFact preserves provided id and keeps sourced id on update" {
     try std.testing.expect(updated.updated);
 }
 
-test "standalone schema allocates legacy facets doc_id and has source_ref indexes" {
+test "standalone schema allocates legacy agent_facts doc_id and has source_ref indexes" {
     var db = try facet_sqlite.Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
@@ -402,7 +402,7 @@ test "standalone schema allocates legacy facets doc_id and has source_ref indexe
     }
 
     {
-        const stmt = try facet_sqlite.prepare(db, "PRAGMA index_list(facets)");
+        const stmt = try facet_sqlite.prepare(db, "PRAGMA index_list(agent_facts)");
         defer facet_sqlite.finalize(stmt);
 
         var found_canonical = false;
@@ -414,8 +414,8 @@ test "standalone schema allocates legacy facets doc_id and has source_ref indexe
 
             const name = try facet_sqlite.dupeColumnText(std.testing.allocator, stmt, 1);
             defer std.testing.allocator.free(name);
-            if (std.mem.eql(u8, name, "facets_source_ref_workspace_uniq")) found_canonical = true;
-            if (std.mem.eql(u8, name, "idx_facets_source_ref_workspace")) found_legacy_compat = true;
+            if (std.mem.eql(u8, name, "agent_facts_source_ref_workspace_uniq")) found_canonical = true;
+            if (std.mem.eql(u8, name, "idx_agent_facts_source_ref_workspace")) found_legacy_compat = true;
         }
         try std.testing.expect(found_canonical);
         try std.testing.expect(found_legacy_compat);
