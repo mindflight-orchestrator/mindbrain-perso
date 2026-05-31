@@ -2408,7 +2408,10 @@ pub const MindbrainHttpApp = struct {
         var options_owned: ?[]u8 = null;
         defer if (options_owned) |value| allocator.free(value);
         if (req.options) |value| {
-            options_owned = try std.json.stringifyAlloc(allocator, value, .{});
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try std.json.stringify(value, .{}, out.writer());
+            options_owned = try out.toOwnedSlice();
             options_json = options_owned.?;
         }
 
