@@ -2673,13 +2673,12 @@ pub const MindbrainHttpApp = struct {
     }
 
     fn archiveLabQueueMessage(queue: *queue_sqlite.QueueStore, queue_name: []const u8, msg_id: i64) void {
-        _ = queue.archive(queue_name, msg_id) catch |err| {
+        queue.archive(queue_name, msg_id) catch |err| {
             log.warn("lab queue archive failed for {s} msg_id={d}: {s}", .{
                 queue_name,
                 msg_id,
                 @errorName(err),
             });
-            return false;
         };
     }
 
