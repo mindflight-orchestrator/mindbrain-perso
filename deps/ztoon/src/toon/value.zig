@@ -66,3 +66,65 @@ pub const Field = struct {
     key: []const u8,
     value: Value,
 };
+
+pub fn deinit(allocator: std.mem.Allocator, value: Value) void {
+    switch (value) {
+        .string => |text| allocator.free(text),
+        .array => |items| {
+            for (items) |item| deinit(allocator, item);
+            allocator.free(items);
+        },
+        .object => |fields| {
+            for (fields) |field| {
+                allocator.free(field.key);
+                deinit(allocator, field.value);
+            }
+            allocator.free(fields);
+        },
+        else => {},
+    }
+}
+
+pub fn toJsonValue(allocator: std.mem.Allocator, value: Value) !std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |v| .{ .bool = v },
+        .integer => |v| .{ .integer = v },
+        .float => |v| .{ .float = v },
+        .string => |v| .{ .string = try allocator.dupe(u8, v) },
+        .array => |items| blk: {
+            var out = std.json.Array.init(allocator);
+            errdefer out.deinit();
+            for (items) |item| try out.append(try toJsonValue(allocator, item));
+            break :blk .{ .array = out };
+        },
+        .object => |fields| blk: {
+            var out = std.json.ObjectMap.empty;
+            errdefer out.deinit(allocator);
+            for (fields) |field| {
+                try out.put(allocator, try allocator.dupe(u8, field.key), try toJsonValue(allocator, field.value));
+            }
+            break :blk .{ .object = out };
+        },
+    };
+}
+
+pub fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |text| allocator.free(text),
+        .array => |items| {
+            for (items.items) |item| deinitJsonValue(allocator, item);
+            items.deinit();
+        },
+        .object => |map| {
+            var copy = map;
+            var it = copy.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValue(allocator, entry.value_ptr.*);
+            }
+            copy.deinit(allocator);
+        },
+        else => {},
+    }
+}

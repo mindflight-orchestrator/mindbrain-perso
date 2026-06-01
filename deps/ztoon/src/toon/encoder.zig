@@ -34,7 +34,7 @@ pub const Encoder = struct {
     }
 
     pub fn encode(self: *Encoder, value: Value) !void {
-        _ = self.options.key_folding;
+        if (self.options.key_folding) return error.UnsupportedKeyFolding;
         try self.writeNode(null, value);
     }
 
@@ -153,8 +153,7 @@ pub const Encoder = struct {
             },
             .float => |float_value| {
                 if (!std.math.isFinite(float_value) or (float_value == 0 and std.math.signbit(float_value))) {
-                    try self.writer.writeAll("null");
-                    return;
+                    return error.UnsupportedFloatValue;
                 }
 
                 var buffer: [128]u8 = undefined;

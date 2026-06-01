@@ -34,6 +34,10 @@ const business_edge_normalize = mindbrain.business_edge_normalize;
 const business_entity_normalize = mindbrain.business_entity_normalize;
 const llm_context_budget = mindbrain.llm_context_budget;
 const syndic_profile_seed = mindbrain.syndic_profile_seed;
+const structured_import = mindbrain.structured_import;
+const structured_import_ddl = mindbrain.structured_import_ddl;
+const structured_import_drift = mindbrain.structured_import_drift;
+const structured_import_semantics = mindbrain.structured_import_semantics;
 
 const Allocator = std.mem.Allocator;
 
@@ -269,6 +273,63 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "structured-import-validate")) {
+        try runStructuredImportValidateCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-dry-run")) {
+        try runStructuredImportDryRunCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-apply")) {
+        try runStructuredImportApplyCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-project")) {
+        try runStructuredImportProjectCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-reindex")) {
+        try runStructuredImportReindexCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-profile")) {
+        try runStructuredImportProfileCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-infer")) {
+        try runStructuredImportInferCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-register-semantics")) {
+        try runStructuredImportRegisterSemanticsCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-validate-provenance")) {
+        try runStructuredImportValidateProvenanceCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-validate-drift")) {
+        try runStructuredImportValidateDriftCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-audit-orphans")) {
+        try runStructuredImportAuditOrphansCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-ddl-propose")) {
+        try runStructuredImportDdlProposeCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-ddl-execute")) {
+        try runStructuredImportDdlExecuteCommand(allocator, args[2..]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "structured-import-load-ws")) {
+        try runStructuredImportLoadWsCommand(allocator, args[2..]);
+        return;
+    }
+
     try printUsage();
     return CliError.InvalidArguments;
 }
@@ -395,6 +456,15 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool queue-archive --db <sqlite_path> --queue <name> --msg-id <id>
         \\  mindbrain-standalone-tool queue-delete --db <sqlite_path> --queue <name> --msg-id <id>
         \\  mindbrain-standalone-tool simulate
+        \\  mindbrain-standalone-tool structured-import-validate [--model <contract.json>] [--mapping <mapping.json>] [--input <dir>]
+        \\  mindbrain-standalone-tool structured-import-dry-run [--facets <csv>] [--edges <csv>]
+        \\  mindbrain-standalone-tool structured-import-apply --db <sqlite> --workspace-id <id> [--ontology-id <id>] [--mode reset|append|ignore-duplicates] --facets <csv> [--edges <csv>]
+        \\  mindbrain-standalone-tool structured-import-project --db <sqlite> --workspace-id <id> --model <contract.json> --mapping <mapping.json> [--input <dir>] [--mode reset|append|ignore-duplicates]
+        \\  mindbrain-standalone-tool structured-import-reindex --db <sqlite> --workspace-id <id> [--scope graph|facets|all]
+        \\  mindbrain-standalone-tool structured-import-profile --input <csv> --output <profile.json>
+        \\  mindbrain-standalone-tool structured-import-infer --model <contract.json> [--mapping <mapping.json>] [--input <csv>] [--output <infer.json>]
+        \\  mindbrain-standalone-tool structured-import-register-semantics --db <sqlite> --workspace-id <id> (--proposal <infer.json> | --model <contract.json> [--mapping <mapping.json>])
+        \\  mindbrain-standalone-tool structured-import-validate-provenance --db <sqlite> --workspace-id <id> [--source-tag <tag>]
         \\
     );
     try stderr.flush();
@@ -6601,6 +6671,469 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
     });
 
     try writeStdout("external link {d} -> {s} ({s}) added\n", .{ link_id, target_uri.?, edge_type });
+}
+
+fn runStructuredImportValidateCommand(allocator: Allocator, args: []const []const u8) !void {
+    var model_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var input_dir: ?[]const u8 = null;
+    var strict_drift: bool = false;
+    var strict_provenance: bool = false;
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--strict-drift")) strict_drift = true else if (std.mem.eql(u8, arg, "--strict-provenance")) strict_provenance = true else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (model_path == null) return CliError.InvalidArguments;
+    try structured_import.validateBundleWithOptions(allocator, .{
+        .model_path = model_path.?,
+        .mapping_path = mapping_path,
+        .input_dir = input_dir,
+        .strict_drift = strict_drift,
+        .strict_provenance = strict_provenance,
+        .db_path = db_path,
+        .workspace_id = workspace_id,
+    });
+    try writeStdout("structured-import validate: ok\n", .{});
+}
+
+fn runStructuredImportDryRunCommand(allocator: Allocator, args: []const []const u8) !void {
+    var facets_path: ?[]const u8 = null;
+    var edges_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--facets")) facets_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--edges")) edges_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (facets_path == null) return CliError.InvalidArguments;
+    const report = try structured_import.dryRunCounts(allocator, facets_path.?, edges_path);
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .facet_rows = report.facet_rows,
+        .edge_rows = report.edge_rows,
+    }, .{})});
+}
+
+fn runStructuredImportApplyCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var mode: structured_import.ImportMode = .append;
+    var facets_path: ?[]const u8 = null;
+    var edges_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var require_semantics: bool = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mode")) {
+            const raw = try requireArg(args, &index);
+            mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--facets")) facets_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--edges")) edges_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--require-semantics")) require_semantics = true else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var data_plane: []const u8 = "import_ready";
+    var data_plane_owned: ?[]const u8 = null;
+    defer if (data_plane_owned) |dp| allocator.free(dp);
+    if (mapping_path) |mp| {
+        data_plane_owned = try structured_import.readDataPlane(mp, allocator);
+        data_plane = data_plane_owned.?;
+    }
+    if (!std.mem.eql(u8, data_plane, "ws") and facets_path == null) return CliError.InvalidArguments;
+    const ont = ontology_id orelse workspace_id.?;
+
+    var mapping_owned: ?structured_import.MappingContract = null;
+    defer if (mapping_owned) |*mapping| mapping.deinit(allocator);
+    if (mapping_path) |mp| {
+        mapping_owned = try structured_import.readMappingContract(allocator, mp);
+    }
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const report = try structured_import.applyImportReady(allocator, db, .{
+        .workspace_id = workspace_id.?,
+        .ontology_id = ont,
+        .mode = mode,
+        .facets_path = facets_path,
+        .edges_path = edges_path,
+        .mapping = if (mapping_owned) |*m| m.* else null,
+        .mapping_path = mapping_path,
+        .require_semantics = require_semantics,
+        .data_plane = data_plane,
+    });
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .facets_inserted = report.facets_inserted,
+        .facets_updated = report.facets_updated,
+        .facets_skipped = report.facets_skipped,
+        .entities_upserted = report.entities_upserted,
+        .edges_inserted = report.edges_inserted,
+        .edges_skipped = report.edges_skipped,
+    }, .{})});
+}
+
+fn runStructuredImportProjectCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var model_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var input_dir: ?[]const u8 = null;
+    var mode: structured_import.ImportMode = .append;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mode")) {
+            const raw = try requireArg(args, &index);
+            mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
+        } else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null or model_path == null or mapping_path == null) return CliError.InvalidArguments;
+
+    const data_plane_owned = try structured_import.readDataPlane(mapping_path.?, allocator);
+    defer allocator.free(data_plane_owned);
+
+    try structured_import.validateBundle(allocator, model_path.?, mapping_path, input_dir);
+
+    var mapping_owned = try structured_import.readMappingContract(allocator, mapping_path.?);
+    defer mapping_owned.deinit(allocator);
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    if (std.mem.eql(u8, data_plane_owned, "ws")) {
+        const report = try structured_import.applyImportReady(allocator, db, .{
+            .workspace_id = workspace_id.?,
+            .ontology_id = mapping_owned.ontology_id,
+            .mode = mode,
+            .mapping = mapping_owned,
+            .mapping_path = mapping_path,
+            .data_plane = "ws",
+        });
+        try writeStdout("{f}\n", .{std.json.fmt(.{
+            .projected = true,
+            .data_plane = "ws",
+            .facets_inserted = report.facets_inserted,
+            .facets_updated = report.facets_updated,
+            .facets_skipped = report.facets_skipped,
+            .entities_upserted = report.entities_upserted,
+            .edges_inserted = report.edges_inserted,
+            .edges_skipped = report.edges_skipped,
+        }, .{})});
+        return;
+    }
+
+    const mapping_text = try structured_import.readJsonFile(allocator, mapping_path.?);
+    defer allocator.free(mapping_text);
+    var mapping = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{});
+    defer mapping.deinit();
+
+    const import_ready = mapping.value.object.get("import_ready") orelse return CliError.InvalidArguments;
+    const facets_rel = import_ready.object.get("facets_csv") orelse return CliError.InvalidArguments;
+    const edges_val = import_ready.object.get("edges_csv");
+    if (facets_rel != .string) return CliError.InvalidArguments;
+
+    const base = input_dir orelse ".";
+    const facets_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, facets_rel.string });
+    defer allocator.free(facets_path);
+    var edges_path: ?[]const u8 = null;
+    defer if (edges_path) |p| allocator.free(p);
+    if (edges_val) |ev| {
+        if (ev != .string) return CliError.InvalidArguments;
+        edges_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, ev.string });
+    }
+
+    const report = try structured_import.applyImportReady(allocator, db, .{
+        .workspace_id = workspace_id.?,
+        .ontology_id = mapping_owned.ontology_id,
+        .mode = mode,
+        .facets_path = facets_path,
+        .edges_path = edges_path,
+        .mapping = mapping_owned,
+        .mapping_path = mapping_path,
+    });
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .projected = true,
+        .facets_inserted = report.facets_inserted,
+        .facets_updated = report.facets_updated,
+        .facets_skipped = report.facets_skipped,
+        .entities_upserted = report.entities_upserted,
+        .edges_inserted = report.edges_inserted,
+        .edges_skipped = report.edges_skipped,
+    }, .{})});
+}
+
+fn runStructuredImportReindexCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var scope: structured_import.ReindexScope = .graph;
+    var source_ref: ?[]const u8 = null;
+    var since_fingerprint: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--scope")) {
+            const raw = try requireArg(args, &index);
+            scope = structured_import.ReindexScope.parse(raw) orelse return CliError.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--source-ref")) source_ref = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--since-fingerprint")) since_fingerprint = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const report = try structured_import.reindexStructured(allocator, &db, workspace_id.?, .{
+        .scope = scope,
+        .source_ref = source_ref,
+        .since_fingerprint = since_fingerprint,
+    });
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .graph_projected = report.graph_projected,
+        .facet_assignments = report.facet_assignments,
+    }, .{})});
+}
+
+fn runStructuredImportProfileCommand(allocator: Allocator, args: []const []const u8) !void {
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (input_path == null or output_path == null) return CliError.InvalidArguments;
+    try structured_import.profileCsv(allocator, input_path.?, output_path.?);
+    try writeStdout("profile written to {s}\n", .{output_path.?});
+}
+
+fn runStructuredImportInferCommand(allocator: Allocator, args: []const []const u8) !void {
+    var model_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+    var input_dir: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-dir")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (model_path == null) return CliError.InvalidArguments;
+    const payload = try structured_import_semantics.inferSemanticsJson(allocator, .{
+        .model_path = model_path.?,
+        .mapping_path = mapping_path,
+        .input_path = input_path,
+        .input_dir = input_dir,
+    });
+    defer allocator.free(payload);
+    const out = output_path orelse "-";
+    if (!std.mem.eql(u8, out, "-")) {
+        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{
+            .sub_path = out,
+            .data = payload,
+            .flags = .{ .truncate = true },
+        });
+    } else {
+        try writeStdout("{s}\n", .{payload});
+    }
+}
+
+fn runStructuredImportRegisterSemanticsCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var proposal_path: ?[]const u8 = null;
+    var model_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--proposal")) proposal_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    const proposal_json = if (proposal_path) |pp| blk: {
+        break :blk try structured_import.readJsonFile(allocator, pp);
+    } else blk: {
+        if (model_path == null) return CliError.InvalidArguments;
+        break :blk try structured_import_semantics.inferSemanticsJson(allocator, .{
+            .model_path = model_path.?,
+            .mapping_path = mapping_path,
+            .input_path = null,
+        });
+    };
+    defer allocator.free(proposal_json);
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const report = try structured_import_semantics.registerSemanticsJson(allocator, db, workspace_id.?, proposal_json);
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .tables = report.tables,
+        .columns = report.columns,
+        .relations = report.relations,
+        .source_mappings = report.source_mappings,
+    }, .{})});
+}
+
+fn runStructuredImportValidateProvenanceCommand(allocator: Allocator, args: []const []const u8) !void {
+    _ = allocator;
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var source_tag: []const u8 = structured_import.SourceTag;
+    var strict_table_id: bool = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--source-tag")) source_tag = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--strict-table-id")) strict_table_id = true else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const report = try structured_import.validateImportProvenance(db, workspace_id.?, source_tag, strict_table_id);
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .ok = report.ok(),
+        .provenance_rows = report.provenance_rows,
+        .tagged_facts = report.tagged_facts,
+        .facts_without_provenance = report.facts_without_provenance,
+        .provenance_without_fact = report.provenance_without_fact,
+        .provenance_without_table_id = report.provenance_without_table_id,
+    }, .{})});
+    if (!report.ok()) return CliError.InvalidArguments;
+}
+
+fn runStructuredImportValidateDriftCommand(allocator: Allocator, args: []const []const u8) !void {
+    var model_path: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+    var input_dir: ?[]const u8 = null;
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var strict: bool = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-dir")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--strict")) strict = true else return CliError.InvalidArguments;
+    }
+    if (model_path == null) return CliError.InvalidArguments;
+    var report = try structured_import_drift.validateDrift(allocator, .{
+        .model_path = model_path.?,
+        .mapping_path = mapping_path,
+        .input_path = input_path,
+        .input_dir = input_dir,
+        .db_path = db_path,
+        .workspace_id = workspace_id,
+        .strict = strict,
+    });
+    defer report.deinit(allocator);
+    for (report.warnings) |warning| std.log.warn("{s}", .{warning});
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .ok = report.ok(),
+        .errors = report.errors.len,
+        .warnings = report.warnings.len,
+    }, .{})});
+    if (!report.ok()) return CliError.InvalidArguments;
+}
+
+fn runStructuredImportAuditOrphansCommand(allocator: Allocator, args: []const []const u8) !void {
+    _ = allocator;
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var source_tag: []const u8 = structured_import.SourceTag;
+    var max_ratio: f64 = 0.15;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--source-tag")) source_tag = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--max-ratio")) {
+            const raw = try requireArg(args, &index);
+            max_ratio = std.fmt.parseFloat(f64, raw) catch return CliError.InvalidArguments;
+        } else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const report = try structured_import.auditOrphans(db, workspace_id.?, source_tag);
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .orphan_entities = report.orphan_entities,
+        .tagged_entities = report.tagged_entities,
+        .orphan_ratio = report.orphan_ratio,
+        .within_threshold = report.withinThreshold(max_ratio),
+        .max_ratio = max_ratio,
+    }, .{})});
+}
+
+fn runStructuredImportDdlProposeCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const report = try structured_import_ddl.ddlPropose(allocator, db, workspace_id.?);
+    defer allocator.free(report.sql);
+    if (output_path) |out| {
+        try std.Io.Dir.cwd().writeFile(mindbrain.zig16_compat.io(), .{ .sub_path = out, .data = report.sql, .flags = .{ .truncate = true } });
+    } else {
+        try writeStdout("{s}\n", .{report.sql});
+    }
+    try writeStdout("{f}\n", .{std.json.fmt(.{ .tables = report.tables, .indexes = report.indexes }, .{})});
+}
+
+fn runStructuredImportDdlExecuteCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var sql_path: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--sql")) sql_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+    if (db_path == null or sql_path == null) return CliError.InvalidArguments;
+    const sql = try structured_import.readJsonFile(allocator, sql_path.?);
+    defer allocator.free(sql);
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const report = try structured_import_ddl.ddlExecute(allocator, db, sql);
+    try writeStdout("{f}\n", .{std.json.fmt(.{ .statements_executed = report.statements_executed }, .{})});
+}
+
+fn runStructuredImportLoadWsCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var mapping_path: ?[]const u8 = null;
+    var input_dir: ?[]const u8 = null;
+    var mode: structured_import.ImportMode = .append;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mode")) {
+            const raw = try requireArg(args, &index);
+            mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
+        } else return CliError.InvalidArguments;
+    }
+    if (db_path == null or workspace_id == null or mapping_path == null) return CliError.InvalidArguments;
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const report = try structured_import_ddl.loadWsFromPath(allocator, db, workspace_id.?, mapping_path.?, input_dir, mode);
+    _ = try structured_import_ddl.setupWsSearchTables(allocator, db, workspace_id.?);
+    try writeStdout("{f}\n", .{std.json.fmt(.{
+        .rows_loaded = report.rows_loaded,
+        .tables_loaded = report.tables_loaded,
+    }, .{})});
 }
 
 fn writeStdout(comptime fmt: []const u8, args: anytype) !void {

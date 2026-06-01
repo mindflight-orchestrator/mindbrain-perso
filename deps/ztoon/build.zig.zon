@@ -1,0 +1,13 @@
+.{
+    .name = .ztoon,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "testdata",
+    },
+    .fingerprint = 0x9af98f922211ac2a,
+}

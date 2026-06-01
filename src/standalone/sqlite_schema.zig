@@ -150,7 +150,7 @@ test "sqlite schema is loaded from the canonical install file" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS table_semantics") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS column_semantics") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS relation_semantics") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS source_mappings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS structured_import_provenance") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS facet_tables") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS facet_definitions") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS facet_postings") != null);

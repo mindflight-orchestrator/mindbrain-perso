@@ -106,6 +106,24 @@ CREATE TABLE IF NOT EXISTS source_mappings (
     UNIQUE(workspace_id, source_key)
 );
 
+CREATE TABLE IF NOT EXISTS structured_import_provenance (
+    workspace_id TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    source_tag TEXT NOT NULL,
+    table_id INTEGER,
+    row_fingerprint TEXT,
+    fact_id TEXT,
+    entity_external_id TEXT,
+    relation_external_ids_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (workspace_id, source_ref, source_tag),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+    FOREIGN KEY(table_id) REFERENCES table_semantics(table_id)
+);
+
+CREATE INDEX IF NOT EXISTS structured_import_provenance_table_idx
+    ON structured_import_provenance(workspace_id, table_id);
+
 CREATE TABLE IF NOT EXISTS facet_tables (
     table_id INTEGER PRIMARY KEY,
     schema_name TEXT NOT NULL,

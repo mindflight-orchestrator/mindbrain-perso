@@ -1,4 +1,3 @@
-const std = @import("std");
 const value_mod = @import("value.zig");
 
 const Field = value_mod.Field;
@@ -38,3 +37,5 @@ pub fn headerFields(items: []const Value) ?[]const Field {
 
     return first;
 }
+
+const std = @import("std");

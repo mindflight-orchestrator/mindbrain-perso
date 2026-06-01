@@ -123,6 +123,47 @@ pub fn upsertTableSemantic(
     try stepDone(stmt);
 }
 
+pub const ColumnSemanticUpsert = struct {
+    column_semantic_id: u64,
+    table_id: u64,
+    column_name: []const u8,
+    column_role: []const u8,
+    data_type: ?[]const u8 = null,
+    is_nullable: bool = true,
+    rich_meta: ?[]const u8 = null,
+};
+
+pub fn upsertColumnSemanticFull(db: Database, spec: ColumnSemanticUpsert) !void {
+    const lookup = try prepare(db, "SELECT workspace_id, table_schema, table_name FROM table_semantics WHERE table_id = ?1");
+    defer finalize(lookup);
+    try bindInt64(lookup, 1, spec.table_id);
+    if (c.sqlite3_step(lookup) != c.SQLITE_ROW) return error.NotFound;
+    const workspace_ptr = c.sqlite3_column_text(lookup, 0) orelse return error.MissingRow;
+    const workspace_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 0));
+    const schema_ptr = c.sqlite3_column_text(lookup, 1) orelse return error.MissingRow;
+    const schema_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 1));
+    const table_ptr = c.sqlite3_column_text(lookup, 2) orelse return error.MissingRow;
+    const table_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 2));
+    const workspace_value: []const u8 = @as([*]const u8, @ptrCast(workspace_ptr))[0..workspace_len];
+    const schema_value: []const u8 = @as([*]const u8, @ptrCast(schema_ptr))[0..schema_len];
+    const table_value: []const u8 = @as([*]const u8, @ptrCast(table_ptr))[0..table_len];
+
+    const stmt = try prepare(db, "INSERT OR REPLACE INTO column_semantics(column_semantic_id, workspace_id, table_id, table_schema, table_name, column_name, column_role, semantic_role, data_type, is_nullable, rich_meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, spec.column_semantic_id);
+    try bindText(stmt, 2, workspace_value);
+    try bindInt64(stmt, 3, spec.table_id);
+    try bindText(stmt, 4, schema_value);
+    try bindText(stmt, 5, table_value);
+    try bindText(stmt, 6, spec.column_name);
+    try bindText(stmt, 7, spec.column_role);
+    if (spec.data_type) |value| try bindText(stmt, 8, value) else try bindNull(stmt, 8);
+    const nullable_flag: i64 = if (spec.is_nullable) 1 else 0;
+    try bindInt64(stmt, 9, nullable_flag);
+    if (spec.rich_meta) |value| try bindText(stmt, 10, value) else try bindNull(stmt, 10);
+    try stepDone(stmt);
+}
+
 pub fn upsertColumnSemantic(
     db: Database,
     column_semantic_id: u64,
@@ -132,36 +173,15 @@ pub fn upsertColumnSemantic(
     data_type: ?[]const u8,
     is_nullable: bool,
 ) !void {
-    const lookup = try prepare(db, "SELECT workspace_id, table_schema, table_name FROM table_semantics WHERE table_id = ?1");
-    defer finalize(lookup);
-    try bindInt64(lookup, 1, table_id);
-    if (c.sqlite3_step(lookup) == c.SQLITE_ROW) {
-        const workspace_ptr = c.sqlite3_column_text(lookup, 0) orelse return error.MissingRow;
-        const workspace_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 0));
-        const schema_ptr = c.sqlite3_column_text(lookup, 1) orelse return error.MissingRow;
-        const schema_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 1));
-        const table_ptr = c.sqlite3_column_text(lookup, 2) orelse return error.MissingRow;
-        const table_len: usize = @intCast(c.sqlite3_column_bytes(lookup, 2));
-        const workspace_value: []const u8 = @as([*]const u8, @ptrCast(workspace_ptr))[0..workspace_len];
-        const schema_value: []const u8 = @as([*]const u8, @ptrCast(schema_ptr))[0..schema_len];
-        const table_value: []const u8 = @as([*]const u8, @ptrCast(table_ptr))[0..table_len];
-
-        const stmt = try prepare(db, "INSERT OR REPLACE INTO column_semantics(column_semantic_id, workspace_id, table_id, table_schema, table_name, column_name, column_role, semantic_role, data_type, is_nullable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)");
-        defer finalize(stmt);
-        try bindInt64(stmt, 1, column_semantic_id);
-        try bindText(stmt, 2, workspace_value);
-        try bindInt64(stmt, 3, table_id);
-        try bindText(stmt, 4, schema_value);
-        try bindText(stmt, 5, table_value);
-        try bindText(stmt, 6, column_name);
-        try bindText(stmt, 7, semantic_role);
-        if (data_type) |value| try bindText(stmt, 8, value) else try bindNull(stmt, 8);
-        const nullable_flag: i64 = if (is_nullable) 1 else 0;
-        try bindInt64(stmt, 9, nullable_flag);
-        try stepDone(stmt);
-        return;
-    }
-    return error.NotFound;
+    try upsertColumnSemanticFull(db, .{
+        .column_semantic_id = column_semantic_id,
+        .table_id = table_id,
+        .column_name = column_name,
+        .column_role = semantic_role,
+        .data_type = data_type,
+        .is_nullable = is_nullable,
+        .rich_meta = null,
+    });
 }
 
 pub fn upsertRelationSemantic(
@@ -920,6 +940,140 @@ fn dupeColumnText(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, index: c_
     const ptr = c.sqlite3_column_text(stmt, index) orelse return error.MissingRow;
     const bytes: []const u8 = @as([*]const u8, @ptrCast(ptr))[0..@intCast(len)];
     return allocator.dupe(u8, bytes);
+}
+
+pub fn lookupTableId(
+    db: Database,
+    workspace_id: []const u8,
+    schema_name: []const u8,
+    table_name: []const u8,
+) !?u64 {
+    const stmt = try prepare(db, "SELECT table_id FROM table_semantics WHERE workspace_id = ?1 AND table_schema = ?2 AND table_name = ?3 LIMIT 1");
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    try bindText(stmt, 2, schema_name);
+    try bindText(stmt, 3, table_name);
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) return try columnU64(stmt, 0);
+    return null;
+}
+
+pub fn nextTableId(db: Database) !u64 {
+    const stmt = try prepare(db, "SELECT COALESCE(MAX(table_id), 0) + 1 FROM table_semantics");
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
+}
+
+pub fn nextColumnSemanticId(db: Database) !u64 {
+    const stmt = try prepare(db, "SELECT COALESCE(MAX(column_semantic_id), 0) + 1 FROM column_semantics");
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
+}
+
+pub fn nextRelationSemanticId(db: Database) !u64 {
+    const stmt = try prepare(db, "SELECT COALESCE(MAX(relation_semantic_id), 0) + 1 FROM relation_semantics");
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
+}
+
+pub fn nextSourceMappingId(db: Database) !u64 {
+    const stmt = try prepare(db, "SELECT COALESCE(MAX(source_mapping_id), 0) + 1 FROM source_mappings");
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try columnU64(stmt, 0);
+}
+
+pub const TableSemanticUpsert = struct {
+    table_id: u64,
+    workspace_id: []const u8,
+    schema_name: []const u8,
+    table_name: []const u8,
+    key_column: []const u8 = "record_id",
+    content_column: []const u8 = "content",
+    metadata_column: []const u8 = "facets_json",
+    vector_column: ?[]const u8 = null,
+    language: []const u8 = "english",
+    business_role: ?[]const u8 = null,
+    generation_strategy: []const u8 = "structured_import",
+    emit_facets: bool = true,
+    emit_graph_entity: bool = true,
+    emit_graph_relation: bool = true,
+    notes: ?[]const u8 = null,
+};
+
+pub fn upsertTableSemanticFull(db: Database, spec: TableSemanticUpsert) !void {
+    const stmt = try prepare(db, "INSERT OR REPLACE INTO table_semantics(table_id, workspace_id, table_schema, table_name, business_role, generation_strategy, emit_facets, emit_graph_entity, emit_graph_relation, notes, schema_name, key_column, content_column, metadata_column, vector_column, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?3, ?11, ?12, ?13, ?14, ?15)");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, spec.table_id);
+    try bindText(stmt, 2, spec.workspace_id);
+    try bindText(stmt, 3, spec.schema_name);
+    try bindText(stmt, 4, spec.table_name);
+    if (spec.business_role) |value| try bindText(stmt, 5, value) else try bindNull(stmt, 5);
+    try bindText(stmt, 6, spec.generation_strategy);
+    try bindInt64(stmt, 7, @intFromBool(spec.emit_facets));
+    try bindInt64(stmt, 8, @intFromBool(spec.emit_graph_entity));
+    try bindInt64(stmt, 9, @intFromBool(spec.emit_graph_relation));
+    if (spec.notes) |value| try bindText(stmt, 10, value) else try bindNull(stmt, 10);
+    try bindText(stmt, 11, spec.key_column);
+    try bindText(stmt, 12, spec.content_column);
+    try bindText(stmt, 13, spec.metadata_column);
+    if (spec.vector_column) |value| try bindText(stmt, 14, value) else try bindNull(stmt, 14);
+    try bindText(stmt, 15, spec.language);
+    try stepDone(stmt);
+}
+
+pub fn upsertRelationSemanticWithFk(
+    db: Database,
+    relation_semantic_id: u64,
+    workspace_id: []const u8,
+    relation_name: []const u8,
+    source_table_id: u64,
+    target_table_id: u64,
+    fk_column: []const u8,
+    relation_kind: []const u8,
+    edge_type: ?[]const u8,
+    metadata_json: []const u8,
+) !void {
+    const source_lookup = try prepare(db, "SELECT workspace_id, table_schema, table_name FROM table_semantics WHERE table_id = ?1");
+    defer finalize(source_lookup);
+    try bindInt64(source_lookup, 1, source_table_id);
+    if (c.sqlite3_step(source_lookup) != c.SQLITE_ROW) return error.NotFound;
+    const source_schema_ptr = c.sqlite3_column_text(source_lookup, 1) orelse return error.MissingRow;
+    const source_schema_len: usize = @intCast(c.sqlite3_column_bytes(source_lookup, 1));
+    const source_table_ptr = c.sqlite3_column_text(source_lookup, 2) orelse return error.MissingRow;
+    const source_table_len: usize = @intCast(c.sqlite3_column_bytes(source_lookup, 2));
+    const source_schema_value: []const u8 = @as([*]const u8, @ptrCast(source_schema_ptr))[0..source_schema_len];
+    const source_table_value: []const u8 = @as([*]const u8, @ptrCast(source_table_ptr))[0..source_table_len];
+
+    const target_lookup = try prepare(db, "SELECT workspace_id, table_schema, table_name FROM table_semantics WHERE table_id = ?1");
+    defer finalize(target_lookup);
+    try bindInt64(target_lookup, 1, target_table_id);
+    if (c.sqlite3_step(target_lookup) != c.SQLITE_ROW) return error.NotFound;
+    const target_schema_ptr = c.sqlite3_column_text(target_lookup, 1) orelse return error.MissingRow;
+    const target_schema_len: usize = @intCast(c.sqlite3_column_bytes(target_lookup, 1));
+    const target_table_ptr = c.sqlite3_column_text(target_lookup, 2) orelse return error.MissingRow;
+    const target_table_len: usize = @intCast(c.sqlite3_column_bytes(target_lookup, 2));
+    const target_schema_value: []const u8 = @as([*]const u8, @ptrCast(target_schema_ptr))[0..target_schema_len];
+    const target_table_value: []const u8 = @as([*]const u8, @ptrCast(target_table_ptr))[0..target_table_len];
+
+    const stmt = try prepare(db, "INSERT OR REPLACE INTO relation_semantics(relation_semantic_id, workspace_id, from_schema, from_table, to_schema, to_table, fk_column, relation_kind, relation_name, source_table_id, target_table_id, edge_type, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, relation_semantic_id);
+    try bindText(stmt, 2, workspace_id);
+    try bindText(stmt, 3, source_schema_value);
+    try bindText(stmt, 4, source_table_value);
+    try bindText(stmt, 5, target_schema_value);
+    try bindText(stmt, 6, target_table_value);
+    try bindText(stmt, 7, fk_column);
+    try bindText(stmt, 8, relation_kind);
+    try bindText(stmt, 9, relation_name);
+    try bindInt64(stmt, 10, source_table_id);
+    try bindInt64(stmt, 11, target_table_id);
+    if (edge_type) |value| try bindText(stmt, 12, value) else try bindNull(stmt, 12);
+    try bindText(stmt, 13, metadata_json);
+    try stepDone(stmt);
 }
 
 test "workspace export returns standalone workspace metadata and semantics" {

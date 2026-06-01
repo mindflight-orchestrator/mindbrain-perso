@@ -61,6 +61,10 @@ comptime {
     _ = @import("search_compact_store.zig");
     _ = @import("search_sqlite.zig");
     _ = @import("search_store.zig");
+    _ = @import("structured_import.zig");
+    _ = @import("structured_import_ddl.zig");
+    _ = @import("structured_import_drift.zig");
+    _ = @import("structured_import_semantics.zig");
     _ = @import("sqlite_schema.zig");
     _ = @import("tokenization_sqlite.zig");
     _ = @import("toon_exports.zig");
