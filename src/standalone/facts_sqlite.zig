@@ -25,6 +25,10 @@ pub const FactWriteResult = struct {
     updated: bool,
 };
 
+pub const FactWriteOptions = struct {
+    manage_transaction: bool = true,
+};
+
 pub fn deinitFactWriteResult(allocator: std.mem.Allocator, result: FactWriteResult) void {
     allocator.free(result.id);
 }
@@ -40,6 +44,15 @@ pub fn writeFact(
     allocator: std.mem.Allocator,
     write: FactWrite,
 ) !FactWriteResult {
+    return writeFactWithOptions(db, allocator, write, .{});
+}
+
+pub fn writeFactWithOptions(
+    db: facet_sqlite.Database,
+    allocator: std.mem.Allocator,
+    write: FactWrite,
+    options: FactWriteOptions,
+) !FactWriteResult {
     if (write.schema_id.len == 0 or write.content.len == 0) return error.InvalidFactWrite;
     if (write.workspace_id.len == 0) return error.InvalidFactWrite;
     if (write.source_ref) |source_ref| {
@@ -47,8 +60,8 @@ pub fn writeFact(
     }
     try validateFacetsJsonObject(allocator, write.facets_json);
 
-    try db.exec("BEGIN IMMEDIATE");
-    var transaction_active = true;
+    if (options.manage_transaction) try db.exec("BEGIN IMMEDIATE");
+    var transaction_active = options.manage_transaction;
     errdefer if (transaction_active) {
         db.exec("ROLLBACK") catch |rollback_err| {
             std.log.warn("facts write rollback failed: {s}", .{@errorName(rollback_err)});
@@ -59,7 +72,7 @@ pub fn writeFact(
         const updated = try updateFactBySourceRef(db, write, source_ref);
         if (updated) {
             const selected = try selectFactBySourceRef(db, allocator, write.workspace_id, source_ref);
-            try commitTransaction(db, &transaction_active);
+            if (options.manage_transaction) try commitTransaction(db, &transaction_active);
             return .{
                 .id = selected.id,
                 .doc_id = selected.doc_id,
@@ -77,7 +90,7 @@ pub fn writeFact(
 
     try insertFact(db, write, id);
     const doc_id = try selectDocIdById(db, id);
-    try commitTransaction(db, &transaction_active);
+    if (options.manage_transaction) try commitTransaction(db, &transaction_active);
     return .{
         .id = id,
         .doc_id = doc_id,

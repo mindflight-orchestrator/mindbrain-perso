@@ -280,6 +280,15 @@ fn readJsonTabularBundle(allocator: std.mem.Allocator, path: []const u8) !Tabula
     return try tabularBundleFromJsonRoot(allocator, parsed.value);
 }
 
+fn dataPlaneFromMappingValue(mapping: std.json.Value) []const u8 {
+    if (mapping == .object) {
+        if (mapping.object.get("data_plane")) |plane| {
+            if (plane == .string) return plane.string;
+        }
+    }
+    return "import_ready";
+}
+
 fn tabularBundleFromJsonRoot(allocator: std.mem.Allocator, root: std.json.Value) !TabularBundle {
     switch (root) {
         .array => |items| {
@@ -809,6 +818,56 @@ pub const ApplyOptions = struct {
     data_plane: []const u8 = "import_ready",
 };
 
+const ApplyBatch = struct {
+    fact_exists_stmt: *facet_sqlite.c.sqlite3_stmt,
+    provenance_stmt: *facet_sqlite.c.sqlite3_stmt,
+    relation_exists_stmt: *facet_sqlite.c.sqlite3_stmt,
+
+    fn init(db: facet_sqlite.Database) !ApplyBatch {
+        const fact_exists_stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM agent_facts WHERE workspace_id = ?1 AND source_ref = ?2 LIMIT 1");
+        errdefer facet_sqlite.finalize(fact_exists_stmt);
+        const provenance_stmt = try facet_sqlite.prepare(db,
+            \\INSERT OR REPLACE INTO structured_import_provenance(
+            \\  workspace_id, source_ref, source_tag, table_id, row_fingerprint,
+            \\  fact_id, entity_external_id, relation_external_ids_json, updated_at
+            \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+        );
+        errdefer facet_sqlite.finalize(provenance_stmt);
+        const relation_exists_stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM relations_raw WHERE workspace_id = ?1 AND external_id = ?2 LIMIT 1");
+        return .{
+            .fact_exists_stmt = fact_exists_stmt,
+            .provenance_stmt = provenance_stmt,
+            .relation_exists_stmt = relation_exists_stmt,
+        };
+    }
+
+    fn deinit(self: ApplyBatch) void {
+        facet_sqlite.finalize(self.fact_exists_stmt);
+        facet_sqlite.finalize(self.provenance_stmt);
+        facet_sqlite.finalize(self.relation_exists_stmt);
+    }
+
+    fn factExistsBySourceRef(self: *ApplyBatch, workspace_id: []const u8, source_ref: []const u8) bool {
+        facet_sqlite.resetStatement(self.fact_exists_stmt) catch return false;
+        facet_sqlite.bindText(self.fact_exists_stmt, 1, workspace_id) catch return false;
+        facet_sqlite.bindText(self.fact_exists_stmt, 2, source_ref) catch return false;
+        return facet_sqlite.c.sqlite3_step(self.fact_exists_stmt) == facet_sqlite.c.SQLITE_ROW;
+    }
+
+    fn relationExistsByExternalId(self: *ApplyBatch, workspace_id: []const u8, external_id: []const u8) bool {
+        facet_sqlite.resetStatement(self.relation_exists_stmt) catch return false;
+        facet_sqlite.bindText(self.relation_exists_stmt, 1, workspace_id) catch return false;
+        facet_sqlite.bindText(self.relation_exists_stmt, 2, external_id) catch return false;
+        return facet_sqlite.c.sqlite3_step(self.relation_exists_stmt) == facet_sqlite.c.SQLITE_ROW;
+    }
+
+    fn upsertProvenance(self: *ApplyBatch, row: ProvenanceUpsert) !void {
+        try facet_sqlite.resetStatement(self.provenance_stmt);
+        try bindProvenanceRow(self.provenance_stmt, row);
+        try facet_sqlite.stepDone(self.provenance_stmt);
+    }
+};
+
 pub const FacetRecord = struct {
     source_ref: []const u8,
     schema_id: []const u8,
@@ -822,10 +881,7 @@ pub fn readDataPlane(mapping_path: []const u8, allocator: std.mem.Allocator) ![]
     defer allocator.free(mapping_text);
     var mapping = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{});
     defer mapping.deinit();
-    if (mapping.value.object.get("data_plane")) |plane| {
-        if (plane == .string) return try allocator.dupe(u8, plane.string);
-    }
-    return try allocator.dupe(u8, "import_ready");
+    return try allocator.dupe(u8, dataPlaneFromMappingValue(mapping.value));
 }
 
 fn applyFacetRecord(
@@ -835,10 +891,15 @@ fn applyFacetRecord(
     record: FacetRecord,
     contract_relations: []const ContractRelation,
     report: *ApplyReport,
+    batch: ?*ApplyBatch,
 ) !void {
     const workspace_id = effective.workspace_id;
 
-    if (effective.mode == .ignore_duplicates and factExistsBySourceRef(db, workspace_id, record.source_ref)) {
+    const fact_exists = if (batch) |b|
+        b.factExistsBySourceRef(workspace_id, record.source_ref)
+    else
+        factExistsBySourceRef(db, workspace_id, record.source_ref);
+    if (effective.mode == .ignore_duplicates and fact_exists) {
         report.facets_skipped += 1;
         return;
     }
@@ -849,7 +910,7 @@ fn applyFacetRecord(
     const stable_id = try stableFactId(allocator, workspace_id, record.source_ref);
     defer allocator.free(stable_id);
 
-    const result = try facts_sqlite.writeFact(db, allocator, .{
+    const result = try facts_sqlite.writeFactWithOptions(db, allocator, .{
         .id = stable_id,
         .workspace_id = workspace_id,
         .schema_id = record.schema_id,
@@ -857,6 +918,8 @@ fn applyFacetRecord(
         .facets_json = facets_json,
         .created_by = effective.created_by,
         .source_ref = record.source_ref,
+    }, .{
+        .manage_transaction = batch == null,
     });
     defer facts_sqlite.deinitFactWriteResult(allocator, result);
     if (result.created) report.facets_inserted += 1 else report.facets_updated += 1;
@@ -885,6 +948,7 @@ fn applyFacetRecord(
             .facets_json = facets_json,
             .contract_relations = contract_relations,
             .mode = effective.mode,
+            .batch = batch,
         });
         report.edges_inserted += derived.inserted;
         report.edges_skipped += derived.skipped;
@@ -906,7 +970,7 @@ fn applyFacetRecord(
         .row_fingerprint = fingerprint,
         .fact_id = stable_id,
         .entity_external_id = record.source_ref,
-    });
+    }, batch);
 }
 
 const TableSemanticsRow = struct {
@@ -1006,6 +1070,7 @@ fn buildFacetsJsonFromWsRow(
     record_id: []const u8,
     source_tag: []const u8,
     columns: []const []const u8,
+    column_index: *const std.StringHashMap(usize),
     values: []const []const u8,
 ) ![]const u8 {
     var buf: std.Io.Writer.Allocating = .init(allocator);
@@ -1026,7 +1091,7 @@ fn buildFacetsJsonFromWsRow(
         .{ .key = "source", .value = source_tag },
     };
     for (injects) |item| {
-        if (findColumnValue(columns, values, item.key) != null) continue;
+        if (column_index.contains(item.key)) continue;
         if (wrote_any) try buf.writer.writeAll(",");
         wrote_any = true;
         try buf.writer.print("\"{s}\":", .{item.key});
@@ -1037,14 +1102,28 @@ fn buildFacetsJsonFromWsRow(
     return buf.toOwnedSlice();
 }
 
-fn loadWsTableRows(
+fn findColumnValueIndexed(column_index: *const std.StringHashMap(usize), values: []const []const u8, name: []const u8) ?[]const u8 {
+    const idx = column_index.get(name) orelse return null;
+    if (idx >= values.len) return null;
+    return values[idx];
+}
+
+const WsApplyContext = struct {
+    db: facet_sqlite.Database,
+    effective: ApplyOptions,
+    entity_name: []const u8,
+    semantics: *const TableSemanticsRow,
+    contract_relations: []const ContractRelation,
+    batch: ?*ApplyBatch,
+    report: *ApplyReport,
+};
+
+fn forEachWsTableRow(
     allocator: std.mem.Allocator,
     db: facet_sqlite.Database,
     ws_name: []const u8,
-) !struct {
-    columns: []const []const u8,
-    rows: []const []const []const u8,
-} {
+    ctx: *WsApplyContext,
+) !void {
     const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM {s}", .{ws_name});
     defer allocator.free(sql);
 
@@ -1060,14 +1139,15 @@ fn loadWsTableRows(
         const name = facet_sqlite.c.sqlite3_column_name(stmt, @intCast(idx)) orelse return error.StepFailed;
         columns[idx] = try allocator.dupe(u8, std.mem.span(name));
     }
+    defer {
+        for (columns) |col| allocator.free(col);
+        allocator.free(columns);
+    }
 
-    var rows = std.ArrayList([]const []const u8).empty;
-    errdefer {
-        for (rows.items) |row| {
-            for (row) |cell| allocator.free(cell);
-            allocator.free(row);
-        }
-        rows.deinit(allocator);
+    var column_index = std.StringHashMap(usize).init(allocator);
+    defer column_index.deinit();
+    for (columns, 0..) |col, idx| {
+        try column_index.put(col, idx);
     }
 
     while (true) {
@@ -1086,13 +1166,46 @@ fn loadWsTableRows(
             };
             row[idx] = text;
         }
-        try rows.append(allocator, row);
+        defer {
+            for (row) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
+        try applyWsRow(allocator, ctx, columns, &column_index, row);
     }
+}
 
-    return .{
-        .columns = columns,
-        .rows = try rows.toOwnedSlice(allocator),
-    };
+fn applyWsRow(
+    allocator: std.mem.Allocator,
+    ctx: *WsApplyContext,
+    columns: []const []const u8,
+    column_index: *const std.StringHashMap(usize),
+    row_values: []const []const u8,
+) !void {
+    const semantics = ctx.semantics.*;
+    const record_id = findColumnValueIndexed(column_index, row_values, semantics.key_column) orelse return error.InvalidWsRow;
+    const content = findColumnValueIndexed(column_index, row_values, semantics.content_column) orelse record_id;
+    const source_ref = try expandEntityExternalId(allocator, ctx.entity_name, record_id);
+    defer allocator.free(source_ref);
+
+    const facets_json_raw = try buildFacetsJsonFromWsRow(
+        allocator,
+        ctx.entity_name,
+        semantics.ontology,
+        record_id,
+        ctx.effective.source_tag,
+        columns,
+        column_index,
+        row_values,
+    );
+    defer allocator.free(facets_json_raw);
+
+    try applyFacetRecord(allocator, ctx.db, ctx.effective, .{
+        .source_ref = source_ref,
+        .schema_id = semantics.schema_id,
+        .content = content,
+        .facets_json_raw = facets_json_raw,
+        .table_id = semantics.table_id,
+    }, ctx.contract_relations, ctx.report, ctx.batch);
 }
 
 fn applyFromWsTables(
@@ -1100,14 +1213,11 @@ fn applyFromWsTables(
     db: facet_sqlite.Database,
     effective: ApplyOptions,
     contract_relations: []const ContractRelation,
+    mapping: std.json.Value,
+    batch: ?*ApplyBatch,
 ) !ApplyReport {
-    const mapping_path = effective.mapping_path orelse return error.InvalidMapping;
-    const mapping_text = try readJsonFile(allocator, mapping_path);
-    defer allocator.free(mapping_text);
-    var mapping = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{});
-    defer mapping.deinit();
-
-    const entities = mapping.value.object.get("entities") orelse return error.InvalidMapping;
+    if (mapping != .object) return error.InvalidMapping;
+    const entities = mapping.object.get("entities") orelse return error.InvalidMapping;
     if (entities != .object) return error.InvalidMapping;
 
     var report = ApplyReport{};
@@ -1130,45 +1240,19 @@ fn applyFromWsTables(
         const ws_name = try wsTableName(allocator, entity_name);
         defer allocator.free(ws_name);
 
-        const table = loadWsTableRows(allocator, db, ws_name) catch |err| switch (err) {
+        var ctx = WsApplyContext{
+            .db = db,
+            .effective = effective,
+            .entity_name = entity_name,
+            .semantics = &semantics,
+            .contract_relations = contract_relations,
+            .batch = batch,
+            .report = &report,
+        };
+        forEachWsTableRow(allocator, db, ws_name, &ctx) catch |err| switch (err) {
             error.StepFailed, error.WsTableEmpty => return error.WsTableMissing,
             else => |e| return e,
         };
-        defer {
-            for (table.columns) |col| allocator.free(col);
-            allocator.free(table.columns);
-            for (table.rows) |row| {
-                for (row) |cell| allocator.free(cell);
-                allocator.free(row);
-            }
-            allocator.free(table.rows);
-        }
-
-        for (table.rows) |row_values| {
-            const record_id = findColumnValue(table.columns, row_values, semantics.key_column) orelse return error.InvalidWsRow;
-            const content = findColumnValue(table.columns, row_values, semantics.content_column) orelse record_id;
-            const source_ref = try expandEntityExternalId(allocator, entity_name, record_id);
-            defer allocator.free(source_ref);
-
-            const facets_json_raw = try buildFacetsJsonFromWsRow(
-                allocator,
-                entity_name,
-                semantics.ontology,
-                record_id,
-                effective.source_tag,
-                table.columns,
-                row_values,
-            );
-            defer allocator.free(facets_json_raw);
-
-            try applyFacetRecord(allocator, db, effective, .{
-                .source_ref = source_ref,
-                .schema_id = semantics.schema_id,
-                .content = content,
-                .facets_json_raw = facets_json_raw,
-                .table_id = semantics.table_id,
-            }, contract_relations, &report);
-        }
     }
 
     if (report.entities_upserted == 0 and report.facets_inserted + report.facets_updated == 0) {
@@ -1185,12 +1269,17 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
         effective.edges_mode = mapping.edges_mode;
     }
 
-    var data_plane_owned: ?[]const u8 = null;
-    defer if (data_plane_owned) |dp| allocator.free(dp);
+    var mapping_text_owned: ?[]const u8 = null;
+    defer if (mapping_text_owned) |text| allocator.free(text);
+    var mapping_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (mapping_parsed) |*parsed| parsed.deinit();
+    var mapping_value: ?std.json.Value = null;
     var data_plane = effective.data_plane;
     if (opts.mapping_path) |mp| {
-        data_plane_owned = try readDataPlane(mp, allocator);
-        data_plane = data_plane_owned.?;
+        mapping_text_owned = try readJsonFile(allocator, mp);
+        mapping_parsed = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text_owned.?, .{});
+        mapping_value = mapping_parsed.?.value;
+        data_plane = dataPlaneFromMappingValue(mapping_value.?);
     }
 
     try collections_sqlite.ensureWorkspace(db, .{
@@ -1203,15 +1292,24 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
         .name = effective.ontology_id,
     });
 
-    if (effective.mode == .reset) {
-        try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
-    }
-
     const contract_relations = if (opts.mapping) |mapping| mapping.contract_relations else &[_]ContractRelation{};
 
     if (std.mem.eql(u8, data_plane, "ws")) {
-        if (effective.mapping_path == null) return error.InvalidMapping;
-        return try applyFromWsTables(allocator, db, effective, contract_relations);
+        const map = mapping_value orelse return error.InvalidMapping;
+        try db.exec("BEGIN IMMEDIATE");
+        var transaction_active = true;
+        errdefer if (transaction_active) {
+            db.exec("ROLLBACK") catch |rollback_err| {
+                std.log.warn("structured import rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        };
+        var batch = try ApplyBatch.init(db);
+        defer batch.deinit();
+        if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
+        const report = try applyFromWsTables(allocator, db, effective, contract_relations, map, &batch);
+        try db.exec("COMMIT");
+        transaction_active = false;
+        return report;
     }
 
     const facets_path = effective.facets_path orelse return error.InvalidFacetsCsv;
@@ -1228,6 +1326,17 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
         }
     }
 
+    try db.exec("BEGIN IMMEDIATE");
+    var transaction_active = true;
+    errdefer if (transaction_active) {
+        db.exec("ROLLBACK") catch |rollback_err| {
+            std.log.warn("structured import rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+    };
+    var batch = try ApplyBatch.init(db);
+    defer batch.deinit();
+    if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
+
     var report = ApplyReport{};
     for (facets.rows, 0..) |_, row_idx| {
         const workspace_id = facets.cell(row_idx, "workspace_id") orelse return error.InvalidFacetsCsv;
@@ -1242,16 +1351,18 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
             .schema_id = schema_id,
             .content = content,
             .facets_json_raw = facets_json_raw,
-        }, contract_relations, &report);
+        }, contract_relations, &report, &batch);
     }
 
     if (edges_table) |edges| {
         for (edges.rows, 0..) |_, row_idx| {
-            const inserted = try applyEdgeRow(allocator, db, edges, row_idx, effective);
+            const inserted = try applyEdgeRow(allocator, db, edges, row_idx, effective, &batch);
             if (inserted) report.edges_inserted += 1 else report.edges_skipped += 1;
         }
     }
 
+    try db.exec("COMMIT");
+    transaction_active = false;
     return report;
 }
 
@@ -1268,9 +1379,10 @@ const DeriveEdgeContext = struct {
     facets_json: []const u8,
     contract_relations: []const ContractRelation,
     mode: ImportMode,
+    batch: ?*ApplyBatch = null,
 };
 
-fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: CsvTable, row_idx: usize, opts: ApplyOptions) !bool {
+fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: CsvTable, row_idx: usize, opts: ApplyOptions, batch: ?*ApplyBatch) !bool {
     const workspace_id = edges.cell(row_idx, "workspace_id") orelse return error.InvalidEdgesCsv;
     const source = edges.cell(row_idx, "source") orelse return error.InvalidEdgesCsv;
     const target = edges.cell(row_idx, "target") orelse return error.InvalidEdgesCsv;
@@ -1290,7 +1402,8 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
     if (opts.mode == .ignore_duplicates) {
         const ext = try edgeExternalId(allocator, source, label, target);
         defer allocator.free(ext);
-        if (relationExistsByExternalId(db, workspace_id, ext)) return false;
+        const exists = if (batch) |b| b.relationExistsByExternalId(workspace_id, ext) else relationExistsByExternalId(db, workspace_id, ext);
+        if (exists) return false;
     }
 
     const source_id = try collections_sqlite.upsertEntityRawAuto(db, .{
@@ -1352,7 +1465,11 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
 
         const edge_ext = try edgeExternalId(allocator, source_external, rel.edge_label, target_external);
         defer allocator.free(edge_ext);
-        if (ctx.mode == .ignore_duplicates and relationExistsByExternalId(db, ctx.workspace_id, edge_ext)) {
+        const relation_exists = if (ctx.batch) |batch|
+            batch.relationExistsByExternalId(ctx.workspace_id, edge_ext)
+        else
+            relationExistsByExternalId(db, ctx.workspace_id, edge_ext);
+        if (ctx.mode == .ignore_duplicates and relation_exists) {
             out.skipped += 1;
             continue;
         }
@@ -1406,15 +1523,7 @@ pub const ProvenanceUpsert = struct {
     relation_external_ids_json: []const u8 = "[]",
 };
 
-fn upsertProvenance(db: facet_sqlite.Database, row: ProvenanceUpsert) !void {
-    const sql =
-        \\INSERT OR REPLACE INTO structured_import_provenance(
-        \\  workspace_id, source_ref, source_tag, table_id, row_fingerprint,
-        \\  fact_id, entity_external_id, relation_external_ids_json, updated_at
-        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
+fn bindProvenanceRow(stmt: *facet_sqlite.c.sqlite3_stmt, row: ProvenanceUpsert) !void {
     try facet_sqlite.bindText(stmt, 1, row.workspace_id);
     try facet_sqlite.bindText(stmt, 2, row.source_ref);
     try facet_sqlite.bindText(stmt, 3, row.source_tag);
@@ -1427,7 +1536,23 @@ fn upsertProvenance(db: facet_sqlite.Database, row: ProvenanceUpsert) !void {
     if (row.fact_id) |fact_id| try facet_sqlite.bindText(stmt, 6, fact_id) else try facet_sqlite.bindNull(stmt, 6);
     if (row.entity_external_id) |entity_id| try facet_sqlite.bindText(stmt, 7, entity_id) else try facet_sqlite.bindNull(stmt, 7);
     try facet_sqlite.bindText(stmt, 8, row.relation_external_ids_json);
-    if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_DONE) return error.StepFailed;
+}
+
+fn upsertProvenance(db: facet_sqlite.Database, row: ProvenanceUpsert, batch: ?*ApplyBatch) !void {
+    if (batch) |b| {
+        try b.upsertProvenance(row);
+        return;
+    }
+    const sql =
+        \\INSERT OR REPLACE INTO structured_import_provenance(
+        \\  workspace_id, source_ref, source_tag, table_id, row_fingerprint,
+        \\  fact_id, entity_external_id, relation_external_ids_json, updated_at
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try bindProvenanceRow(stmt, row);
+    try facet_sqlite.stepDone(stmt);
 }
 
 fn rowFingerprint(allocator: std.mem.Allocator, source_ref: []const u8, facets_json: []const u8) ![]const u8 {
@@ -1867,8 +1992,7 @@ pub fn profileCsv(allocator: std.mem.Allocator, input_path: []const u8, output_p
     for (table.headers, 0..) |header, idx| {
         var non_empty: u64 = 0;
         for (table.rows) |row| {
-            const col_idx = table.columnIndex(header) orelse continue;
-            if (col_idx < row.len and row[col_idx].len > 0) non_empty += 1;
+            if (idx < row.len and row[idx].len > 0) non_empty += 1;
         }
         if (idx > 0) try payload.append(allocator, ',');
         try payload.appendSlice(allocator, "{\"name\":\"");
@@ -1985,4 +2109,59 @@ test "csvTableFromToonRoot reads tabular toon" {
     try std.testing.expectEqualStrings("Ari", table.cell(0, "name").?);
     try std.testing.expectEqualStrings("true", table.cell(0, "active").?);
     try std.testing.expectEqualStrings("false", table.cell(1, "active").?);
+}
+
+fn countRows(db: facet_sqlite.Database, sql: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+    return try facet_sqlite.columnU64(stmt, 0);
+}
+
+test "applyFromWsTables streams ws rows into facts and provenance" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-test", .label = "ws-test" });
+    try collections_sqlite.ensureOntology(db, .{ .workspace_id = "ws-test", .ontology_id = "onto-test", .name = "onto-test" });
+
+    try workspace_sqlite.upsertWorkspace(db, "ws-test", "{\"domain\":\"test\"}");
+    try workspace_sqlite.upsertTableSemanticFull(db, .{
+        .table_id = 1,
+        .workspace_id = "ws-test",
+        .schema_name = "structured",
+        .table_name = "lot",
+        .key_column = "record_id",
+        .content_column = "content",
+        .notes = "{\"schema_id\":\"test:lot\",\"entity_family\":\"test\"}",
+    });
+    try workspace_sqlite.upsertColumnSemanticFull(db, .{
+        .column_semantic_id = 1,
+        .table_id = 1,
+        .column_name = "record_id",
+        .column_role = "primary_key",
+        .data_type = "text",
+    });
+
+    try db.exec(
+        \\CREATE TABLE ws_lot(record_id TEXT PRIMARY KEY, content TEXT, status TEXT);
+        \\INSERT INTO ws_lot(record_id, content, status) VALUES ('001', 'Lot 001', 'active');
+        \\INSERT INTO ws_lot(record_id, content, status) VALUES ('002', 'Lot 002', 'inactive');
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"entities":{"lot":{"schema_id":"test:lot"}}}
+    , .{});
+    defer parsed.deinit();
+
+    const report = try applyFromWsTables(std.testing.allocator, db, .{
+        .workspace_id = "ws-test",
+        .ontology_id = "onto-test",
+        .data_plane = "ws",
+    }, &[_]ContractRelation{}, parsed.value, null);
+
+    try std.testing.expectEqual(@as(u64, 2), report.facets_inserted);
+    try std.testing.expectEqual(@as(u64, 2), report.entities_upserted);
+    try std.testing.expectEqual(@as(u64, 2), try countRows(db, "SELECT COUNT(*) FROM agent_facts WHERE workspace_id = 'ws-test'"));
+    try std.testing.expectEqual(@as(u64, 2), try countRows(db, "SELECT COUNT(*) FROM structured_import_provenance WHERE workspace_id = 'ws-test'"));
 }

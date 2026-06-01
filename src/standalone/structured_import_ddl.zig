@@ -171,8 +171,10 @@ pub fn loadWsFromBundle(
         const key_column_owned = try lookupKeyColumn(allocator, db, workspace_id, named.name);
         defer if (key_column_owned) |k| allocator.free(k);
         const key_column = key_column_owned orelse "record_id";
+        const batch = try WsUpsertBatch.init(allocator, db, ws_name, key_column, named.table.headers);
+        defer batch.deinit();
         for (named.table.rows) |row| {
-            try upsertWsRow(allocator, db, ws_name, key_column, named.table.headers, row);
+            try batch.upsertRow(row);
             report.rows_loaded += 1;
         }
         report.tables_loaded += 1;
@@ -330,6 +332,64 @@ fn upsertWsRow(
     }
     if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_DONE) return error.StepFailed;
 }
+
+const WsUpsertBatch = struct {
+    stmt: *facet_sqlite.c.sqlite3_stmt,
+    headers: []const []const u8,
+    key_idx: usize,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        db: facet_sqlite.Database,
+        ws_name: []const u8,
+        key_column: []const u8,
+        headers: []const []const u8,
+    ) !WsUpsertBatch {
+        const key_idx = blk: {
+            for (headers, 0..) |header, idx| {
+                if (std.mem.eql(u8, header, key_column)) break :blk idx;
+            }
+            return error.MissingPrimaryKey;
+        };
+
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "INSERT OR REPLACE INTO ");
+        try sql.appendSlice(allocator, ws_name);
+        try sql.append(allocator, '(');
+        for (headers, 0..) |col, idx| {
+            if (idx > 0) try sql.append(allocator, ',');
+            try sql.appendSlice(allocator, col);
+        }
+        try sql.appendSlice(allocator, ") VALUES (");
+        for (0..headers.len) |idx| {
+            if (idx > 0) try sql.append(allocator, ',');
+            try sql.appendSlice(allocator, "?");
+        }
+        try sql.append(allocator, ')');
+
+        return .{
+            .stmt = try facet_sqlite.prepare(db, sql.items),
+            .headers = headers,
+            .key_idx = key_idx,
+        };
+    }
+
+    fn deinit(self: WsUpsertBatch) void {
+        facet_sqlite.finalize(self.stmt);
+    }
+
+    fn upsertRow(self: WsUpsertBatch, row: []const []const u8) !void {
+        if (row.len != self.headers.len) return error.WsRowShapeMismatch;
+        if (row[self.key_idx].len == 0) return error.MissingPrimaryKey;
+
+        try facet_sqlite.resetStatement(self.stmt);
+        for (row, 0..) |value, idx| {
+            try facet_sqlite.bindText(self.stmt, @intCast(idx + 1), value);
+        }
+        try facet_sqlite.stepDone(self.stmt);
+    }
+};
 
 fn wsTableName(allocator: std.mem.Allocator, entity_name: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "ws_{s}", .{entity_name});
