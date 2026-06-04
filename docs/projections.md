@@ -47,6 +47,13 @@ The memory pragma surface also uses projection-like rows such as
 idea: they are ranked, searchable memory views used for context packing
 and next-hop suggestions.
 
+The answer artifact registry is separate from these projection rows. It stores
+stable answer-facing artifact ids, versions, lifecycle state, payload JSON, and
+retained update events in `mindbrain_answer_artifacts` and
+`mindbrain_answer_events`. Legacy `projections` rows can be represented as
+`analysis_plan` compatibility artifacts, and graph `ProjectionResult` bundles
+can be represented as `answer_snapshot` compatibility artifacts.
+
 ## What They Are Used For
 
 Projections are used when the system needs a small, useful view instead of
@@ -82,6 +89,11 @@ Do not treat a projection as the only copy of an important fact unless the
 application explicitly models projections as the write surface. Prefer to
 ground it with `source_ref`, a graph entity/relation, or a document/chunk
 reference.
+
+For answer artifact identity, do not overload `projections.id` or
+`ProjectionResult` entity ids as public versioned artifact ids. The registry
+uses version-less `artifact_id` values and stores the mutable version in
+`current_version`.
 
 ## How an LLM Should Create One
 

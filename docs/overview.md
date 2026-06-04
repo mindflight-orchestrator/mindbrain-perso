@@ -7,6 +7,7 @@
 3. **Pragma** — Context packing over `memory_projections` and durable `projections`, plus proposition DSL parsing and standalone rank/pack helpers.
 4. **Workspace registry** — Tables under **`mindbrain`** for workspaces, pending DDL, semantics, and integration with facet/graph rows via `workspace_id`.
 5. **Ontology layer** — Workspace-scoped vocabulary tables, raw RDF preservation, LinkML/OWL2 import/export, taxonomy APIs, coverage, and projection relevance helpers.
+6. **Answer artifacts** — Backend-owned registry rows and update events for answer-facing plans, live views, snapshots, and evidence packs. See [artifacts/artifact-model.md](artifacts/artifact-model.md).
 
 The same Zig codebase also builds a **standalone SQLite** stack (see [standalone.md](standalone.md)) for portability and tooling.
 As of `v1.4.0`, the standalone search and graph stores maintain their hot
@@ -45,10 +46,12 @@ flowchart LR
   SQL --> mindbrainSch[mindbrain schema]
   SQL --> pragmaFn[pragma and projection tables]
   SQL --> ontoSch[ontology tables]
+  SQL --> artifactSch[answer artifact registry]
   SQL --> rawOnt[collections raw ontology tables]
   Zig --> facetsSch
   Zig --> graphSch
   Zig --> pragmaFn
+  Zig --> artifactSch
   Zig --> rawOnt
 ```
 
@@ -67,6 +70,7 @@ flowchart LR
 - [facets/README.md](facets/README.md)
 - [graphs/README.md](graphs/README.md)
 - [pragma/README.md](pragma/README.md)
+- [artifacts/artifact-model.md](artifacts/artifact-model.md)
 - [ontology/README.md](ontology/README.md)
 
 ## Version

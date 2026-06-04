@@ -22,6 +22,7 @@ comptime {
     _ = @import("business_entity_normalize.zig");
     _ = @import("facet_parity_test.zig");
     _ = @import("bm25_stopwords_sqlite.zig");
+    _ = @import("answer_artifacts.zig");
     _ = @import("bench.zig");
     _ = @import("facet_sqlite.zig");
     _ = @import("facts_sqlite.zig");

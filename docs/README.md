@@ -35,6 +35,8 @@ the SQLite MVP; follow-up work is tracked in
 | [graph.md](graph.md) | Legacy graph overview and pointer to the canonical graph docs |
 | [pragma/README.md](pragma/README.md) | Complete pragma documentation: memory projections, DSL, context packing, SQL/CLI/HTTP APIs |
 | [pragma.md](pragma.md) | Legacy pragma pointer kept for existing links |
+| [artifacts/artifact-model.md](artifacts/artifact-model.md) | Backend-owned answer artifact registry, artifact kinds, events, refresh, and legacy projection compatibility |
+| [artifacts/non-artifact-gaps-and-reports.md](artifacts/non-artifact-gaps-and-reports.md) | Gap, diagnostics, coverage, answerability, and MECE/doc surfaces that intentionally stay outside answer artifacts |
 | [ontology/README.md](ontology/README.md) | Complete ontology documentation: raw triples, taxonomy, LinkML/OWL2, APIs, coverage |
 | [dsl-rules.md](dsl-rules.md) | Proposition DSL line format (for `projection_type = 'proposition'`) |
 | [workspace.md](workspace.md) | `mindbrain.*` workspace and semantics tables |

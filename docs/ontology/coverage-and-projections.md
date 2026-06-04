@@ -6,6 +6,10 @@ Ontology coverage answers a different question than graph traversal:
 - ontology coverage asks which ontology or taxonomy nodes are reflected by the
   current graph/facet/projection state.
 
+Coverage gaps are report rows, not answer artifacts. See
+[../artifacts/non-artifact-gaps-and-reports.md](../artifacts/non-artifact-gaps-and-reports.md)
+for the gap/report boundary.
+
 ## Coverage CLI
 
 ```bash

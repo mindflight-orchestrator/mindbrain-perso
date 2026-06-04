@@ -1,4 +1,5 @@
 const std = @import("std");
+const answer_artifacts = @import("answer_artifacts.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
 const facts_sqlite = @import("facts_sqlite.zig");
 const graph_diagnostics = @import("graph_diagnostics.zig");
@@ -1098,6 +1099,18 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projection-get")) {
             return self.handleGhostcrabProjectionGet(allocator, query);
         }
+        if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/refresh")) |artifact_id| {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return self.handleGhostcrabArtifactRefresh(allocator, artifact_id);
+        }
+        if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/events")) |artifact_id| {
+            if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
+            return self.handleGhostcrabArtifactEvents(allocator, artifact_id, query);
+        }
+        if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "")) |artifact_id| {
+            if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
+            return self.handleGhostcrabArtifactGet(allocator, artifact_id);
+        }
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/graph-search")) {
             return self.handleGhostcrabGraphSearch(allocator, query);
         }
@@ -1184,6 +1197,10 @@ pub const MindbrainHttpApp = struct {
         search_sqlite.syncSearchDocumentIfTriggered(self.writer_db, allocator, 1, result.doc_id, content, "english") catch |err| {
             self.writer_failed += 1;
             self.recordWriterError(self.writer_db, "facts.write.fts_sync", err);
+        };
+        _ = answer_artifacts.markWorkspaceLiveViewsStale(self.writer_db, workspace_id) catch |err| {
+            self.writer_failed += 1;
+            self.recordWriterError(self.writer_db, "facts.write.artifact_stale", err);
         };
 
         return toResponse(
@@ -1348,6 +1365,10 @@ pub const MindbrainHttpApp = struct {
             .workspace_id = workspace_id,
             .collection_id = collection_id,
             .projection_id = projection_id,
+            .artifact_kind = "answer_snapshot",
+            .legacy_kind = "projection_type_b",
+            .frozen = true,
+            .terminal = true,
             .projection_result_count = projection_results.len,
             .linked_evidence_count = linked_evidence.len,
             .delta_count = deltas.len,
@@ -1357,6 +1378,8 @@ pub const MindbrainHttpApp = struct {
             .workspace_id = workspace_id,
             .collection_id = collection_id,
             .projection_id = projection_id,
+            .artifact_kind = "answer_snapshot",
+            .legacy_kind = "projection_type_b",
             .projection_results = projection_results,
             .linked_evidence = linked_evidence,
             .deltas = deltas,
@@ -3040,6 +3063,9 @@ pub const MindbrainHttpApp = struct {
             weight: f32,
             source_ref: ?[]const u8,
             status: []const u8,
+            artifact_kind: []const u8,
+            legacy_kind: []const u8,
+            public_label: []const u8,
         };
         const response_rows = try allocator.alloc(ResponseRow, rows.len);
         defer allocator.free(response_rows);
@@ -3051,6 +3077,9 @@ pub const MindbrainHttpApp = struct {
                 .weight = row.weight,
                 .source_ref = row.source_ref,
                 .status = row.status,
+                .artifact_kind = "analysis_plan",
+                .legacy_kind = "projection_type_a",
+                .public_label = row.content,
             };
         }
 
@@ -3069,6 +3098,69 @@ pub const MindbrainHttpApp = struct {
             .content_type = "application/json; charset=utf-8",
             .body = body,
         };
+    }
+
+    fn handleGhostcrabArtifactGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+        const row = (try answer_artifacts.getArtifact(db, allocator, artifact_id)) orelse return error.NotFound;
+        defer row.deinit(allocator);
+        return jsonResponseWithStatus(allocator, .ok, .{
+            .artifact_id = row.artifact_id,
+            .slug = row.slug,
+            .workspace_id = row.workspace_id,
+            .agent_id = row.agent_id,
+            .scope = row.scope,
+            .artifact_kind = row.artifact_kind,
+            .public_label = row.public_label,
+            .lifecycle = row.lifecycle,
+            .state = row.state,
+            .current_version = row.current_version,
+            .payload_json = row.payload_json,
+            .legacy_ref = row.legacy_ref,
+        });
+    }
+
+    fn handleGhostcrabArtifactRefresh(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8) !Response {
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        const row = answer_artifacts.refreshLiveAnswerView(self.writer_db, allocator, artifact_id) catch |err| switch (err) {
+            error.MissingRow => return error.NotFound,
+            error.ValueOutOfRange => return error.BadRequest,
+            else => return err,
+        };
+        defer row.deinit(allocator);
+        self.writer_completed += 1;
+        return jsonResponseWithStatus(allocator, .ok, .{
+            .ok = true,
+            .artifact_id = row.artifact_id,
+            .artifact_kind = row.artifact_kind,
+            .current_version = row.current_version,
+            .state = row.state,
+        });
+    }
+
+    fn handleGhostcrabArtifactEvents(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            50;
+        if (limit == 0 or limit > 500) return error.BadRequest;
+        const rows = try answer_artifacts.listEvents(db, allocator, artifact_id, limit);
+        defer {
+            for (rows) |row| row.deinit(allocator);
+            allocator.free(rows);
+        }
+        return jsonResponseWithStatus(allocator, .ok, .{
+            .artifact_id = artifact_id,
+            .event_kind = "answer_update_event",
+            .rows = rows,
+        });
     }
 
     fn handleGhostcrabProjectionsRelevance(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
@@ -3509,6 +3601,19 @@ fn normalizeOptionalText(value: ?[]const u8) ?[]const u8 {
     const text = value orelse return null;
     if (text.len == 0) return null;
     return text;
+}
+
+fn artifactRouteId(path: []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    if (suffix.len == 0) {
+        if (std.mem.indexOfScalar(u8, rest, '/') != null) return null;
+        return if (rest.len > 0) rest else null;
+    }
+    if (!std.mem.endsWith(u8, rest, suffix)) return null;
+    const artifact_id = rest[0 .. rest.len - suffix.len];
+    if (artifact_id.len == 0 or std.mem.indexOfScalar(u8, artifact_id, '/') != null) return null;
+    return artifact_id;
 }
 
 fn bindOptionalText(stmt: *facet_sqlite.c.sqlite3_stmt, index: c_int, value: ?[]const u8) !void {
@@ -4498,8 +4603,10 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
         \\INSERT INTO ontology_values(ontology_id, namespace, dimension, value_id, value, parent_value_id, label, metadata_json) VALUES ('ws_api::core', 'source', 'document_type', 1, 'PV', NULL, 'Procès-verbal', '{}');
         \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (1, 'ws_api', 'person', 'Ada', 0.99, '{}');
         \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (2, 'ws_api', 'unit', 'Unit 1', 0.95, '{}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (3, 'ws_api', 'ProjectionResult', 'Ownership snapshot', 0.97, '{"projection_id":"proj-snapshot","collection_id":"registry"}');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-pack', 'agent-studio', 'ws_api', 'FACT', 'Ada owns Unit 1', 1.0, 'active');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-other', 'agent-studio', 'ws_api', 'FACT', 'Other context', 0.9, 'active');
+        \\INSERT INTO mindbrain_answer_artifacts(artifact_id, slug, workspace_id, artifact_kind, public_label, lifecycle, state, payload_json) VALUES ('live_answer_view__ws_api', 'ws_api', 'ws_api', 'live_answer_view', 'API live view', 'stale', 'dirty', '{}');
     );
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4524,7 +4631,7 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
 
     const workspaces = try app.handleWorkspaceList(arena);
     try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"id\":\"ws_api\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"entity_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"entity_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspaces.body, "\"default_ontology_id\":\"ws_api::core\"") != null);
 
     const type_counts = try app.handleGraphTypeCounts(arena, "workspace_id=ws_api");
@@ -4534,11 +4641,22 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
 
     const pack = try app.handleGhostcrabPackProjections(arena, "agent_id=agent-studio");
     try std.testing.expect(std.mem.indexOf(u8, pack.body, "Ada owns Unit 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.body, "\"artifact_kind\":\"analysis_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.body, "\"legacy_kind\":\"projection_type_a\"") != null);
 
     const relevance = try app.handleGhostcrabProjectionsRelevance(arena, "agent_id=agent-studio&entity_name=Ada&query=Other");
     const ada_pos = std.mem.indexOf(u8, relevance.body, "Ada owns Unit 1").?;
     const other_pos = std.mem.indexOf(u8, relevance.body, "Other context").?;
     try std.testing.expect(ada_pos < other_pos);
+
+    const projection_get = try app.handleGhostcrabProjectionGet(arena, "workspace_id=ws_api&collection_id=registry&projection_id=proj-snapshot");
+    try std.testing.expect(std.mem.indexOf(u8, projection_get.body, "\"artifact_kind\":\"answer_snapshot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projection_get.body, "\"legacy_kind\":\"projection_type_b\"") != null);
+
+    const artifact_refresh = try app.handleGhostcrabArtifactRefresh(arena, "live_answer_view__ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, artifact_refresh.body, "\"current_version\":2") != null);
+    const artifact_events = try app.handleGhostcrabArtifactEvents(arena, "live_answer_view__ws_api", "");
+    try std.testing.expect(std.mem.indexOf(u8, artifact_events.body, "\"event_kind\":\"answer_update_event\"") != null);
 
     try app.writer_db.exec("UPDATE ontologies SET frozen = 1 WHERE ontology_id = 'ws_api::core'");
     try std.testing.expect(try collections_sqlite.isOntologyFrozen(app.writer_db, "ws_api::core"));
@@ -4594,12 +4712,14 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(rules.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"kind\":\"graph_gap_rules\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"rule_id\":\"unit-one-building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"artifact_kind\"") == null);
 
     const diagnostics = try app.handleGraphDiagnostics(arena, "workspace_id=ws_diag_api&limit=25&component_small_max=2");
     try std.testing.expect(diagnostics.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"kind\":\"graph_diagnostics_report\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"too_many_relations\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"rule_id\":\"unit-one-building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"artifact_kind\"") == null);
 }
 
 test "graph gap rules import and delete HTTP handlers accept contract payloads" {
@@ -4636,9 +4756,7 @@ test "graph gap rules import and delete HTTP handlers accept contract payloads" 
     try std.testing.expect(rules.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"rule_id\":\"probe-rule\"") != null);
 
-    const deleted = try graph_diagnostics.deleteRulesJson(
-        app.writer_db,
-        std.testing.allocator,
+    const deleted = try graph_diagnostics.deleteRulesJson(app.writer_db, std.testing.allocator,
         \\{"ontology_id":"ws_gap_write::core","workspace_id":"ws_gap_write","rule_ids":["probe-rule"]}
     );
     try std.testing.expect(deleted >= 1);

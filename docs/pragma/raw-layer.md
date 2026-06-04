@@ -26,11 +26,14 @@ The repository uses the word projection in several contexts.
 |---------|-------|-------------|
 | Agent projection rows | `projections` | Durable facts/goals/steps/constraints for an agent. |
 | Memory projection rows | `memory_projections` | Legacy memory views typed as `canonical`, `proposition`, or `raw`. |
+| Answer artifact registry | `mindbrain_answer_artifacts`, `mindbrain_answer_events` | Backend-owned identity/version/event layer for answer plans, live views, snapshots, and evidence packs. |
 | Raw-to-derived materialization | reindex and graph/facet code | Rebuilding derived indexes from raw rows. |
 
 Keep these separate when debugging. `ghostcrab_projection_get` style output is
 also different from working-memory pack rows: it returns a materialized graph
 projection bundle, not the same row family as `/ghostcrab/pack-projections`.
+The answer artifact registry overlays those legacy surfaces but does not turn
+diagnostics, gap rules, coverage reports, or graph search rows into artifacts.
 
 ## Grounding
 
@@ -51,6 +54,8 @@ For backup and restore, preserve:
 
 - the raw source rows that justify projections;
 - `projections` if agent state and audit history matter;
+- `mindbrain_answer_artifacts` and retained `mindbrain_answer_events` if answer
+  artifact ids, versions, and update lineage must round-trip;
 - `memory_items`, `memory_projections`, and `memory_edges` if legacy memory pack
   behavior must round-trip.
 

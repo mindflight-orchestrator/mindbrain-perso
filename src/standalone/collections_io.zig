@@ -38,6 +38,8 @@ pub const BundleSummary = struct {
     facet_table_id: ?u64,
     facet_collection_id: ?[]const u8,
     relation_property_count: usize,
+    answer_artifact_count: usize,
+    answer_event_count: usize,
 
     pub fn deinit(self: BundleSummary, allocator: Allocator) void {
         allocator.free(self.kind);
@@ -83,6 +85,8 @@ const Bundle = struct {
     entity_chunks_raw: []EntityChunkRow,
     document_links_raw: []DocumentLinkRow,
     external_links_raw: []ExternalLinkRow = &.{},
+    mindbrain_answer_artifacts: []AnswerArtifactRow = &.{},
+    mindbrain_answer_events: []AnswerEventRow = &.{},
 };
 
 const ScopeJson = struct {
@@ -224,6 +228,34 @@ const FacetDefinitionRow = struct {
     table_id: i64,
     facet_id: i64,
     facet_name: []const u8,
+};
+
+const AnswerArtifactRow = struct {
+    artifact_id: []const u8,
+    slug: []const u8,
+    workspace_id: ?[]const u8,
+    agent_id: ?[]const u8,
+    scope: ?[]const u8,
+    artifact_kind: []const u8,
+    public_label_key: ?[]const u8,
+    public_label: []const u8,
+    lifecycle: []const u8,
+    state: []const u8,
+    current_version: i64,
+    payload_json: []const u8,
+    legacy_ref: ?[]const u8,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+};
+
+const AnswerEventRow = struct {
+    event_id: []const u8,
+    artifact_id: []const u8,
+    event_kind: []const u8,
+    from_version: ?i64,
+    to_version: ?i64,
+    signal_json: []const u8,
+    created_at_unix: i64,
 };
 
 const DocumentRow = struct {
@@ -432,6 +464,8 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
         .entity_chunks_raw = if (taxonomies_only) &.{} else try selectEntityChunks(arena_allocator, db, workspace_id, collection_filter),
         .document_links_raw = if (taxonomies_only) &.{} else try selectDocumentLinks(arena_allocator, db, workspace_id, collection_filter),
         .external_links_raw = if (taxonomies_only) &.{} else try selectExternalLinks(arena_allocator, db, workspace_id, collection_filter),
+        .mindbrain_answer_artifacts = if (collection_filter == null) try selectAnswerArtifacts(arena_allocator, db, workspace_id) else &.{},
+        .mindbrain_answer_events = if (collection_filter == null) try selectAnswerEvents(arena_allocator, db, workspace_id) else &.{},
     };
 
     return try std.json.Stringify.valueAlloc(allocator, bundle, .{ .whitespace = .indent_2 });
@@ -818,7 +852,81 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         });
     }
 
+    for (bundle.mindbrain_answer_artifacts) |row| {
+        try upsertAnswerArtifact(db, row);
+    }
+
+    for (bundle.mindbrain_answer_events) |row| {
+        try upsertAnswerEvent(db, row);
+    }
+
     try db.exec("COMMIT");
+}
+
+fn upsertAnswerArtifact(db: Database, row: AnswerArtifactRow) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind,
+        \\  public_label_key, public_label, lifecycle, state, current_version,
+        \\  payload_json, legacy_ref, created_at_unix, updated_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        \\ON CONFLICT(artifact_id) DO UPDATE SET
+        \\  slug = excluded.slug,
+        \\  workspace_id = excluded.workspace_id,
+        \\  agent_id = excluded.agent_id,
+        \\  scope = excluded.scope,
+        \\  artifact_kind = excluded.artifact_kind,
+        \\  public_label_key = excluded.public_label_key,
+        \\  public_label = excluded.public_label,
+        \\  lifecycle = excluded.lifecycle,
+        \\  state = excluded.state,
+        \\  current_version = excluded.current_version,
+        \\  payload_json = excluded.payload_json,
+        \\  legacy_ref = excluded.legacy_ref,
+        \\  created_at_unix = excluded.created_at_unix,
+        \\  updated_at_unix = excluded.updated_at_unix
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.artifact_id);
+    try facet_sqlite.bindText(stmt, 2, row.slug);
+    try bindMaybeText(stmt, 3, row.workspace_id);
+    try bindMaybeText(stmt, 4, row.agent_id);
+    try bindMaybeText(stmt, 5, row.scope);
+    try facet_sqlite.bindText(stmt, 6, row.artifact_kind);
+    try bindMaybeText(stmt, 7, row.public_label_key);
+    try facet_sqlite.bindText(stmt, 8, row.public_label);
+    try facet_sqlite.bindText(stmt, 9, row.lifecycle);
+    try facet_sqlite.bindText(stmt, 10, row.state);
+    try facet_sqlite.bindInt64(stmt, 11, row.current_version);
+    try facet_sqlite.bindText(stmt, 12, row.payload_json);
+    try bindMaybeText(stmt, 13, row.legacy_ref);
+    try facet_sqlite.bindInt64(stmt, 14, row.created_at_unix);
+    try facet_sqlite.bindInt64(stmt, 15, row.updated_at_unix);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn upsertAnswerEvent(db: Database, row: AnswerEventRow) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO mindbrain_answer_events(
+        \\  event_id, artifact_id, event_kind, from_version, to_version, signal_json, created_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\ON CONFLICT(event_id) DO UPDATE SET
+        \\  artifact_id = excluded.artifact_id,
+        \\  event_kind = excluded.event_kind,
+        \\  from_version = excluded.from_version,
+        \\  to_version = excluded.to_version,
+        \\  signal_json = excluded.signal_json,
+        \\  created_at_unix = excluded.created_at_unix
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.event_id);
+    try facet_sqlite.bindText(stmt, 2, row.artifact_id);
+    try facet_sqlite.bindText(stmt, 3, row.event_kind);
+    try bindMaybeInt(stmt, 4, row.from_version);
+    try bindMaybeInt(stmt, 5, row.to_version);
+    try facet_sqlite.bindText(stmt, 6, row.signal_json);
+    try facet_sqlite.bindInt64(stmt, 7, row.created_at_unix);
+    try facet_sqlite.stepDone(stmt);
 }
 
 fn rawIdMapKey(allocator: Allocator, workspace_id: []const u8, id: u64) ![]const u8 {
@@ -870,6 +978,8 @@ pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !Bundle
         .facet_table_id = if (bundle.facet_tables.len == 1) std.math.cast(u64, bundle.facet_tables[0].table_id) orelse return error.ValueOutOfRange else null,
         .facet_collection_id = if (bundle.facet_tables.len == 1) try allocator.dupe(u8, bundle.facet_tables[0].collection_id) else null,
         .relation_property_count = bundle.relation_properties_raw.len,
+        .answer_artifact_count = bundle.mindbrain_answer_artifacts.len,
+        .answer_event_count = bundle.mindbrain_answer_events.len,
     };
 }
 
@@ -1848,9 +1958,85 @@ fn selectDocumentLinks(arena: Allocator, db: Database, workspace_id: []const u8,
     return rows.toOwnedSlice(arena);
 }
 
+fn selectAnswerArtifacts(arena: Allocator, db: Database, workspace_id: []const u8) ![]AnswerArtifactRow {
+    const sql =
+        \\SELECT artifact_id, slug, workspace_id, agent_id, scope, artifact_kind,
+        \\       public_label_key, public_label, lifecycle, state, current_version,
+        \\       payload_json, legacy_ref, created_at_unix, updated_at_unix
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE workspace_id = ?1 OR (artifact_kind = 'analysis_plan' AND scope = ?1)
+        \\ORDER BY artifact_kind, slug, artifact_id
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(AnswerArtifactRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .artifact_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .slug = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .workspace_id = try maybeColText(arena, stmt, 2),
+            .agent_id = try maybeColText(arena, stmt, 3),
+            .scope = try maybeColText(arena, stmt, 4),
+            .artifact_kind = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .public_label_key = try maybeColText(arena, stmt, 6),
+            .public_label = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+            .lifecycle = try facet_sqlite.dupeColumnText(arena, stmt, 8),
+            .state = try facet_sqlite.dupeColumnText(arena, stmt, 9),
+            .current_version = c.sqlite3_column_int64(stmt, 10),
+            .payload_json = try facet_sqlite.dupeColumnText(arena, stmt, 11),
+            .legacy_ref = try maybeColText(arena, stmt, 12),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 13),
+            .updated_at_unix = c.sqlite3_column_int64(stmt, 14),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectAnswerEvents(arena: Allocator, db: Database, workspace_id: []const u8) ![]AnswerEventRow {
+    const sql =
+        \\SELECT e.event_id, e.artifact_id, e.event_kind, e.from_version, e.to_version,
+        \\       e.signal_json, e.created_at_unix
+        \\FROM mindbrain_answer_events e
+        \\JOIN mindbrain_answer_artifacts a ON a.artifact_id = e.artifact_id
+        \\WHERE a.workspace_id = ?1 OR (a.artifact_kind = 'analysis_plan' AND a.scope = ?1)
+        \\ORDER BY e.created_at_unix ASC, e.event_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(AnswerEventRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .event_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .artifact_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .event_kind = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .from_version = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 3),
+            .to_version = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 4),
+            .signal_json = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 6),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
 fn maybeColText(arena: Allocator, stmt: *c.sqlite3_stmt, index: c_int) !?[]const u8 {
     if (c.sqlite3_column_type(stmt, index) == c.SQLITE_NULL) return null;
     return try facet_sqlite.dupeColumnText(arena, stmt, index);
+}
+
+fn bindMaybeText(stmt: *c.sqlite3_stmt, index: c_int, value: ?[]const u8) !void {
+    if (value) |text| try facet_sqlite.bindText(stmt, index, text) else try facet_sqlite.bindNull(stmt, index);
+}
+
+fn bindMaybeInt(stmt: *c.sqlite3_stmt, index: c_int, value: ?i64) !void {
+    if (value) |int| try facet_sqlite.bindInt64(stmt, index, int) else try facet_sqlite.bindNull(stmt, index);
 }
 
 fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
@@ -1989,6 +2175,21 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
         .value_type = .text,
         .value_text = "learned",
     });
+    try db.exec(
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, workspace_id, artifact_kind, public_label,
+        \\  lifecycle, state, current_version, payload_json, legacy_ref
+        \\) VALUES (
+        \\  'live_answer_view__round', 'round', 'ws_round', 'live_answer_view',
+        \\  'Round live view', 'active', 'refreshed', 3, '{}', 'manual:round'
+        \\);
+        \\INSERT INTO mindbrain_answer_events(
+        \\  event_id, artifact_id, event_kind, from_version, to_version, signal_json
+        \\) VALUES (
+        \\  'answer_update_event__round__3', 'live_answer_view__round',
+        \\  'answer_update_event', 2, 3, '{"refresh":"explicit"}'
+        \\);
+    );
 
     const bundle = try exportToJson(std.testing.allocator, db, .{ .workspace = "ws_round" });
     defer std.testing.allocator.free(bundle);
@@ -1997,6 +2198,8 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"schema_version\": \"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"ontology_values\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "confidence_note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_artifacts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_events\"") != null);
 
     var dest = try Database.openInMemory();
     defer dest.close();
@@ -2024,6 +2227,8 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM relation_properties_raw WHERE workspace_id = 'ws_round' AND property_key = 'confidence_note'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM chunks_raw_vector WHERE workspace_id = 'ws_round'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id = 'ws_round' AND current_version = 3"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
 }
 
 test "taxonomies-only bundle round-trips ontology body without documents" {

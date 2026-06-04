@@ -193,10 +193,16 @@ GhostCrab SQLite integrations can consume MindBrain-owned read behavior.
 
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
-| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/pack-projections` | `agent_id`, `query` optional, `scope` optional, `limit` optional | JSON projection rows for packed context; empty or omitted `query` matches all active rows |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/pack-projections` | `agent_id`, `query` optional, `scope` optional, `limit` optional | JSON projection rows for packed context; rows include `artifact_kind: "analysis_plan"`, `legacy_kind: "projection_type_a"`, and `public_label` |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projections/relevance` | `agent_id`, `entity_name`, `query` optional, `scope` optional, `limit` optional | JSON projection rows ranked by graph-context relevance |
-| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, `collection_id` optional, `include_evidence` optional, `include_deltas` optional | JSON projection result, linked evidence, deltas, and report |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, `collection_id` optional, `include_evidence` optional, `include_deltas` optional | JSON projection result bundle with `artifact_kind: "answer_snapshot"` and `legacy_kind: "projection_type_b"`, plus linked evidence, deltas, and report |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}` | none | JSON answer artifact registry row |
+| `POST` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}/refresh` | none | Refreshes a `live_answer_view`, increments `current_version`, writes one `answer_update_event`, and returns the new version/state |
+| `GET`/`HEAD` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}/events` | `limit` optional | JSON retained `answer_update_event` rows for the artifact |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/graph-search` | `workspace_id`, `query` optional, `collection_id` optional, repeated `entity_type` optional, `metadata_filters` optional, `limit` optional | JSON graph entity search result |
+
+Graph diagnostics, graph gap rules, coverage, and graph search are not answer
+artifacts and do not add `artifact_kind` fields.
 
 ## CLI
 
@@ -224,6 +230,7 @@ mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlit
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
 mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
+mindbrain-standalone-tool artifact-migrate --db <sqlite_path> (--dry-run | --repair)
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
 mindbrain-standalone-tool document-normalize --input <path> --output-dir <dir> [--languages fr,nl] [--split-by-language] [--pdf-backend auto|pdftotext|ocrmypdf|deepseek|none] [--html-backend pandoc|builtin-strip] [--deepseek-command <template>]
@@ -263,7 +270,7 @@ Command families:
 | Graph | `traverse`, `graph-path`, `graph-diagnostics`, `graph-gap-rules-import` |
 | Search and context | `search-compact-info`, `pack` |
 | Queue | `queue-send`, `queue-read`, `queue-archive`, `queue-delete` |
-| Demo and maintenance | `seed-demo`, `bootstrap-from-sql`, `benchmark-db`, `corpus-eval`, `simulate` |
+| Demo and maintenance | `seed-demo`, `bootstrap-from-sql`, `artifact-migrate`, `benchmark-db`, `corpus-eval`, `simulate` |
 
 HTTP clients can write indexed search vectors with:
 

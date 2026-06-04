@@ -1,5 +1,6 @@
 const std = @import("std");
 const mindbrain = @import("mindbrain");
+const answer_artifacts = mindbrain.answer_artifacts;
 const chunker = mindbrain.chunker;
 const chunking_policy = mindbrain.chunking_policy;
 const collections_io = mindbrain.collections_io;
@@ -130,6 +131,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "backup-load")) {
         try runBackupLoadCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "artifact-migrate")) {
+        try runArtifactMigrateCommand(args[2..]);
         return;
     }
 
@@ -428,6 +434,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
         \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
+        \\  mindbrain-standalone-tool artifact-migrate --db <sqlite_path> (--dry-run | --repair)
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
         \\  mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
         \\  mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
@@ -1493,6 +1500,45 @@ fn requireArg(args: []const []const u8, index: *usize) ![]const u8 {
     index.* += 1;
     if (index.* >= args.len) return CliError.InvalidArguments;
     return args[index.*];
+}
+
+fn runArtifactMigrateCommand(args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var dry_run = false;
+    var repair = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            db_path = try requireArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--repair")) {
+            repair = true;
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+    if (db_path == null or dry_run == repair) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    const stats = if (dry_run)
+        try answer_artifacts.dryRunLegacyRepair(db)
+    else
+        try answer_artifacts.repairFromLegacy(db, std.heap.page_allocator);
+
+    var stdout_file_writer = std.Io.File.stdout().writer(mindbrain.zig16_compat.io(), &.{});
+    const stdout = &stdout_file_writer.interface;
+    try stdout.print("{f}\n", .{std.json.fmt(.{
+        .ok = true,
+        .dry_run = dry_run,
+        .repair = repair,
+        .projection_rows = stats.projection_rows,
+        .projection_result_rows = stats.projection_result_rows,
+        .inserted_or_updated = stats.inserted_or_updated,
+    }, .{})});
+    try stdout.flush();
 }
 
 fn runWorkspaceCreateCommand(allocator: Allocator, args: []const []const u8) !void {
@@ -2801,7 +2847,6 @@ fn writeQualificationEdgeTypesJson(
         try writer.writeAll("}");
     }
 }
-
 
 fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const u8, env_map: *const std.process.Environ.Map) !void {
     var db_path: ?[]const u8 = null;

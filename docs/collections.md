@@ -172,6 +172,12 @@ A collection-scoped export keeps cross-collection links whose **source
 or target** lives inside the requested collection, so a legal export
 still carries the `legal → technical` mappings it needs.
 
+Workspace-scoped backup bundles also include answer artifact registry rows:
+`mindbrain_answer_artifacts` and retained `mindbrain_answer_events`. Import
+preserves artifact ids, `current_version`, payload JSON, and included event
+lineage. Collection-scoped exports omit artifact registry rows because answer
+artifacts are workspace/agent scoped rather than collection-local.
+
 ## CLI
 
 `mindbrain-standalone-tool` implements workspace and collection management

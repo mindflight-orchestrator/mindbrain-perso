@@ -51,13 +51,20 @@ The CLI prints a TOON `pack_context` payload.
 | Route | Query | Response |
 |-------|-------|----------|
 | `GET /api/mindbrain/pack` | `user_id`, `query`, optional `scope`, optional `limit` | TOON packed context from `memory_projections`. |
-| `GET /api/mindbrain/ghostcrab/pack-projections` | `agent_id`, optional `query`, optional `scope`, optional `limit` | JSON rows from durable `projections`. |
+| `GET /api/mindbrain/ghostcrab/pack-projections` | `agent_id`, optional `query`, optional `scope`, optional `limit` | JSON rows from durable `projections`, with additive `analysis_plan` artifact compatibility fields. |
 | `GET /api/mindbrain/ghostcrab/projections/relevance` | `agent_id`, `entity_name`, optional `query`, optional `scope`, optional `limit` | JSON durable projections ranked for graph context. |
-| `GET /api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, optional `collection_id`, evidence/delta flags | JSON materialized graph projection bundle. |
+| `GET /api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, optional `collection_id`, evidence/delta flags | JSON materialized graph projection bundle with additive `answer_snapshot` artifact compatibility fields. |
+| `GET /api/mindbrain/ghostcrab/artifact/{artifact_id}` | none | JSON answer artifact registry row. |
+| `POST /api/mindbrain/ghostcrab/artifact/{artifact_id}/refresh` | none | Explicitly refresh a `live_answer_view`, incrementing version and writing one update event. |
+| `GET /api/mindbrain/ghostcrab/artifact/{artifact_id}/events` | optional `limit` | JSON retained `answer_update_event` rows. |
 
 `/api/mindbrain/pack` and `/ghostcrab/pack-projections` are intentionally not
 the same route. The first is the memory-table pack path. The second is a
 GhostCrab compatibility route over durable `projections`.
+
+Answer artifact registry rows live outside both `memory_projections` and
+durable `projections`. They provide stable artifact ids, versions, lifecycle
+state, and retained update events for backend-owned answer surfaces.
 
 ## Useful Inspection Queries
 

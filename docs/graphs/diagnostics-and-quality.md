@@ -3,6 +3,9 @@
 Graph diagnostics combine closed-world business rules with native graph quality
 checks. The implementation is
 [`src/standalone/graph_diagnostics.zig`](../../src/standalone/graph_diagnostics.zig).
+These reports and gap rules are not answer artifacts; see
+[../artifacts/non-artifact-gaps-and-reports.md](../artifacts/non-artifact-gaps-and-reports.md)
+for the boundary.
 
 ## Open world vs closed world
 

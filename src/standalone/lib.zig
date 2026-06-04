@@ -5,6 +5,7 @@ pub const corpus_eval = @import("corpus_eval.zig");
 pub const corpus_profile = @import("corpus_profile.zig");
 pub const corpus_profile_prompt = @import("corpus_profile_prompt.zig");
 pub const bm25_stopwords_sqlite = @import("bm25_stopwords_sqlite.zig");
+pub const answer_artifacts = @import("answer_artifacts.zig");
 pub const business_edge_normalize = @import("business_edge_normalize.zig");
 pub const business_entity_normalize = @import("business_entity_normalize.zig");
 pub const llm_context_budget = @import("llm_context_budget.zig");
