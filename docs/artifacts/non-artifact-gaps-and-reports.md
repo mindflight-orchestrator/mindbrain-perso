@@ -13,6 +13,7 @@ validation findings are not answer artifacts and must not receive
 | Meaning | Preferred code | Current MindBrain surface | Stored? |
 |---------|----------------|---------------------------|---------|
 | Graph data gap | `graph_data_gap` | `graph_diagnostics` issue rows | No dedicated table; computed report output. |
+| Graph fact conflict | `graph_conflict` | Planned `graph_diagnostics` conflict kinds + optional `graph_knowledge_patch` proposals | Rules in `graph_conflict_rules` (planned); findings computed on read. |
 | Graph validation rule | `graph_gap_rule` | `graph_gap_rules` table and gap-rules routes | Yes, in `graph_gap_rules`. |
 | Ontology coverage gap | `coverage_gap` | `coverage_report.gaps` and diagnostics `ontology_coverage_gap` bridge | No dedicated table; computed report output. |
 | Answerability gap | `answerability_gap` | GhostCrab gap-auditor categories | Not in this MindBrain runtime. |
@@ -67,6 +68,17 @@ Current issue kinds are:
 | `relation_without_evidence` | Native check | Relation has no `graph_relation_property.ref_doc_id`. |
 | `ontology_coverage_gap` | Coverage bridge | Ontology/taxonomy node is not represented by graph usage. |
 
+Planned conflict issue kinds (`graph_conflict`, not `graph_data_gap`):
+
+| Issue kind | Meaning |
+|------------|---------|
+| `mutually_exclusive_facts` | Incompatible active targets for the same relation slot. |
+| `temporal_conflict` | Overlapping or invalid validity intervals. |
+| `granularity_conflict` | Coarse vs fine endpoint specificity clash. |
+| `redundant_fact` | Duplicate active edges or claims. |
+
+Spec: [../graphs/graph-conflict-taxonomy.md](../graphs/graph-conflict-taxonomy.md).
+
 Routes:
 
 - `GET /api/mindbrain/graph/diagnostics`
@@ -109,5 +121,8 @@ CLI:
 
 - [artifact-model.md](artifact-model.md)
 - [../graphs/diagnostics-and-quality.md](../graphs/diagnostics-and-quality.md)
+- [../graphs/graph-conflict-taxonomy.md](../graphs/graph-conflict-taxonomy.md)
+- [../graphs/schema-pattern-frequency.md](../graphs/schema-pattern-frequency.md)
+- [../graphs/memory-guided-recall.md](../graphs/memory-guided-recall.md)
 - [../ontology/coverage-and-projections.md](../ontology/coverage-and-projections.md)
 - [../methodology/graphing/immeuble-gap-diagnostics-demo.md](../methodology/graphing/immeuble-gap-diagnostics-demo.md)

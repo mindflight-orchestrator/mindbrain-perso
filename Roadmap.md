@@ -125,9 +125,34 @@ Cross-cutting rules for graph intelligence work after §9:
 - **Closed world** is explicit via `graph_gap_rules`; LinkML/OWL remain open world.
 - Validate each phase on the `immeuble-demo` workspace before generalizing.
 
-Recommended priority after §9: **§9b** (demo + Studio panel), **§11** (motifs),
-**§10** (topology), **§12** (SHACL compile), **§13–§14** (structure + suggest),
-**§15–§16** (batch ML and optional OWL bridge).
+Recommended priority after §9: **§9c** (MemGraph QC bridge), **§9b** (demo +
+Studio panel), **§11** (motifs), **§10** (topology), **§12** (SHACL compile),
+**§13–§14** (structure + suggest), **§15–§16** (batch ML and optional OWL
+bridge).
+
+### 9c. MemGraphRAG-Aligned Graph Quality Control (spec delivered)
+
+Spec docs in `docs/graphs/`:
+
+- `graph-conflict-taxonomy.md` — `graph_conflict_*` vs `graph_data_gap`
+- `graph-conflict-diagnostics-queries.md` — SQL for exclusive/temporal/granularity/redundant
+- `schema-pattern-frequency.md` — `graph_schema_pattern_frequency` + genericity penalty
+- `knowledge-patch-proposal-pipeline.md` — pending patches with evidence scoring
+- `memory-guided-recall.md` — unified `POST /ghostcrab/recall` pipeline
+
+Migration draft: `sql/migrations/2026-06-05-graph-quality-control.sql`.
+
+Implementation phases:
+
+1. Migration + `evaluateGraphConflicts` in `graph_diagnostics.zig`.
+2. `refreshSchemaPatternFrequency` hook after `business-extract` / reindex.
+3. `graph-conflicts-propose` + patch approve/reject routes.
+4. `memory_recall.zig` + `ghostcrab_recall` MCP wrapper.
+5. PPR expansion mode when §13 PageRank ships.
+
+**Done when:** immeuble-demo shows at least one synthetic conflict detected,
+one pending patch proposed with evidence scores, and `recall` returns
+`memory_hit: true` for a graph-grounded query.
 
 ### 9b. Immeuble Gap Demo And Studio Diagnostics Panel
 

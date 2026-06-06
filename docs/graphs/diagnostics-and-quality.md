@@ -70,6 +70,8 @@ optional `entity_id`, `relation_id`, `rule_id`, `observed_count`,
 
 ## Issue kinds
 
+### Shipped today (`graph_data_gap`)
+
 | Kind | Source | Meaning |
 | --- | --- | --- |
 | `missing_required_relation` | Gap rule | Count is below `min_count`. |
@@ -81,15 +83,50 @@ optional `entity_id`, `relation_id`, `rule_id`, `observed_count`,
 | `relation_without_evidence` | Native check | Relation has no property with `ref_doc_id`. |
 | `ontology_coverage_gap` | Coverage bridge | Ontology/taxonomy node is not represented in graph usage. |
 
-## Coverage vs diagnostics
+### Planned (`graph_conflict`)
+
+Fact conflicts are distinct from data gaps. See
+[graph-conflict-taxonomy.md](graph-conflict-taxonomy.md).
+
+| Kind | Meaning |
+| --- | --- |
+| `mutually_exclusive_facts` | Same relation slot, incompatible active targets. |
+| `temporal_conflict` | Overlapping or invalid `valid_from_unix` / `valid_to_unix`. |
+| `granularity_conflict` | Same predicate at incompatible endpoint specificity. |
+| `redundant_fact` | Duplicate active edges or claims. |
+
+Detection SQL: [graph-conflict-diagnostics-queries.md](graph-conflict-diagnostics-queries.md).
+Resolution proposals: [knowledge-patch-proposal-pipeline.md](knowledge-patch-proposal-pipeline.md).
+
+### Planned (schema frequency, informational)
+
+| Kind | Meaning |
+| --- | --- |
+| `schema_pattern_weak_support` | Ontology-declared pattern with low `observation_count`. |
+| `schema_pattern_undeclared` | High-frequency instance pattern missing from ontology edges. |
+
+Spec: [schema-pattern-frequency.md](schema-pattern-frequency.md).
+
+## Coverage vs diagnostics vs conflicts
 
 Coverage asks: which ontology or taxonomy nodes are not instantiated?
 
-Diagnostics asks: which graph facts violate rules, topology expectations,
-endpoint typing, or evidence expectations?
+Diagnostics (`graph_data_gap`) asks: which graph facts violate rules, topology
+expectations, endpoint typing, or evidence expectations?
 
-Use both. Coverage finds unused model surface. Diagnostics finds actionable
-problems in current instance data.
+Conflict detection (`graph_conflict`) asks: which active facts contradict each
+other under ontology and evidence constraints?
+
+| Sense | Code | Example |
+| --- | --- | --- |
+| Missing lease on rented unit | `graph_data_gap` | `missing_required_relation` |
+| Two different `born_in` targets for one person | `graph_conflict` | `mutually_exclusive_facts` |
+| Cardinality rule `max_count: 1` violated | `graph_data_gap` | `too_many_relations` |
+| Same slot, two targets, no rule declared | `graph_conflict` | `mutually_exclusive_facts` |
+
+Use all three lenses. Coverage finds unused model surface. Data-gap diagnostics
+find missing or malformed facts. Conflict diagnostics find incompatible facts
+that may both have evidence.
 
 ## Remediation workflow
 

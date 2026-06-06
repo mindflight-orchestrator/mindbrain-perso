@@ -34,6 +34,11 @@ the derived graph through the pipeline.
 | [ingestion-and-reindex.md](ingestion-and-reindex.md) | How raw rows become derived graph rows and when to refresh indexes. |
 | [queries-and-apis.md](queries-and-apis.md) | GPQ, traversal, HTTP routes, CLI-facing surfaces, and SQL snippets. |
 | [diagnostics-and-quality.md](diagnostics-and-quality.md) | Gap rules, diagnostics issue kinds, coverage, and remediation workflow. |
+| [graph-conflict-taxonomy.md](graph-conflict-taxonomy.md) | `graph_conflict_*` kinds vs `graph_data_gap` and `graph_gap_rule`. |
+| [graph-conflict-diagnostics-queries.md](graph-conflict-diagnostics-queries.md) | SQL detection for mutually exclusive, temporal, granularity, redundant facts. |
+| [schema-pattern-frequency.md](schema-pattern-frequency.md) | Observed schema counts, genericity penalty, retrieval filtering. |
+| [knowledge-patch-proposal-pipeline.md](knowledge-patch-proposal-pipeline.md) | Auto-generated pending patches with evidence scoring. |
+| [memory-guided-recall.md](memory-guided-recall.md) | Unified recall: schema + entity + passage activation → traverse/PPR. |
 | [examples-immeuble-demo.md](examples-immeuble-demo.md) | Read-only snapshot and queries for `data/immeuble-demo.sqlite`. |
 
 ## What is possible today
