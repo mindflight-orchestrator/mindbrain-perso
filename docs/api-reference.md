@@ -33,6 +33,7 @@ Environment and CLI options:
 | `MINDBRAIN_HTTP_MAX_BODY_BYTES` | Maximum JSON body size for SQL requests. | `1048576` |
 | `MINDBRAIN_HTTP_MAX_CONNS` | Maximum concurrent accepted connections. | `128` |
 | `--sqlite-busy-timeout-ms <n>` / `MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS` | SQLite busy timeout for backend connections. | `1000` |
+| `MINDBRAIN_GRAPH_BITMAP_MODE` | Graph bitmap strategy enum: `dense32`, `auto`, or `direct64`. `direct64` is reported as unsupported until a separate 64-bit sidecar exists. | `dense32` |
 
 ### Security
 

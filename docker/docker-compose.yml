@@ -5,6 +5,8 @@ services:
       dockerfile: docker/Dockerfile
     container_name: mindbrain
     restart: unless-stopped
+    environment:
+      - MINDBRAIN_GRAPH_BITMAP_MODE=${MINDBRAIN_GRAPH_BITMAP_MODE:-dense32}
     volumes:
       - mindbrain_data:/data
     ports:

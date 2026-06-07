@@ -5,6 +5,27 @@ pub const default_max_body_bytes: usize = 1024 * 1024;
 pub const default_max_connections: u32 = 128;
 pub const default_sqlite_busy_timeout_ms: u32 = 1_000;
 
+pub const GraphBitmapMode = enum {
+    dense32,
+    auto,
+    direct64,
+
+    pub fn text(self: GraphBitmapMode) []const u8 {
+        return switch (self) {
+            .dense32 => "dense32",
+            .auto => "auto",
+            .direct64 => "direct64",
+        };
+    }
+
+    pub fn effectiveText(self: GraphBitmapMode) []const u8 {
+        return switch (self) {
+            .direct64 => "unsupported",
+            else => "dense32",
+        };
+    }
+};
+
 pub const StartupOptions = struct {
     addr_text: []const u8,
     db_path: []const u8,
@@ -13,6 +34,7 @@ pub const StartupOptions = struct {
     max_body_bytes: usize,
     max_connections: u32,
     sqlite_busy_timeout_ms: u32,
+    graph_bitmap_mode: GraphBitmapMode,
 };
 
 pub fn resolveStartupOptions(
@@ -23,6 +45,7 @@ pub fn resolveStartupOptions(
     env_max_body: ?[]const u8,
     env_max_conns: ?[]const u8,
     env_sqlite_busy_timeout_ms: ?[]const u8,
+    env_graph_bitmap_mode: ?[]const u8,
     printUsageFn: *const fn () anyerror!void,
 ) !StartupOptions {
     var options = StartupOptions{
@@ -33,6 +56,7 @@ pub fn resolveStartupOptions(
         .max_body_bytes = if (env_max_body) |value| try parsePositiveUsize(value) else default_max_body_bytes,
         .max_connections = if (env_max_conns) |value| try parsePositiveU32(value) else default_max_connections,
         .sqlite_busy_timeout_ms = if (env_sqlite_busy_timeout_ms) |value| try parsePositiveU32(value) else default_sqlite_busy_timeout_ms,
+        .graph_bitmap_mode = if (env_graph_bitmap_mode) |value| try parseGraphBitmapMode(value) else .dense32,
     };
 
     var index: usize = 1;
@@ -108,6 +132,13 @@ fn parsePositiveU32(text: []const u8) !u32 {
     return value;
 }
 
+pub fn parseGraphBitmapMode(text: []const u8) !GraphBitmapMode {
+    if (std.ascii.eqlIgnoreCase(text, "dense32")) return .dense32;
+    if (std.ascii.eqlIgnoreCase(text, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(text, "direct64")) return .direct64;
+    return error.InvalidArguments;
+}
+
 fn extractListenHost(text: []const u8) ?[]const u8 {
     if (text.len == 0 or text[0] == ':') return null;
     if (text[0] == '[') {
@@ -129,6 +160,7 @@ test "startup options default to loopback and env limits" {
         "4096",
         "7",
         "1234",
+        null,
         noopUsage,
     );
 
@@ -138,12 +170,14 @@ test "startup options default to loopback and env limits" {
     try std.testing.expectEqual(@as(usize, 4096), options.max_body_bytes);
     try std.testing.expectEqual(@as(u32, 7), options.max_connections);
     try std.testing.expectEqual(@as(u32, 1234), options.sqlite_busy_timeout_ms);
+    try std.testing.expectEqual(GraphBitmapMode.dense32, options.graph_bitmap_mode);
 }
 
 test "startup options prefer env listen addr when cli is absent" {
     const options = try resolveStartupOptions(
         &.{"mindbrain-http"},
         "0.0.0.0:9000",
+        null,
         null,
         null,
         null,
@@ -164,10 +198,27 @@ test "startup options let cli override env listen addr" {
         null,
         null,
         null,
+        null,
         noopUsage,
     );
 
     try std.testing.expectEqualStrings("127.0.0.1:7001", options.addr_text);
+}
+
+test "startup options read graph bitmap mode from env" {
+    const options = try resolveStartupOptions(
+        &.{"mindbrain-http"},
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        "auto",
+        noopUsage,
+    );
+
+    try std.testing.expectEqual(GraphBitmapMode.auto, options.graph_bitmap_mode);
 }
 
 test "parseListenAddress supports bracketed IPv6" {
@@ -179,4 +230,11 @@ test "loopback listen text detection matches secure default" {
     try std.testing.expect(isLoopbackListenText("[::1]:8091"));
     try std.testing.expect(!isLoopbackListenText(":8091"));
     try std.testing.expect(!isLoopbackListenText("0.0.0.0:8091"));
+}
+
+test "graph bitmap mode accepts supported enum values" {
+    try std.testing.expectEqual(GraphBitmapMode.dense32, try parseGraphBitmapMode("dense32"));
+    try std.testing.expectEqual(GraphBitmapMode.auto, try parseGraphBitmapMode("AUTO"));
+    try std.testing.expectEqual(GraphBitmapMode.direct64, try parseGraphBitmapMode("direct64"));
+    try std.testing.expectError(error.InvalidArguments, parseGraphBitmapMode("64bits"));
 }

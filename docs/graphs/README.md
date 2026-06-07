@@ -33,6 +33,7 @@ the derived graph through the pipeline.
 | [raw-layer.md](raw-layer.md) | Raw documents, chunks, entities, relations, properties, evidence, and links. |
 | [ingestion-and-reindex.md](ingestion-and-reindex.md) | How raw rows become derived graph rows and when to refresh indexes. |
 | [queries-and-apis.md](queries-and-apis.md) | GPQ, traversal, HTTP routes, CLI-facing surfaces, and SQL snippets. |
+| [bitmap-width-strategy.md](bitmap-width-strategy.md) | Roaring bitmap mode, dense32 default, and direct64 limits in the SQLite runtime. |
 | [diagnostics-and-quality.md](diagnostics-and-quality.md) | Gap rules, diagnostics issue kinds, coverage, and remediation workflow. |
 | [graph-conflict-taxonomy.md](graph-conflict-taxonomy.md) | `graph_conflict_*` kinds vs `graph_data_gap` and `graph_gap_rule`. |
 | [graph-conflict-diagnostics-queries.md](graph-conflict-diagnostics-queries.md) | SQL detection for mutually exclusive, temporal, granularity, redundant facts. |

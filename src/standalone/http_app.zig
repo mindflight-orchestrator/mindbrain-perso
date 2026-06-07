@@ -210,6 +210,7 @@ pub const MindbrainHttpOptions = struct {
     max_body_bytes: usize = http_config.default_max_body_bytes,
     max_connections: u32 = http_config.default_max_connections,
     sqlite_busy_timeout_ms: u32 = http_config.default_sqlite_busy_timeout_ms,
+    graph_bitmap_mode: http_config.GraphBitmapMode = .dense32,
     service_name: []const u8 = "mindbrain-http",
     warn_on_empty_graph: bool = true,
     /// When false (default), lab-only routes (`/api/events`, `/api/mindbrain/simulate`)
@@ -232,6 +233,7 @@ pub const MindbrainHttpApp = struct {
     max_connections: u32,
     warn_on_empty_graph: bool,
     enable_lab_routes: bool,
+    graph_bitmap_mode: http_config.GraphBitmapMode,
     db_path_owned: []u8,
     static_dir_owned: []u8,
     listen_addr_text_owned: []u8,
@@ -267,6 +269,7 @@ pub const MindbrainHttpApp = struct {
         const env_max_body = environ_map.get("MINDBRAIN_HTTP_MAX_BODY_BYTES");
         const env_max_conns = environ_map.get("MINDBRAIN_HTTP_MAX_CONNS");
         const env_sqlite_busy_timeout_ms = environ_map.get("MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS");
+        const env_graph_bitmap_mode = environ_map.get("MINDBRAIN_GRAPH_BITMAP_MODE");
 
         const options = try http_config.resolveStartupOptions(
             args,
@@ -276,6 +279,7 @@ pub const MindbrainHttpApp = struct {
             env_max_body,
             env_max_conns,
             env_sqlite_busy_timeout_ms,
+            env_graph_bitmap_mode,
             printUsage,
         );
 
@@ -287,6 +291,7 @@ pub const MindbrainHttpApp = struct {
             .max_body_bytes = options.max_body_bytes,
             .max_connections = options.max_connections,
             .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
+            .graph_bitmap_mode = options.graph_bitmap_mode,
             .enable_lab_routes = true,
         });
     }
@@ -342,6 +347,7 @@ pub const MindbrainHttpApp = struct {
             .max_connections = options.max_connections,
             .warn_on_empty_graph = options.warn_on_empty_graph,
             .enable_lab_routes = options.enable_lab_routes,
+            .graph_bitmap_mode = options.graph_bitmap_mode,
             .db_path_owned = db_path_owned,
             .static_dir_owned = static_dir_owned,
             .listen_addr_text_owned = listen_addr_text_owned,
@@ -2951,7 +2957,6 @@ pub const MindbrainHttpApp = struct {
     }
 
     fn handleCapabilities(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
-        _ = self;
         const features = .{
             .graph_diagnostics = @hasDecl(@This(), "handleGraphDiagnostics"),
             .graph_gap_rules = @hasDecl(@This(), "handleGraphGapRules"),
@@ -2963,7 +2968,7 @@ pub const MindbrainHttpApp = struct {
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{}}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -2974,6 +2979,8 @@ pub const MindbrainHttpApp = struct {
                 features.graph_pattern_query,
                 features.ontology_import,
                 features.ontology_compile_linkml,
+                self.graph_bitmap_mode.text(),
+                self.graph_bitmap_mode.effectiveText(),
             },
         );
         return .{
@@ -4137,6 +4144,7 @@ fn printUsage() !void {
         \\  MINDBRAIN_HTTP_MAX_BODY_BYTES=1048576  cap SQL JSON request bodies
         \\  MINDBRAIN_HTTP_MAX_CONNS=128           cap concurrent connections
         \\  MINDBRAIN_SQLITE_BUSY_TIMEOUT_MS=1000  SQLite busy timeout
+        \\  MINDBRAIN_GRAPH_BITMAP_MODE=dense32    dense32 | auto | direct64 (direct64 unsupported)
         \\  MINDBRAIN_DB_PATH=data/mindbrain.sqlite
         \\  MINDBRAIN_STATIC_DIR=dashboard/dist
         \\
@@ -4903,6 +4911,9 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_delete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_import\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_compile_linkml\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_configured\":\"dense32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_effective\":\"dense32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"direct64_supported\":false") != null);
 
     const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_diag_api");
     try std.testing.expect(rules.status == .ok);
@@ -5212,4 +5223,27 @@ test "production embedders disable lab-only SSE and simulate routes by default" 
     });
     defer app.deinit();
     try std.testing.expect(app.enable_lab_routes == false);
+}
+
+test "capabilities expose configured auto bitmap mode" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-bitmap-capabilities-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+        .graph_bitmap_mode = .auto,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const response = try app.handleCapabilities(arena_state.allocator());
+    try std.testing.expect(response.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"bitmap_mode_configured\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"bitmap_mode_effective\":\"dense32\"") != null);
 }

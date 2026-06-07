@@ -60,6 +60,10 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 - `--addr` overrides `MINDBRAIN_HTTP_ADDR` when you need a one-off CLI override.
 - `MINDBRAIN_HTTP_MAX_BODY_BYTES` caps SQL JSON request bodies.
 - `MINDBRAIN_HTTP_MAX_CONNS` caps concurrent client connections.
+- `MINDBRAIN_GRAPH_BITMAP_MODE` accepts `dense32`, `auto`, or `direct64`.
+  The standalone SQLite runtime currently stores graph and search bitmaps with
+  `u32` dense IDs; `direct64` is exposed in capabilities as unsupported until a
+  separate CRoaring 64-bit path exists.
 
 ### Route sensitivity
 
