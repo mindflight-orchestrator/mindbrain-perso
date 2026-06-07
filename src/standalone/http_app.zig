@@ -11,10 +11,13 @@ const interfaces = @import("interfaces.zig");
 const ontology_sqlite = @import("ontology_sqlite.zig");
 const collections_io = @import("collections_io.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
+const linkml_interchange = @import("linkml_interchange.zig");
+const owl2_import = @import("owl2_import.zig");
 const reindex_http = @import("reindex_http.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
+const syndic_profile_seed = @import("syndic_profile_seed.zig");
 const toon_exports = @import("toon_exports.zig");
 const workspace_sqlite = @import("workspace_sqlite.zig");
 const zig16_compat = @import("zig16_compat.zig");
@@ -42,6 +45,13 @@ fn applyWriterConnectionPragmas(db: facet_sqlite.Database, busy_timeout_ms: u32)
     try applyReadConnectionPragmas(db, busy_timeout_ms);
     try db.exec("PRAGMA journal_mode=WAL");
     try db.exec("PRAGMA synchronous=NORMAL");
+}
+
+fn ontologyIsFrozenIfExists(db: facet_sqlite.Database, ontology_id: []const u8) !bool {
+    return collections_sqlite.isOntologyFrozen(db, ontology_id) catch |err| switch (err) {
+        error.NotFound => false,
+        else => |e| return e,
+    };
 }
 
 fn setBusyTimeout(db: facet_sqlite.Database, busy_timeout_ms: u32) !void {
@@ -166,6 +176,23 @@ const OntologyTripleRequest = struct {
     object_language: ?[]const u8 = null,
     source_line: []const u8 = "studio:/ontology/triple",
     metadata_json: []const u8 = "{}",
+};
+
+const OntologyImportRequest = struct {
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    input_path: []const u8,
+    name: ?[]const u8 = null,
+    materialize_graph: bool = false,
+};
+
+const OntologyCompileLinkmlRequest = struct {
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    input_path: []const u8,
+    name: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    materialize_graph: bool = false,
 };
 
 pub const DefaultWorkspaceOptions = struct {
@@ -963,6 +990,16 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/reindex/all")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleReindexAll(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/import")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyImportPost(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/compile-linkml")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleOntologyCompileLinkmlPost(allocator, request, body_buffer);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy/dimension")) {
@@ -2128,6 +2165,122 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleOntologyImportPost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const import_request = try self.parseOntologyImportRequest(allocator, request, body_buffer);
+        return try self.runOntologyImportRequest(allocator, import_request);
+    }
+
+    fn runOntologyImportRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        import_request: OntologyImportRequest,
+    ) !Response {
+        if (import_request.workspace_id.len == 0 or import_request.ontology_id.len == 0 or import_request.input_path.len == 0) {
+            return error.BadRequest;
+        }
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try ontologyIsFrozenIfExists(self.writer_db, import_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        var in_file = try std.Io.Dir.cwd().openFile(self.io, import_request.input_path, .{});
+        defer in_file.close(self.io);
+        var read_buf: [65536]u8 = undefined;
+        var fr = in_file.reader(self.io, &read_buf);
+
+        const summary = try owl2_import.importNTriplesReader(
+            self.writer_db,
+            allocator,
+            import_request.workspace_id,
+            import_request.ontology_id,
+            &fr.interface,
+            .{
+                .ontology_name = import_request.name,
+                .materialize_graph = import_request.materialize_graph,
+            },
+        );
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{
+            .ontology_id = summary.ontology_id,
+            .triples = summary.triples,
+            .classes = summary.classes,
+            .object_properties = summary.object_properties,
+            .datatype_properties = summary.datatype_properties,
+            .ontology_relations = summary.ontology_relations,
+            .graph_relations = summary.graph_relations,
+        }));
+    }
+
+    fn handleOntologyCompileLinkmlPost(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const compile_request = try self.parseOntologyCompileLinkmlRequest(allocator, request, body_buffer);
+        return try self.runOntologyCompileLinkmlRequest(allocator, compile_request);
+    }
+
+    fn runOntologyCompileLinkmlRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        compile_request: OntologyCompileLinkmlRequest,
+    ) !Response {
+        if (compile_request.workspace_id.len == 0 or compile_request.ontology_id.len == 0 or compile_request.input_path.len == 0) {
+            return error.BadRequest;
+        }
+        if (compile_request.profile) |profile| {
+            if (!std.mem.eql(u8, profile, "syndic")) return error.BadRequest;
+        }
+
+        var result = try linkml_interchange.compileLinkmlToBundle(allocator, .{
+            .input_path = compile_request.input_path,
+            .workspace_id = compile_request.workspace_id,
+            .ontology_id = compile_request.ontology_id,
+            .ontology_name = compile_request.name,
+        });
+        defer result.deinit(allocator);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        if (try ontologyIsFrozenIfExists(self.writer_db, compile_request.ontology_id)) {
+            return try self.ontologyFrozenResponse(allocator);
+        }
+
+        try collections_sqlite.ensureWorkspace(self.writer_db, .{
+            .workspace_id = compile_request.workspace_id,
+            .domain_profile = if (compile_request.profile != null) "syndic" else null,
+        });
+        try linkml_interchange.importCompiledBundle(self.writer_db, allocator, result.bundle_json);
+        if (compile_request.profile != null) {
+            try syndic_profile_seed.seedSyndicProfile(self.writer_db, compile_request.workspace_id, compile_request.ontology_id);
+        }
+        try collections_sqlite.setDefaultOntology(self.writer_db, compile_request.workspace_id, compile_request.ontology_id);
+
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{
+            .ontology_id = compile_request.ontology_id,
+            .entity_types = result.entity_type_count,
+            .edge_types = result.edge_type_count,
+            .enum_values = result.enum_value_count,
+            .triples = result.triple_count,
+            .imported = true,
+        }));
+    }
+
     fn handleOntologyTaxonomyDimensionPost(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -2494,6 +2647,36 @@ pub const MindbrainHttpApp = struct {
         );
     }
 
+    fn parseOntologyImportRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyImportRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyImportRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseOntologyCompileLinkmlRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !OntologyCompileLinkmlRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            OntologyCompileLinkmlRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
     fn parseOntologyEdgeTypeRequest(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -2775,10 +2958,12 @@ pub const MindbrainHttpApp = struct {
             .graph_gap_rules_import = @hasDecl(@This(), "handleGraphGapRulesImport"),
             .graph_gap_rules_delete = @hasDecl(@This(), "handleGraphGapRulesDelete"),
             .graph_pattern_query = @hasDecl(@This(), "handleGraphPatternQuery"),
+            .ontology_import = @hasDecl(@This(), "handleOntologyImportPost"),
+            .ontology_compile_linkml = @hasDecl(@This(), "handleOntologyCompileLinkmlPost"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{}}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{}}}}}
         ,
             .{
                 mindbrain_version,
@@ -2787,6 +2972,8 @@ pub const MindbrainHttpApp = struct {
                 features.graph_gap_rules_import,
                 features.graph_gap_rules_delete,
                 features.graph_pattern_query,
+                features.ontology_import,
+                features.ontology_compile_linkml,
             },
         );
         return .{
@@ -4483,6 +4670,13 @@ fn parseSearchEmbeddingUpsertBody(allocator: std.mem.Allocator, body: []const u8
     };
 }
 
+fn testCountSqlRows(db: facet_sqlite.Database, sql: []const u8) !i64 {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
+    return facet_sqlite.c.sqlite3_column_int64(stmt, 0);
+}
+
 test "graph subgraph sse encoder emits expected frames" {
     var events = try std.testing.allocator.alloc(graph_sqlite.GraphStreamEvent, 2);
     defer {
@@ -4707,6 +4901,8 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_import\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_delete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_import\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_compile_linkml\":true") != null);
 
     const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_diag_api");
     try std.testing.expect(rules.status == .ok);
@@ -4764,6 +4960,139 @@ test "graph gap rules import and delete HTTP handlers accept contract payloads" 
     const rules_after = try app.handleGraphGapRules(arena, "workspace_id=ws_gap_write");
     try std.testing.expect(rules_after.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, rules_after.body, "\"rule_id\":\"probe-rule\"") == null);
+}
+
+test "ontology import HTTP handler imports ntriples and materializes graph rows" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-ontology-import-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const response = try app.runOntologyImportRequest(arena, .{
+        .workspace_id = "ws_import_http",
+        .ontology_id = "ws_import_http::core",
+        .input_path = "docs/source/owl2-core.nt",
+        .name = "HTTP import core",
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"triples\":17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"classes\":3") != null);
+    try std.testing.expectEqual(@as(i64, 17), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = 'ws_import_http::core'"));
+    try std.testing.expect(try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws_import_http'") > 0);
+}
+
+test "ontology compile linkml HTTP handler imports bundle and sets workspace default" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-ontology-linkml-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const response = try app.runOntologyCompileLinkmlRequest(arena, .{
+        .workspace_id = "ws_linkml_http",
+        .ontology_id = "ws_linkml_http::core",
+        .input_path = "ontologies/immeuble-demo/core.yaml",
+        .name = "core",
+        .profile = "syndic",
+    });
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"imported\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"entity_types\":") != null);
+
+    const default_id = try collections_sqlite.defaultOntology(app.writer_db, std.testing.allocator, "ws_linkml_http");
+    defer if (default_id) |id| std.testing.allocator.free(id);
+    try std.testing.expect(default_id != null);
+    try std.testing.expectEqualStrings("ws_linkml_http::core", default_id.?);
+    try std.testing.expect(try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_dimensions WHERE ontology_id = 'ws_linkml_http::core'") >= syndic_profile_seed.syndicDimensionCount());
+}
+
+test "ontology import HTTP handlers reject busy frozen and invalid requests" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-ontology-import-errors-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try collections_sqlite.ensureWorkspace(app.writer_db, .{ .workspace_id = "ws_error_http" });
+    try collections_sqlite.ensureOntology(app.writer_db, .{
+        .ontology_id = "ws_error_http::core",
+        .workspace_id = "ws_error_http",
+        .name = "core",
+    });
+    try app.writer_db.exec("UPDATE ontologies SET frozen = 1 WHERE ontology_id = 'ws_error_http::core'");
+
+    const frozen = try app.runOntologyImportRequest(arena, .{
+        .workspace_id = "ws_error_http",
+        .ontology_id = "ws_error_http::core",
+        .input_path = "docs/source/owl2-core.nt",
+    });
+    try std.testing.expectEqual(http.Status.conflict, frozen.status);
+    try std.testing.expect(std.mem.indexOf(u8, frozen.body, "ontology_frozen") != null);
+
+    const frozen_linkml = try app.runOntologyCompileLinkmlRequest(arena, .{
+        .workspace_id = "ws_error_http",
+        .ontology_id = "ws_error_http::core",
+        .input_path = "ontologies/immeuble-demo/core.yaml",
+    });
+    try std.testing.expectEqual(http.Status.conflict, frozen_linkml.status);
+    try std.testing.expect(std.mem.indexOf(u8, frozen_linkml.body, "ontology_frozen") != null);
+
+    app.writer_active_session_id = 42;
+    defer app.writer_active_session_id = null;
+    const busy = try app.runOntologyImportRequest(arena, .{
+        .workspace_id = "ws_busy_http",
+        .ontology_id = "ws_busy_http::core",
+        .input_path = "docs/source/owl2-core.nt",
+    });
+    try std.testing.expectEqual(http.Status.service_unavailable, busy.status);
+    try std.testing.expect(std.mem.indexOf(u8, busy.body, "sql_session_busy") != null);
+
+    try std.testing.expectError(error.BadRequest, app.runOntologyCompileLinkmlRequest(arena, .{
+        .workspace_id = "ws_bad_http",
+        .ontology_id = "ws_bad_http::core",
+        .input_path = "ontologies/immeuble-demo/core.yaml",
+        .profile = "unknown",
+    }));
+    try std.testing.expectError(error.BadRequest, app.runOntologyImportRequest(arena, .{
+        .workspace_id = "",
+        .ontology_id = "missing",
+        .input_path = "docs/source/owl2-core.nt",
+    }));
 }
 
 test "studio ontology schema write endpoints expose entity edge property and triple APIs" {
