@@ -88,11 +88,16 @@ const EnumValue = struct {
 const EnumDef = struct {
     name: []const u8,
     description: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    annotations: std.ArrayList(Annotation) = .empty,
     values: std.ArrayList(EnumValue) = .empty,
 
     fn deinit(self: *EnumDef, allocator: Allocator) void {
         allocator.free(self.name);
         if (self.description) |value| allocator.free(value);
+        if (self.namespace) |value| allocator.free(value);
+        for (self.annotations.items) |*annotation| annotation.deinit(allocator);
+        self.annotations.deinit(allocator);
         for (self.values.items) |*value| value.deinit(allocator);
         self.values.deinit(allocator);
         self.* = undefined;
@@ -156,7 +161,7 @@ pub const CompileResult = struct {
 };
 
 const Section = enum { none, prefixes, imports, classes, slots, enums };
-const AnnotationTarget = enum { none, class, slot };
+const AnnotationTarget = enum { none, class, slot, enum_def };
 const EnumContext = enum { none, permissible_values, value };
 
 const ImportLoadContext = struct {
@@ -229,7 +234,11 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
 
     const ontology_name = options.ontology_name orelse schema.name orelse lastOntologySegment(options.ontology_id);
     const version = schema.version orelse "1.0.0";
-    const default_prefix = schema.default_prefix orelse "default";
+    var enum_namespaces: std.ArrayList([]const u8) = .empty;
+    defer enum_namespaces.deinit(allocator);
+    for (schema.enums.items) |enum_def| {
+        try appendNamespaceIfMissing(allocator, &enum_namespaces, enumNamespace(schema, enum_def));
+    }
 
     try out.writer.writeAll("{\n  \"kind\": \"ghostcrab_backup_bundle\",\n  \"schema_version\": \"2\",\n");
     try out.writer.print("  \"scope\": {{ \"kind\": \"taxonomies\", \"workspace_id\": {f}, \"collection_id\": null }},\n", .{std.json.fmt(options.workspace_id, .{})});
@@ -244,15 +253,25 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
     defer allocator.free(ontology_metadata);
     try out.writer.print("{f} }}],\n", .{std.json.fmt(ontology_metadata, .{})});
 
-    try out.writer.writeAll("  \"ontology_namespaces\": [],\n  \"ontology_dimensions\": [");
+    try out.writer.writeAll("  \"ontology_namespaces\": [");
+    for (enum_namespaces.items, 0..) |namespace, namespace_index| {
+        if (namespace_index > 0) try out.writer.writeAll(",");
+        try out.writer.print("\n    {{ \"ontology_id\": {f}, \"namespace\": {f}, \"label\": {f}, \"parent_namespace\": null, \"metadata_json\": \"{{}}\" }}", .{
+            std.json.fmt(options.ontology_id, .{}),
+            std.json.fmt(namespace, .{}),
+            std.json.fmt(namespace, .{}),
+        });
+    }
+    try out.writer.writeAll("\n  ],\n  \"ontology_dimensions\": [");
     var enum_value_count: usize = 0;
     for (schema.enums.items, 0..) |enum_def, enum_index| {
         if (enum_index > 0) try out.writer.writeAll(",");
         const metadata = try enumMetadataJson(allocator, enum_def);
         defer allocator.free(metadata);
+        const namespace = enumNamespace(schema, enum_def);
         try out.writer.print("\n    {{ \"ontology_id\": {f}, \"namespace\": {f}, \"dimension\": {f}, \"value_type\": \"string\", \"is_multi\": false, \"hierarchy_kind\": \"flat\", \"metadata_json\": {f} }}", .{
             std.json.fmt(options.ontology_id, .{}),
-            std.json.fmt(default_prefix, .{}),
+            std.json.fmt(namespace, .{}),
             std.json.fmt(enum_def.name, .{}),
             std.json.fmt(metadata, .{}),
         });
@@ -261,6 +280,7 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
     try out.writer.writeAll("\n  ],\n  \"ontology_values\": [");
     var first_value = true;
     for (schema.enums.items) |enum_def| {
+        const namespace = enumNamespace(schema, enum_def);
         for (enum_def.values.items, 0..) |value, value_index| {
             if (!first_value) try out.writer.writeAll(",");
             first_value = false;
@@ -268,7 +288,7 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
             defer allocator.free(metadata);
             try out.writer.print("\n    {{ \"ontology_id\": {f}, \"namespace\": {f}, \"dimension\": {f}, \"value_id\": {}, \"value\": {f}, \"parent_value_id\": null, \"label\": {f}, \"metadata_json\": {f} }}", .{
                 std.json.fmt(options.ontology_id, .{}),
-                std.json.fmt(default_prefix, .{}),
+                std.json.fmt(namespace, .{}),
                 std.json.fmt(enum_def.name, .{}),
                 value_index + 1,
                 std.json.fmt(value.value, .{}),
@@ -533,20 +553,30 @@ fn parseSchemaFile(allocator: Allocator, absolute_path: []const u8) !Schema {
             .enums => {
                 if (indent == 2 and std.mem.endsWith(u8, trimmed, ":")) {
                     const name = std.mem.trimEnd(u8, trimmed, ":");
-                    try schema.enums.append(allocator, .{ .name = try allocator.dupe(u8, name) });
+                    try schema.enums.append(allocator, .{
+                        .name = try allocator.dupe(u8, name),
+                        .namespace = if (schema.default_prefix) |value| try allocator.dupe(u8, value) else null,
+                    });
                     current_enum = schema.enums.items.len - 1;
                     enum_context = .none;
+                    annotation_target = .none;
                 } else if (indent == 4 and current_enum != null) {
                     if (std.mem.eql(u8, trimmed, "permissible_values:")) {
                         enum_context = .permissible_values;
+                        annotation_target = .none;
+                    } else if (std.mem.eql(u8, trimmed, "annotations:")) {
+                        annotation_target = .enum_def;
                     } else if (splitYamlKeyValue(trimmed)) |kv| {
                         try setEnumScalar(allocator, &schema.enums.items[current_enum.?], kv.key, kv.value);
                     }
+                } else if (indent == 6 and annotation_target == .enum_def and current_enum != null) {
+                    if (splitYamlKeyValue(trimmed)) |kv| try appendAnnotation(allocator, &schema.enums.items[current_enum.?].annotations, kv.key, kv.value);
                 } else if (indent == 6 and current_enum != null and std.mem.endsWith(u8, trimmed, ":")) {
                     const name = std.mem.trimEnd(u8, trimmed, ":");
                     try schema.enums.items[current_enum.?].values.append(allocator, .{ .value = try allocator.dupe(u8, name) });
                     current_enum_value = schema.enums.items[current_enum.?].values.items.len - 1;
                     enum_context = .value;
+                    annotation_target = .none;
                 } else if (indent == 8 and current_enum != null and current_enum_value != null and enum_context == .value) {
                     if (splitYamlKeyValue(trimmed)) |kv| try setEnumValueScalar(allocator, &schema.enums.items[current_enum.?].values.items[current_enum_value.?], kv.key, kv.value);
                 }
@@ -622,7 +652,12 @@ fn cloneEnum(allocator: Allocator, src: EnumDef) !EnumDef {
     var out = EnumDef{
         .name = try allocator.dupe(u8, src.name),
         .description = if (src.description) |value| try allocator.dupe(u8, value) else null,
+        .namespace = if (src.namespace) |value| try allocator.dupe(u8, value) else null,
     };
+    for (src.annotations.items) |annotation| try out.annotations.append(allocator, .{
+        .key = try allocator.dupe(u8, annotation.key),
+        .value = try allocator.dupe(u8, annotation.value),
+    });
     for (src.values.items) |value| try out.values.append(allocator, .{
         .value = try allocator.dupe(u8, value.value),
         .meaning = if (value.meaning) |text| try allocator.dupe(u8, text) else null,
@@ -717,6 +752,20 @@ fn annotationValue(annotations: []const Annotation, key: []const u8) ?[]const u8
         if (std.mem.eql(u8, annotation.key, key)) return annotation.value;
     }
     return null;
+}
+
+fn enumNamespace(schema: Schema, enum_def: EnumDef) []const u8 {
+    return annotationValue(enum_def.annotations.items, "ghostcrab.namespace") orelse
+        enum_def.namespace orelse
+        schema.default_prefix orelse
+        "default";
+}
+
+fn appendNamespaceIfMissing(allocator: Allocator, namespaces: *std.ArrayList([]const u8), namespace: []const u8) !void {
+    for (namespaces.items) |existing| {
+        if (std.mem.eql(u8, existing, namespace)) return;
+    }
+    try namespaces.append(allocator, namespace);
 }
 
 fn shouldProjectClass(class: ClassDef) bool {
@@ -830,10 +879,13 @@ fn slotMetadataJson(allocator: Allocator, schema: Schema, slot: SlotDef) ![]cons
 }
 
 fn enumMetadataJson(allocator: Allocator, enum_def: EnumDef) ![]const u8 {
+    const annotations = try annotationsJson(allocator, enum_def.annotations.items);
+    defer allocator.free(annotations);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"description\":");
     try writeOptionalJsonString(&out.writer, enum_def.description);
+    try out.writer.print(",\"ghostcrab\":{s}", .{annotations});
     try out.writer.writeAll("}");
     return try out.toOwnedSlice();
 }
@@ -1270,6 +1322,60 @@ test "LinkML interchange index preserves first duplicate class definition" {
 
     try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"target_entity_type\": \"imported_asset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "https://example.test/ImportedAsset") != null);
+}
+
+test "LinkML interchange emits namespace rows for root and imported enums" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "shared.yaml",
+        .data =
+        \\id: test:shared
+        \\name: shared
+        \\default_prefix: shared
+        \\enums:
+        \\  SharedStatus:
+        \\    permissible_values:
+        \\      inherited:
+        \\        description: Imported enum value
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+    try tmp.dir.writeFile(zig16_compat.io(), .{
+        .sub_path = "root.yaml",
+        .data =
+        \\id: test:root
+        \\name: root
+        \\default_prefix: root
+        \\imports:
+        \\  - shared.yaml
+        \\enums:
+        \\  LocalStatus:
+        \\    annotations:
+        \\      ghostcrab.namespace: custom
+        \\    permissible_values:
+        \\      active:
+        \\        description: Local enum value
+        \\
+        ,
+        .flags = .{ .truncate = true },
+    });
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/root.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(path);
+    var result = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = path,
+        .workspace_id = "test",
+        .ontology_id = "test::namespaces",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"namespace\": \"shared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"namespace\": \"custom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"dimension\": \"SharedStatus\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.bundle_json, "\"dimension\": \"LocalStatus\"") != null);
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {

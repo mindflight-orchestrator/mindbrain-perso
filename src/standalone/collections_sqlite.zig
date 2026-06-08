@@ -491,7 +491,21 @@ pub fn ensureNamespace(db: Database, spec: NamespaceSpec) !void {
     try facet_sqlite.stepDone(stmt);
 }
 
+pub fn ensureNamespaceExists(db: Database, ontology_id: []const u8, namespace: []const u8) !void {
+    const sql =
+        \\INSERT INTO ontology_namespaces(ontology_id, namespace, label, parent_namespace, metadata_json)
+        \\VALUES(?1, ?2, ?2, NULL, '{}')
+        \\ON CONFLICT(ontology_id, namespace) DO NOTHING
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    try facet_sqlite.bindText(stmt, 2, namespace);
+    try facet_sqlite.stepDone(stmt);
+}
+
 pub fn ensureDimension(db: Database, spec: DimensionSpec) !void {
+    try ensureNamespaceExists(db, spec.ontology_id, spec.namespace);
     const sql =
         \\INSERT INTO ontology_dimensions(ontology_id, namespace, dimension, value_type, is_multi, hierarchy_kind, metadata_json)
         \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1590,6 +1604,25 @@ test "loadOntologyBundle persists namespaces, dimensions, values, types" {
     defer facet_sqlite.finalize(stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "ensureDimension creates missing namespace parent" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws-dim" });
+    try ensureOntology(db, .{ .ontology_id = "ws-dim::core", .workspace_id = "ws-dim", .name = "core" });
+    try ensureDimension(db, .{ .ontology_id = "ws-dim::core", .namespace = "finance", .dimension = "status" });
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT COUNT(*)
+        \\FROM ontology_namespaces
+        \\WHERE ontology_id = 'ws-dim::core' AND namespace = 'finance'
+    );
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
 }
 
 test "raw document, chunk, facet assignment, and cross-collection link round-trip" {

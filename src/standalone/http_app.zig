@@ -1103,6 +1103,9 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ontology/taxonomy")) {
             return self.handleOntologyTaxonomyGet(allocator, query);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/inspect")) {
+            return self.handleOntologyInspect(allocator, query);
+        }
         if (std.mem.eql(u8, path, "/api/mindbrain/workspace/list")) {
             return self.handleWorkspaceList(allocator);
         }
@@ -2025,6 +2028,140 @@ pub const MindbrainHttpApp = struct {
             try out.writer.writeAll("}");
         }
         try out.writer.writeAll("]}");
+        return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
+    }
+
+    fn handleOntologyInspect(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const ontology_id = try resolveOntologyIdForRequest(allocator, db, workspace_id, normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id")));
+        defer allocator.free(ontology_id);
+        try verifyOntologyWorkspaceAccess(allocator, db, ontology_id, workspace_id);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"ontology_id\":");
+        try out.writer.print("{f}", .{std.json.fmt(ontology_id, .{})});
+
+        {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT workspace_id, name, version, source_kind, frozen, metadata_json
+                \\FROM ontologies
+                \\WHERE ontology_id = ?1
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            if (!try helper_api.stepRow(stmt)) return error.NotFound;
+            const row_workspace = try helper_api.colTextOptional(allocator, stmt, 0);
+            defer if (row_workspace) |value| allocator.free(value);
+            const name = try helper_api.dupeColText(allocator, stmt, 1);
+            defer allocator.free(name);
+            const version = try helper_api.dupeColText(allocator, stmt, 2);
+            defer allocator.free(version);
+            const source_kind = try helper_api.dupeColText(allocator, stmt, 3);
+            defer allocator.free(source_kind);
+            const metadata = try helper_api.dupeColText(allocator, stmt, 5);
+            defer allocator.free(metadata);
+            try out.writer.writeAll(",\"workspace_id\":");
+            try writeOptionalJsonString(&out.writer, row_workspace);
+            try out.writer.writeAll(",\"name\":");
+            try out.writer.print("{f}", .{std.json.fmt(name, .{})});
+            try out.writer.writeAll(",\"version\":");
+            try out.writer.print("{f}", .{std.json.fmt(version, .{})});
+            try out.writer.writeAll(",\"source_kind\":");
+            try out.writer.print("{f}", .{std.json.fmt(source_kind, .{})});
+            try out.writer.print(",\"frozen\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 4) != 0});
+            try out.writer.writeAll(",\"metadata\":");
+            try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
+        }
+
+        try out.writer.writeAll(",\"namespaces\":[");
+        {
+            const stmt = try facet_sqlite.prepare(db,
+                \\SELECT namespace, label, parent_namespace, metadata_json
+                \\FROM ontology_namespaces
+                \\WHERE ontology_id = ?1
+                \\ORDER BY namespace
+            );
+            defer facet_sqlite.finalize(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology_id);
+            var first = true;
+            while (try helper_api.stepRow(stmt)) {
+                if (!first) try out.writer.writeAll(",");
+                first = false;
+                const namespace = try helper_api.dupeColText(allocator, stmt, 0);
+                defer allocator.free(namespace);
+                const label = try helper_api.colTextOptional(allocator, stmt, 1);
+                defer if (label) |value| allocator.free(value);
+                const parent_namespace = try helper_api.colTextOptional(allocator, stmt, 2);
+                defer if (parent_namespace) |value| allocator.free(value);
+                const metadata = try helper_api.dupeColText(allocator, stmt, 3);
+                defer allocator.free(metadata);
+                try out.writer.writeAll("{\"namespace\":");
+                try out.writer.print("{f}", .{std.json.fmt(namespace, .{})});
+                try out.writer.writeAll(",\"label\":");
+                try writeOptionalJsonString(&out.writer, label);
+                try out.writer.writeAll(",\"parent_namespace\":");
+                try writeOptionalJsonString(&out.writer, parent_namespace);
+                try out.writer.writeAll(",\"metadata\":");
+                try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
+                try out.writer.writeAll("}");
+            }
+        }
+        try out.writer.writeAll("],\"dimensions\":[");
+
+        {
+            const dimensions = try collections_io.selectDimensionsForOntology(allocator, db, ontology_id);
+            defer allocator.free(dimensions);
+            for (dimensions, 0..) |row, index| {
+                if (index > 0) try out.writer.writeAll(",");
+                try out.writer.writeAll("{\"namespace\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.namespace, .{})});
+                try out.writer.writeAll(",\"dimension\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.dimension, .{})});
+                try out.writer.writeAll(",\"value_type\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.value_type, .{})});
+                try out.writer.print(",\"is_multi\":{}", .{row.is_multi});
+                try out.writer.writeAll(",\"hierarchy_kind\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.hierarchy_kind, .{})});
+                try out.writer.writeAll(",\"metadata\":");
+                try writeRawJsonObject(&out.writer, try allocator.dupe(u8, row.metadata_json), allocator);
+                try out.writer.writeAll("}");
+            }
+        }
+        try out.writer.writeAll("],\"values\":[");
+
+        {
+            const values = try collections_io.selectValuesForOntology(allocator, db, ontology_id);
+            defer allocator.free(values);
+            for (values, 0..) |row, index| {
+                if (index > 0) try out.writer.writeAll(",");
+                try out.writer.writeAll("{\"namespace\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.namespace, .{})});
+                try out.writer.writeAll(",\"dimension\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.dimension, .{})});
+                try out.writer.print(",\"value_id\":{}", .{row.value_id});
+                try out.writer.writeAll(",\"value\":");
+                try out.writer.print("{f}", .{std.json.fmt(row.value, .{})});
+                try out.writer.writeAll(",\"parent_value_id\":");
+                if (row.parent_value_id) |parent| try out.writer.print("{d}", .{parent}) else try out.writer.writeAll("null");
+                try out.writer.writeAll(",\"label\":");
+                try writeOptionalJsonString(&out.writer, row.label);
+                try out.writer.writeAll(",\"metadata\":");
+                try writeRawJsonObject(&out.writer, try allocator.dupe(u8, row.metadata_json), allocator);
+                try out.writer.writeAll("}");
+            }
+        }
+        try out.writer.writeAll("],\"entity_types\":[");
+
+        try writeOntologyInspectEntityTypes(allocator, db, ontology_id, &out.writer);
+        try out.writer.writeAll("],\"edge_types\":[");
+        try writeOntologyInspectEdgeTypes(allocator, db, ontology_id, &out.writer);
+        try out.writer.writeAll("],\"integrity\":");
+        try writeOntologyInspectIntegrity(db, ontology_id, &out.writer);
+        try out.writer.writeAll("}");
         return .{ .status = .ok, .content_type = "application/json; charset=utf-8", .body = try out.toOwnedSlice() };
     }
 
@@ -2965,10 +3102,11 @@ pub const MindbrainHttpApp = struct {
             .graph_pattern_query = @hasDecl(@This(), "handleGraphPatternQuery"),
             .ontology_import = @hasDecl(@This(), "handleOntologyImportPost"),
             .ontology_compile_linkml = @hasDecl(@This(), "handleOntologyCompileLinkmlPost"),
+            .ontology_inspect = @hasDecl(@This(), "handleOntologyInspect"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -2979,6 +3117,7 @@ pub const MindbrainHttpApp = struct {
                 features.graph_pattern_query,
                 features.ontology_import,
                 features.ontology_compile_linkml,
+                features.ontology_inspect,
                 self.graph_bitmap_mode.text(),
                 self.graph_bitmap_mode.effectiveText(),
             },
@@ -4273,6 +4412,100 @@ fn verifyOntologyWorkspaceAccess(
     }
 }
 
+fn writeOntologyInspectEntityTypes(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_type, label, metadata_json
+        \\FROM ontology_entity_types
+        \\WHERE ontology_id = ?1
+        \\ORDER BY entity_type
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        const entity_type = try helper_api.dupeColText(allocator, stmt, 0);
+        defer allocator.free(entity_type);
+        const label = try helper_api.colTextOptional(allocator, stmt, 1);
+        defer if (label) |value| allocator.free(value);
+        const metadata = try helper_api.dupeColText(allocator, stmt, 2);
+        defer allocator.free(metadata);
+        try writer.writeAll("{\"entity_type\":");
+        try writer.print("{f}", .{std.json.fmt(entity_type, .{})});
+        try writer.writeAll(",\"label\":");
+        try writeOptionalJsonString(writer, label);
+        try writer.writeAll(",\"metadata\":");
+        try writeRawJsonObject(writer, try allocator.dupe(u8, metadata), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn writeOntologyInspectEdgeTypes(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT edge_type, directed, source_entity_type, target_entity_type, metadata_json
+        \\FROM ontology_edge_types
+        \\WHERE ontology_id = ?1
+        \\ORDER BY edge_type
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    var first = true;
+    while (try helper_api.stepRow(stmt)) {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        const edge_type = try helper_api.dupeColText(allocator, stmt, 0);
+        defer allocator.free(edge_type);
+        const source_type = try helper_api.colTextOptional(allocator, stmt, 2);
+        defer if (source_type) |value| allocator.free(value);
+        const target_type = try helper_api.colTextOptional(allocator, stmt, 3);
+        defer if (target_type) |value| allocator.free(value);
+        const metadata = try helper_api.dupeColText(allocator, stmt, 4);
+        defer allocator.free(metadata);
+        try writer.writeAll("{\"edge_type\":");
+        try writer.print("{f}", .{std.json.fmt(edge_type, .{})});
+        try writer.print(",\"directed\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 1) != 0});
+        try writer.writeAll(",\"source_entity_type\":");
+        try writeOptionalJsonString(writer, source_type);
+        try writer.writeAll(",\"target_entity_type\":");
+        try writeOptionalJsonString(writer, target_type);
+        try writer.writeAll(",\"metadata\":");
+        try writeRawJsonObject(writer, try allocator.dupe(u8, metadata), allocator);
+        try writer.writeAll("}");
+    }
+}
+
+fn countOntologyIntegrityIssue(db: facet_sqlite.Database, ontology_id: []const u8, sql: []const u8) !i64 {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    if (!try helper_api.stepRow(stmt)) return error.StepFailed;
+    return facet_sqlite.c.sqlite3_column_int64(stmt, 0);
+}
+
+fn writeOntologyInspectIntegrity(db: facet_sqlite.Database, ontology_id: []const u8, writer: *std.Io.Writer) !void {
+    const missing_namespaces = try countOntologyIntegrityIssue(db, ontology_id,
+        \\SELECT COUNT(*)
+        \\FROM ontology_dimensions d
+        \\LEFT JOIN ontology_namespaces n
+        \\  ON n.ontology_id = d.ontology_id AND n.namespace = d.namespace
+        \\WHERE d.ontology_id = ?1 AND n.namespace IS NULL
+    );
+    const missing_dimensions = try countOntologyIntegrityIssue(db, ontology_id,
+        \\SELECT COUNT(*)
+        \\FROM ontology_values v
+        \\LEFT JOIN ontology_dimensions d
+        \\  ON d.ontology_id = v.ontology_id
+        \\ AND d.namespace = v.namespace
+        \\ AND d.dimension = v.dimension
+        \\WHERE v.ontology_id = ?1 AND d.dimension IS NULL
+    );
+    try writer.print(
+        "{{\"ok\":{},\"missing_namespace_dimensions\":{},\"missing_dimension_values\":{}}}",
+        .{ missing_namespaces == 0 and missing_dimensions == 0, missing_namespaces, missing_dimensions },
+    );
+}
+
 fn resolveOntologyIdForRequest(
     allocator: std.mem.Allocator,
     db: facet_sqlite.Database,
@@ -4801,6 +5034,7 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
         \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_api', 'ws_api::core');
         \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'person', 'Personne', '{}');
         \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label, metadata_json) VALUES ('ws_api::core', 'unit', 'Lot', '{}');
+        \\INSERT INTO ontology_namespaces(ontology_id, namespace, label, metadata_json) VALUES ('ws_api::core', 'source', 'Source', '{}');
         \\INSERT INTO ontology_dimensions(ontology_id, namespace, dimension, value_type, is_multi, hierarchy_kind, metadata_json) VALUES ('ws_api::core', 'source', 'document_type', 'string', 0, 'tree', '{}');
         \\INSERT INTO ontology_values(ontology_id, namespace, dimension, value_id, value, parent_value_id, label, metadata_json) VALUES ('ws_api::core', 'source', 'document_type', 1, 'PV', NULL, 'Procès-verbal', '{}');
         \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (1, 'ws_api', 'person', 'Ada', 0.99, '{}');
@@ -4818,6 +5052,10 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
     const taxonomy = try app.handleOntologyTaxonomyGet(arena, "ontology_id=ws_api%3A%3Acore&workspace_id=ws_api");
     try std.testing.expect(std.mem.indexOf(u8, taxonomy.body, "\"dimension\":\"document_type\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, taxonomy.body, "\"value\":\"PV\"") != null);
+    const inspect = try app.handleOntologyInspect(arena, "ontology_id=ws_api%3A%3Acore&workspace_id=ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"namespaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"namespace\":\"source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"integrity\":{\"ok\":true") != null);
 
     try collections_sqlite.ensureValue(app.writer_db, .{
         .ontology_id = "ws_api::core",
@@ -4911,6 +5149,7 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"graph_gap_rules_delete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_import\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_compile_linkml\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_inspect\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_configured\":\"dense32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_effective\":\"dense32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"direct64_supported\":false") != null);
