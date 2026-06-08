@@ -70,6 +70,7 @@ const Bundle = struct {
     ontology_triples: []OntologyTripleRow = &.{},
     collection_ontologies: []CollectionOntologyRow,
     workspace_settings: []WorkspaceSettingsRow,
+    agent_facts: []AgentFactRow = &.{},
     facet_tables: []FacetTableRow = &.{},
     facet_definitions: []FacetDefinitionRow = &.{},
     documents_raw: []DocumentRow,
@@ -83,6 +84,12 @@ const Bundle = struct {
     relation_properties_raw: []RelationPropertyRow = &.{},
     entity_documents_raw: []EntityDocumentRow,
     entity_chunks_raw: []EntityChunkRow,
+    graph_entity: []GraphEntityRow = &.{},
+    graph_entity_alias: []GraphEntityAliasRow = &.{},
+    graph_relation: []GraphRelationRow = &.{},
+    graph_relation_property: []GraphRelationPropertyRow = &.{},
+    graph_entity_document: []GraphEntityDocumentRow = &.{},
+    graph_entity_chunk: []GraphEntityChunkRow = &.{},
     document_links_raw: []DocumentLinkRow,
     external_links_raw: []ExternalLinkRow = &.{},
     mindbrain_answer_artifacts: []AnswerArtifactRow = &.{},
@@ -208,6 +215,27 @@ const CollectionOntologyRow = struct {
 const WorkspaceSettingsRow = struct {
     workspace_id: []const u8,
     default_ontology_id: ?[]const u8,
+};
+
+const AgentFactRow = struct {
+    id: []const u8,
+    schema_id: []const u8,
+    content: []const u8,
+    facets: []const u8,
+    facets_json: []const u8,
+    embedding: ?[]const u8,
+    created_by: ?[]const u8,
+    created_at: []const u8,
+    created_at_unix: i64,
+    updated_at: []const u8,
+    updated_at_unix: i64,
+    version: i64,
+    supersedes: ?[]const u8,
+    valid_from_unix: ?i64,
+    valid_until_unix: ?i64,
+    workspace_id: []const u8,
+    source_ref: ?[]const u8,
+    doc_id: ?i64,
 };
 
 const FacetTableRow = struct {
@@ -372,6 +400,69 @@ const EntityChunkRow = struct {
     confidence: f64,
 };
 
+const GraphEntityRow = struct {
+    entity_id: i64,
+    workspace_id: []const u8,
+    entity_type: []const u8,
+    name: []const u8,
+    confidence: f64,
+    deprecated_at: ?i64,
+    metadata_json: []const u8,
+    created_at_unix: i64,
+};
+
+const GraphEntityAliasRow = struct {
+    term: []const u8,
+    entity_id: i64,
+    confidence: f64,
+};
+
+const GraphRelationRow = struct {
+    relation_id: i64,
+    workspace_id: []const u8,
+    relation_type: []const u8,
+    source_id: i64,
+    target_id: i64,
+    valid_from_unix: ?i64,
+    valid_to_unix: ?i64,
+    confidence: f64,
+    deprecated_at: ?i64,
+    run_id: ?i64,
+    patch_id: ?i64,
+    metadata_json: []const u8,
+    created_at_unix: i64,
+};
+
+const GraphRelationPropertyRow = struct {
+    relation_id: i64,
+    property_key: []const u8,
+    value_type: []const u8,
+    value_text: ?[]const u8,
+    value_number: ?f64,
+    value_integer: ?i64,
+    ref_doc_id: ?i64,
+    currency: ?[]const u8,
+};
+
+const GraphEntityDocumentRow = struct {
+    entity_id: i64,
+    doc_id: i64,
+    table_id: i64,
+    role: ?[]const u8,
+    confidence: f64,
+};
+
+const GraphEntityChunkRow = struct {
+    workspace_id: []const u8,
+    entity_id: i64,
+    collection_id: []const u8,
+    doc_id: i64,
+    chunk_index: i64,
+    role: ?[]const u8,
+    confidence: f64,
+    metadata_json: []const u8,
+};
+
 const ExternalLinkRow = struct {
     workspace_id: []const u8,
     link_id: i64,
@@ -449,6 +540,7 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
         .ontology_triples = try selectOntologyTriples(arena_allocator, db, workspace_id, collection_filter),
         .collection_ontologies = if (taxonomies_only) &.{} else try selectCollectionOntologies(arena_allocator, db, workspace_id, collection_filter),
         .workspace_settings = try selectWorkspaceSettings(arena_allocator, db, workspace_id),
+        .agent_facts = if (taxonomies_only or collection_filter != null) &.{} else try selectAgentFacts(arena_allocator, db, workspace_id),
         .facet_tables = if (taxonomies_only) &.{} else try selectFacetTables(arena_allocator, db, workspace_id, collection_filter),
         .facet_definitions = if (taxonomies_only) &.{} else try selectFacetDefinitions(arena_allocator, db, workspace_id, collection_filter),
         .documents_raw = if (taxonomies_only) &.{} else try selectDocuments(arena_allocator, db, workspace_id, collection_filter),
@@ -462,6 +554,12 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
         .relation_properties_raw = if (taxonomies_only) &.{} else try selectRelationProperties(arena_allocator, db, workspace_id),
         .entity_documents_raw = if (taxonomies_only) &.{} else try selectEntityDocuments(arena_allocator, db, workspace_id, collection_filter),
         .entity_chunks_raw = if (taxonomies_only) &.{} else try selectEntityChunks(arena_allocator, db, workspace_id, collection_filter),
+        .graph_entity = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphEntities(arena_allocator, db, workspace_id),
+        .graph_entity_alias = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphEntityAliases(arena_allocator, db, workspace_id),
+        .graph_relation = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphRelations(arena_allocator, db, workspace_id),
+        .graph_relation_property = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphRelationProperties(arena_allocator, db, workspace_id),
+        .graph_entity_document = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphEntityDocuments(arena_allocator, db, workspace_id),
+        .graph_entity_chunk = if (taxonomies_only or collection_filter != null) &.{} else try selectGraphEntityChunks(arena_allocator, db, workspace_id),
         .document_links_raw = if (taxonomies_only) &.{} else try selectDocumentLinks(arena_allocator, db, workspace_id, collection_filter),
         .external_links_raw = if (taxonomies_only) &.{} else try selectExternalLinks(arena_allocator, db, workspace_id, collection_filter),
         .mindbrain_answer_artifacts = if (collection_filter == null) try selectAnswerArtifacts(arena_allocator, db, workspace_id) else &.{},
@@ -621,6 +719,10 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         try collections_sqlite.attachOntologyToCollection(db, row.workspace_id, row.collection_id, row.ontology_id, row.role);
     }
 
+    for (bundle.agent_facts) |row| {
+        try upsertAgentFactBundleRow(db, row);
+    }
+
     for (bundle.facet_tables) |row| {
         const table_id = std.math.cast(u64, row.table_id) orelse return error.ValueOutOfRange;
         const chunk_bits = std.math.cast(u8, row.chunk_bits) orelse return error.ValueOutOfRange;
@@ -730,6 +832,10 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     defer freeStringHashMapKeys(allocator, &entity_id_map);
     var relation_id_map = std.StringHashMap(u64).init(allocator);
     defer freeStringHashMapKeys(allocator, &relation_id_map);
+    var graph_entity_id_map = std.StringHashMap(u64).init(allocator);
+    defer freeStringHashMapKeys(allocator, &graph_entity_id_map);
+    var graph_relation_id_map = std.StringHashMap(u64).init(allocator);
+    defer freeStringHashMapKeys(allocator, &graph_relation_id_map);
 
     for (bundle.entities_raw) |row| {
         const old_entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange;
@@ -818,6 +924,42 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
             .role = row.role,
             .confidence = row.confidence,
         });
+    }
+
+    for (bundle.graph_entity) |row| {
+        const old_entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange;
+        const new_entity_id = try upsertGraphEntityBundleRow(db, row);
+        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_entity_id);
+        try graph_entity_id_map.put(map_key, new_entity_id);
+    }
+
+    for (bundle.graph_entity_alias) |row| {
+        const entity_id = try lookupRawId(&graph_entity_id_map, bundle.scope.workspace_id, row.entity_id);
+        try upsertGraphEntityAliasBundleRow(db, row, entity_id);
+    }
+
+    for (bundle.graph_relation) |row| {
+        const old_relation_id = std.math.cast(u64, row.relation_id) orelse return error.ValueOutOfRange;
+        const source_id = try lookupRawId(&graph_entity_id_map, row.workspace_id, row.source_id);
+        const target_id = try lookupRawId(&graph_entity_id_map, row.workspace_id, row.target_id);
+        const new_relation_id = try upsertGraphRelationBundleRow(db, row, source_id, target_id);
+        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_relation_id);
+        try graph_relation_id_map.put(map_key, new_relation_id);
+    }
+
+    for (bundle.graph_relation_property) |row| {
+        const relation_id = try lookupRawId(&graph_relation_id_map, bundle.scope.workspace_id, row.relation_id);
+        try upsertGraphRelationPropertyBundleRow(db, row, relation_id);
+    }
+
+    for (bundle.graph_entity_document) |row| {
+        const entity_id = try lookupRawId(&graph_entity_id_map, bundle.scope.workspace_id, row.entity_id);
+        try upsertGraphEntityDocumentBundleRow(db, row, entity_id);
+    }
+
+    for (bundle.graph_entity_chunk) |row| {
+        const entity_id = try lookupRawId(&graph_entity_id_map, row.workspace_id, row.entity_id);
+        try upsertGraphEntityChunkBundleRow(db, row, entity_id);
     }
 
     for (bundle.document_links_raw) |row| {
@@ -952,6 +1094,242 @@ fn freeStringHashMapKeys(allocator: Allocator, map: *std.StringHashMap(u64)) voi
     var it = map.keyIterator();
     while (it.next()) |key| allocator.free(key.*);
     map.deinit();
+}
+
+fn upsertAgentFactBundleRow(db: Database, row: AgentFactRow) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO agent_facts(
+        \\  id, schema_id, content, facets, facets_json, embedding, created_by,
+        \\  created_at, created_at_unix, updated_at, updated_at_unix, version,
+        \\  supersedes, valid_from_unix, valid_until_unix, workspace_id, source_ref, doc_id
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        \\ON CONFLICT(id) DO UPDATE SET
+        \\  schema_id = excluded.schema_id,
+        \\  content = excluded.content,
+        \\  facets = excluded.facets,
+        \\  facets_json = excluded.facets_json,
+        \\  embedding = excluded.embedding,
+        \\  created_by = excluded.created_by,
+        \\  created_at = excluded.created_at,
+        \\  created_at_unix = excluded.created_at_unix,
+        \\  updated_at = excluded.updated_at,
+        \\  updated_at_unix = excluded.updated_at_unix,
+        \\  version = excluded.version,
+        \\  supersedes = excluded.supersedes,
+        \\  valid_from_unix = excluded.valid_from_unix,
+        \\  valid_until_unix = excluded.valid_until_unix,
+        \\  workspace_id = excluded.workspace_id,
+        \\  source_ref = excluded.source_ref,
+        \\  doc_id = excluded.doc_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.id);
+    try facet_sqlite.bindText(stmt, 2, row.schema_id);
+    try facet_sqlite.bindText(stmt, 3, row.content);
+    try facet_sqlite.bindText(stmt, 4, row.facets);
+    try facet_sqlite.bindText(stmt, 5, row.facets_json);
+    try bindMaybeText(stmt, 6, row.embedding);
+    try bindMaybeText(stmt, 7, row.created_by);
+    try facet_sqlite.bindText(stmt, 8, row.created_at);
+    try facet_sqlite.bindInt64(stmt, 9, row.created_at_unix);
+    try facet_sqlite.bindText(stmt, 10, row.updated_at);
+    try facet_sqlite.bindInt64(stmt, 11, row.updated_at_unix);
+    try facet_sqlite.bindInt64(stmt, 12, row.version);
+    try bindMaybeText(stmt, 13, row.supersedes);
+    try bindMaybeInt(stmt, 14, row.valid_from_unix);
+    try bindMaybeInt(stmt, 15, row.valid_until_unix);
+    try facet_sqlite.bindText(stmt, 16, row.workspace_id);
+    try bindMaybeText(stmt, 17, row.source_ref);
+    try bindMaybeInt(stmt, 18, row.doc_id);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn upsertGraphEntityBundleRow(db: Database, row: GraphEntityRow) !u64 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_entity(
+        \\  workspace_id, entity_type, name, confidence, deprecated_at, metadata_json, created_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\ON CONFLICT(workspace_id, entity_type, name) DO UPDATE SET
+        \\  confidence = excluded.confidence,
+        \\  deprecated_at = excluded.deprecated_at,
+        \\  metadata_json = excluded.metadata_json,
+        \\  created_at_unix = excluded.created_at_unix
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, row.entity_type);
+    try facet_sqlite.bindText(stmt, 3, row.name);
+    try bindDouble(stmt, 4, row.confidence);
+    try bindMaybeInt(stmt, 5, row.deprecated_at);
+    try facet_sqlite.bindText(stmt, 6, row.metadata_json);
+    try facet_sqlite.bindInt64(stmt, 7, row.created_at_unix);
+    try facet_sqlite.stepDone(stmt);
+
+    return try lookupGraphEntityId(db, row.workspace_id, row.entity_type, row.name);
+}
+
+fn lookupGraphEntityId(db: Database, workspace_id: []const u8, entity_type: []const u8, name: []const u8) !u64 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_id FROM graph_entity
+        \\WHERE workspace_id = ?1 AND entity_type = ?2 AND name = ?3
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, entity_type);
+    try facet_sqlite.bindText(stmt, 3, name);
+    const status = c.sqlite3_step(stmt);
+    if (status == c.SQLITE_ROW) return std.math.cast(u64, c.sqlite3_column_int64(stmt, 0)) orelse error.ValueOutOfRange;
+    if (status == c.SQLITE_DONE) return error.MissingRow;
+    return error.StepFailed;
+}
+
+fn upsertGraphEntityAliasBundleRow(db: Database, row: GraphEntityAliasRow, entity_id: u64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_entity_alias(term, entity_id, confidence)
+        \\VALUES (?1, ?2, ?3)
+        \\ON CONFLICT(term, entity_id) DO UPDATE SET confidence = excluded.confidence
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.term);
+    try facet_sqlite.bindInt64(stmt, 2, @as(i64, @intCast(entity_id)));
+    try bindDouble(stmt, 3, row.confidence);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn upsertGraphRelationBundleRow(db: Database, row: GraphRelationRow, source_id: u64, target_id: u64) !u64 {
+    if (lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id)) |existing_id| {
+        const update_stmt = try facet_sqlite.prepare(db,
+            \\UPDATE graph_relation SET
+            \\  valid_from_unix = ?1,
+            \\  valid_to_unix = ?2,
+            \\  confidence = ?3,
+            \\  deprecated_at = ?4,
+            \\  run_id = ?5,
+            \\  patch_id = ?6,
+            \\  metadata_json = ?7,
+            \\  created_at_unix = ?8
+            \\WHERE relation_id = ?9
+        );
+        defer facet_sqlite.finalize(update_stmt);
+        try bindMaybeInt(update_stmt, 1, row.valid_from_unix);
+        try bindMaybeInt(update_stmt, 2, row.valid_to_unix);
+        try bindDouble(update_stmt, 3, row.confidence);
+        try bindMaybeInt(update_stmt, 4, row.deprecated_at);
+        try bindMaybeInt(update_stmt, 5, row.run_id);
+        try bindMaybeInt(update_stmt, 6, row.patch_id);
+        try facet_sqlite.bindText(update_stmt, 7, row.metadata_json);
+        try facet_sqlite.bindInt64(update_stmt, 8, row.created_at_unix);
+        try facet_sqlite.bindInt64(update_stmt, 9, @as(i64, @intCast(existing_id)));
+        try facet_sqlite.stepDone(update_stmt);
+        return existing_id;
+    } else |err| switch (err) {
+        error.MissingRow => {},
+        else => return err,
+    }
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_relation(
+        \\  workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix,
+        \\  confidence, deprecated_at, run_id, patch_id, metadata_json, created_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, row.relation_type);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(source_id)));
+    try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(target_id)));
+    try bindMaybeInt(stmt, 5, row.valid_from_unix);
+    try bindMaybeInt(stmt, 6, row.valid_to_unix);
+    try bindDouble(stmt, 7, row.confidence);
+    try bindMaybeInt(stmt, 8, row.deprecated_at);
+    try bindMaybeInt(stmt, 9, row.run_id);
+    try bindMaybeInt(stmt, 10, row.patch_id);
+    try facet_sqlite.bindText(stmt, 11, row.metadata_json);
+    try facet_sqlite.bindInt64(stmt, 12, row.created_at_unix);
+    try facet_sqlite.stepDone(stmt);
+
+    return try lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id);
+}
+
+fn lookupGraphRelationId(db: Database, workspace_id: []const u8, relation_type: []const u8, source_id: u64, target_id: u64) !u64 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT relation_id FROM graph_relation
+        \\WHERE workspace_id = ?1 AND relation_type = ?2 AND source_id = ?3 AND target_id = ?4
+        \\ORDER BY relation_id DESC LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, relation_type);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(source_id)));
+    try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(target_id)));
+    const status = c.sqlite3_step(stmt);
+    if (status == c.SQLITE_ROW) return std.math.cast(u64, c.sqlite3_column_int64(stmt, 0)) orelse error.ValueOutOfRange;
+    if (status == c.SQLITE_DONE) return error.MissingRow;
+    return error.StepFailed;
+}
+
+fn upsertGraphRelationPropertyBundleRow(db: Database, row: GraphRelationPropertyRow, relation_id: u64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_relation_property(
+        \\  relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\ON CONFLICT(relation_id, property_key) DO UPDATE SET
+        \\  value_type = excluded.value_type,
+        \\  value_text = excluded.value_text,
+        \\  value_number = excluded.value_number,
+        \\  value_integer = excluded.value_integer,
+        \\  ref_doc_id = excluded.ref_doc_id,
+        \\  currency = excluded.currency
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, @as(i64, @intCast(relation_id)));
+    try facet_sqlite.bindText(stmt, 2, row.property_key);
+    try facet_sqlite.bindText(stmt, 3, row.value_type);
+    try bindMaybeText(stmt, 4, row.value_text);
+    try bindMaybeDouble(stmt, 5, row.value_number);
+    try bindMaybeInt(stmt, 6, row.value_integer);
+    try bindMaybeInt(stmt, 7, row.ref_doc_id);
+    try bindMaybeText(stmt, 8, row.currency);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn upsertGraphEntityDocumentBundleRow(db: Database, row: GraphEntityDocumentRow, entity_id: u64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_entity_document(entity_id, doc_id, table_id, role, confidence)
+        \\VALUES (?1, ?2, ?3, ?4, ?5)
+        \\ON CONFLICT(entity_id, doc_id, table_id) DO UPDATE SET
+        \\  role = excluded.role,
+        \\  confidence = excluded.confidence
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, @as(i64, @intCast(entity_id)));
+    try facet_sqlite.bindInt64(stmt, 2, row.doc_id);
+    try facet_sqlite.bindInt64(stmt, 3, row.table_id);
+    try bindMaybeText(stmt, 4, row.role);
+    try bindDouble(stmt, 5, row.confidence);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn upsertGraphEntityChunkBundleRow(db: Database, row: GraphEntityChunkRow, entity_id: u64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_entity_chunk(
+        \\  entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        \\ON CONFLICT(entity_id, workspace_id, collection_id, doc_id, chunk_index) DO UPDATE SET
+        \\  role = excluded.role,
+        \\  confidence = excluded.confidence,
+        \\  metadata_json = excluded.metadata_json
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, @as(i64, @intCast(entity_id)));
+    try facet_sqlite.bindText(stmt, 2, row.workspace_id);
+    try facet_sqlite.bindText(stmt, 3, row.collection_id);
+    try facet_sqlite.bindInt64(stmt, 4, row.doc_id);
+    try facet_sqlite.bindInt64(stmt, 5, row.chunk_index);
+    try bindMaybeText(stmt, 6, row.role);
+    try bindDouble(stmt, 7, row.confidence);
+    try facet_sqlite.bindText(stmt, 8, row.metadata_json);
+    try facet_sqlite.stepDone(stmt);
 }
 
 pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !BundleSummary {
@@ -1467,6 +1845,47 @@ fn selectWorkspaceSettings(arena: Allocator, db: Database, workspace_id: []const
     return rows.toOwnedSlice(arena);
 }
 
+fn selectAgentFacts(arena: Allocator, db: Database, workspace_id: []const u8) ![]AgentFactRow {
+    const sql =
+        \\SELECT id, schema_id, content, facets, facets_json, embedding, created_by, created_at,
+        \\       created_at_unix, updated_at, updated_at_unix, version, supersedes,
+        \\       valid_from_unix, valid_until_unix, workspace_id, source_ref, doc_id
+        \\FROM agent_facts
+        \\WHERE workspace_id = ?1
+        \\ORDER BY created_at_unix, id
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(AgentFactRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .schema_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .content = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .facets = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .facets_json = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .embedding = try maybeColText(arena, stmt, 5),
+            .created_by = try maybeColText(arena, stmt, 6),
+            .created_at = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 8),
+            .updated_at = try facet_sqlite.dupeColumnText(arena, stmt, 9),
+            .updated_at_unix = c.sqlite3_column_int64(stmt, 10),
+            .version = c.sqlite3_column_int64(stmt, 11),
+            .supersedes = try maybeColText(arena, stmt, 12),
+            .valid_from_unix = if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 13),
+            .valid_until_unix = if (c.sqlite3_column_type(stmt, 14) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 14),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 15),
+            .source_ref = try maybeColText(arena, stmt, 16),
+            .doc_id = if (c.sqlite3_column_type(stmt, 17) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 17),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
 fn selectFacetTables(arena: Allocator, db: Database, workspace_id: []const u8, collection_filter: ?[]const u8) ![]FacetTableRow {
     const sql_all =
         \\SELECT ft.table_id, ts.workspace_id, ft.table_name, ft.schema_name, ft.table_name, ft.chunk_bits,
@@ -1802,8 +2221,12 @@ fn selectEntityAliases(arena: Allocator, db: Database, workspace_id: []const u8)
 
 fn selectRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]RelationRow {
     const sql =
-        \\SELECT workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json
-        \\FROM relations_raw WHERE workspace_id = ?1
+        \\SELECT r.workspace_id, r.ontology_id, r.relation_id, r.external_id, r.edge_type,
+        \\       r.source_entity_id, r.target_entity_id, r.valid_from, r.valid_to, r.confidence, r.metadata_json
+        \\FROM relations_raw r
+        \\JOIN entities_raw s ON s.workspace_id = r.workspace_id AND s.entity_id = r.source_entity_id
+        \\JOIN entities_raw t ON t.workspace_id = r.workspace_id AND t.entity_id = r.target_entity_id
+        \\WHERE r.workspace_id = ?1
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
@@ -1832,9 +2255,14 @@ fn selectRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]
 
 fn selectRelationProperties(arena: Allocator, db: Database, workspace_id: []const u8) ![]RelationPropertyRow {
     const sql =
-        \\SELECT workspace_id, relation_id, property_key, value_type, value_text, value_number, value_integer, ref_doc_id, currency
-        \\FROM relation_properties_raw WHERE workspace_id = ?1
-        \\ORDER BY relation_id, property_key
+        \\SELECT p.workspace_id, p.relation_id, p.property_key, p.value_type, p.value_text,
+        \\       p.value_number, p.value_integer, p.ref_doc_id, p.currency
+        \\FROM relation_properties_raw p
+        \\JOIN relations_raw r ON r.workspace_id = p.workspace_id AND r.relation_id = p.relation_id
+        \\JOIN entities_raw s ON s.workspace_id = r.workspace_id AND s.entity_id = r.source_entity_id
+        \\JOIN entities_raw t ON t.workspace_id = r.workspace_id AND t.entity_id = r.target_entity_id
+        \\WHERE p.workspace_id = ?1
+        \\ORDER BY p.relation_id, p.property_key
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
@@ -1915,6 +2343,178 @@ fn selectEntityChunks(arena: Allocator, db: Database, workspace_id: []const u8, 
             .chunk_index = c.sqlite3_column_int64(stmt, 4),
             .role = try maybeColText(arena, stmt, 5),
             .confidence = c.sqlite3_column_double(stmt, 6),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphEntities(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphEntityRow {
+    const sql =
+        \\SELECT entity_id, workspace_id, entity_type, name, confidence, deprecated_at, metadata_json, created_at_unix
+        \\FROM graph_entity WHERE workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphEntityRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .entity_id = c.sqlite3_column_int64(stmt, 0),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .entity_type = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .name = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .confidence = c.sqlite3_column_double(stmt, 4),
+            .deprecated_at = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 5),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 7),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphEntityAliases(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphEntityAliasRow {
+    const sql =
+        \\SELECT a.term, a.entity_id, a.confidence
+        \\FROM graph_entity_alias a
+        \\JOIN graph_entity e ON e.entity_id = a.entity_id
+        \\WHERE e.workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphEntityAliasRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .term = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .entity_id = c.sqlite3_column_int64(stmt, 1),
+            .confidence = c.sqlite3_column_double(stmt, 2),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphRelations(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphRelationRow {
+    const sql =
+        \\SELECT r.relation_id, r.workspace_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix,
+        \\       r.confidence, r.deprecated_at, r.run_id, r.patch_id, r.metadata_json, r.created_at_unix
+        \\FROM graph_relation r
+        \\JOIN graph_entity s ON s.workspace_id = r.workspace_id AND s.entity_id = r.source_id
+        \\JOIN graph_entity t ON t.workspace_id = r.workspace_id AND t.entity_id = r.target_id
+        \\WHERE r.workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphRelationRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .relation_id = c.sqlite3_column_int64(stmt, 0),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .relation_type = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .source_id = c.sqlite3_column_int64(stmt, 3),
+            .target_id = c.sqlite3_column_int64(stmt, 4),
+            .valid_from_unix = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 5),
+            .valid_to_unix = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 6),
+            .confidence = c.sqlite3_column_double(stmt, 7),
+            .deprecated_at = if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 8),
+            .run_id = if (c.sqlite3_column_type(stmt, 9) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 9),
+            .patch_id = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 10),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 11),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 12),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphRelationProperties(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphRelationPropertyRow {
+    const sql =
+        \\SELECT p.relation_id, p.property_key, p.value_type, p.value_text, p.value_number,
+        \\       p.value_integer, p.ref_doc_id, p.currency
+        \\FROM graph_relation_property p
+        \\JOIN graph_relation r ON r.relation_id = p.relation_id
+        \\JOIN graph_entity s ON s.workspace_id = r.workspace_id AND s.entity_id = r.source_id
+        \\JOIN graph_entity t ON t.workspace_id = r.workspace_id AND t.entity_id = r.target_id
+        \\WHERE r.workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphRelationPropertyRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .relation_id = c.sqlite3_column_int64(stmt, 0),
+            .property_key = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .value_type = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .value_text = try maybeColText(arena, stmt, 3),
+            .value_number = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL) null else c.sqlite3_column_double(stmt, 4),
+            .value_integer = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 5),
+            .ref_doc_id = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 6),
+            .currency = try maybeColText(arena, stmt, 7),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphEntityDocuments(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphEntityDocumentRow {
+    const sql =
+        \\SELECT d.entity_id, d.doc_id, d.table_id, d.role, d.confidence
+        \\FROM graph_entity_document d
+        \\JOIN graph_entity e ON e.entity_id = d.entity_id
+        \\WHERE e.workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphEntityDocumentRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .entity_id = c.sqlite3_column_int64(stmt, 0),
+            .doc_id = c.sqlite3_column_int64(stmt, 1),
+            .table_id = c.sqlite3_column_int64(stmt, 2),
+            .role = try maybeColText(arena, stmt, 3),
+            .confidence = c.sqlite3_column_double(stmt, 4),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectGraphEntityChunks(arena: Allocator, db: Database, workspace_id: []const u8) ![]GraphEntityChunkRow {
+    const sql =
+        \\SELECT entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json
+        \\FROM graph_entity_chunk WHERE workspace_id = ?1
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(GraphEntityChunkRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .entity_id = c.sqlite3_column_int64(stmt, 0),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .collection_id = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .doc_id = c.sqlite3_column_int64(stmt, 3),
+            .chunk_index = c.sqlite3_column_int64(stmt, 4),
+            .role = try maybeColText(arena, stmt, 5),
+            .confidence = c.sqlite3_column_double(stmt, 6),
+            .metadata_json = try facet_sqlite.dupeColumnText(arena, stmt, 7),
         });
     }
     return rows.toOwnedSlice(arena);
@@ -2037,6 +2637,14 @@ fn bindMaybeText(stmt: *c.sqlite3_stmt, index: c_int, value: ?[]const u8) !void 
 
 fn bindMaybeInt(stmt: *c.sqlite3_stmt, index: c_int, value: ?i64) !void {
     if (value) |int| try facet_sqlite.bindInt64(stmt, index, int) else try facet_sqlite.bindNull(stmt, index);
+}
+
+fn bindMaybeDouble(stmt: *c.sqlite3_stmt, index: c_int, value: ?f64) !void {
+    if (value) |number| try bindDouble(stmt, index, number) else try facet_sqlite.bindNull(stmt, index);
+}
+
+fn bindDouble(stmt: *c.sqlite3_stmt, index: c_int, value: f64) !void {
+    if (c.sqlite3_bind_double(stmt, index, value) != c.SQLITE_OK) return error.BindFailed;
 }
 
 fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
