@@ -94,6 +94,8 @@ const Bundle = struct {
     external_links_raw: []ExternalLinkRow = &.{},
     mindbrain_answer_artifacts: []AnswerArtifactRow = &.{},
     mindbrain_answer_events: []AnswerEventRow = &.{},
+    quality_convergence_run: []QualityConvergenceRunRow = &.{},
+    quality_remediation_action: []QualityRemediationActionRow = &.{},
 };
 
 const ScopeJson = struct {
@@ -284,6 +286,47 @@ const AnswerEventRow = struct {
     to_version: ?i64,
     signal_json: []const u8,
     created_at_unix: i64,
+};
+
+const QualityConvergenceRunRow = struct {
+    run_id: []const u8,
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8,
+    run_kind: []const u8,
+    status: []const u8,
+    canonical_layer: []const u8,
+    input_fingerprint: []const u8,
+    summary_json: []const u8,
+    report_json: []const u8,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+};
+
+const QualityRemediationActionRow = struct {
+    action_id: []const u8,
+    run_id: []const u8,
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8,
+    issue_type: []const u8,
+    severity: []const u8,
+    confidence: f64,
+    reason: []const u8,
+    schema_id: ?[]const u8,
+    entity_type: ?[]const u8,
+    projection_id: ?[]const u8,
+    evidence_json: []const u8,
+    mcp_tool: ?[]const u8,
+    tool_args_json: []const u8,
+    execution_mode: []const u8,
+    idempotency_key: []const u8,
+    status: []const u8,
+    decision_actor: ?[]const u8,
+    decision_note: ?[]const u8,
+    result_json: []const u8,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+    decided_at_unix: ?i64,
+    applied_at_unix: ?i64,
 };
 
 const DocumentRow = struct {
@@ -564,6 +607,8 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
         .external_links_raw = if (taxonomies_only) &.{} else try selectExternalLinks(arena_allocator, db, workspace_id, collection_filter),
         .mindbrain_answer_artifacts = if (collection_filter == null) try selectAnswerArtifacts(arena_allocator, db, workspace_id) else &.{},
         .mindbrain_answer_events = if (collection_filter == null) try selectAnswerEvents(arena_allocator, db, workspace_id) else &.{},
+        .quality_convergence_run = if (collection_filter == null and !taxonomies_only) try selectQualityConvergenceRuns(arena_allocator, db, workspace_id) else &.{},
+        .quality_remediation_action = if (collection_filter == null and !taxonomies_only) try selectQualityRemediationActions(arena_allocator, db, workspace_id) else &.{},
     };
 
     return try std.json.Stringify.valueAlloc(allocator, bundle, .{ .whitespace = .indent_2 });
@@ -1002,7 +1047,110 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
         try upsertAnswerEvent(db, row);
     }
 
+    for (bundle.quality_convergence_run) |row| {
+        try upsertQualityConvergenceRun(db, row);
+    }
+
+    for (bundle.quality_remediation_action) |row| {
+        try upsertQualityRemediationAction(db, row);
+    }
+
     try db.exec("COMMIT");
+}
+
+fn upsertQualityConvergenceRun(db: Database, row: QualityConvergenceRunRow) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO quality_convergence_run(
+        \\  run_id, workspace_id, ontology_id, run_kind, status, canonical_layer,
+        \\  input_fingerprint, summary_json, report_json, created_at_unix, updated_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        \\ON CONFLICT(run_id) DO UPDATE SET
+        \\  workspace_id = excluded.workspace_id,
+        \\  ontology_id = excluded.ontology_id,
+        \\  run_kind = excluded.run_kind,
+        \\  status = excluded.status,
+        \\  canonical_layer = excluded.canonical_layer,
+        \\  input_fingerprint = excluded.input_fingerprint,
+        \\  summary_json = excluded.summary_json,
+        \\  report_json = excluded.report_json,
+        \\  created_at_unix = excluded.created_at_unix,
+        \\  updated_at_unix = excluded.updated_at_unix
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.run_id);
+    try facet_sqlite.bindText(stmt, 2, row.workspace_id);
+    try bindMaybeText(stmt, 3, row.ontology_id);
+    try facet_sqlite.bindText(stmt, 4, row.run_kind);
+    try facet_sqlite.bindText(stmt, 5, row.status);
+    try facet_sqlite.bindText(stmt, 6, row.canonical_layer);
+    try facet_sqlite.bindText(stmt, 7, row.input_fingerprint);
+    try facet_sqlite.bindText(stmt, 8, row.summary_json);
+    try facet_sqlite.bindText(stmt, 9, row.report_json);
+    try facet_sqlite.bindInt64(stmt, 10, row.created_at_unix);
+    try facet_sqlite.bindInt64(stmt, 11, row.updated_at_unix);
+    try execPreparedDone(stmt);
+}
+
+fn upsertQualityRemediationAction(db: Database, row: QualityRemediationActionRow) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO quality_remediation_action(
+        \\  action_id, run_id, workspace_id, ontology_id, issue_type, severity,
+        \\  confidence, reason, schema_id, entity_type, projection_id, evidence_json,
+        \\  mcp_tool, tool_args_json, execution_mode, idempotency_key, status,
+        \\  decision_actor, decision_note, result_json, created_at_unix,
+        \\  updated_at_unix, decided_at_unix, applied_at_unix
+        \\) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+        \\ON CONFLICT(action_id) DO UPDATE SET
+        \\  run_id = excluded.run_id,
+        \\  workspace_id = excluded.workspace_id,
+        \\  ontology_id = excluded.ontology_id,
+        \\  issue_type = excluded.issue_type,
+        \\  severity = excluded.severity,
+        \\  confidence = excluded.confidence,
+        \\  reason = excluded.reason,
+        \\  schema_id = excluded.schema_id,
+        \\  entity_type = excluded.entity_type,
+        \\  projection_id = excluded.projection_id,
+        \\  evidence_json = excluded.evidence_json,
+        \\  mcp_tool = excluded.mcp_tool,
+        \\  tool_args_json = excluded.tool_args_json,
+        \\  execution_mode = excluded.execution_mode,
+        \\  idempotency_key = excluded.idempotency_key,
+        \\  status = excluded.status,
+        \\  decision_actor = excluded.decision_actor,
+        \\  decision_note = excluded.decision_note,
+        \\  result_json = excluded.result_json,
+        \\  created_at_unix = excluded.created_at_unix,
+        \\  updated_at_unix = excluded.updated_at_unix,
+        \\  decided_at_unix = excluded.decided_at_unix,
+        \\  applied_at_unix = excluded.applied_at_unix
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.action_id);
+    try facet_sqlite.bindText(stmt, 2, row.run_id);
+    try facet_sqlite.bindText(stmt, 3, row.workspace_id);
+    try bindMaybeText(stmt, 4, row.ontology_id);
+    try facet_sqlite.bindText(stmt, 5, row.issue_type);
+    try facet_sqlite.bindText(stmt, 6, row.severity);
+    try bindDouble(stmt, 7, row.confidence);
+    try facet_sqlite.bindText(stmt, 8, row.reason);
+    try bindMaybeText(stmt, 9, row.schema_id);
+    try bindMaybeText(stmt, 10, row.entity_type);
+    try bindMaybeText(stmt, 11, row.projection_id);
+    try facet_sqlite.bindText(stmt, 12, row.evidence_json);
+    try bindMaybeText(stmt, 13, row.mcp_tool);
+    try facet_sqlite.bindText(stmt, 14, row.tool_args_json);
+    try facet_sqlite.bindText(stmt, 15, row.execution_mode);
+    try facet_sqlite.bindText(stmt, 16, row.idempotency_key);
+    try facet_sqlite.bindText(stmt, 17, row.status);
+    try bindMaybeText(stmt, 18, row.decision_actor);
+    try bindMaybeText(stmt, 19, row.decision_note);
+    try facet_sqlite.bindText(stmt, 20, row.result_json);
+    try facet_sqlite.bindInt64(stmt, 21, row.created_at_unix);
+    try facet_sqlite.bindInt64(stmt, 22, row.updated_at_unix);
+    try bindMaybeInt(stmt, 23, row.decided_at_unix);
+    try bindMaybeInt(stmt, 24, row.applied_at_unix);
+    try execPreparedDone(stmt);
 }
 
 fn upsertAnswerArtifact(db: Database, row: AnswerArtifactRow) !void {
@@ -2626,6 +2774,88 @@ fn selectAnswerEvents(arena: Allocator, db: Database, workspace_id: []const u8) 
     return rows.toOwnedSlice(arena);
 }
 
+fn selectQualityConvergenceRuns(arena: Allocator, db: Database, workspace_id: []const u8) ![]QualityConvergenceRunRow {
+    const sql =
+        \\SELECT run_id, workspace_id, ontology_id, run_kind, status, canonical_layer,
+        \\       input_fingerprint, summary_json, report_json, created_at_unix, updated_at_unix
+        \\FROM quality_convergence_run
+        \\WHERE workspace_id = ?1
+        \\ORDER BY created_at_unix ASC, run_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(QualityConvergenceRunRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .run_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .ontology_id = try maybeColText(arena, stmt, 2),
+            .run_kind = try facet_sqlite.dupeColumnText(arena, stmt, 3),
+            .status = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .canonical_layer = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .input_fingerprint = try facet_sqlite.dupeColumnText(arena, stmt, 6),
+            .summary_json = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+            .report_json = try facet_sqlite.dupeColumnText(arena, stmt, 8),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 9),
+            .updated_at_unix = c.sqlite3_column_int64(stmt, 10),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn selectQualityRemediationActions(arena: Allocator, db: Database, workspace_id: []const u8) ![]QualityRemediationActionRow {
+    const sql =
+        \\SELECT action_id, run_id, workspace_id, ontology_id, issue_type, severity,
+        \\       confidence, reason, schema_id, entity_type, projection_id, evidence_json,
+        \\       mcp_tool, tool_args_json, execution_mode, idempotency_key, status,
+        \\       decision_actor, decision_note, result_json, created_at_unix, updated_at_unix,
+        \\       decided_at_unix, applied_at_unix
+        \\FROM quality_remediation_action
+        \\WHERE workspace_id = ?1
+        \\ORDER BY created_at_unix ASC, action_id ASC
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var rows = std.ArrayList(QualityRemediationActionRow).empty;
+    while (true) {
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_DONE) break;
+        if (status != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(arena, .{
+            .action_id = try facet_sqlite.dupeColumnText(arena, stmt, 0),
+            .run_id = try facet_sqlite.dupeColumnText(arena, stmt, 1),
+            .workspace_id = try facet_sqlite.dupeColumnText(arena, stmt, 2),
+            .ontology_id = try maybeColText(arena, stmt, 3),
+            .issue_type = try facet_sqlite.dupeColumnText(arena, stmt, 4),
+            .severity = try facet_sqlite.dupeColumnText(arena, stmt, 5),
+            .confidence = c.sqlite3_column_double(stmt, 6),
+            .reason = try facet_sqlite.dupeColumnText(arena, stmt, 7),
+            .schema_id = try maybeColText(arena, stmt, 8),
+            .entity_type = try maybeColText(arena, stmt, 9),
+            .projection_id = try maybeColText(arena, stmt, 10),
+            .evidence_json = try facet_sqlite.dupeColumnText(arena, stmt, 11),
+            .mcp_tool = try maybeColText(arena, stmt, 12),
+            .tool_args_json = try facet_sqlite.dupeColumnText(arena, stmt, 13),
+            .execution_mode = try facet_sqlite.dupeColumnText(arena, stmt, 14),
+            .idempotency_key = try facet_sqlite.dupeColumnText(arena, stmt, 15),
+            .status = try facet_sqlite.dupeColumnText(arena, stmt, 16),
+            .decision_actor = try maybeColText(arena, stmt, 17),
+            .decision_note = try maybeColText(arena, stmt, 18),
+            .result_json = try facet_sqlite.dupeColumnText(arena, stmt, 19),
+            .created_at_unix = c.sqlite3_column_int64(stmt, 20),
+            .updated_at_unix = c.sqlite3_column_int64(stmt, 21),
+            .decided_at_unix = if (c.sqlite3_column_type(stmt, 22) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 22),
+            .applied_at_unix = if (c.sqlite3_column_type(stmt, 23) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 23),
+        });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
 fn maybeColText(arena: Allocator, stmt: *c.sqlite3_stmt, index: c_int) !?[]const u8 {
     if (c.sqlite3_column_type(stmt, index) == c.SQLITE_NULL) return null;
     return try facet_sqlite.dupeColumnText(arena, stmt, index);
@@ -2645,6 +2875,11 @@ fn bindMaybeDouble(stmt: *c.sqlite3_stmt, index: c_int, value: ?f64) !void {
 
 fn bindDouble(stmt: *c.sqlite3_stmt, index: c_int, value: f64) !void {
     if (c.sqlite3_bind_double(stmt, index, value) != c.SQLITE_OK) return error.BindFailed;
+}
+
+fn execPreparedDone(stmt: *c.sqlite3_stmt) !void {
+    const status = c.sqlite3_step(stmt);
+    if (status != c.SQLITE_DONE) return error.StepFailed;
 }
 
 fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {

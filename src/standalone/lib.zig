@@ -39,6 +39,7 @@ pub const pragma_dsl = @import("pragma_dsl.zig");
 pub const pragma_projection_types = @import("pragma_projection_types.zig");
 pub const pragma_sqlite = @import("pragma_sqlite.zig");
 pub const query_executor = @import("query_executor.zig");
+pub const quality_convergence = @import("quality_convergence.zig");
 pub const queue_sqlite = @import("queue_sqlite.zig");
 pub const qualification_apply = @import("qualification_apply.zig");
 pub const qualification_normalize = @import("qualification_normalize.zig");

@@ -57,6 +57,7 @@ comptime {
     _ = @import("pragma_dsl.zig");
     _ = @import("pragma_sqlite.zig");
     _ = @import("query_executor.zig");
+    _ = @import("quality_convergence.zig");
     _ = @import("queue_sqlite.zig");
     _ = @import("reference_extractor.zig");
     _ = @import("search_compact_store.zig");

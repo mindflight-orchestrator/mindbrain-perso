@@ -15,6 +15,7 @@ const linkml_interchange = @import("linkml_interchange.zig");
 const owl2_import = @import("owl2_import.zig");
 const reindex_http = @import("reindex_http.zig");
 const pragma_sqlite = @import("pragma_sqlite.zig");
+const quality_convergence = @import("quality_convergence.zig");
 const queue_sqlite = @import("queue_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
 const syndic_profile_seed = @import("syndic_profile_seed.zig");
@@ -193,6 +194,27 @@ const OntologyCompileLinkmlRequest = struct {
     name: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     materialize_graph: bool = false,
+};
+
+const QualityConvergenceRunRequest = struct {
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8 = null,
+    persist: bool = true,
+    limit: usize = 200,
+    component_small_max: usize = 2,
+};
+
+const QualityRemediationDecisionRequest = struct {
+    action_id: []const u8,
+    decision: []const u8,
+    actor: ?[]const u8 = null,
+    note: ?[]const u8 = null,
+};
+
+const QualityRemediationStatusRequest = struct {
+    action_id: []const u8,
+    status: []const u8,
+    result_json: []const u8 = "{}",
 };
 
 pub const DefaultWorkspaceOptions = struct {
@@ -1053,6 +1075,21 @@ pub const MindbrainHttpApp = struct {
             return try self.handleGraphPatternQuery(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/run")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleQualityConvergenceRun(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/remediation/decision")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleQualityRemediationDecision(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/remediation/status")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleQualityRemediationStatus(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -1117,6 +1154,15 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules")) {
             return self.handleGraphGapRules(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/runs")) {
+            return self.handleQualityConvergenceRuns(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/run")) {
+            return self.handleQualityConvergenceGet(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/remediation/actions")) {
+            return self.handleQualityRemediationActions(allocator, query);
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/entity")) {
             return self.handleGraphEntityDetail(allocator, query);
@@ -2308,6 +2354,154 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleQualityConvergenceRun(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const run_request = try self.parseQualityConvergenceRunRequest(allocator, request, body_buffer);
+
+        if (run_request.persist) {
+            self.writer_mutex.lockUncancelable(self.io);
+            defer self.writer_mutex.unlock(self.io);
+            if (self.writer_active_session_id != null) {
+                return try self.writerSessionBusyResponse(allocator);
+            }
+            var result = quality_convergence.runConvergence(self.writer_db, allocator, .{
+                .workspace_id = run_request.workspace_id,
+                .ontology_id = run_request.ontology_id,
+                .persist = true,
+                .limit = run_request.limit,
+                .component_small_max = run_request.component_small_max,
+            }) catch |err| {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "quality.convergence.run", err);
+                return err;
+            };
+            defer result.deinit(allocator);
+            self.writer_completed += 1;
+            return .{
+                .status = .ok,
+                .content_type = "application/json; charset=utf-8",
+                .body = try allocator.dupe(u8, result.report_json),
+            };
+        }
+
+        var db = try self.openDb();
+        defer db.close();
+        var result = try quality_convergence.runConvergence(db, allocator, .{
+            .workspace_id = run_request.workspace_id,
+            .ontology_id = run_request.ontology_id,
+            .persist = false,
+            .limit = run_request.limit,
+            .component_small_max = run_request.component_small_max,
+        });
+        defer result.deinit(allocator);
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try allocator.dupe(u8, result.report_json),
+        };
+    }
+
+    fn handleQualityConvergenceRuns(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try std.fmt.parseInt(usize, value, 10)
+        else
+            20;
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try quality_convergence.listRunsJson(db, allocator, workspace_id, limit),
+        };
+    }
+
+    fn handleQualityConvergenceGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const run_id = (try queryValue(allocator, query, "run_id")) orelse return error.BadRequest;
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try quality_convergence.getRunJson(db, allocator, run_id),
+        };
+    }
+
+    fn handleQualityRemediationActions(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const run_id = (try queryValue(allocator, query, "run_id")) orelse return error.BadRequest;
+        const status = normalizeOptionalQueryValue(try queryValue(allocator, query, "status"));
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try quality_convergence.actionsJson(db, allocator, run_id, status),
+        };
+    }
+
+    fn handleQualityRemediationDecision(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const decision_request = try self.parseQualityRemediationDecisionRequest(allocator, request, body_buffer);
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        quality_convergence.decideAction(self.writer_db, decision_request.action_id, decision_request.decision, decision_request.actor, decision_request.note) catch |err| switch (err) {
+            error.InvalidDecision => return error.BadRequest,
+            else => {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "quality.remediation.decision", err);
+                return err;
+            },
+        };
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{
+            .ok = true,
+            .action_id = decision_request.action_id,
+            .decision = decision_request.decision,
+        }));
+    }
+
+    fn handleQualityRemediationStatus(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const status_request = try self.parseQualityRemediationStatusRequest(allocator, request, body_buffer);
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        quality_convergence.updateActionStatus(self.writer_db, status_request.action_id, status_request.status, status_request.result_json) catch |err| switch (err) {
+            error.InvalidStatus => return error.BadRequest,
+            else => {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "quality.remediation.status", err);
+                return err;
+            },
+        };
+        self.writer_completed += 1;
+        return toResponse(try helper_api.jsonResponse(allocator, .{
+            .ok = true,
+            .action_id = status_request.action_id,
+            .status = status_request.status,
+        }));
+    }
+
     fn handleOntologyImportPost(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -2895,6 +3089,51 @@ pub const MindbrainHttpApp = struct {
         );
     }
 
+    fn parseQualityConvergenceRunRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !QualityConvergenceRunRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            QualityConvergenceRunRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseQualityRemediationDecisionRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !QualityRemediationDecisionRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            QualityRemediationDecisionRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
+    fn parseQualityRemediationStatusRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !QualityRemediationStatusRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            QualityRemediationStatusRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
     fn readPostBody(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -3103,10 +3342,12 @@ pub const MindbrainHttpApp = struct {
             .ontology_import = @hasDecl(@This(), "handleOntologyImportPost"),
             .ontology_compile_linkml = @hasDecl(@This(), "handleOntologyCompileLinkmlPost"),
             .ontology_inspect = @hasDecl(@This(), "handleOntologyInspect"),
+            .quality_convergence = @hasDecl(@This(), "handleQualityConvergenceRun"),
+            .quality_remediation_actions = @hasDecl(@This(), "handleQualityRemediationActions"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -3118,6 +3359,8 @@ pub const MindbrainHttpApp = struct {
                 features.ontology_import,
                 features.ontology_compile_linkml,
                 features.ontology_inspect,
+                features.quality_convergence,
+                features.quality_remediation_actions,
                 self.graph_bitmap_mode.text(),
                 self.graph_bitmap_mode.effectiveText(),
             },

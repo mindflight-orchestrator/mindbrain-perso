@@ -20,6 +20,7 @@ const llm = mindbrain.llm;
 const llm_provider = mindbrain.llm_provider;
 const nanoid = mindbrain.nanoid;
 const pragma_sqlite = mindbrain.pragma_sqlite;
+const quality_convergence = mindbrain.quality_convergence;
 const queue_sqlite = mindbrain.queue_sqlite;
 const query_executor = mindbrain.query_executor;
 const ontology_sqlite = mindbrain.ontology_sqlite;
@@ -211,6 +212,26 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "graph-gap-rules-import")) {
         try runGraphGapRulesImportCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "quality-convergence")) {
+        try runQualityConvergenceCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "quality-remediation-list")) {
+        try runQualityRemediationListCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "quality-remediation-decision")) {
+        try runQualityRemediationDecisionCommand(args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "quality-remediation-status")) {
+        try runQualityRemediationStatusCommand(args[2..]);
         return;
     }
 
@@ -450,6 +471,10 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
         \\  mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
         \\  mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
+        \\  mindbrain-standalone-tool quality-convergence --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--no-persist] [--limit <n>]
+        \\  mindbrain-standalone-tool quality-remediation-list --db <sqlite_path> --run-id <id> [--status <status>]
+        \\  mindbrain-standalone-tool quality-remediation-decision --db <sqlite_path> --action-id <id> --decision approved|rejected [--actor <id>] [--note <text>]
+        \\  mindbrain-standalone-tool quality-remediation-status --db <sqlite_path> --action-id <id> --status proposed|approved|rejected|applied|failed|skipped [--result-json <json>]
         \\  mindbrain-standalone-tool search-compact-info --db <sqlite_path>
         \\  mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
         \\  mindbrain-standalone-tool seed-demo --db <sqlite_path>
@@ -793,6 +818,180 @@ fn runGraphGapRulesImportCommand(allocator: Allocator, args: []const []const u8)
 
     const imported = try graph_diagnostics.importRulesJson(db, allocator, json);
     try writeStdout("{f}\n", .{std.json.fmt(.{ .ok = true, .imported = imported }, .{})});
+}
+
+fn runQualityConvergenceCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var persist = true;
+    var limit: usize = 200;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--workspace-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            workspace_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--ontology-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            ontology_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--no-persist")) {
+            persist = false;
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var result = try quality_convergence.runConvergence(db, allocator, .{
+        .workspace_id = workspace_id.?,
+        .ontology_id = ontology_id,
+        .persist = persist,
+        .limit = limit,
+    });
+    defer result.deinit(allocator);
+    try writeStdout("{s}\n", .{result.report_json});
+}
+
+fn runQualityRemediationListCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var run_id: ?[]const u8 = null;
+    var status: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--run-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            run_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--status")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            status = args[index];
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or run_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const payload = try quality_convergence.actionsJson(db, allocator, run_id.?, status);
+    defer allocator.free(payload);
+    try writeStdout("{s}\n", .{payload});
+}
+
+fn runQualityRemediationDecisionCommand(args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var action_id: ?[]const u8 = null;
+    var decision: ?[]const u8 = null;
+    var actor: ?[]const u8 = null;
+    var note: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--action-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            action_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--decision")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            decision = args[index];
+        } else if (std.mem.eql(u8, arg, "--actor")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            actor = args[index];
+        } else if (std.mem.eql(u8, arg, "--note")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            note = args[index];
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or action_id == null or decision == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    quality_convergence.decideAction(db, action_id.?, decision.?, actor, note) catch |err| switch (err) {
+        error.InvalidDecision => return CliError.InvalidArguments,
+        else => return err,
+    };
+    try writeStdout("{f}\n", .{std.json.fmt(.{ .ok = true, .action_id = action_id.?, .decision = decision.? }, .{})});
+}
+
+fn runQualityRemediationStatusCommand(args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var action_id: ?[]const u8 = null;
+    var status: ?[]const u8 = null;
+    var result_json: []const u8 = "{}";
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--action-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            action_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--status")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            status = args[index];
+        } else if (std.mem.eql(u8, arg, "--result-json")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            result_json = args[index];
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or action_id == null or status == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+    quality_convergence.updateActionStatus(db, action_id.?, status.?, result_json) catch |err| switch (err) {
+        error.InvalidStatus => return CliError.InvalidArguments,
+        else => return err,
+    };
+    try writeStdout("{f}\n", .{std.json.fmt(.{ .ok = true, .action_id = action_id.?, .status = status.? }, .{})});
 }
 
 fn runCoverageCommand(allocator: Allocator, args: []const []const u8, by_domain: bool) !void {
