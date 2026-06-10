@@ -28,7 +28,7 @@ const http = std.http;
 const log = std.log.scoped(.mindbrain_http);
 
 /// Standalone HTTP engine version exposed by GET /api/mindbrain/capabilities.
-const mindbrain_version = "1.6.1";
+const mindbrain_version = "1.7.1";
 
 fn unixTimestamp() i64 {
     return std.Io.Timestamp.now(zig16_compat.io(), .real).toSeconds();
