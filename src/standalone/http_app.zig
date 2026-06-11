@@ -21,6 +21,7 @@ const search_sqlite = @import("search_sqlite.zig");
 const syndic_profile_seed = @import("syndic_profile_seed.zig");
 const toon_exports = @import("toon_exports.zig");
 const workspace_sqlite = @import("workspace_sqlite.zig");
+const schema_column_migrations = @import("schema_column_migrations.zig");
 const zig16_compat = @import("zig16_compat.zig");
 const http_config = @import("http_server_config.zig");
 
@@ -28,7 +29,7 @@ const http = std.http;
 const log = std.log.scoped(.mindbrain_http);
 
 /// Standalone HTTP engine version exposed by GET /api/mindbrain/capabilities.
-const mindbrain_version = "1.7.1";
+const mindbrain_version = schema_column_migrations.mindbrain_version;
 
 fn unixTimestamp() i64 {
     return std.Io.Timestamp.now(zig16_compat.io(), .real).toSeconds();
@@ -1107,6 +1108,10 @@ pub const MindbrainHttpApp = struct {
 
         if (std.mem.eql(u8, path, "/api/mindbrain/capabilities")) {
             return self.handleCapabilities(allocator);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/schema/status")) {
+            return self.handleSchemaStatus(allocator);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/simulate")) {
@@ -3365,6 +3370,48 @@ pub const MindbrainHttpApp = struct {
                 self.graph_bitmap_mode.effectiveText(),
             },
         );
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = body,
+        };
+    }
+
+    fn handleSchemaStatus(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        var db = try self.openDb();
+        defer db.close();
+        try db.applyStandaloneSchema();
+
+        const applied = try schema_column_migrations.listAppliedMigrations(allocator, db);
+        defer {
+            for (applied) |id| allocator.free(id);
+            allocator.free(applied);
+        }
+
+        const missing = try schema_column_migrations.findMissingColumns(allocator, db);
+        defer {
+            for (missing) |item| {
+                allocator.free(item.table);
+                allocator.free(item.column);
+            }
+            allocator.free(missing);
+        }
+
+        const tables_count = try schema_column_migrations.schemaTablesCount(db);
+
+        var missing_json = std.ArrayList(struct { table: []const u8, column: []const u8 }).empty;
+        defer missing_json.deinit(allocator);
+        for (missing) |item| {
+            try missing_json.append(allocator, .{ .table = item.table, .column = item.column });
+        }
+
+        const body = try std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "mindbrain_schema_status",
+            .mindbrain_version = mindbrain_version,
+            .schema_tables_count = tables_count,
+            .applied_migrations = applied,
+            .missing_columns = missing_json.items,
+        }, .{});
         return .{
             .status = .ok,
             .content_type = "application/json; charset=utf-8",

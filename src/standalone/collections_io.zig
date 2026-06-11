@@ -7,6 +7,7 @@ const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
+const schema_column_migrations = @import("schema_column_migrations.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = facet_sqlite.Database;
@@ -40,6 +41,7 @@ pub const BundleSummary = struct {
     relation_property_count: usize,
     answer_artifact_count: usize,
     answer_event_count: usize,
+    exported_mindbrain_version: ?[]const u8 = null,
 
     pub fn deinit(self: BundleSummary, allocator: Allocator) void {
         allocator.free(self.kind);
@@ -48,6 +50,7 @@ pub const BundleSummary = struct {
         allocator.free(self.workspace_id);
         if (self.collection_id) |value| allocator.free(value);
         if (self.facet_collection_id) |value| allocator.free(value);
+        if (self.exported_mindbrain_version) |value| allocator.free(value);
     }
 };
 
@@ -56,6 +59,7 @@ const json_writer_capacity: usize = 8 * 1024;
 const Bundle = struct {
     kind: []const u8 = "ghostcrab_backup_bundle",
     schema_version: []const u8 = "2",
+    exported_with: ?ExportedWithJson = null,
     scope: ScopeJson,
     workspaces: []WorkspaceRow,
     collections: []CollectionRow,
@@ -102,6 +106,11 @@ const ScopeJson = struct {
     kind: []const u8,
     workspace_id: []const u8,
     collection_id: ?[]const u8,
+};
+
+const ExportedWithJson = struct {
+    mindbrain_version: []const u8,
+    bundle_schema_version: []const u8,
 };
 
 const WorkspaceRow = struct {
@@ -561,6 +570,10 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
     };
 
     const bundle = Bundle{
+        .exported_with = .{
+            .mindbrain_version = schema_column_migrations.mindbrain_version,
+            .bundle_schema_version = "2",
+        },
         .scope = .{
             .kind = switch (scope) {
                 .workspace => "workspace",
@@ -1506,7 +1519,37 @@ pub fn summarizeBundleJson(allocator: Allocator, json_bytes: []const u8) !Bundle
         .relation_property_count = bundle.relation_properties_raw.len,
         .answer_artifact_count = bundle.mindbrain_answer_artifacts.len,
         .answer_event_count = bundle.mindbrain_answer_events.len,
+        .exported_mindbrain_version = if (bundle.exported_with) |meta| try allocator.dupe(u8, meta.mindbrain_version) else null,
     };
+}
+
+pub const SchemaColumnsMissingError = error{
+    SchemaColumnsMissing,
+};
+
+/// Returns missing manifest columns still absent after `applyStandaloneSchema`.
+pub fn findMissingSchemaColumns(allocator: Allocator, db: Database) ![]schema_column_migrations.MissingColumn {
+    return schema_column_migrations.findMissingColumns(allocator, db);
+}
+
+/// Fails with `SchemaColumnsMissing` when required columns are still absent.
+pub fn ensureBundleSchemaReady(allocator: Allocator, db: Database) !void {
+    const missing = try findMissingSchemaColumns(allocator, db);
+    defer {
+        for (missing) |item| {
+            allocator.free(item.table);
+            allocator.free(item.column);
+        }
+        allocator.free(missing);
+    }
+    if (missing.len == 0) return;
+
+    std.debug.print("backup-load schema preflight failed: missing columns after upgrade:\n", .{});
+    for (missing) |item| {
+        std.debug.print("  - {s}.{s}\n", .{ item.table, item.column });
+    }
+    std.debug.print("Run mindbrain schema apply / gcp brain upgrade --db <path> on the target database first.\n", .{});
+    return SchemaColumnsMissingError.SchemaColumnsMissing;
 }
 
 // ---- Internal selectors ---------------------------------------------------
@@ -3039,6 +3082,8 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expect(std.mem.indexOf(u8, bundle, "ws_round::docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"kind\": \"ghostcrab_backup_bundle\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"schema_version\": \"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"exported_with\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_version\": \"1.7.1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"ontology_values\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "confidence_note") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_artifacts\"") != null);
@@ -3072,6 +3117,52 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM chunks_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id = 'ws_round' AND current_version = 3"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
+}
+
+test "legacy database missing additive columns imports bundle after schema apply" {
+    var source = try Database.openInMemory();
+    defer source.close();
+    try source.applyStandaloneSchema();
+
+    try collections_sqlite.ensureWorkspace(source, .{ .workspace_id = "ws_legacy", .label = "Legacy" });
+    try collections_sqlite.ensureCollection(source, .{
+        .workspace_id = "ws_legacy",
+        .collection_id = "ws_legacy::docs",
+        .name = "docs",
+        .key_kind = "integer",
+        .chunk_bits = 8,
+        .default_language = "fr",
+    });
+    try collections_sqlite.upsertDocumentRaw(source, .{
+        .workspace_id = "ws_legacy",
+        .collection_id = "ws_legacy::docs",
+        .doc_id = 1,
+        .doc_nanoid = "doc1",
+        .content = "hello",
+        .summary = "short",
+    });
+
+    const bundle = try exportToJson(std.testing.allocator, source, .{ .workspace = "ws_legacy" });
+    defer std.testing.allocator.free(bundle);
+
+    var legacy = try Database.openInMemory();
+    defer legacy.close();
+    try legacy.applyStandaloneSchema();
+    try legacy.exec("ALTER TABLE documents_raw DROP COLUMN summary");
+    try std.testing.expect(!try schema_column_migrations.columnExists(legacy, "documents_raw", "summary"));
+
+    try legacy.applyStandaloneSchema();
+    try ensureBundleSchemaReady(std.testing.allocator, legacy);
+    try importBundleJson(legacy, std.testing.allocator, bundle);
+
+    const stmt = try facet_sqlite.prepare(
+        legacy,
+        "SELECT summary FROM documents_raw WHERE workspace_id = 'ws_legacy' AND doc_id = 1",
+    );
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    const summary_ptr = c.sqlite3_column_text(stmt, 0) orelse return error.MissingRow;
+    try std.testing.expectEqualStrings("short", std.mem.span(summary_ptr));
 }
 
 test "taxonomies-only bundle round-trips ontology body without documents" {

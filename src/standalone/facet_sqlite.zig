@@ -2,6 +2,7 @@ const std = @import("std");
 const interfaces = @import("interfaces.zig");
 const roaring = @import("roaring.zig");
 const sqlite_schema = @import("sqlite_schema.zig");
+const schema_column_migrations = @import("schema_column_migrations.zig");
 
 const bm25_stopwords_seed_sql = @embedFile("seed_bm25_stopwords.sql");
 
@@ -133,11 +134,16 @@ pub const Database = struct {
         const schema = try sqlite_schema.renderMetadataSchema(std.heap.page_allocator);
         defer std.heap.page_allocator.free(schema);
         try self.exec(schema);
+        try self.applyAdditiveColumnMigrations();
         try self.applyStandaloneStopwordsSeed();
         try self.applyGraphEntityWorkspaceMigration();
         try self.applyRawGraphAutoincrementMigration();
         try self.applyGraphGapRulesMigration();
         try self.applyAgentFactsTableRenameMigration();
+    }
+
+    fn applyAdditiveColumnMigrations(self: Database) Error!void {
+        try schema_column_migrations.applyAdditiveColumnMigrations(self);
     }
 
     fn migrationApplied(self: Database, migration_id: []const u8) Error!bool {

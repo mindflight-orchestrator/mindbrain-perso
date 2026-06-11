@@ -54,6 +54,7 @@ pub const structured_import_ddl = @import("structured_import_ddl.zig");
 pub const structured_import_drift = @import("structured_import_drift.zig");
 pub const structured_import_semantics = @import("structured_import_semantics.zig");
 pub const syndic_profile_seed = @import("syndic_profile_seed.zig");
+pub const schema_column_migrations = @import("schema_column_migrations.zig");
 pub const sqlite_schema = @import("sqlite_schema.zig");
 pub const vector_blob = @import("vector_blob.zig");
 pub const vector_distance = @import("vector_distance.zig");

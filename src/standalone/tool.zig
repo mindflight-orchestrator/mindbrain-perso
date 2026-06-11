@@ -11,6 +11,7 @@ const corpus_profile = mindbrain.corpus_profile;
 const corpus_profile_prompt = mindbrain.corpus_profile_prompt;
 const document_normalize = mindbrain.document_normalize;
 const facet_sqlite = mindbrain.facet_sqlite;
+const schema_column_migrations = mindbrain.schema_column_migrations;
 const graph_diagnostics = mindbrain.graph_diagnostics;
 const graph_sqlite = mindbrain.graph_sqlite;
 const interfaces = mindbrain.interfaces;
@@ -4964,9 +4965,38 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     if (dry_run) {
         const summary = try collections_io.summarizeBundleJson(allocator, buf);
         defer summary.deinit(allocator);
+
+        var missing_columns: ?[]schema_column_migrations.MissingColumn = null;
+        defer if (missing_columns) |items| {
+            for (items) |item| {
+                allocator.free(item.table);
+                allocator.free(item.column);
+            }
+            allocator.free(items);
+        };
+
+        if (db_path) |path| {
+            var db = try facet_sqlite.Database.open(path);
+            defer db.close();
+            try db.applyStandaloneSchema();
+            missing_columns = try schema_column_migrations.findMissingColumns(allocator, db);
+        }
+
+        var preflight = std.ArrayList(struct { table: []const u8, column: []const u8 }).empty;
+        defer preflight.deinit(allocator);
+        if (missing_columns) |items| {
+            for (items) |item| {
+                try preflight.append(allocator, .{ .table = item.table, .column = item.column });
+            }
+        }
+
         try writeStdout("{f}\n", .{std.json.fmt(.{
             .kind = summary.kind,
             .schema_version = summary.schema_version,
+            .exported_with = if (summary.exported_mindbrain_version) |version| .{
+                .mindbrain_version = version,
+                .bundle_schema_version = summary.schema_version,
+            } else null,
             .scope = .{
                 .kind = summary.scope_kind,
                 .workspace_id = summary.workspace_id,
@@ -4982,6 +5012,10 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
                 .facet_tables = summary.facet_table_count,
                 .relation_properties = summary.relation_property_count,
             },
+            .schema_preflight = .{
+                .missing_columns = preflight.items,
+                .ready = preflight.items.len == 0,
+            },
             .reindex = @tagName(reindex_mode),
         }, .{})});
         return;
@@ -4990,6 +5024,7 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
     try db.applyStandaloneSchema();
+    try collections_io.ensureBundleSchemaReady(allocator, db);
 
     const summary = try collections_io.summarizeBundleJson(allocator, buf);
     defer summary.deinit(allocator);

@@ -24,6 +24,7 @@ comptime {
     _ = @import("bm25_stopwords_sqlite.zig");
     _ = @import("answer_artifacts.zig");
     _ = @import("bench.zig");
+    _ = @import("schema_column_migrations.zig");
     _ = @import("facet_sqlite.zig");
     _ = @import("facts_sqlite.zig");
     _ = @import("facet_store.zig");
