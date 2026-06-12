@@ -1091,6 +1091,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleQualityRemediationStatus(allocator, request, body_buffer);
         }
 
+        if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/refresh")) |artifact_id| {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return self.handleGhostcrabArtifactRefresh(allocator, artifact_id);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql/write-status")) {
             if (request.head.method != .GET) return error.MethodNotAllowed;
             return try self.handleSqlWriteStatus(allocator);
@@ -1195,10 +1200,6 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/projection-get")) {
             return self.handleGhostcrabProjectionGet(allocator, query);
-        }
-        if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/refresh")) |artifact_id| {
-            if (request.head.method != .POST) return error.MethodNotAllowed;
-            return self.handleGhostcrabArtifactRefresh(allocator, artifact_id);
         }
         if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/events")) |artifact_id| {
             if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
