@@ -1,5 +1,7 @@
 # MindBrain
 
+**Integration note:** this repository is used as a vendored/internal dependency of [`ghostcrab-personal-mcp`](https://github.com/mindflight-orchestrator/ghostcrab-personal-mcp) and is **not intended for separate installation or standalone use**.
+
 SQLite-first knowledge runtime and native library for **faceted search** (Roaring Bitmaps + **BM25**), **graph traversal**, **memory projection** helpers, workspace metadata, document collections, and a small local HTTP/CLI API. The implementation is primarily **Zig**.
 
 ## Documentation
