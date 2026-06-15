@@ -919,7 +919,11 @@ pub const MindbrainHttpApp = struct {
             const request_allocator = request_arena.allocator();
 
             const parsed = parseTarget(request.head.target) catch {
-                try self.respondError(request_allocator, &request, .bad_request, "invalid request target");
+                try self.respondError(request_allocator, &request, .bad_request, "invalid request target", "", "");
+                continue;
+            };
+            validateQueryEncoding(parsed.query) catch {
+                try self.respondError(request_allocator, &request, .bad_request, "BadRequest", parsed.path, parsed.query);
                 continue;
             };
 
@@ -949,7 +953,14 @@ pub const MindbrainHttpApp = struct {
                 if (status == .internal_server_error) {
                     log.err("request failed on {s}: {s}", .{ parsed.path, @errorName(err) });
                 }
-                try self.respondError(request_allocator, &request, status, @errorName(err));
+                try self.respondError(
+                    request_allocator,
+                    &request,
+                    status,
+                    @errorName(err),
+                    parsed.path,
+                    parsed.query,
+                );
                 continue;
             };
 
@@ -1603,7 +1614,7 @@ pub const MindbrainHttpApp = struct {
         const metadata_filters = normalizeOptionalQueryValue(try queryValue(allocator, query, "metadata_filters"));
         const entity_types = try queryValues(allocator, query, "entity_type");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             20;
 
@@ -1757,11 +1768,11 @@ pub const MindbrainHttpApp = struct {
         const value_query = try queryValue(allocator, query, "value");
         defer if (value_query) |value| allocator.free(value);
         const table_id = if (try queryValue(allocator, query, "table_id")) |raw|
-            try std.fmt.parseInt(u64, raw, 10)
+            try parseQueryInt(u64, raw)
         else
             null;
         const limit = if (try queryValue(allocator, query, "limit")) |raw|
-            try std.fmt.parseInt(usize, raw, 10)
+            try parseQueryInt(usize, raw)
         else
             25;
 
@@ -2320,11 +2331,11 @@ pub const MindbrainHttpApp = struct {
         const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
         const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             200;
         const component_small_max = if (try queryValue(allocator, query, "component_small_max")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             2;
 
@@ -2417,7 +2428,7 @@ pub const MindbrainHttpApp = struct {
 
         const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             20;
         return .{
@@ -3167,7 +3178,7 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const entity_id_text = (try queryValue(allocator, query, "entity_id")) orelse return error.BadRequest;
-        const entity_id = try std.fmt.parseInt(u32, entity_id_text, 10);
+        const entity_id = try parseQueryInt(u32, entity_id_text);
         const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
 
         const stmt = try facet_sqlite.prepare(db,
@@ -3214,7 +3225,7 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const relation_id_text = (try queryValue(allocator, query, "relation_id")) orelse return error.BadRequest;
-        const relation_id = try std.fmt.parseInt(u32, relation_id_text, 10);
+        const relation_id = try parseQueryInt(u32, relation_id_text);
         const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
 
         const stmt = try facet_sqlite.prepare(db,
@@ -3497,7 +3508,7 @@ pub const MindbrainHttpApp = struct {
         const source = (try queryValue(allocator, query, "source")) orelse return error.BadRequest;
         const target = (try queryValue(allocator, query, "target")) orelse return error.BadRequest;
         const max_depth = if (try queryValue(allocator, query, "max_depth")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             4;
         const edge_labels = try queryValues(allocator, query, "edge_label");
@@ -3529,7 +3540,7 @@ pub const MindbrainHttpApp = struct {
         if (seed_ids.len == 0) return error.BadRequest;
 
         const hops = if (try queryValue(allocator, query, "hops")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             2;
 
@@ -3591,7 +3602,7 @@ pub const MindbrainHttpApp = struct {
         else
             graph_sqlite.TraverseDirection.outbound;
         const depth = if (try queryValue(allocator, query, "depth")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             3;
         const target = try queryValue(allocator, query, "target");
@@ -3633,7 +3644,7 @@ pub const MindbrainHttpApp = struct {
         const query_text = (try queryValue(allocator, query, "query")) orelse return error.BadRequest;
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             15;
 
@@ -3666,7 +3677,7 @@ pub const MindbrainHttpApp = struct {
         const query_text = (try queryValue(allocator, query, "query")) orelse "";
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             15;
 
@@ -3771,7 +3782,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             50;
         if (limit == 0 or limit > 500) return error.BadRequest;
@@ -3796,7 +3807,7 @@ pub const MindbrainHttpApp = struct {
         const query_text = (try queryValue(allocator, query, "query")) orelse "";
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
-            try std.fmt.parseInt(usize, value, 10)
+            try parseQueryInt(usize, value)
         else
             15;
 
@@ -4078,10 +4089,29 @@ pub const MindbrainHttpApp = struct {
         return null;
     }
 
-    fn respondError(_: *MindbrainHttpApp, allocator: std.mem.Allocator, request: *http.Server.Request, status: http.Status, message: []const u8) !void {
+    fn respondError(
+        _: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        status: http.Status,
+        message: []const u8,
+        path: []const u8,
+        query: []const u8,
+    ) !void {
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        try out.writer.print("{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
+        if (status == .bad_request) {
+            try out.writer.print(
+                "{{\"ok\":false,\"error\":{{\"code\":\"bad_request\",\"message\":{f}}},\"path\":{f},\"query\":{f}}}",
+                .{
+                    std.json.fmt(message, .{}),
+                    std.json.fmt(path, .{}),
+                    std.json.fmt(query, .{}),
+                },
+            );
+        } else {
+            try out.writer.print("{f}", .{std.json.fmt(.{ .@"error" = message }, .{})});
+        }
         const payload = try out.toOwnedSlice();
         try request.respond(
             payload,
@@ -5140,10 +5170,14 @@ fn parseCsvU32List(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
     while (it.next()) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0) continue;
-        try result.append(allocator, try std.fmt.parseInt(u32, trimmed, 10));
+        try result.append(allocator, try parseCsvU32(trimmed));
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+fn parseCsvU32(value: []const u8) !u32 {
+    return std.fmt.parseInt(u32, value, 10) catch error.BadRequest;
 }
 
 fn parseCsvStringList(allocator: std.mem.Allocator, text: []const u8) ![]const []const u8 {
@@ -5161,12 +5195,32 @@ fn parseCsvStringList(allocator: std.mem.Allocator, text: []const u8) ![]const [
 }
 
 fn decodeQueryComponent(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    try validateQueryEncoding(raw);
+
     const copy = try allocator.alloc(u8, raw.len);
     @memcpy(copy, raw);
     for (copy) |*byte| {
         if (byte.* == '+') byte.* = ' ';
     }
     return std.Uri.percentDecodeInPlace(copy);
+}
+
+fn validateQueryEncoding(raw: []const u8) !void {
+    var index: usize = 0;
+    while (index < raw.len) {
+        const byte = raw[index];
+        if (byte == '%') {
+            if (index + 2 >= raw.len) return error.BadRequest;
+            if (!std.ascii.isHex(raw[index + 1]) or !std.ascii.isHex(raw[index + 2])) return error.BadRequest;
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn parseQueryInt(comptime Int: type, value: []const u8) !Int {
+    return std.fmt.parseInt(Int, value, 10) catch error.BadRequest;
 }
 
 fn parseDirection(text: []const u8) ?graph_sqlite.TraverseDirection {
@@ -5737,6 +5791,29 @@ test "http search embedding request rejects malformed JSON bodies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.BadRequest, parseSearchEmbeddingUpsertBody(arena.allocator(), "{\"table_id\":1,\"doc_id\":2,\"embedding\":[0.1],\"extra\":true}"));
+}
+
+test "decodeQueryComponent handles plus and colon encoding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = try decodeQueryComponent(arena.allocator(), "a+b%3Ac");
+    try std.testing.expect(std.mem.eql(u8, decoded, "a b:c"));
+}
+
+test "decodeQueryComponent rejects malformed percent encoding" {
+    try std.testing.expectError(error.BadRequest, decodeQueryComponent(std.testing.allocator, "a%ZZ"));
+    try std.testing.expectError(error.BadRequest, decodeQueryComponent(std.testing.allocator, "a%"));
+}
+
+test "decodeQueryComponent rejects truncated trailing percent" {
+    try std.testing.expectError(error.BadRequest, decodeQueryComponent(std.testing.allocator, "%"));
+}
+
+test "query boundary rejects malformed percent encoding" {
+    try std.testing.expectError(error.BadRequest, validateQueryEncoding("bad=%ZZ"));
+    try std.testing.expectError(error.BadRequest, validateQueryEncoding("bad=%Z"));
+    try std.testing.expectError(error.BadRequest, validateQueryEncoding("bad=%"));
+    try validateQueryEncoding("workspace_id=ws%3Aok&query=a+b");
 }
 
 test "production embedders disable lab-only SSE and simulate routes by default" {

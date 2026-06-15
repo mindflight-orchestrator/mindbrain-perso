@@ -9,6 +9,7 @@ ADDR="127.0.0.1:${PORT}"
 BASE_URL="http://${ADDR}"
 DB_PATH="$(mktemp "/tmp/mindbrain-http-contract.XXXXXX.sqlite")"
 LOG_PATH="$(mktemp "/tmp/mindbrain-http-contract.XXXXXX.log")"
+FACTS_TABLE="agent_facts"
 
 server_pid=""
 cleanup() {
@@ -111,6 +112,28 @@ invalid_status="$(
 test "${invalid_status}" = "400"
 rm -f /tmp/mindbrain-http-contract-invalid.json
 
+malformed_query_body="$(mktemp "/tmp/mindbrain-http-contract-malformed-query.XXXXXX.json")"
+malformed_query_status="$(
+  curl -sS --max-time 10 -o "${malformed_query_body}" -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X GET "${BASE_URL}/api/mindbrain/graph/type-counts?workspace_id=%ZZ"
+)"
+test "${malformed_query_status}" = "400"
+malformed_query_body_contents="$(cat "${malformed_query_body}")"
+assert_json "${malformed_query_body_contents}" "value.ok === false && value.path === '/api/mindbrain/graph/type-counts' && value.query === 'workspace_id=%ZZ' && value.error.code === 'bad_request'"
+rm -f "${malformed_query_body}"
+
+ignored_malformed_query_body="$(mktemp "/tmp/mindbrain-http-contract-ignored-malformed-query.XXXXXX.json")"
+ignored_malformed_query_status="$(
+  curl -sS --max-time 10 -o "${ignored_malformed_query_body}" -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -X GET "${BASE_URL}/api/mindbrain/capabilities?bad=%ZZ"
+)"
+test "${ignored_malformed_query_status}" = "400"
+ignored_malformed_query_body_contents="$(cat "${ignored_malformed_query_body}")"
+assert_json "${ignored_malformed_query_body_contents}" "value.ok === false && value.path === '/api/mindbrain/capabilities' && value.query === 'bad=%ZZ' && value.error.code === 'bad_request'"
+rm -f "${ignored_malformed_query_body}"
+
 lock_session_open="$(post_json /api/mindbrain/sql/session/open '{}')"
 lock_session_id="$(json_field "${lock_session_open}" "value.session_id")"
 active_write_status="$(get_json /api/mindbrain/sql/write-status)"
@@ -135,7 +158,7 @@ busy_write_status="$(
   curl -sS --max-time 10 -o "${busy_write_body}" -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST "${BASE_URL}/api/mindbrain/sql" \
-    --data '{"sql":"INSERT INTO facets (schema_id, content, facets, workspace_id) VALUES (\"busy:http\", \"busy raw\", \"{}\", \"default\")","params":[]}'
+    --data "{\"sql\":\"INSERT INTO ${FACTS_TABLE} (schema_id, content, facets, workspace_id) VALUES ('busy:http', 'busy raw', '{}', 'default')\",\"params\":[]}"
 )"
 busy_write_elapsed_ms="$(( $(date +%s%3N) - busy_write_start_ms ))"
 test "${busy_write_status}" = "503"
@@ -148,7 +171,7 @@ with_write_status="$(
   curl -sS --max-time 10 -o "${with_write_body}" -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST "${BASE_URL}/api/mindbrain/sql" \
-    --data '{"sql":"WITH row AS (SELECT 1) INSERT INTO facets (schema_id, content, facets, workspace_id) SELECT \"busy:with\", \"busy with\", \"{}\", \"default\" FROM row","params":[]}'
+    --data "{\"sql\":\"WITH row AS (SELECT 1) INSERT INTO ${FACTS_TABLE} (schema_id, content, facets, workspace_id) SELECT 'busy:with', 'busy with', '{}', 'default' FROM row\",\"params\":[]}"
 )"
 test "${with_write_status}" = "503"
 with_write_error="$(cat "${with_write_body}")"
@@ -162,7 +185,7 @@ curl -fsS "${BASE_URL}/health" >/dev/null
 
 constraint_error="$(
   curl -sS -H "Content-Type: application/json" -X POST "${BASE_URL}/api/mindbrain/sql" \
-    --data '{"sql":"INSERT INTO facets (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES (\"dup-doc\", \"ghostcrab.fact\", \"dup\", \"{}\", \"{}\", \"default\", 1)","params":[]}'
+    --data "{\"sql\":\"INSERT INTO ${FACTS_TABLE} (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES ('dup-doc', 'ghostcrab.fact', 'dup', '{}', '{}', 'default', 1)\",\"params\":[]}"
 )"
 assert_json "${constraint_error}" "value.ok === false && value.error.kind === 'StepFailed' && value.error.sqlite_code === 19 && value.error.sqlite_extended_code === 2067 && value.error.sqlite_message.includes('UNIQUE constraint failed')"
 
@@ -170,7 +193,7 @@ session_open="$(post_json /api/mindbrain/sql/session/open '{}')"
 session_id="$(json_field "${session_open}" "value.session_id")"
 session_error="$(
   curl -sS -H "Content-Type: application/json" -X POST "${BASE_URL}/api/mindbrain/sql/session/query" \
-    --data "{\"session_id\":${session_id},\"sql\":\"INSERT INTO facets (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES ('dup-in-session', 'ghostcrab.fact', 'dup', '{}', '{}', 'default', 1)\",\"params\":[]}"
+    --data "{\"session_id\":${session_id},\"sql\":\"INSERT INTO ${FACTS_TABLE} (id, schema_id, content, facets, facets_json, workspace_id, doc_id) VALUES ('dup-in-session', 'ghostcrab.fact', 'dup', '{}', '{}', 'default', 1)\",\"params\":[]}"
 )"
 assert_json "${session_error}" "value.ok === false && value.error.kind === 'StepFailed'"
 failed_status="$(get_json /api/mindbrain/sql/write-status)"
@@ -178,19 +201,19 @@ assert_json "${failed_status}" "value.ok === true && value.last_error && value.l
 session_close="$(post_json /api/mindbrain/sql/session/close "{\"session_id\":${session_id},\"commit\":false}")"
 assert_json "${session_close}" "value.ok === true && value.session_id === ${session_id} && value.committed === false"
 
-post_rollback_query="$(post_json /api/mindbrain/sql '{"sql":"SELECT COUNT(*) AS count FROM facets","params":[]}')"
+post_rollback_query="$(post_json /api/mindbrain/sql "{\"sql\":\"SELECT COUNT(*) AS count FROM ${FACTS_TABLE}\",\"params\":[]}")"
 assert_json "${post_rollback_query}" "value.ok === true && value.rows[0][0] >= 5"
 
-legacy_insert="$(post_json /api/mindbrain/sql '{"sql":"INSERT INTO facets (schema_id, content, facets, workspace_id) VALUES (\"legacy:http\", \"legacy raw\", \"{}\", \"default\")","params":[]}')"
+legacy_insert="$(post_json /api/mindbrain/sql "{\"sql\":\"INSERT INTO ${FACTS_TABLE} (schema_id, content, facets, workspace_id) VALUES ('legacy:http', 'legacy raw', '{}', 'default')\",\"params\":[]}")"
 assert_json "${legacy_insert}" "value.ok === true"
 
-schema_query="$(post_json /api/mindbrain/sql '{"sql":"SELECT COUNT(*) FROM facets WHERE schema_id = \"legacy:http\" AND doc_id IS NOT NULL","params":[]}')"
+schema_query="$(post_json /api/mindbrain/sql "{\"sql\":\"SELECT COUNT(*) FROM ${FACTS_TABLE} WHERE schema_id = 'legacy:http' AND doc_id IS NOT NULL\",\"params\":[]}")"
 assert_json "${schema_query}" "value.ok === true && value.rows[0][0] === 1"
 
-index_query="$(post_json /api/mindbrain/sql '{"sql":"SELECT name FROM pragma_index_list(\"facets\") WHERE name IN (\"facets_source_ref_workspace_uniq\", \"idx_facets_source_ref_workspace\") ORDER BY name","params":[]}')"
-assert_json "${index_query}" "value.ok === true && value.rows.length === 2 && value.rows[0][0] === 'facets_source_ref_workspace_uniq' && value.rows[1][0] === 'idx_facets_source_ref_workspace'"
+index_query="$(post_json /api/mindbrain/sql '{"sql":"SELECT name FROM pragma_index_list(\"agent_facts\") WHERE name IN (\"agent_facts_source_ref_workspace_uniq\", \"idx_agent_facts_source_ref_workspace\") ORDER BY name","params":[]}')"
+assert_json "${index_query}" "value.ok === true && value.rows.length === 2 && value.rows[0][0] === 'agent_facts_source_ref_workspace_uniq' && value.rows[1][0] === 'idx_agent_facts_source_ref_workspace'"
 
-sync_query="$(post_json /api/mindbrain/sql '{"sql":"SELECT COUNT(*) FROM facets WHERE facets != facets_json OR doc_id IS NULL","params":[]}')"
+sync_query="$(post_json /api/mindbrain/sql "{\"sql\":\"SELECT COUNT(*) FROM ${FACTS_TABLE} WHERE facets != facets_json OR doc_id IS NULL\",\"params\":[]}")"
 assert_json "${sync_query}" "value.ok === true && value.rows[0][0] === 0"
 
 echo "standalone HTTP contract passed on ${BASE_URL}"
