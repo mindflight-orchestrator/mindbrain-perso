@@ -62,6 +62,7 @@ const Candidate = struct {
     workspace_id: ?[]const u8 = null,
     agent_id: ?[]const u8 = null,
     scope: ?[]const u8 = null,
+    slug_hint: ?[]const u8 = null,
     label: []const u8,
     state: []const u8,
     lifecycle: []const u8,
@@ -228,6 +229,10 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
         defer allocator.free(content);
         const status = try facet_sqlite.dupeColumnText(allocator, stmt, 5);
         defer allocator.free(status);
+        var parsed_content = parseProjectionContentMetadata(allocator, content);
+        defer if (parsed_content) |*parsed| parsed.deinit();
+        const slug_hint = if (parsed_content) |parsed| parsed.slug_hint else null;
+        const label = if (parsed_content) |parsed| parsed.label orelse content else content;
         const legacy_ref = try std.fmt.allocPrint(allocator, "projection:{s}", .{projection_id});
         defer allocator.free(legacy_ref);
         const payload_json = try std.fmt.allocPrint(allocator, "{{\"projection_id\":{f}}}", .{std.json.fmt(projection_id, .{})});
@@ -237,7 +242,8 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
             .legacy_ref = legacy_ref,
             .agent_id = agent_id,
             .scope = scope orelse "default",
-            .label = content,
+            .slug_hint = slug_hint,
+            .label = label,
             .state = status,
             .lifecycle = if (std.mem.eql(u8, status, "active")) "active" else "archived",
             .payload_json = payload_json,
@@ -271,6 +277,52 @@ fn materializeWorkspacePayload(db: Database, allocator: std.mem.Allocator, works
         "{{\"workspace_id\":{f},\"graph_entities\":{},\"graph_relations\":{},\"facts\":{}}}",
         .{ std.json.fmt(workspace_id, .{}), graph_entities, graph_relations, facts },
     );
+}
+
+const ProjectionContentMetadata = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    slug_hint: ?[]const u8,
+    label: ?[]const u8,
+
+    fn deinit(self: *ProjectionContentMetadata) void {
+        self.parsed.deinit();
+    }
+};
+
+fn parseProjectionContentMetadata(allocator: std.mem.Allocator, content: []const u8) ?ProjectionContentMetadata {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return null;
+    }
+
+    const object = parsed.value.object;
+    const slug_hint = firstStringField(object, &.{ "name", "slug", "label" });
+    const label = firstStringField(object, &.{ "label", "public_label", "name" });
+    if (slug_hint == null and label == null) {
+        parsed.deinit();
+        return null;
+    }
+
+    return .{
+        .parsed = parsed,
+        .slug_hint = slug_hint,
+        .label = label,
+    };
+}
+
+fn firstStringField(
+    object: std.json.ObjectMap,
+    comptime fields: []const []const u8,
+) ?[]const u8 {
+    inline for (fields) |field| {
+        if (object.get(field)) |value| {
+            if (value == .string and std.mem.trim(u8, value.string, " \t\r\n").len > 0) {
+                return value.string;
+            }
+        }
+    }
+    return null;
 }
 
 fn backfillProjectionResults(db: Database, allocator: std.mem.Allocator, stats: *RepairStats) !usize {
@@ -315,7 +367,7 @@ fn upsertCandidate(db: Database, allocator: std.mem.Allocator, candidate: Candid
     defer allocator.free(slug);
     const artifact_id = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ candidate.kind, slug });
     defer allocator.free(artifact_id);
-    if (try updateCandidateByLegacy(db, candidate)) return;
+    if (try updateCandidateByLegacy(db, allocator, candidate, slug, artifact_id)) return;
     const stmt = try facet_sqlite.prepare(db,
         \\INSERT INTO mindbrain_answer_artifacts(
         \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind,
@@ -338,13 +390,18 @@ fn upsertCandidate(db: Database, allocator: std.mem.Allocator, candidate: Candid
     try facet_sqlite.stepDone(stmt);
 }
 
-fn updateCandidateByLegacy(db: Database, candidate: Candidate) !bool {
+fn updateCandidateByLegacy(db: Database, allocator: std.mem.Allocator, candidate: Candidate, slug: []const u8, artifact_id: []const u8) !bool {
+    const existing_artifact_id = try artifactIdByLegacy(db, allocator, candidate.legacy_ref);
+    defer if (existing_artifact_id) |v| allocator.free(v);
+
     const stmt = try facet_sqlite.prepare(db,
         \\UPDATE mindbrain_answer_artifacts
         \\SET public_label = ?2,
         \\    lifecycle = ?3,
         \\    state = ?4,
         \\    payload_json = ?5,
+        \\    artifact_id = ?6,
+        \\    slug = ?7,
         \\    updated_at_unix = unixepoch()
         \\WHERE legacy_ref = ?1
     );
@@ -354,12 +411,49 @@ fn updateCandidateByLegacy(db: Database, candidate: Candidate) !bool {
     try facet_sqlite.bindText(stmt, 3, candidate.lifecycle);
     try facet_sqlite.bindText(stmt, 4, candidate.state);
     try facet_sqlite.bindText(stmt, 5, candidate.payload_json);
+    try facet_sqlite.bindText(stmt, 6, artifact_id);
+    try facet_sqlite.bindText(stmt, 7, slug);
     try facet_sqlite.stepDone(stmt);
-    return c.sqlite3_changes(db.handle) > 0;
+    const changed = c.sqlite3_changes(db.handle) > 0;
+    if (changed) {
+        if (existing_artifact_id) |old_id| {
+            if (!std.mem.eql(u8, old_id, artifact_id)) {
+                try updateEventsArtifactId(db, old_id, artifact_id);
+            }
+        }
+    }
+    return changed;
+}
+
+fn artifactIdByLegacy(db: Database, allocator: std.mem.Allocator, legacy_ref: []const u8) !?[]const u8 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT artifact_id
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE legacy_ref = ?1
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, legacy_ref);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return null;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+}
+
+fn updateEventsArtifactId(db: Database, old_artifact_id: []const u8, new_artifact_id: []const u8) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\UPDATE mindbrain_answer_events
+        \\SET artifact_id = ?2
+        \\WHERE artifact_id = ?1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, old_artifact_id);
+    try facet_sqlite.bindText(stmt, 2, new_artifact_id);
+    try facet_sqlite.stepDone(stmt);
 }
 
 fn slugForCandidate(db: Database, allocator: std.mem.Allocator, candidate: Candidate) ![]const u8 {
-    const base = try slugify(allocator, candidate.label);
+    const base = try slugify(allocator, candidate.slug_hint orelse candidate.label);
     defer allocator.free(base);
     var suffix: usize = 1;
     while (true) : (suffix += 1) {
@@ -463,27 +557,134 @@ test "answer artifact repair backfills projections and projection results idempo
     try db.exec(
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, status) VALUES
         \\  ('p1', 'agent-a', 'scope-a', 'FACT', 'Weekly Pilotage', 'active'),
-        \\  ('p2', 'agent-a', 'scope-a', 'GOAL', 'Weekly Pilotage', 'active');
+        \\  ('p2', 'agent-a', 'scope-a', 'GOAL', 'Weekly Pilotage', 'active'),
+        \\  ('p3', 'agent-a', 'scope-a', 'STEP', '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}', 'active');
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
+        \\) VALUES (
+        \\  'analysis_plan__artifact_kindanalysis_plannamecopropriete_360',
+        \\  'artifact_kindanalysis_plannamecopropriete_360',
+        \\  'agent-a',
+        \\  'scope-a',
+        \\  'analysis_plan',
+        \\  '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}',
+        \\  'active',
+        \\  'active',
+        \\  '{}',
+        \\  'projection:p3'
+        \\);
         \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES
         \\  (1, 'ws-a', 'ProjectionResult', 'Frozen Result', '{"projection_id":"proj-a"}');
     );
 
     const first = try repairFromLegacy(db, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), first.projection_rows);
+    try std.testing.expectEqual(@as(usize, 3), first.projection_rows);
     try std.testing.expectEqual(@as(usize, 1), first.projection_result_rows);
     const second = try repairFromLegacy(db, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), second.projection_rows);
+    try std.testing.expectEqual(@as(usize, 3), second.projection_rows);
     try std.testing.expectEqual(@as(usize, 1), second.projection_result_rows);
 
     const count_stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM mindbrain_answer_artifacts");
     defer facet_sqlite.finalize(count_stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
-    try std.testing.expectEqual(@as(i64, 3), c.sqlite3_column_int64(count_stmt, 0));
+    try std.testing.expectEqual(@as(i64, 4), c.sqlite3_column_int64(count_stmt, 0));
 
     const slug_stmt = try facet_sqlite.prepare(db, "SELECT slug FROM mindbrain_answer_artifacts WHERE legacy_ref = 'projection:p2'");
     defer facet_sqlite.finalize(slug_stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(slug_stmt));
     try std.testing.expectEqualStrings("weekly_pilotage__2", std.mem.span(c.sqlite3_column_text(slug_stmt, 0)));
+
+    const json_slug_stmt = try facet_sqlite.prepare(db, "SELECT artifact_id, slug, public_label FROM mindbrain_answer_artifacts WHERE legacy_ref = 'projection:p3'");
+    defer facet_sqlite.finalize(json_slug_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(json_slug_stmt));
+    try std.testing.expectEqualStrings("analysis_plan__copropriete_360", std.mem.span(c.sqlite3_column_text(json_slug_stmt, 0)));
+    try std.testing.expectEqualStrings("copropriete_360", std.mem.span(c.sqlite3_column_text(json_slug_stmt, 1)));
+    try std.testing.expectEqualStrings("Copropriete 360", std.mem.span(c.sqlite3_column_text(json_slug_stmt, 2)));
+}
+
+test "answer artifact repair normalizes json plans, scoped rows, events, and collisions" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO projections(id, agent_id, scope, proj_type, content, status) VALUES
+        \\  ('p_json_bad', 'agent:self', 'serenity-v4:production:copropriete_360', 'STEP', '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}', 'active'),
+        \\  ('p_json_collision', 'agent:self', 'serenity-v4:production:copropriete_360', 'GOAL', '{"artifact_kind":"analysis_plan","label":"Copropriete 360"}', 'active'),
+        \\  ('p_plain', 'agent:self', 'serenity-v4:production:plain', 'FACT', 'Plain fallback plan', 'resolved');
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
+        \\) VALUES (
+        \\  'analysis_plan__artifact_kindanalysis_plannamecopropriete_360labelcopropriete_360',
+        \\  'artifact_kindanalysis_plannamecopropriete_360labelcopropriete_360',
+        \\  'agent:self',
+        \\  'serenity-v4:production:copropriete_360',
+        \\  'analysis_plan',
+        \\  '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}',
+        \\  'active',
+        \\  'active',
+        \\  '{}',
+        \\  'projection:p_json_bad'
+        \\);
+        \\INSERT INTO mindbrain_answer_events(
+        \\  event_id, artifact_id, event_kind, from_version, to_version, signal_json
+        \\) VALUES (
+        \\  'evt_bad_plan', 'analysis_plan__artifact_kindanalysis_plannamecopropriete_360labelcopropriete_360',
+        \\  'answer_update_event', 1, 2, '{"repair":"legacy-id"}'
+        \\);
+    );
+
+    const first = try repairFromLegacy(db, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), first.projection_rows);
+    try std.testing.expectEqual(@as(usize, 0), first.projection_result_rows);
+    const second = try repairFromLegacy(db, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), second.projection_rows);
+    try std.testing.expectEqual(@as(usize, 0), second.projection_result_rows);
+
+    const canonical_stmt = try facet_sqlite.prepare(db,
+        \\SELECT artifact_id, slug, workspace_id, public_label
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE legacy_ref = 'projection:p_json_bad'
+    );
+    defer facet_sqlite.finalize(canonical_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(canonical_stmt));
+    try std.testing.expectEqualStrings("analysis_plan__copropriete_360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 0)));
+    try std.testing.expectEqualStrings("copropriete_360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 1)));
+    try std.testing.expectEqual(c.SQLITE_NULL, c.sqlite3_column_type(canonical_stmt, 2));
+    try std.testing.expectEqualStrings("Copropriete 360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 3)));
+
+    const collision_stmt = try facet_sqlite.prepare(db,
+        \\SELECT artifact_id, slug
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE legacy_ref = 'projection:p_json_collision'
+    );
+    defer facet_sqlite.finalize(collision_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(collision_stmt));
+    try std.testing.expectEqualStrings("analysis_plan__copropriete_360__2", std.mem.span(c.sqlite3_column_text(collision_stmt, 0)));
+    try std.testing.expectEqualStrings("copropriete_360__2", std.mem.span(c.sqlite3_column_text(collision_stmt, 1)));
+
+    const fallback_stmt = try facet_sqlite.prepare(db,
+        \\SELECT slug, lifecycle
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE legacy_ref = 'projection:p_plain'
+    );
+    defer facet_sqlite.finalize(fallback_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(fallback_stmt));
+    try std.testing.expectEqualStrings("plain_fallback_plan", std.mem.span(c.sqlite3_column_text(fallback_stmt, 0)));
+    try std.testing.expectEqualStrings("archived", std.mem.span(c.sqlite3_column_text(fallback_stmt, 1)));
+
+    const event_stmt = try facet_sqlite.prepare(db,
+        \\SELECT artifact_id
+        \\FROM mindbrain_answer_events
+        \\WHERE event_id = 'evt_bad_plan'
+    );
+    defer facet_sqlite.finalize(event_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(event_stmt));
+    try std.testing.expectEqualStrings("analysis_plan__copropriete_360", std.mem.span(c.sqlite3_column_text(event_stmt, 0)));
+
+    const count_stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM mindbrain_answer_artifacts");
+    defer facet_sqlite.finalize(count_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+    try std.testing.expectEqual(@as(i64, 3), c.sqlite3_column_int64(count_stmt, 0));
 }
 
 test "live answer view refresh increments version and writes event" {
