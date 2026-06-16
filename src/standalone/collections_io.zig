@@ -2756,14 +2756,11 @@ fn selectAnswerArtifacts(arena: Allocator, db: Database, workspace_id: []const u
         \\       payload_json, legacy_ref, created_at_unix, updated_at_unix
         \\FROM mindbrain_answer_artifacts
         \\WHERE workspace_id = ?1
-        \\   OR (artifact_kind = 'analysis_plan' AND (scope = ?1 OR scope LIKE ?2))
         \\ORDER BY artifact_kind, slug, artifact_id
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
-    const scope_prefix = try std.fmt.allocPrint(arena, "{s}:%", .{workspace_id});
     try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, scope_prefix);
     var rows = std.ArrayList(AnswerArtifactRow).empty;
     while (true) {
         const status = c.sqlite3_step(stmt);
@@ -2797,14 +2794,11 @@ fn selectAnswerEvents(arena: Allocator, db: Database, workspace_id: []const u8) 
         \\FROM mindbrain_answer_events e
         \\JOIN mindbrain_answer_artifacts a ON a.artifact_id = e.artifact_id
         \\WHERE a.workspace_id = ?1
-        \\   OR (a.artifact_kind = 'analysis_plan' AND (a.scope = ?1 OR a.scope LIKE ?2))
         \\ORDER BY e.created_at_unix ASC, e.event_id ASC
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
-    const scope_prefix = try std.fmt.allocPrint(arena, "{s}:%", .{workspace_id});
     try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, scope_prefix);
     var rows = std.ArrayList(AnswerEventRow).empty;
     while (true) {
         const status = c.sqlite3_step(stmt);
@@ -3076,10 +3070,10 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
         \\  'Round live view', 'active', 'refreshed', 3, '{}', 'manual:round'
         \\);
         \\INSERT INTO mindbrain_answer_artifacts(
-        \\  artifact_id, slug, agent_id, scope, artifact_kind, public_label,
+        \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind, public_label,
         \\  lifecycle, state, current_version, payload_json, legacy_ref
         \\) VALUES (
-        \\  'analysis_plan__round_scoped', 'round_scoped', 'agent:self',
+        \\  'analysis_plan__round_scoped', 'round_scoped', 'ws_round', 'agent:self',
         \\  'ws_round:production:round_scoped', 'analysis_plan',
         \\  'Round scoped plan', 'active', 'open', 2, '{}', 'projection:round_scoped'
         \\);
@@ -3134,7 +3128,7 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM chunks_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id = 'ws_round' AND current_version = 3"));
-    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE artifact_kind = 'analysis_plan' AND workspace_id IS NULL AND scope = 'ws_round:production:round_scoped'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE artifact_kind = 'analysis_plan' AND workspace_id = 'ws_round' AND scope = 'ws_round:production:round_scoped'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'analysis_plan__round_scoped'"));
 }

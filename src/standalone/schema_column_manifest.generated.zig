@@ -251,7 +251,7 @@ pub const column_manifest: []const ColumnManifestEntry = &.{
     .{ .table = "graph_gap_rules", .column = "severity", .ddl = "TEXT NOT NULL DEFAULT 'warning'", .migration_id = "add-col-graph_gap_rules-severity" },
     .{ .table = "graph_gap_rules", .column = "target_entity_type", .ddl = "TEXT", .migration_id = "add-col-graph_gap_rules-target_entity_type" },
     .{ .table = "graph_gap_rules", .column = "updated_at", .ddl = "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP", .migration_id = "add-col-graph_gap_rules-updated_at" },
-    .{ .table = "graph_gap_rules", .column = "workspace_id", .ddl = "TEXT", .migration_id = "add-col-graph_gap_rules-workspace_id" },
+    .{ .table = "graph_gap_rules", .column = "workspace_id", .ddl = "TEXT NOT NULL", .migration_id = "add-col-graph_gap_rules-workspace_id" },
     .{ .table = "graph_knowledge_patch", .column = "applied_at_unix", .ddl = "INTEGER", .migration_id = "add-col-graph_knowledge_patch-applied_at_unix" },
     .{ .table = "graph_knowledge_patch", .column = "applied_by", .ddl = "TEXT", .migration_id = "add-col-graph_knowledge_patch-applied_by" },
     .{ .table = "graph_knowledge_patch", .column = "artifacts_json", .ddl = "TEXT NOT NULL DEFAULT '[]'", .migration_id = "add-col-graph_knowledge_patch-artifacts_json" },
@@ -316,7 +316,7 @@ pub const column_manifest: []const ColumnManifestEntry = &.{
     .{ .table = "mindbrain_answer_artifacts", .column = "slug", .ddl = "TEXT NOT NULL", .migration_id = "add-col-mindbrain_answer_artifacts-slug" },
     .{ .table = "mindbrain_answer_artifacts", .column = "state", .ddl = "TEXT NOT NULL", .migration_id = "add-col-mindbrain_answer_artifacts-state" },
     .{ .table = "mindbrain_answer_artifacts", .column = "updated_at_unix", .ddl = "INTEGER NOT NULL DEFAULT (unixepoch())", .migration_id = "add-col-mindbrain_answer_artifacts-updated_at_unix" },
-    .{ .table = "mindbrain_answer_artifacts", .column = "workspace_id", .ddl = "TEXT", .migration_id = "add-col-mindbrain_answer_artifacts-workspace_id" },
+    .{ .table = "mindbrain_answer_artifacts", .column = "workspace_id", .ddl = "TEXT NOT NULL", .migration_id = "add-col-mindbrain_answer_artifacts-workspace_id" },
     .{ .table = "mindbrain_answer_events", .column = "artifact_id", .ddl = "TEXT NOT NULL", .migration_id = "add-col-mindbrain_answer_events-artifact_id" },
     .{ .table = "mindbrain_answer_events", .column = "created_at_unix", .ddl = "INTEGER NOT NULL DEFAULT (unixepoch())", .migration_id = "add-col-mindbrain_answer_events-created_at_unix" },
     .{ .table = "mindbrain_answer_events", .column = "event_kind", .ddl = "TEXT NOT NULL CHECK (event_kind = 'answer_update_event')", .migration_id = "add-col-mindbrain_answer_events-event_kind" },
@@ -574,4 +574,3 @@ pub const column_manifest: []const ColumnManifestEntry = &.{
 };
 
 pub const column_manifest_count = 562;
-

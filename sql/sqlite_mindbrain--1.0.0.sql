@@ -349,7 +349,7 @@ CREATE TABLE IF NOT EXISTS graph_entity_degree (
 CREATE TABLE IF NOT EXISTS graph_gap_rules (
     rule_id TEXT PRIMARY KEY,
     ontology_id TEXT NOT NULL,
-    workspace_id TEXT,
+    workspace_id TEXT NOT NULL,
     entity_type TEXT NOT NULL,
     relation_type TEXT NOT NULL,
     direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
@@ -569,18 +569,18 @@ CREATE TABLE IF NOT EXISTS mindbrain_answer_artifacts (
     created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
     CHECK (
-        (artifact_kind = 'analysis_plan' AND workspace_id IS NULL AND agent_id IS NOT NULL AND scope IS NOT NULL) OR
-        (artifact_kind IN ('live_answer_view', 'answer_snapshot') AND workspace_id IS NOT NULL) OR
+        (artifact_kind = 'analysis_plan' AND agent_id IS NOT NULL AND scope IS NOT NULL) OR
+        (artifact_kind IN ('live_answer_view', 'answer_snapshot')) OR
         (artifact_kind = 'evidence_pack' AND json_extract(payload_json, '$.parent_artifact_id') IS NOT NULL)
     )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_workspace_uidx
     ON mindbrain_answer_artifacts(workspace_id, artifact_kind, slug)
-    WHERE workspace_id IS NOT NULL AND artifact_kind IN ('live_answer_view', 'answer_snapshot');
+    WHERE artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot');
 
 CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_agent_uidx
-    ON mindbrain_answer_artifacts(agent_id, scope, artifact_kind, slug)
+    ON mindbrain_answer_artifacts(workspace_id, agent_id, scope, artifact_kind, slug)
     WHERE artifact_kind = 'analysis_plan';
 
 CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_legacy_uidx

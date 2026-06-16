@@ -229,6 +229,9 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
         defer allocator.free(content);
         const status = try facet_sqlite.dupeColumnText(allocator, stmt, 5);
         defer allocator.free(status);
+        const resolved_scope = scope orelse "default";
+        const workspace_id = try workspaceForScope(db, allocator, resolved_scope);
+        defer allocator.free(workspace_id);
         var parsed_content = parseProjectionContentMetadata(allocator, content);
         defer if (parsed_content) |*parsed| parsed.deinit();
         const slug_hint = if (parsed_content) |parsed| parsed.slug_hint else null;
@@ -240,8 +243,9 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
         try upsertCandidate(db, allocator, .{
             .kind = "analysis_plan",
             .legacy_ref = legacy_ref,
+            .workspace_id = workspace_id,
             .agent_id = agent_id,
-            .scope = scope orelse "default",
+            .scope = resolved_scope,
             .slug_hint = slug_hint,
             .label = label,
             .state = status,
@@ -251,6 +255,29 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
         stats.inserted_or_updated += 1;
     }
     return count;
+}
+
+fn workspaceForScope(db: Database, allocator: std.mem.Allocator, scope: []const u8) ![]const u8 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT workspace_id
+        \\FROM workspaces
+        \\WHERE ?1 = workspace_id
+        \\   OR ?1 LIKE workspace_id || ':%'
+        \\ORDER BY length(workspace_id) DESC, workspace_id ASC
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, scope);
+
+    const first_rc = c.sqlite3_step(stmt);
+    if (first_rc == c.SQLITE_DONE) return error.MissingWorkspace;
+    if (first_rc != c.SQLITE_ROW) return error.StepFailed;
+    const workspace_id = try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+    errdefer allocator.free(workspace_id);
+
+    const second_rc = c.sqlite3_step(stmt);
+    if (second_rc == c.SQLITE_ROW) return error.AmbiguousWorkspace;
+    if (second_rc != c.SQLITE_DONE) return error.StepFailed;
+    return workspace_id;
 }
 
 fn countRows(db: Database, sql: []const u8) !usize {
@@ -378,7 +405,11 @@ fn upsertCandidate(db: Database, allocator: std.mem.Allocator, candidate: Candid
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, artifact_id);
     try facet_sqlite.bindText(stmt, 2, slug);
-    try bindOptionalText(stmt, 3, candidate.workspace_id);
+    if (candidate.workspace_id) |workspace_id| {
+        try facet_sqlite.bindText(stmt, 3, workspace_id);
+    } else {
+        return error.MissingWorkspace;
+    }
     try bindOptionalText(stmt, 4, candidate.agent_id);
     try bindOptionalText(stmt, 5, candidate.scope);
     try facet_sqlite.bindText(stmt, 6, candidate.kind);
@@ -402,6 +433,7 @@ fn updateCandidateByLegacy(db: Database, allocator: std.mem.Allocator, candidate
         \\    payload_json = ?5,
         \\    artifact_id = ?6,
         \\    slug = ?7,
+        \\    workspace_id = ?8,
         \\    updated_at_unix = unixepoch()
         \\WHERE legacy_ref = ?1
     );
@@ -413,6 +445,11 @@ fn updateCandidateByLegacy(db: Database, allocator: std.mem.Allocator, candidate
     try facet_sqlite.bindText(stmt, 5, candidate.payload_json);
     try facet_sqlite.bindText(stmt, 6, artifact_id);
     try facet_sqlite.bindText(stmt, 7, slug);
+    if (candidate.workspace_id) |workspace_id| {
+        try facet_sqlite.bindText(stmt, 8, workspace_id);
+    } else {
+        return error.MissingWorkspace;
+    }
     try facet_sqlite.stepDone(stmt);
     const changed = c.sqlite3_changes(db.handle) > 0;
     if (changed) {
@@ -555,15 +592,19 @@ test "answer artifact repair backfills projections and projection results idempo
     defer db.close();
     try db.applyStandaloneSchema();
     try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES
+        \\  ('scope-a', 'scope-a', 'Scope A'),
+        \\  ('ws-a', 'ws-a', 'Workspace A');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, status) VALUES
         \\  ('p1', 'agent-a', 'scope-a', 'FACT', 'Weekly Pilotage', 'active'),
         \\  ('p2', 'agent-a', 'scope-a', 'GOAL', 'Weekly Pilotage', 'active'),
         \\  ('p3', 'agent-a', 'scope-a', 'STEP', '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}', 'active');
         \\INSERT INTO mindbrain_answer_artifacts(
-        \\  artifact_id, slug, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
+        \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
         \\) VALUES (
         \\  'analysis_plan__artifact_kindanalysis_plannamecopropriete_360',
         \\  'artifact_kindanalysis_plannamecopropriete_360',
+        \\  'scope-a',
         \\  'agent-a',
         \\  'scope-a',
         \\  'analysis_plan',
@@ -607,15 +648,18 @@ test "answer artifact repair normalizes json plans, scoped rows, events, and col
     defer db.close();
     try db.applyStandaloneSchema();
     try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES
+        \\  ('serenity-v4', 'serenity-v4', 'Serenity V4');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, status) VALUES
         \\  ('p_json_bad', 'agent:self', 'serenity-v4:production:copropriete_360', 'STEP', '{"artifact_kind":"analysis_plan","name":"copropriete_360","label":"Copropriete 360"}', 'active'),
         \\  ('p_json_collision', 'agent:self', 'serenity-v4:production:copropriete_360', 'GOAL', '{"artifact_kind":"analysis_plan","label":"Copropriete 360"}', 'active'),
         \\  ('p_plain', 'agent:self', 'serenity-v4:production:plain', 'FACT', 'Plain fallback plan', 'resolved');
         \\INSERT INTO mindbrain_answer_artifacts(
-        \\  artifact_id, slug, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
+        \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind, public_label, lifecycle, state, payload_json, legacy_ref
         \\) VALUES (
         \\  'analysis_plan__artifact_kindanalysis_plannamecopropriete_360labelcopropriete_360',
         \\  'artifact_kindanalysis_plannamecopropriete_360labelcopropriete_360',
+        \\  'serenity-v4',
         \\  'agent:self',
         \\  'serenity-v4:production:copropriete_360',
         \\  'analysis_plan',
@@ -649,7 +693,7 @@ test "answer artifact repair normalizes json plans, scoped rows, events, and col
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(canonical_stmt));
     try std.testing.expectEqualStrings("analysis_plan__copropriete_360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 0)));
     try std.testing.expectEqualStrings("copropriete_360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 1)));
-    try std.testing.expectEqual(c.SQLITE_NULL, c.sqlite3_column_type(canonical_stmt, 2));
+    try std.testing.expectEqualStrings("serenity-v4", std.mem.span(c.sqlite3_column_text(canonical_stmt, 2)));
     try std.testing.expectEqualStrings("Copropriete 360", std.mem.span(c.sqlite3_column_text(canonical_stmt, 3)));
 
     const collision_stmt = try facet_sqlite.prepare(db,
