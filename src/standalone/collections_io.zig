@@ -2755,7 +2755,7 @@ fn selectAnswerArtifacts(arena: Allocator, db: Database, workspace_id: []const u
         \\       public_label_key, public_label, lifecycle, state, current_version,
         \\       payload_json, legacy_ref, created_at_unix, updated_at_unix
         \\FROM mindbrain_answer_artifacts
-        \\WHERE workspace_id = ?1 OR (artifact_kind = 'analysis_plan' AND scope = ?1)
+        \\WHERE workspace_id = ?1
         \\ORDER BY artifact_kind, slug, artifact_id
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -2793,7 +2793,7 @@ fn selectAnswerEvents(arena: Allocator, db: Database, workspace_id: []const u8) 
         \\       e.signal_json, e.created_at_unix
         \\FROM mindbrain_answer_events e
         \\JOIN mindbrain_answer_artifacts a ON a.artifact_id = e.artifact_id
-        \\WHERE a.workspace_id = ?1 OR (a.artifact_kind = 'analysis_plan' AND a.scope = ?1)
+        \\WHERE a.workspace_id = ?1
         \\ORDER BY e.created_at_unix ASC, e.event_id ASC
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -3069,11 +3069,22 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
         \\  'live_answer_view__round', 'round', 'ws_round', 'live_answer_view',
         \\  'Round live view', 'active', 'refreshed', 3, '{}', 'manual:round'
         \\);
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind, public_label,
+        \\  lifecycle, state, current_version, payload_json, legacy_ref
+        \\) VALUES (
+        \\  'analysis_plan__round_scoped', 'round_scoped', 'ws_round', 'agent:self',
+        \\  'ws_round:production:round_scoped', 'analysis_plan',
+        \\  'Round scoped plan', 'active', 'open', 2, '{}', 'projection:round_scoped'
+        \\);
         \\INSERT INTO mindbrain_answer_events(
         \\  event_id, artifact_id, event_kind, from_version, to_version, signal_json
         \\) VALUES (
         \\  'answer_update_event__round__3', 'live_answer_view__round',
         \\  'answer_update_event', 2, 3, '{"refresh":"explicit"}'
+        \\), (
+        \\  'answer_update_event__round_scoped__2', 'analysis_plan__round_scoped',
+        \\  'answer_update_event', 1, 2, '{"repair":"scoped"}'
         \\);
     );
 
@@ -3088,6 +3099,7 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expect(std.mem.indexOf(u8, bundle, "confidence_note") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_artifacts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "analysis_plan__round_scoped") != null);
 
     var dest = try Database.openInMemory();
     defer dest.close();
@@ -3116,7 +3128,9 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM chunks_raw_vector WHERE workspace_id = 'ws_round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id = 'ws_round' AND current_version = 3"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE artifact_kind = 'analysis_plan' AND workspace_id = 'ws_round' AND scope = 'ws_round:production:round_scoped'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'analysis_plan__round_scoped'"));
 }
 
 test "legacy database missing additive columns imports bundle after schema apply" {

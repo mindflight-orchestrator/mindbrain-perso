@@ -139,7 +139,9 @@ pub const Database = struct {
         try self.applyGraphEntityWorkspaceMigration();
         try self.applyRawGraphAutoincrementMigration();
         try self.applyGraphGapRulesMigration();
+        try self.applyGraphGapRulesWorkspaceStrictMigration();
         try self.applyAgentFactsTableRenameMigration();
+        try self.applyAnswerArtifactsWorkspaceStrictMigration();
     }
 
     fn applyAdditiveColumnMigrations(self: Database) Error!void {
@@ -242,6 +244,172 @@ pub const Database = struct {
             if (std.mem.eql(u8, name, "external_id")) return true;
         }
         return false;
+    }
+
+    fn answerArtifactsWorkspaceStrict(self: Database) Error!bool {
+        const stmt = try prepare(
+            self,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mindbrain_answer_artifacts' LIMIT 1",
+        );
+        defer finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const create_sql = std.mem.span(c.sqlite3_column_text(stmt, 0) orelse return false);
+        return std.mem.indexOf(u8, create_sql, "workspace_id TEXT NOT NULL") != null and
+            std.mem.indexOf(u8, create_sql, "artifact_kind = 'analysis_plan' AND workspace_id IS NULL") == null;
+    }
+
+    fn applyAnswerArtifactsWorkspaceStrictMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-06-16-answer-artifacts-workspace-strict-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        if (try self.answerArtifactsWorkspaceStrict()) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        try self.exec(
+            \\PRAGMA foreign_keys = OFF;
+            \\
+            \\CREATE TEMP TABLE IF NOT EXISTS answer_artifact_workspace_guard (
+            \\    must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
+            \\);
+            \\
+            \\INSERT INTO answer_artifact_workspace_guard(must_be_zero)
+            \\SELECT 1
+            \\WHERE EXISTS (
+            \\    SELECT 1
+            \\    FROM mindbrain_answer_artifacts a
+            \\    WHERE a.artifact_kind = 'analysis_plan'
+            \\      AND a.workspace_id IS NULL
+            \\      AND (
+            \\          a.scope IS NULL
+            \\          OR (
+            \\              SELECT COUNT(*)
+            \\              FROM workspaces w
+            \\              WHERE a.scope = w.workspace_id
+            \\                 OR a.scope LIKE w.workspace_id || ':%'
+            \\          ) != 1
+            \\      )
+            \\);
+            \\
+            \\DROP TABLE answer_artifact_workspace_guard;
+            \\
+            \\CREATE TABLE IF NOT EXISTS mindbrain_answer_events (
+            \\    event_id TEXT PRIMARY KEY,
+            \\    artifact_id TEXT NOT NULL,
+            \\    event_kind TEXT NOT NULL CHECK (event_kind = 'answer_update_event'),
+            \\    from_version INTEGER,
+            \\    to_version INTEGER,
+            \\    signal_json TEXT NOT NULL CHECK (json_valid(signal_json)),
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    FOREIGN KEY(artifact_id) REFERENCES mindbrain_answer_artifacts(artifact_id)
+            \\);
+            \\
+            \\DROP INDEX IF EXISTS mindbrain_answer_events_artifact_idx;
+            \\DROP INDEX IF EXISTS mindbrain_answer_artifacts_workspace_uidx;
+            \\DROP INDEX IF EXISTS mindbrain_answer_artifacts_agent_uidx;
+            \\DROP INDEX IF EXISTS mindbrain_answer_artifacts_legacy_uidx;
+            \\DROP INDEX IF EXISTS mindbrain_answer_artifacts_workspace_idx;
+            \\
+            \\ALTER TABLE mindbrain_answer_events RENAME TO mindbrain_answer_events__artifact_workspace_strict;
+            \\ALTER TABLE mindbrain_answer_artifacts RENAME TO mindbrain_answer_artifacts__legacy_workspace_nullable;
+            \\
+            \\CREATE TABLE mindbrain_answer_artifacts (
+            \\    artifact_id TEXT PRIMARY KEY,
+            \\    slug TEXT NOT NULL,
+            \\    workspace_id TEXT NOT NULL,
+            \\    agent_id TEXT,
+            \\    scope TEXT,
+            \\    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),
+            \\    public_label_key TEXT,
+            \\    public_label TEXT NOT NULL,
+            \\    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('draft', 'active', 'frozen', 'stale', 'archived', 'deleted')),
+            \\    state TEXT NOT NULL,
+            \\    current_version INTEGER NOT NULL DEFAULT 1 CHECK (current_version >= 1),
+            \\    payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+            \\    legacy_ref TEXT,
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    CHECK (
+            \\        (artifact_kind = 'analysis_plan' AND agent_id IS NOT NULL AND scope IS NOT NULL) OR
+            \\        (artifact_kind IN ('live_answer_view', 'answer_snapshot')) OR
+            \\        (artifact_kind = 'evidence_pack' AND json_extract(payload_json, '$.parent_artifact_id') IS NOT NULL)
+            \\    )
+            \\);
+            \\
+            \\INSERT INTO mindbrain_answer_artifacts(
+            \\    artifact_id, slug, workspace_id, agent_id, scope, artifact_kind,
+            \\    public_label_key, public_label, lifecycle, state, current_version,
+            \\    payload_json, legacy_ref, created_at_unix, updated_at_unix
+            \\)
+            \\SELECT
+            \\    artifact_id,
+            \\    slug,
+            \\    COALESCE(
+            \\        workspace_id,
+            \\        (
+            \\            SELECT w.workspace_id
+            \\            FROM workspaces w
+            \\            WHERE mindbrain_answer_artifacts__legacy_workspace_nullable.scope = w.workspace_id
+            \\               OR mindbrain_answer_artifacts__legacy_workspace_nullable.scope LIKE w.workspace_id || ':%'
+            \\            ORDER BY length(w.workspace_id) DESC
+            \\            LIMIT 1
+            \\        )
+            \\    ),
+            \\    agent_id, scope, artifact_kind,
+            \\    public_label_key, public_label, lifecycle, state, current_version,
+            \\    payload_json, legacy_ref, created_at_unix, updated_at_unix
+            \\FROM mindbrain_answer_artifacts__legacy_workspace_nullable;
+            \\
+            \\DROP TABLE mindbrain_answer_artifacts__legacy_workspace_nullable;
+            \\
+            \\CREATE TABLE mindbrain_answer_events (
+            \\    event_id TEXT PRIMARY KEY,
+            \\    artifact_id TEXT NOT NULL,
+            \\    event_kind TEXT NOT NULL CHECK (event_kind = 'answer_update_event'),
+            \\    from_version INTEGER,
+            \\    to_version INTEGER,
+            \\    signal_json TEXT NOT NULL CHECK (json_valid(signal_json)),
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    FOREIGN KEY(artifact_id) REFERENCES mindbrain_answer_artifacts(artifact_id)
+            \\);
+            \\
+            \\INSERT INTO mindbrain_answer_events(
+            \\    event_id, artifact_id, event_kind, from_version, to_version, signal_json, created_at_unix
+            \\)
+            \\SELECT
+            \\    event_id, artifact_id, event_kind, from_version, to_version, signal_json, created_at_unix
+            \\FROM mindbrain_answer_events__artifact_workspace_strict;
+            \\
+            \\DROP TABLE mindbrain_answer_events__artifact_workspace_strict;
+            \\
+            \\CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_workspace_uidx
+            \\    ON mindbrain_answer_artifacts(workspace_id, artifact_kind, slug)
+            \\    WHERE artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot');
+            \\
+            \\CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_agent_uidx
+            \\    ON mindbrain_answer_artifacts(workspace_id, agent_id, scope, artifact_kind, slug)
+            \\    WHERE artifact_kind = 'analysis_plan';
+            \\
+            \\CREATE UNIQUE INDEX IF NOT EXISTS mindbrain_answer_artifacts_legacy_uidx
+            \\    ON mindbrain_answer_artifacts(legacy_ref)
+            \\    WHERE legacy_ref IS NOT NULL;
+            \\
+            \\CREATE INDEX IF NOT EXISTS mindbrain_answer_artifacts_workspace_idx
+            \\    ON mindbrain_answer_artifacts(workspace_id, artifact_kind, lifecycle);
+            \\
+            \\CREATE INDEX IF NOT EXISTS mindbrain_answer_events_artifact_idx
+            \\    ON mindbrain_answer_events(artifact_id, created_at_unix DESC);
+        );
+
+        try self.markMigrationApplied(applied_id);
     }
 
     fn applyRawGraphAutoincrementMigration(self: Database) Error!void {
@@ -481,7 +649,7 @@ pub const Database = struct {
             \\CREATE TABLE IF NOT EXISTS graph_gap_rules (
             \\    rule_id TEXT PRIMARY KEY,
             \\    ontology_id TEXT NOT NULL,
-            \\    workspace_id TEXT,
+            \\    workspace_id TEXT NOT NULL,
             \\    entity_type TEXT NOT NULL,
             \\    relation_type TEXT NOT NULL,
             \\    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
@@ -497,6 +665,91 @@ pub const Database = struct {
             \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
             \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
             \\);
+            \\CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
+            \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        );
+
+        try self.markMigrationApplied(applied_id);
+    }
+
+    fn graphGapRulesWorkspaceStrict(self: Database) Error!bool {
+        const stmt = try prepare(
+            self,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'graph_gap_rules' LIMIT 1",
+        );
+        defer finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const create_sql = std.mem.span(c.sqlite3_column_text(stmt, 0) orelse return false);
+        return std.mem.indexOf(u8, create_sql, "workspace_id TEXT NOT NULL") != null;
+    }
+
+    fn applyGraphGapRulesWorkspaceStrictMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-06-16-graph-gap-rules-workspace-strict-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        if (try self.graphGapRulesWorkspaceStrict()) {
+            try self.markMigrationApplied(applied_id);
+            return;
+        }
+
+        try self.exec(
+            \\CREATE TEMP TABLE IF NOT EXISTS graph_gap_rules_workspace_guard (
+            \\    must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
+            \\);
+            \\
+            \\INSERT INTO graph_gap_rules_workspace_guard(must_be_zero)
+            \\SELECT 1
+            \\WHERE EXISTS (
+            \\    SELECT 1
+            \\    FROM graph_gap_rules
+            \\    WHERE workspace_id IS NULL
+            \\);
+            \\
+            \\DROP TABLE graph_gap_rules_workspace_guard;
+            \\
+            \\DROP INDEX IF EXISTS graph_gap_rules_lookup_idx;
+            \\ALTER TABLE graph_gap_rules RENAME TO graph_gap_rules__legacy_workspace_nullable;
+            \\
+            \\CREATE TABLE graph_gap_rules (
+            \\    rule_id TEXT PRIMARY KEY,
+            \\    ontology_id TEXT NOT NULL,
+            \\    workspace_id TEXT NOT NULL,
+            \\    entity_type TEXT NOT NULL,
+            \\    relation_type TEXT NOT NULL,
+            \\    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
+            \\    target_entity_type TEXT,
+            \\    min_count INTEGER NOT NULL DEFAULT 1,
+            \\    max_count INTEGER,
+            \\    severity TEXT NOT NULL DEFAULT 'warning',
+            \\    label TEXT NOT NULL,
+            \\    enabled INTEGER NOT NULL DEFAULT 1,
+            \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+            \\);
+            \\
+            \\INSERT INTO graph_gap_rules(
+            \\    rule_id, ontology_id, workspace_id, entity_type, relation_type,
+            \\    direction, target_entity_type, min_count, max_count, severity,
+            \\    label, enabled, metadata_json, created_at, updated_at
+            \\)
+            \\SELECT
+            \\    rule_id, ontology_id, workspace_id, entity_type, relation_type,
+            \\    direction, target_entity_type, min_count, max_count, severity,
+            \\    label, enabled, metadata_json, created_at, updated_at
+            \\FROM graph_gap_rules__legacy_workspace_nullable;
+            \\
+            \\DROP TABLE graph_gap_rules__legacy_workspace_nullable;
+            \\
             \\CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
             \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
         );
@@ -2182,4 +2435,98 @@ test "sqlite-backed facet repository traverses hierarchy children" {
     try std.testing.expectEqual(@as(usize, 2), children.len);
     try std.testing.expectEqualStrings("physics", children[0].facet_value);
     try std.testing.expectEqualStrings("chemistry", children[1].facet_value);
+}
+
+test "answer artifact workspace strict migration backfills analysis plans from scope" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE workspaces (
+        \\    id TEXT PRIMARY KEY,
+        \\    workspace_id TEXT UNIQUE,
+        \\    label TEXT
+        \\);
+        \\CREATE TABLE mindbrain_answer_artifacts (
+        \\    artifact_id TEXT PRIMARY KEY,
+        \\    slug TEXT NOT NULL,
+        \\    workspace_id TEXT,
+        \\    agent_id TEXT,
+        \\    scope TEXT,
+        \\    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),
+        \\    public_label_key TEXT,
+        \\    public_label TEXT NOT NULL,
+        \\    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('draft', 'active', 'frozen', 'stale', 'archived', 'deleted')),
+        \\    state TEXT NOT NULL,
+        \\    current_version INTEGER NOT NULL DEFAULT 1 CHECK (current_version >= 1),
+        \\    payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+        \\    legacy_ref TEXT,
+        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+        \\    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+        \\    CHECK (
+        \\        (artifact_kind = 'analysis_plan' AND workspace_id IS NULL AND agent_id IS NOT NULL AND scope IS NOT NULL) OR
+        \\        (artifact_kind IN ('live_answer_view', 'answer_snapshot') AND workspace_id IS NOT NULL) OR
+        \\        (artifact_kind = 'evidence_pack' AND json_extract(payload_json, '$.parent_artifact_id') IS NOT NULL)
+        \\    )
+        \\);
+        \\CREATE UNIQUE INDEX mindbrain_answer_artifacts_agent_uidx
+        \\    ON mindbrain_answer_artifacts(agent_id, scope, artifact_kind, slug)
+        \\    WHERE artifact_kind = 'analysis_plan';
+        \\INSERT INTO workspaces(id, workspace_id, label)
+        \\VALUES ('ws_plan', 'ws_plan', 'Plan Workspace');
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\    artifact_id, slug, agent_id, scope, artifact_kind,
+        \\    public_label, lifecycle, state, payload_json
+        \\)
+        \\VALUES (
+        \\    'analysis_plan__demo', 'demo', 'agent:self', 'ws_plan:production:demo',
+        \\    'analysis_plan', 'Demo plan', 'active', 'open', '{}'
+        \\);
+    );
+
+    try db.applyAnswerArtifactsWorkspaceStrictMigration();
+
+    const stmt = try prepare(
+        db,
+        "SELECT workspace_id FROM mindbrain_answer_artifacts WHERE artifact_id = 'analysis_plan__demo'",
+    );
+    defer finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("ws_plan", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expect(try db.answerArtifactsWorkspaceStrict());
+}
+
+test "graph gap rules workspace strict migration preserves scoped rules" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE graph_gap_rules (
+        \\    rule_id TEXT PRIMARY KEY,
+        \\    ontology_id TEXT NOT NULL,
+        \\    workspace_id TEXT,
+        \\    entity_type TEXT NOT NULL,
+        \\    relation_type TEXT NOT NULL,
+        \\    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
+        \\    target_entity_type TEXT,
+        \\    min_count INTEGER NOT NULL DEFAULT 1,
+        \\    max_count INTEGER,
+        \\    severity TEXT NOT NULL DEFAULT 'warning',
+        \\    label TEXT NOT NULL,
+        \\    enabled INTEGER NOT NULL DEFAULT 1,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\CREATE INDEX graph_gap_rules_lookup_idx
+        \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        \\INSERT INTO graph_gap_rules(rule_id, ontology_id, workspace_id, entity_type, relation_type, direction, label)
+        \\VALUES ('scoped-rule', 'ws_gap::core', 'ws_gap', 'unit', 'part_of', 'out', 'Scoped');
+    );
+
+    try db.applyGraphGapRulesWorkspaceStrictMigration();
+
+    const stmt = try prepare(db, "SELECT workspace_id FROM graph_gap_rules WHERE rule_id = 'scoped-rule'");
+    defer finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("ws_gap", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expect(try db.graphGapRulesWorkspaceStrict());
 }

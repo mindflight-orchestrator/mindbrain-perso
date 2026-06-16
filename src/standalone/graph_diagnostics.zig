@@ -116,6 +116,7 @@ const RuleImportEnvelope = struct {
     ontology_id: ?[]const u8 = null,
     workspace_id: ?[]const u8 = null,
     replace: bool = false,
+    validation_mode: []const u8 = "warn",
     rules: []RuleImportRow = &.{},
 };
 
@@ -135,6 +136,12 @@ const RuleImportRow = struct {
     metadata_json: []const u8 = "{}",
 };
 
+pub const ReconciliationOptions = struct {
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8 = null,
+    limit: usize = 200,
+};
+
 pub fn resolveOntologyId(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, explicit: ?[]const u8) ![]u8 {
     if (explicit) |ontology_id| return try allocator.dupe(u8, ontology_id);
     const stmt = try facet_sqlite.prepare(db, "SELECT default_ontology_id FROM workspace_settings WHERE workspace_id = ?1 AND default_ontology_id IS NOT NULL");
@@ -142,6 +149,42 @@ pub fn resolveOntologyId(db: Database, allocator: std.mem.Allocator, workspace_i
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.NotFound;
     return try dupeColumnText(allocator, stmt, 0);
+}
+
+fn rowExists1(db: Database, sql: []const u8, value: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, value);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn rowExists2(db: Database, sql: []const u8, a: []const u8, b: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, a);
+    try facet_sqlite.bindText(stmt, 2, b);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn ontologyExists(db: Database, ontology_id: []const u8) !bool {
+    return rowExists1(db, "SELECT 1 FROM ontologies WHERE ontology_id = ?1 LIMIT 1", ontology_id);
+}
+
+fn ontologyEntityTypeExists(db: Database, ontology_id: []const u8, entity_type: []const u8) !bool {
+    return rowExists2(db, "SELECT 1 FROM ontology_entity_types WHERE ontology_id = ?1 AND entity_type = ?2 LIMIT 1", ontology_id, entity_type);
+}
+
+fn ontologyEdgeTypeExists(db: Database, ontology_id: []const u8, edge_type: []const u8) !bool {
+    return rowExists2(db, "SELECT 1 FROM ontology_edge_types WHERE ontology_id = ?1 AND edge_type = ?2 LIMIT 1", ontology_id, edge_type);
+}
+
+fn gapRuleReferencesOntology(db: Database, ontology_id: []const u8, rule: RuleImportRow) !bool {
+    if (!try ontologyEntityTypeExists(db, ontology_id, rule.entity_type)) return false;
+    if (!try ontologyEdgeTypeExists(db, ontology_id, rule.relation_type)) return false;
+    if (rule.target_entity_type) |target| {
+        if (!try ontologyEntityTypeExists(db, ontology_id, target)) return false;
+    }
+    return true;
 }
 
 pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const u8) !usize {
@@ -155,13 +198,20 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
     if (envelope.rules.len == 0) return 0;
     const scope_ontology = envelope.ontology_id orelse envelope.rules[0].ontology_id orelse return error.InvalidArguments;
     if (scope_ontology.len == 0) return error.InvalidArguments;
+    const strict_validation = if (std.mem.eql(u8, envelope.validation_mode, "strict"))
+        true
+    else if (std.mem.eql(u8, envelope.validation_mode, "warn"))
+        false
+    else
+        return error.InvalidArguments;
 
     if (envelope.replace) {
-        const delete_sql = if (envelope.workspace_id) |_| "DELETE FROM graph_gap_rules WHERE ontology_id = ?1 AND workspace_id = ?2" else "DELETE FROM graph_gap_rules WHERE ontology_id = ?1 AND workspace_id IS NULL";
+        const workspace_id = envelope.workspace_id orelse return error.MissingWorkspace;
+        const delete_sql = "DELETE FROM graph_gap_rules WHERE ontology_id = ?1 AND workspace_id = ?2";
         const delete_stmt = try facet_sqlite.prepare(db, delete_sql);
         defer facet_sqlite.finalize(delete_stmt);
         try facet_sqlite.bindText(delete_stmt, 1, scope_ontology);
-        if (envelope.workspace_id) |workspace_id| try facet_sqlite.bindText(delete_stmt, 2, workspace_id);
+        try facet_sqlite.bindText(delete_stmt, 2, workspace_id);
         try facet_sqlite.stepDone(delete_stmt);
     }
 
@@ -194,12 +244,13 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
         if (rule.rule_id.len == 0 or rule.entity_type.len == 0 or rule.relation_type.len == 0 or rule.label.len == 0) return error.InvalidArguments;
         _ = Direction.parse(rule.direction) orelse return error.InvalidArguments;
         const ontology_id = rule.ontology_id orelse envelope.ontology_id orelse return error.InvalidArguments;
-        const workspace_id = rule.workspace_id orelse envelope.workspace_id;
+        const workspace_id = rule.workspace_id orelse envelope.workspace_id orelse return error.MissingWorkspace;
+        if (strict_validation and !try gapRuleReferencesOntology(db, ontology_id, rule)) return error.InvalidArguments;
 
         try facet_sqlite.resetStatement(stmt);
         try facet_sqlite.bindText(stmt, 1, rule.rule_id);
         try facet_sqlite.bindText(stmt, 2, ontology_id);
-        if (workspace_id) |value| try facet_sqlite.bindText(stmt, 3, value) else try facet_sqlite.bindNull(stmt, 3);
+        try facet_sqlite.bindText(stmt, 3, workspace_id);
         try facet_sqlite.bindText(stmt, 4, rule.entity_type);
         try facet_sqlite.bindText(stmt, 5, rule.relation_type);
         try facet_sqlite.bindText(stmt, 6, rule.direction);
@@ -231,25 +282,20 @@ pub fn deleteRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
     defer parsed.deinit();
     const envelope = parsed.value;
     if (envelope.rule_ids.len == 0) return 0;
+    const workspace_id = envelope.workspace_id orelse return error.MissingWorkspace;
 
     var deleted: usize = 0;
     for (envelope.rule_ids) |rule_id| {
         if (rule_id.len == 0) return error.InvalidArguments;
-        const sql = if (envelope.ontology_id) |ontology_id| blk: {
-            if (envelope.workspace_id != null) {
-                break :blk "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND ontology_id = ?2 AND workspace_id = ?3";
-            }
-            _ = ontology_id;
-            break :blk "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND ontology_id = ?2 AND workspace_id IS NULL";
-        } else "DELETE FROM graph_gap_rules WHERE rule_id = ?1";
+        const sql = if (envelope.ontology_id) |_| "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND ontology_id = ?2 AND workspace_id = ?3" else "DELETE FROM graph_gap_rules WHERE rule_id = ?1 AND workspace_id = ?2";
         const stmt = try facet_sqlite.prepare(db, sql);
         defer facet_sqlite.finalize(stmt);
         try facet_sqlite.bindText(stmt, 1, rule_id);
         if (envelope.ontology_id) |ontology_id| {
             try facet_sqlite.bindText(stmt, 2, ontology_id);
-            if (envelope.workspace_id) |workspace_id| {
-                try facet_sqlite.bindText(stmt, 3, workspace_id);
-            }
+            try facet_sqlite.bindText(stmt, 3, workspace_id);
+        } else {
+            try facet_sqlite.bindText(stmt, 2, workspace_id);
         }
         try facet_sqlite.stepDone(stmt);
         if (c.sqlite3_changes(db.handle) > 0) deleted += 1;
@@ -341,6 +387,7 @@ fn entityMatchesRuleFilter(allocator: std.mem.Allocator, entity_metadata_json: [
 }
 
 pub fn rulesJson(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8, workspace_id: ?[]const u8) ![]u8 {
+    const resolved_workspace_id = workspace_id orelse return error.MissingWorkspace;
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"kind\":\"graph_gap_rules\",\"ontology_id\":");
@@ -353,13 +400,13 @@ pub fn rulesJson(db: Database, allocator: std.mem.Allocator, ontology_id: []cons
         \\       target_entity_type, min_count, max_count, severity, label, enabled, metadata_json
         \\FROM graph_gap_rules
         \\WHERE ontology_id = ?1
-        \\  AND (workspace_id IS NULL OR workspace_id = ?2)
+        \\  AND workspace_id = ?2
         \\ORDER BY rule_id
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, ontology_id);
-    try facet_sqlite.bindText(stmt, 2, workspace_id orelse "");
+    try facet_sqlite.bindText(stmt, 2, resolved_workspace_id);
     var first = true;
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
         if (!first) try out.writer.writeAll(",");
@@ -431,6 +478,295 @@ pub fn buildReport(db: Database, allocator: std.mem.Allocator, options: Diagnost
     };
 }
 
+const ReconciliationWriter = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    first_issue: bool = true,
+    issue_count: usize = 0,
+    limit: usize,
+
+    fn append(
+        self: *ReconciliationWriter,
+        kind: []const u8,
+        severity: []const u8,
+        section: []const u8,
+        label: []const u8,
+        suggested_action: []const u8,
+    ) !void {
+        _ = self.allocator;
+        if (self.issue_count >= self.limit) return;
+        if (!self.first_issue) try self.writer.writeAll(",");
+        self.first_issue = false;
+        self.issue_count += 1;
+        try self.writer.writeAll("{");
+        try writeJsonField(self.writer, "kind", kind);
+        try self.writer.writeAll(",");
+        try writeJsonField(self.writer, "severity", severity);
+        try self.writer.writeAll(",");
+        try writeJsonField(self.writer, "section", section);
+        try self.writer.writeAll(",");
+        try writeJsonField(self.writer, "label", label);
+        try self.writer.writeAll(",");
+        try writeJsonField(self.writer, "suggested_action", suggested_action);
+        try self.writer.writeAll("}");
+    }
+};
+
+pub fn reconciliationJson(db: Database, allocator: std.mem.Allocator, options: ReconciliationOptions) ![]u8 {
+    const ontology_id = try resolveOntologyId(db, allocator, options.workspace_id, options.ontology_id);
+    defer allocator.free(ontology_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"ontology_reconciliation_report\",\"summary\":{");
+    try writeJsonField(&out.writer, "workspace_id", options.workspace_id);
+    try out.writer.writeAll(",");
+    try writeJsonField(&out.writer, "ontology_id", ontology_id);
+    try out.writer.writeAll(",\"issues_total\":__ISSUES_TOTAL__},\"issues\":[");
+
+    var rw = ReconciliationWriter{
+        .allocator = allocator,
+        .writer = &out.writer,
+        .limit = options.limit,
+    };
+
+    if (!try ontologyExists(db, ontology_id)) {
+        const label = try std.fmt.allocPrint(allocator, "Workspace {s} resolves to missing ontology {s}", .{ options.workspace_id, ontology_id });
+        defer allocator.free(label);
+        try rw.append("workspace_default_ontology_missing", "error", "workspace", label, "set_workspace_default_ontology_or_import_ontology");
+    }
+
+    try reconcileRegistryProjections(db, allocator, options.workspace_id, ontology_id, &rw);
+    try reconcileRawGraph(db, allocator, options.workspace_id, ontology_id, &rw);
+    try reconcileRuntimeGraph(db, allocator, options.workspace_id, ontology_id, &rw);
+    try reconcileGapRules(db, allocator, options.workspace_id, ontology_id, &rw);
+    try reconcileFacetAssignments(db, allocator, options.workspace_id, ontology_id, &rw);
+    try reconcileCollectionOntologyBindings(db, allocator, options.workspace_id, ontology_id, &rw);
+
+    try out.writer.writeAll("]}");
+    const raw = try out.toOwnedSlice();
+    const marker = "__ISSUES_TOTAL__";
+    if (std.mem.indexOf(u8, raw, marker)) |index| {
+        const replacement = try std.fmt.allocPrint(allocator, "{d}", .{rw.issue_count});
+        defer allocator.free(replacement);
+        var patched: std.Io.Writer.Allocating = .init(allocator);
+        defer patched.deinit();
+        try patched.writer.writeAll(raw[0..index]);
+        try patched.writer.writeAll(replacement);
+        try patched.writer.writeAll(raw[index + marker.len ..]);
+        allocator.free(raw);
+        return try patched.toOwnedSlice();
+    }
+    return raw;
+}
+
+fn reconcileRegistryProjections(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    const aggregate_exists = try registrySchemaExists(db, workspace_id, ontology_id);
+    if (!aggregate_exists) {
+        const label = try std.fmt.allocPrint(allocator, "MCP schema registry projection is missing for ontology {s}", .{ontology_id});
+        defer allocator.free(label);
+        try rw.append("registry_projection_missing", "warning", "mcp_schema_registry", label, "generate_ontology_registry_projection");
+    }
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT json_extract(facets_json, '$.schema_id')
+        \\FROM agent_facts
+        \\WHERE workspace_id = ?1
+        \\  AND schema_id = 'mindbrain:schema'
+        \\  AND json_extract(facets_json, '$.generated_from') = 'ontology'
+        \\  AND json_extract(facets_json, '$.ontology_id') IS NOT NULL
+        \\  AND json_extract(facets_json, '$.ontology_id') != ?2
+        \\ORDER BY id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW and rw.issue_count < rw.limit) {
+        const label = try std.fmt.allocPrint(allocator, "Generated registry schema {s} points at a different ontology", .{columnText(stmt, 0)});
+        defer allocator.free(label);
+        try rw.append("registry_projection_orphan", "warning", "mcp_schema_registry", label, "review_or_remove_orphan_generated_schema_projection");
+    }
+}
+
+fn registrySchemaExists(db: Database, workspace_id: []const u8, schema_id: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT 1
+        \\FROM agent_facts
+        \\WHERE workspace_id = ?1
+        \\  AND schema_id = 'mindbrain:schema'
+        \\  AND json_extract(facets_json, '$.schema_id') = ?2
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, schema_id);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+fn reconcileRawGraph(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT e.entity_type
+        \\FROM entities_raw e
+        \\LEFT JOIN ontology_entity_types oe ON oe.ontology_id = ?2 AND oe.entity_type = e.entity_type
+        \\WHERE e.workspace_id = ?1 AND e.ontology_id = ?2 AND oe.entity_type IS NULL
+        \\ORDER BY e.entity_type
+    , workspace_id, ontology_id, "raw_entity_unknown_type", "raw_graph", "Raw entity type ", " is not declared in ontology", "declare_entity_type_or_fix_raw_entity_type");
+
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT r.edge_type
+        \\FROM relations_raw r
+        \\LEFT JOIN ontology_edge_types oe ON oe.ontology_id = ?2 AND oe.edge_type = r.edge_type
+        \\WHERE r.workspace_id = ?1 AND r.ontology_id = ?2 AND oe.edge_type IS NULL
+        \\ORDER BY r.edge_type
+    , workspace_id, ontology_id, "raw_relation_unknown_edge_type", "raw_graph", "Raw relation edge type ", " is not declared in ontology", "declare_edge_type_or_fix_raw_relation_type");
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT r.relation_id, r.edge_type
+        \\FROM relations_raw r
+        \\JOIN entities_raw s ON s.workspace_id = r.workspace_id AND s.entity_id = r.source_entity_id
+        \\JOIN entities_raw t ON t.workspace_id = r.workspace_id AND t.entity_id = r.target_entity_id
+        \\JOIN ontology_edge_types oe ON oe.ontology_id = ?2 AND oe.edge_type = r.edge_type
+        \\WHERE r.workspace_id = ?1 AND r.ontology_id = ?2
+        \\  AND ((oe.source_entity_type IS NOT NULL AND oe.source_entity_type != s.entity_type)
+        \\    OR (oe.target_entity_type IS NOT NULL AND oe.target_entity_type != t.entity_type))
+        \\ORDER BY r.relation_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW and rw.issue_count < rw.limit) {
+        const label = try std.fmt.allocPrint(allocator, "Raw relation {d} ({s}) endpoint types do not match ontology", .{ c.sqlite3_column_int64(stmt, 0), columnText(stmt, 1) });
+        defer allocator.free(label);
+        try rw.append("raw_relation_endpoint_mismatch", "error", "raw_graph", label, "review_raw_relation_type_or_endpoint_entity_types");
+    }
+}
+
+fn reconcileRuntimeGraph(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT e.entity_type
+        \\FROM graph_entity e
+        \\LEFT JOIN ontology_entity_types oe ON oe.ontology_id = ?2 AND oe.entity_type = e.entity_type
+        \\WHERE e.workspace_id = ?1 AND e.deprecated_at IS NULL AND oe.entity_type IS NULL
+        \\ORDER BY e.entity_type
+    , workspace_id, ontology_id, "runtime_entity_unknown_type", "runtime_graph", "Runtime entity type ", " is not declared in ontology", "reindex_after_fixing_raw_graph_or_declare_entity_type");
+
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT r.relation_type
+        \\FROM graph_relation r
+        \\LEFT JOIN ontology_edge_types oe ON oe.ontology_id = ?2 AND oe.edge_type = r.relation_type
+        \\WHERE r.workspace_id = ?1 AND r.deprecated_at IS NULL AND oe.edge_type IS NULL
+        \\ORDER BY r.relation_type
+    , workspace_id, ontology_id, "runtime_relation_unknown_edge_type", "runtime_graph", "Runtime relation type ", " is not declared in ontology", "reindex_after_fixing_raw_graph_or_declare_edge_type");
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT r.relation_id, r.relation_type
+        \\FROM graph_relation r
+        \\JOIN graph_entity s ON s.entity_id = r.source_id
+        \\JOIN graph_entity t ON t.entity_id = r.target_id
+        \\JOIN ontology_edge_types oe ON oe.ontology_id = ?2 AND oe.edge_type = r.relation_type
+        \\WHERE r.workspace_id = ?1 AND r.deprecated_at IS NULL
+        \\  AND ((oe.source_entity_type IS NOT NULL AND oe.source_entity_type != s.entity_type)
+        \\    OR (oe.target_entity_type IS NOT NULL AND oe.target_entity_type != t.entity_type))
+        \\ORDER BY r.relation_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW and rw.issue_count < rw.limit) {
+        const label = try std.fmt.allocPrint(allocator, "Runtime relation {d} ({s}) endpoint types do not match ontology", .{ c.sqlite3_column_int64(stmt, 0), columnText(stmt, 1) });
+        defer allocator.free(label);
+        try rw.append("runtime_relation_endpoint_mismatch", "error", "runtime_graph", label, "review_relation_type_or_endpoint_entity_types_then_reindex");
+    }
+}
+
+fn reconcileGapRules(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT g.entity_type
+        \\FROM graph_gap_rules g
+        \\LEFT JOIN ontology_entity_types oe ON oe.ontology_id = ?2 AND oe.entity_type = g.entity_type
+        \\WHERE g.ontology_id = ?2 AND g.workspace_id = ?1 AND oe.entity_type IS NULL
+        \\ORDER BY g.entity_type
+    , workspace_id, ontology_id, "gap_rule_unknown_entity_type", "gap_rules", "Gap rule entity type ", " is not declared in ontology", "fix_gap_rule_or_declare_entity_type");
+
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT g.relation_type
+        \\FROM graph_gap_rules g
+        \\LEFT JOIN ontology_edge_types oe ON oe.ontology_id = ?2 AND oe.edge_type = g.relation_type
+        \\WHERE g.ontology_id = ?2 AND g.workspace_id = ?1 AND oe.edge_type IS NULL
+        \\ORDER BY g.relation_type
+    , workspace_id, ontology_id, "gap_rule_unknown_relation_type", "gap_rules", "Gap rule relation type ", " is not declared in ontology", "fix_gap_rule_or_declare_edge_type");
+
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT g.target_entity_type
+        \\FROM graph_gap_rules g
+        \\LEFT JOIN ontology_entity_types oe ON oe.ontology_id = ?2 AND oe.entity_type = g.target_entity_type
+        \\WHERE g.ontology_id = ?2 AND g.workspace_id = ?1
+        \\  AND g.target_entity_type IS NOT NULL AND oe.entity_type IS NULL
+        \\ORDER BY g.target_entity_type
+    , workspace_id, ontology_id, "gap_rule_target_type_mismatch", "gap_rules", "Gap rule target type ", " is not declared in ontology", "fix_gap_rule_target_type_or_declare_entity_type");
+}
+
+fn reconcileFacetAssignments(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT f.namespace || ':' || f.dimension
+        \\FROM facet_assignments_raw f
+        \\LEFT JOIN ontology_dimensions d ON d.ontology_id = ?2 AND d.namespace = f.namespace AND d.dimension = f.dimension
+        \\WHERE f.workspace_id = ?1 AND f.ontology_id = ?2 AND d.dimension IS NULL
+        \\ORDER BY 1
+    , workspace_id, ontology_id, "facet_assignment_unknown_dimension", "collection_facets", "Facet assignment dimension ", " is not declared in ontology", "declare_dimension_or_fix_facet_assignment");
+
+    try emitUnknownRows(db, allocator, rw,
+        \\SELECT DISTINCT f.namespace || ':' || f.dimension || '=' || f.value
+        \\FROM facet_assignments_raw f
+        \\LEFT JOIN ontology_values v ON v.ontology_id = ?2 AND v.namespace = f.namespace AND v.dimension = f.dimension AND v.value = f.value
+        \\WHERE f.workspace_id = ?1 AND f.ontology_id = ?2 AND v.value IS NULL
+        \\ORDER BY 1
+    , workspace_id, ontology_id, "facet_assignment_unknown_value", "collection_facets", "Facet assignment value ", " is not declared in ontology", "declare_value_or_fix_facet_assignment");
+}
+
+fn reconcileCollectionOntologyBindings(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rw: *ReconciliationWriter) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT DISTINCT f.collection_id
+        \\FROM facet_assignments_raw f
+        \\LEFT JOIN collection_ontologies co
+        \\  ON co.workspace_id = f.workspace_id AND co.collection_id = f.collection_id AND co.ontology_id = f.ontology_id
+        \\WHERE f.workspace_id = ?1 AND f.ontology_id = ?2 AND co.ontology_id IS NULL
+        \\ORDER BY f.collection_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW and rw.issue_count < rw.limit) {
+        const label = try std.fmt.allocPrint(allocator, "Collection {s} has ontology-backed facets without a collection_ontologies binding", .{columnText(stmt, 0)});
+        defer allocator.free(label);
+        try rw.append("collection_ontology_missing", "warning", "collection_bindings", label, "attach_collection_to_ontology");
+    }
+}
+
+fn emitUnknownRows(
+    db: Database,
+    allocator: std.mem.Allocator,
+    rw: *ReconciliationWriter,
+    sql: []const u8,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    kind: []const u8,
+    section: []const u8,
+    label_prefix: []const u8,
+    label_suffix: []const u8,
+    suggested_action: []const u8,
+) !void {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW and rw.issue_count < rw.limit) {
+        const label = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ label_prefix, columnText(stmt, 0), label_suffix });
+        defer allocator.free(label);
+        try rw.append(kind, "error", section, label, suggested_action);
+    }
+}
+
 pub fn reportJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -470,7 +806,7 @@ fn loadRules(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8
         \\FROM graph_gap_rules
         \\WHERE ontology_id = ?1
         \\  AND enabled != 0
-        \\  AND (workspace_id IS NULL OR workspace_id = ?2)
+        \\  AND workspace_id = ?2
         \\ORDER BY rule_id
     );
     defer facet_sqlite.finalize(stmt);
@@ -1029,14 +1365,88 @@ test "deleteRulesJson removes selected rule ids" {
         \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_delete::core', 'ws_delete', 'core');
     );
     _ = try importRulesJson(db, std.testing.allocator,
-        \\{"ontology_id":"ws_delete::core","rules":[{"rule_id":"keep-me","entity_type":"unit","relation_type":"contains","direction":"in","label":"Keep"},{"rule_id":"drop-me","entity_type":"unit","relation_type":"owns","direction":"in","label":"Drop"}]}
+        \\{"ontology_id":"ws_delete::core","workspace_id":"ws_delete","rules":[{"rule_id":"keep-me","entity_type":"unit","relation_type":"contains","direction":"in","label":"Keep"},{"rule_id":"drop-me","entity_type":"unit","relation_type":"owns","direction":"in","label":"Drop"}]}
     );
     const deleted = try deleteRulesJson(db, std.testing.allocator,
-        \\{"ontology_id":"ws_delete::core","rule_ids":["drop-me"]}
+        \\{"ontology_id":"ws_delete::core","workspace_id":"ws_delete","rule_ids":["drop-me"]}
     );
     try std.testing.expectEqual(@as(usize, 1), deleted);
-    const rules_json = try rulesJson(db, std.testing.allocator, "ws_delete::core", null);
+    const rules_json = try rulesJson(db, std.testing.allocator, "ws_delete::core", "ws_delete");
     defer std.testing.allocator.free(rules_json);
     try std.testing.expect(std.mem.indexOf(u8, rules_json, "keep-me") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules_json, "drop-me") == null);
+}
+
+test "importRulesJson rejects workspace-less gap rules" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_required', 'ws_required', 'Required');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_required::core', 'ws_required', 'core');
+    );
+
+    try std.testing.expectError(
+        error.MissingWorkspace,
+        importRulesJson(db, std.testing.allocator,
+            \\{"ontology_id":"ws_required::core","rules":[{"rule_id":"missing-workspace","entity_type":"unit","relation_type":"owns","direction":"in","label":"Missing workspace"}]}
+        ),
+    );
+}
+
+test "strict gap rule import validates ontology references" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_strict', 'ws_strict', 'Strict');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_strict::core', 'ws_strict', 'core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_strict::core', 'unit', 'Unit');
+    );
+
+    try std.testing.expectError(error.InvalidArguments, importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_strict::core","workspace_id":"ws_strict","validation_mode":"strict","rules":[{"rule_id":"bad-edge","entity_type":"unit","relation_type":"missing_edge","direction":"out","label":"Bad edge"}]}
+    ));
+
+    const imported = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_strict::core","workspace_id":"ws_strict","validation_mode":"warn","rules":[{"rule_id":"bad-edge","entity_type":"unit","relation_type":"missing_edge","direction":"out","label":"Bad edge"}]}
+    );
+    try std.testing.expectEqual(@as(usize, 1), imported);
+}
+
+test "ontology reconciliation reports registry and graph drift" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_reconcile', 'ws_reconcile', 'Reconcile');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_reconcile::core', 'ws_reconcile', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_reconcile', 'ws_reconcile::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_reconcile::core', 'unit', 'Unit');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_reconcile::core', 'building', 'Building');
+        \\INSERT INTO ontology_edge_types(ontology_id, edge_type, source_entity_type, target_entity_type) VALUES ('ws_reconcile::core', 'part_of', 'unit', 'building');
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_type, name) VALUES ('ws_reconcile', 'ws_reconcile::core', 'ghost_type', 'Raw unknown');
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_type, name) VALUES ('ws_reconcile', 'ws_reconcile::core', 'unit', 'Raw unit');
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_type, name) VALUES ('ws_reconcile', 'ws_reconcile::core', 'building', 'Raw building');
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, edge_type, source_entity_id, target_entity_id) VALUES ('ws_reconcile', 'ws_reconcile::core', 'unknown_edge', 2, 3);
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (10, 'ws_reconcile', 'unknown_runtime', 'Runtime unknown');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (11, 'ws_reconcile', 'building', 'Runtime building');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id) VALUES (20, 'ws_reconcile', 'part_of', 11, 10);
+    );
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_reconcile::core","workspace_id":"ws_reconcile","rules":[{"rule_id":"bad-rule","entity_type":"missing_type","relation_type":"missing_edge","direction":"out","label":"Bad rule"}]}
+    );
+
+    const json = try reconciliationJson(db, std.testing.allocator, .{
+        .workspace_id = "ws_reconcile",
+        .limit = 50,
+    });
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "registry_projection_missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "raw_entity_unknown_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "raw_relation_unknown_edge_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "runtime_entity_unknown_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "runtime_relation_endpoint_mismatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "gap_rule_unknown_entity_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"issues_total\":") != null);
 }

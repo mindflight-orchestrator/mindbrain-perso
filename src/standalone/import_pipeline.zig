@@ -143,6 +143,7 @@ pub const Pipeline = struct {
     }
 
     pub fn addRelation(self: *Pipeline, relation: RelationImport) !void {
+        const ws = self.workspace_id orelse return error.MissingWorkspace;
         try self.graph.addRelation(.{
             .relation_id = relation.relation_id,
             .source_id = relation.source_id,
@@ -152,15 +153,18 @@ pub const Pipeline = struct {
             .valid_from_unix = relation.valid_from_unix,
             .valid_to_unix = relation.valid_to_unix,
         });
-        try graph_sqlite.upsertRelation(self.db.*, .{
-            .relation_id = relation.relation_id,
-            .source_id = relation.source_id,
-            .target_id = relation.target_id,
-            .relation_type = relation.relation_type,
-            .confidence = relation.confidence,
-            .valid_from_unix = relation.valid_from_unix,
-            .valid_to_unix = relation.valid_to_unix,
-        });
+        try graph_sqlite.upsertRelationFull(
+            self.db.*,
+            relation.relation_id,
+            ws,
+            relation.relation_type,
+            relation.source_id,
+            relation.target_id,
+            relation.valid_from_unix,
+            relation.valid_to_unix,
+            relation.confidence,
+            "{}",
+        );
 
         try self.graph.appendOutgoing(relation.source_id, relation.relation_id);
         try self.graph.appendIncoming(relation.target_id, relation.relation_id);
@@ -270,7 +274,7 @@ pub const Pipeline = struct {
         const tgt: u32 = std.math.cast(u32, spec.target_entity_id) orelse return error.ValueOutOfRange;
         const valid_from_unix = try unixepochText(self.db.*, spec.valid_from);
         const valid_to_unix = try unixepochText(self.db.*, spec.valid_to);
-        try self.addRelation(.{
+        try self.graph.addRelation(.{
             .relation_id = rid,
             .source_id = src,
             .target_id = tgt,
@@ -280,6 +284,10 @@ pub const Pipeline = struct {
             .valid_to_unix = valid_to_unix,
         });
         try graph_sqlite.upsertRelationFull(self.db.*, rid, spec.workspace_id, spec.edge_type, src, tgt, valid_from_unix, valid_to_unix, @floatCast(spec.confidence), spec.metadata_json);
+        try self.graph.appendOutgoing(src, rid);
+        try self.graph.appendIncoming(tgt, rid);
+        try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_out", src, rid, self.allocator);
+        try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_in", tgt, rid, self.allocator);
     }
 
     /// Persists a single typed edge property into the raw staging table and
@@ -808,7 +816,7 @@ pub const Pipeline = struct {
             defer self.allocator.free(metadata_json);
 
             try graph_sqlite.assertRelationEndpointsInWorkspace(self.db.*, workspace_id, src, tgt);
-            try self.addRelation(.{
+            try self.graph.addRelation(.{
                 .relation_id = rid,
                 .source_id = src,
                 .target_id = tgt,
@@ -818,6 +826,10 @@ pub const Pipeline = struct {
                 .valid_to_unix = valid_to_unix,
             });
             try graph_sqlite.upsertRelationFull(self.db.*, rid, workspace_id, edge, src, tgt, valid_from_unix, valid_to_unix, confidence, metadata_json);
+            try self.graph.appendOutgoing(src, rid);
+            try self.graph.appendIncoming(tgt, rid);
+            try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_out", src, rid, self.allocator);
+            try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_in", tgt, rid, self.allocator);
             projected_count += 1;
         }
 

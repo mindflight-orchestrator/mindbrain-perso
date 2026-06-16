@@ -1164,6 +1164,9 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/ontology/inspect")) {
             return self.handleOntologyInspect(allocator, query);
         }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ontology/reconciliation")) {
+            return self.handleOntologyReconciliation(allocator, query);
+        }
         if (std.mem.eql(u8, path, "/api/mindbrain/workspace/list")) {
             return self.handleWorkspaceList(allocator);
         }
@@ -2353,6 +2356,28 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleOntologyReconciliation(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try parseQueryInt(usize, value)
+        else
+            200;
+
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.reconciliationJson(db, allocator, .{
+                .workspace_id = workspace_id,
+                .ontology_id = ontology_id,
+                .limit = limit,
+            }),
+        };
+    }
+
     fn handleGraphGapRules(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
         var db = try self.openDb();
         defer db.close();
@@ -3359,12 +3384,13 @@ pub const MindbrainHttpApp = struct {
             .ontology_import = @hasDecl(@This(), "handleOntologyImportPost"),
             .ontology_compile_linkml = @hasDecl(@This(), "handleOntologyCompileLinkmlPost"),
             .ontology_inspect = @hasDecl(@This(), "handleOntologyInspect"),
+            .ontology_reconciliation = @hasDecl(@This(), "handleOntologyReconciliation"),
             .quality_convergence = @hasDecl(@This(), "handleQualityConvergenceRun"),
             .quality_remediation_actions = @hasDecl(@This(), "handleQualityRemediationActions"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -3376,6 +3402,7 @@ pub const MindbrainHttpApp = struct {
                 features.ontology_import,
                 features.ontology_compile_linkml,
                 features.ontology_inspect,
+                features.ontology_reconciliation,
                 features.quality_convergence,
                 features.quality_remediation_actions,
                 self.graph_bitmap_mode.text(),
@@ -4632,6 +4659,7 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/coverage-by-domain?domain_or_workspace=...
         \\  GET /api/mindbrain/workspace-export?workspace_id=...
         \\  GET /api/mindbrain/workspace-export-by-domain?domain_or_workspace=...
+        \\  GET /api/mindbrain/ontology/reconciliation?workspace_id=...
         \\  GET /api/mindbrain/graph-path?source=...&target=...&max_depth=...
         \\  GET /api/mindbrain/graph/subgraph?seed_ids=1,2&hops=2&edge_types=requires
         \\  GET /api/mindbrain/graph/diagnostics?workspace_id=...
