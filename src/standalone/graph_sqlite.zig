@@ -2476,17 +2476,17 @@ pub fn shortestPathToonWorkspace(
     db: Database,
     allocator: std.mem.Allocator,
     workspace_id: []const u8,
-    source_name: []const u8,
-    target_name: []const u8,
+    source_ref: []const u8,
+    target_ref: []const u8,
     edge_types: ?[]const []const u8,
     max_depth: usize,
 ) ![]u8 {
     var runtime = try loadRuntime(db, allocator);
     defer runtime.deinit();
 
-    const source = try loadTraverseEntityByName(db, allocator, workspace_id, source_name);
+    const source = try loadTraverseEntityByRef(db, allocator, workspace_id, source_ref);
     defer deinitTraverseEntitySummary(allocator, source);
-    const target = try loadTraverseEntityByName(db, allocator, workspace_id, target_name);
+    const target = try loadTraverseEntityByRef(db, allocator, workspace_id, target_ref);
     defer deinitTraverseEntitySummary(allocator, target);
 
     const path = (try runtime.shortestPath(
@@ -2496,7 +2496,7 @@ pub fn shortestPathToonWorkspace(
         .{ .edge_types = edge_types },
         max_depth,
     )) orelse {
-        const root = try buildGraphPathValue(allocator, source_name, target_name, null);
+        const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
         defer toon_exports.deinitOwnedValue(allocator, root);
         return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
     };
@@ -2505,7 +2505,7 @@ pub fn shortestPathToonWorkspace(
     var result = try buildPathResult(db, allocator, path);
     defer result.deinit(allocator);
 
-    const root = try buildGraphPathValue(allocator, source_name, target_name, result);
+    const root = try buildGraphPathValue(allocator, source_ref, target_ref, result);
     defer toon_exports.deinitOwnedValue(allocator, root);
 
     return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
@@ -3780,6 +3780,34 @@ fn loadTraverseEntityByName(db: Database, allocator: std.mem.Allocator, workspac
     };
 }
 
+fn loadTraverseEntityByRef(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, entity_ref: []const u8) !TraverseEntitySummary {
+    if (std.fmt.parseInt(u32, entity_ref, 10) catch null) |entity_id| {
+        return loadTraverseEntityByIdInWorkspace(db, allocator, workspace_id, entity_id) catch |err| switch (err) {
+            error.MissingRow => loadTraverseEntityByName(db, allocator, workspace_id, entity_ref),
+            else => return err,
+        };
+    }
+    return loadTraverseEntityByName(db, allocator, workspace_id, entity_ref);
+}
+
+fn loadTraverseEntityByIdInWorkspace(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, entity_id: u32) !TraverseEntitySummary {
+    const stmt = try prepare(
+        db,
+        "SELECT entity_id, name, COALESCE(json_extract(metadata_json, '$.label'), name), COALESCE(json_extract(metadata_json, '$.node_type'), 'entity'), metadata_json FROM graph_entity WHERE workspace_id = ?1 AND entity_id = ?2 AND deprecated_at IS NULL LIMIT 1",
+    );
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    try bindInt64(stmt, 2, entity_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    return .{
+        .entity_id = try columnU32(stmt, 0),
+        .name = try dupeColumnText(allocator, stmt, 1),
+        .node_label = try dupeColumnText(allocator, stmt, 2),
+        .node_type = try dupeColumnText(allocator, stmt, 3),
+        .metadata_json = try dupeColumnText(allocator, stmt, 4),
+    };
+}
+
 fn loadTraverseEntityById(db: Database, allocator: std.mem.Allocator, entity_id: u32) !TraverseEntitySummary {
     const stmt = try prepare(
         db,
@@ -4450,6 +4478,58 @@ test "sqlite-backed graph shortest path has a TOON export variant" {
     try std.testing.expect(std.mem.indexOf(u8, toon, "target_name: Paper") != null);
     try std.testing.expect(std.mem.indexOf(u8, toon, "target_found: true") != null);
     try std.testing.expect(std.mem.indexOf(u8, toon, "segments[2\t]{relation_id\trelation_type\tsource_id\tsource_name\ttarget_id\ttarget_name\tconfidence}:") != null);
+}
+
+test "sqlite-backed graph shortest path accepts workspace-scoped numeric entity refs" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try db.exec(
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (33, 'serenity-v4', 'source', 'production:copropriete_360', 1.0, '{"label":"Production"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (44, 'serenity-v4', 'source', '404', 1.0, '{"label":"Numeric name"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (85, 'serenity-v4', 'target', 'missions:aurora', 1.0, '{"label":"Aurora"}');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (86, 'other', 'target', 'missions:aurora', 1.0, '{}');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence, metadata_json) VALUES (520, 'serenity-v4', 'ouvrir', 33, 85, 0.9, '{}');
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence, metadata_json) VALUES (521, 'serenity-v4', 'fallback_name', 44, 85, 0.8, '{}');
+    );
+    try insertAdjacency(db, "graph_lj_out", 33, &.{520}, std.testing.allocator);
+    try insertAdjacency(db, "graph_lj_out", 44, &.{521}, std.testing.allocator);
+    try insertAdjacency(db, "graph_lj_in", 85, &.{520}, std.testing.allocator);
+
+    const toon = try shortestPathToonWorkspace(
+        db,
+        std.testing.allocator,
+        "serenity-v4",
+        "33",
+        "85",
+        null,
+        1,
+    );
+    defer std.testing.allocator.free(toon);
+
+    try std.testing.expect(std.mem.indexOf(u8, toon, "source_name: 33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toon, "target_name: 85") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toon, "target_found: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toon, "520\touvrir") != null);
+
+    const numeric_name_toon = try shortestPathToonWorkspace(
+        db,
+        std.testing.allocator,
+        "serenity-v4",
+        "404",
+        "85",
+        null,
+        1,
+    );
+    defer std.testing.allocator.free(numeric_name_toon);
+    try std.testing.expect(std.mem.indexOf(u8, numeric_name_toon, "target_found: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, numeric_name_toon, "521\tfallback_name") != null);
+
+    try std.testing.expectError(
+        error.MissingRow,
+        shortestPathToonWorkspace(db, std.testing.allocator, "other", "33", "85", null, 1),
+    );
 }
 
 test "sqlite graph search helpers have TOON export variants" {

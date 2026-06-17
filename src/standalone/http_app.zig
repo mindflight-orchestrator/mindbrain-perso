@@ -1549,13 +1549,18 @@ pub const MindbrainHttpApp = struct {
         )) orelse return error.BadRequest;
 
         const candidate_limit = @min(@as(usize, 1000), search_request.limit * 4);
-        const bm25_matches = if (search_request.query.len > 0)
+        const raw_bm25_matches = if (search_request.query.len > 0)
             try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit)
         else
             try allocator.alloc(search_sqlite.Bm25Match, 0);
-        defer allocator.free(bm25_matches);
+        defer allocator.free(raw_bm25_matches);
+        const bm25_matches = if (table_id == 1)
+            try filterBm25MatchesByWorkspace(db, allocator, raw_bm25_matches, search_request.workspace_id)
+        else
+            raw_bm25_matches;
+        defer if (table_id == 1) allocator.free(bm25_matches);
 
-        const vector_matches = if (query_vector_f32.len > 0)
+        const raw_vector_matches = if (query_vector_f32.len > 0)
             try search_sqlite.searchEmbeddingExactTopK(
                 db,
                 allocator,
@@ -1566,7 +1571,12 @@ pub const MindbrainHttpApp = struct {
             )
         else
             try allocator.alloc(interfaces.VectorSearchMatch, 0);
-        defer allocator.free(vector_matches);
+        defer allocator.free(raw_vector_matches);
+        const vector_matches = if (table_id == 1)
+            try filterVectorMatchesByWorkspace(db, allocator, raw_vector_matches, search_request.workspace_id)
+        else
+            raw_vector_matches;
+        defer if (table_id == 1) allocator.free(vector_matches);
 
         const matches = try hybrid_search.fusePreScored(
             allocator,
@@ -3541,9 +3551,11 @@ pub const MindbrainHttpApp = struct {
         const edge_labels = try queryValues(allocator, query, "edge_label");
         defer allocator.free(edge_labels);
 
-        const body = try graph_sqlite.shortestPathToon(
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse self.default_workspace_id_owned;
+        const body = try graph_sqlite.shortestPathToonWorkspace(
             db,
             allocator,
+            workspace_id,
             source,
             target,
             if (edge_labels.len > 0) edge_labels else null,
@@ -5179,7 +5191,7 @@ fn encodeGraphSubgraphJsonBody(allocator: std.mem.Allocator, events: []const gra
     try out.writer.writeAll("[");
     for (events, 0..) |event, i| {
         if (i > 0) try out.writer.writeAll(",");
-        try out.writer.print("{{\"seq\":{d},\"kind\":{},\"payload\":", .{
+        try out.writer.print("{{\"seq\":{d},\"kind\":{f},\"payload\":", .{
             event.seq,
             std.json.fmt(event.kind, .{}),
         });
@@ -5251,6 +5263,52 @@ fn parseQueryInt(comptime Int: type, value: []const u8) !Int {
     return std.fmt.parseInt(Int, value, 10) catch error.BadRequest;
 }
 
+fn filterBm25MatchesByWorkspace(
+    db: facet_sqlite.Database,
+    allocator: std.mem.Allocator,
+    matches: []const search_sqlite.Bm25Match,
+    workspace_id: []const u8,
+) ![]search_sqlite.Bm25Match {
+    var filtered = std.ArrayList(search_sqlite.Bm25Match).empty;
+    defer filtered.deinit(allocator);
+    for (matches) |match| {
+        if (try agentFactDocInWorkspace(db, match.doc_id, workspace_id)) {
+            try filtered.append(allocator, match);
+        }
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn filterVectorMatchesByWorkspace(
+    db: facet_sqlite.Database,
+    allocator: std.mem.Allocator,
+    matches: []const interfaces.VectorSearchMatch,
+    workspace_id: []const u8,
+) ![]interfaces.VectorSearchMatch {
+    var filtered = std.ArrayList(interfaces.VectorSearchMatch).empty;
+    defer filtered.deinit(allocator);
+    for (matches) |match| {
+        if (try agentFactDocInWorkspace(db, match.doc_id, workspace_id)) {
+            try filtered.append(allocator, match);
+        }
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn agentFactDocInWorkspace(db: facet_sqlite.Database, doc_id: u64, workspace_id: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(
+        db,
+        "SELECT 1 FROM agent_facts WHERE workspace_id = ?1 AND doc_id = ?2 AND (valid_until_unix IS NULL OR valid_until_unix > strftime('%s','now')) LIMIT 1",
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindInt64(stmt, 2, doc_id);
+    const rc = facet_sqlite.c.sqlite3_step(stmt);
+    if (rc == facet_sqlite.c.SQLITE_ROW) return true;
+    if (rc == facet_sqlite.c.SQLITE_DONE) return false;
+    return error.StepFailed;
+}
+
 fn parseDirection(text: []const u8) ?graph_sqlite.TraverseDirection {
     if (std.mem.eql(u8, text, "outbound")) return .outbound;
     if (std.mem.eql(u8, text, "inbound")) return .inbound;
@@ -5320,6 +5378,61 @@ test "graph subgraph sse encoder emits expected frames" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"subgraph\"") != null);
 }
 
+test "graph subgraph json encoder emits valid json kind strings" {
+    var events = try std.testing.allocator.alloc(graph_sqlite.GraphStreamEvent, 2);
+    defer std.testing.allocator.free(events);
+    events[0] = .{
+        .seq = 1,
+        .kind = "seed_node",
+        .payload = "{\"entity_id\":1}",
+    };
+    events[1] = .{
+        .seq = 2,
+        .kind = "done",
+        .payload = "{\"node_count\":1}",
+    };
+
+    const body = try encodeGraphSubgraphJsonBody(std.testing.allocator, events);
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"seed_node\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".{ .value") == null);
+}
+
+test "ghostcrab search filters table one matches by agent facts workspace" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id) VALUES ('target', 'demo', 'Aurora target workspace fact', '{}', 'serenity-v4', 7);
+        \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id) VALUES ('other', 'demo', 'Aurora other workspace fact', '{}', 'default', 9);
+        \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id, valid_until_unix) VALUES ('expired', 'demo', 'Aurora expired workspace fact', '{}', 'serenity-v4', 11, 1);
+    );
+
+    const bm25_raw = [_]search_sqlite.Bm25Match{
+        .{ .doc_id = 7, .score = 3.0 },
+        .{ .doc_id = 9, .score = 2.0 },
+        .{ .doc_id = 11, .score = 1.0 },
+    };
+    const bm25_filtered = try filterBm25MatchesByWorkspace(db, std.testing.allocator, &bm25_raw, "serenity-v4");
+    defer std.testing.allocator.free(bm25_filtered);
+    try std.testing.expectEqual(@as(usize, 1), bm25_filtered.len);
+    try std.testing.expectEqual(@as(u64, 7), bm25_filtered[0].doc_id);
+
+    const vector_raw = [_]interfaces.VectorSearchMatch{
+        .{ .doc_id = 9, .distance = 0.1, .similarity = 0.9 },
+        .{ .doc_id = 7, .distance = 0.2, .similarity = 0.8 },
+        .{ .doc_id = 11, .distance = 0.3, .similarity = 0.7 },
+    };
+    const vector_filtered = try filterVectorMatchesByWorkspace(db, std.testing.allocator, &vector_raw, "serenity-v4");
+    defer std.testing.allocator.free(vector_filtered);
+    try std.testing.expectEqual(@as(usize, 1), vector_filtered.len);
+    try std.testing.expectEqual(@as(u64, 7), vector_filtered[0].doc_id);
+}
+
 test "graph explorer backend endpoints expose ontology and workspace scoped graph detail" {
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-graph-explorer-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
     defer std.testing.allocator.free(db_path);
@@ -5354,6 +5467,7 @@ test "graph explorer backend endpoints expose ontology and workspace scoped grap
         \\INSERT INTO graph_entity_chunk(entity_id, workspace_id, collection_id, doc_id, chunk_index, role, confidence, metadata_json) VALUES (1, 'ws_api', 'registry', 42, 0, 'mention', 0.8, '{"quote":"Ada owns Unit 1"}');
         \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, source_ref, doc_id) VALUES ('facet-1', 'ownership', 'Ada owns Unit 1', '{"entity_id":"1","status":"active"}', 'ws_api', '1', 42);
     );
+    try graph_sqlite.rebuildAdjacencyForWorkspace(app.writer_db, std.testing.allocator, "ws_api", &.{ 1, 2 });
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5382,9 +5496,26 @@ test "graph explorer backend endpoints expose ontology and workspace scoped grap
     try std.testing.expect(std.mem.indexOf(u8, relation.body, "\"ref_doc_id\":42") != null);
 
     const subgraph = try app.handleGraphSubgraph(arena, "workspace_id=ws_api&seed_ids=1&hops=1&format=json");
+    var parsed_subgraph = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, subgraph.body, .{});
+    defer parsed_subgraph.deinit();
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"kind\":\"edge\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "\"relation_id\":11") == null);
     try std.testing.expect(std.mem.indexOf(u8, subgraph.body, "Other Unit") == null);
+
+    const path = try app.handleGraphPath(arena, "workspace_id=ws_api&source=1&target=2&max_depth=1");
+    try std.testing.expect(std.mem.indexOf(u8, path.body, "kind: graph_path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path.body, "target_found: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path.body, "10\towns") != null);
+
+    const mixed_path = try app.handleGraphPath(arena, "workspace_id=ws_api&source=Ada&target=2&max_depth=1");
+    try std.testing.expect(std.mem.indexOf(u8, mixed_path.body, "target_found: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_path.body, "10\towns") != null);
+
+    try std.testing.expectError(
+        error.MissingRow,
+        app.handleGraphPath(arena, "workspace_id=ws_other&source=1&target=3&max_depth=1"),
+    );
 }
 
 test "studio taxonomy and projection endpoints expose taxonomy workspace and relevance APIs" {

@@ -273,6 +273,7 @@ pub fn resolveSearchTableId(
     collection_id: ?[]const u8,
 ) !?u64 {
     if (explicit_table_id) |table_id| {
+        if (table_id == 1) return table_id;
         if (try searchTableBelongsToWorkspace(db, workspace_id, table_id)) return table_id;
         return null;
     }
@@ -1459,6 +1460,7 @@ test "search sqlite resolves scoped table ids" {
     });
 
     try std.testing.expectEqual(@as(?u64, 31), try resolveSearchTableId(db, "default", 31, null));
+    try std.testing.expectEqual(@as(?u64, 1), try resolveSearchTableId(db, "default", 1, null));
     try std.testing.expectEqual(@as(?u64, 31), try resolveSearchTableId(db, "default", null, "documents"));
     try std.testing.expectEqual(@as(?u64, null), try resolveSearchTableId(db, "other", 31, null));
     try std.testing.expectEqual(@as(?u64, null), try resolveSearchTableId(db, "default", null, "missing"));
