@@ -5,7 +5,7 @@ This repository ships a **SQLite-first** knowledge engine with faceted search, B
 ## Current runtime
 
 The standalone HTTP capabilities endpoint currently reports
-`mindbrain_version: "1.7.3"`. This checkout is a post-`v1.4.x` SQLite-first
+`mindbrain_version: "1.7.4"`. This checkout is a post-`v1.4.x` SQLite-first
 runtime with graph diagnostics, graph gap rules, ontology import/inspection,
 quality convergence, GhostCrab compatibility routes, structured import helpers,
 and hybrid BM25/vector search.

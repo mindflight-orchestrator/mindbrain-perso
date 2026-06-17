@@ -1129,8 +1129,12 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/health")) {
             return .{
                 .status = .ok,
-                .content_type = "text/plain; charset=utf-8",
-                .body = try allocator.dupe(u8, "ok\n"),
+                .content_type = "application/json; charset=utf-8",
+                .body = try std.json.Stringify.valueAlloc(allocator, .{
+                    .kind = "mindbrain_health",
+                    .status = "ok",
+                    .mindbrain_version = mindbrain_version,
+                }, .{}),
             };
         }
 

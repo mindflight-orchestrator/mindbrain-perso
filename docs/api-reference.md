@@ -9,7 +9,7 @@ It is derived from the active entrypoints:
 
 MindBrain is SQLite-first in this repository. The operational API that
 applications call in this checkout is the standalone SQLite CLI plus the local
-HTTP server. Runtime capabilities currently report `mindbrain_version: "1.7.3"`.
+HTTP server. Runtime capabilities currently report `mindbrain_version: "1.7.4"`.
 
 ## HTTP server
 
@@ -197,7 +197,7 @@ tool flow.
 
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
-| `GET`/`HEAD` | `/health` | none | `ok\n` |
+| `GET`/`HEAD` | `/health` | none | JSON liveness status with `mindbrain_version` |
 | `GET`/`HEAD` | `/api/mindbrain/capabilities` | none | JSON runtime feature flags, `mindbrain_version`, and bitmap-mode status |
 | `GET`/`HEAD` | `/api/mindbrain/schema/status` | none | JSON schema status with applied additive migrations and missing columns |
 | `GET`/`HEAD` | `/api/mindbrain/simulate` | none | Lab route: JSON simulation event summary; also writes to `demo_firehose` |
