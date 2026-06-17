@@ -267,8 +267,6 @@ pub const Database = struct {
         );
 
         const applied_id = "2026-06-16-answer-artifacts-workspace-strict-applied";
-        if (try self.migrationApplied(applied_id)) return;
-
         if (try self.answerArtifactsWorkspaceStrict()) {
             try self.markMigrationApplied(applied_id);
             return;
@@ -692,8 +690,6 @@ pub const Database = struct {
         );
 
         const applied_id = "2026-06-16-graph-gap-rules-workspace-strict-applied";
-        if (try self.migrationApplied(applied_id)) return;
-
         if (try self.graphGapRulesWorkspaceStrict()) {
             try self.markMigrationApplied(applied_id);
             return;
@@ -2495,6 +2491,67 @@ test "answer artifact workspace strict migration backfills analysis plans from s
     try std.testing.expect(try db.answerArtifactsWorkspaceStrict());
 }
 
+test "answer artifact workspace strict migration ignores stale applied marker" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE mindbrain_schema_migrations (
+        \\    id TEXT PRIMARY KEY,
+        \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\INSERT INTO mindbrain_schema_migrations(id)
+        \\VALUES ('2026-06-16-answer-artifacts-workspace-strict-applied');
+        \\CREATE TABLE workspaces (
+        \\    id TEXT PRIMARY KEY,
+        \\    workspace_id TEXT UNIQUE,
+        \\    label TEXT
+        \\);
+        \\CREATE TABLE mindbrain_answer_artifacts (
+        \\    artifact_id TEXT PRIMARY KEY,
+        \\    slug TEXT NOT NULL,
+        \\    workspace_id TEXT,
+        \\    agent_id TEXT,
+        \\    scope TEXT,
+        \\    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),
+        \\    public_label_key TEXT,
+        \\    public_label TEXT NOT NULL,
+        \\    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('draft', 'active', 'frozen', 'stale', 'archived', 'deleted')),
+        \\    state TEXT NOT NULL,
+        \\    current_version INTEGER NOT NULL DEFAULT 1 CHECK (current_version >= 1),
+        \\    payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+        \\    legacy_ref TEXT,
+        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+        \\    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+        \\    CHECK (
+        \\        (artifact_kind = 'analysis_plan' AND workspace_id IS NULL AND agent_id IS NOT NULL AND scope IS NOT NULL) OR
+        \\        (artifact_kind IN ('live_answer_view', 'answer_snapshot') AND workspace_id IS NOT NULL) OR
+        \\        (artifact_kind = 'evidence_pack' AND json_extract(payload_json, '$.parent_artifact_id') IS NOT NULL)
+        \\    )
+        \\);
+        \\INSERT INTO workspaces(id, workspace_id, label)
+        \\VALUES ('ws_plan', 'ws_plan', 'Plan Workspace');
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\    artifact_id, slug, agent_id, scope, artifact_kind,
+        \\    public_label, lifecycle, state, payload_json
+        \\)
+        \\VALUES (
+        \\    'analysis_plan__demo', 'demo', 'agent:self', 'ws_plan:production:demo',
+        \\    'analysis_plan', 'Demo plan', 'active', 'open', '{}'
+        \\);
+    );
+
+    try db.applyAnswerArtifactsWorkspaceStrictMigration();
+
+    const stmt = try prepare(
+        db,
+        "SELECT workspace_id FROM mindbrain_answer_artifacts WHERE artifact_id = 'analysis_plan__demo'",
+    );
+    defer finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("ws_plan", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expect(try db.answerArtifactsWorkspaceStrict());
+}
+
 test "graph gap rules workspace strict migration preserves scoped rules" {
     var db = try Database.openInMemory();
     defer db.close();
@@ -2518,6 +2575,46 @@ test "graph gap rules workspace strict migration preserves scoped rules" {
         \\);
         \\CREATE INDEX graph_gap_rules_lookup_idx
         \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        \\INSERT INTO graph_gap_rules(rule_id, ontology_id, workspace_id, entity_type, relation_type, direction, label)
+        \\VALUES ('scoped-rule', 'ws_gap::core', 'ws_gap', 'unit', 'part_of', 'out', 'Scoped');
+    );
+
+    try db.applyGraphGapRulesWorkspaceStrictMigration();
+
+    const stmt = try prepare(db, "SELECT workspace_id FROM graph_gap_rules WHERE rule_id = 'scoped-rule'");
+    defer finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("ws_gap", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expect(try db.graphGapRulesWorkspaceStrict());
+}
+
+test "graph gap rules workspace strict migration ignores stale applied marker" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE mindbrain_schema_migrations (
+        \\    id TEXT PRIMARY KEY,
+        \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\INSERT INTO mindbrain_schema_migrations(id)
+        \\VALUES ('2026-06-16-graph-gap-rules-workspace-strict-applied');
+        \\CREATE TABLE graph_gap_rules (
+        \\    rule_id TEXT PRIMARY KEY,
+        \\    ontology_id TEXT NOT NULL,
+        \\    workspace_id TEXT,
+        \\    entity_type TEXT NOT NULL,
+        \\    relation_type TEXT NOT NULL,
+        \\    direction TEXT NOT NULL CHECK(direction IN ('out', 'in', 'either')),
+        \\    target_entity_type TEXT,
+        \\    min_count INTEGER NOT NULL DEFAULT 1,
+        \\    max_count INTEGER,
+        \\    severity TEXT NOT NULL DEFAULT 'warning',
+        \\    label TEXT NOT NULL,
+        \\    enabled INTEGER NOT NULL DEFAULT 1,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
         \\INSERT INTO graph_gap_rules(rule_id, ontology_id, workspace_id, entity_type, relation_type, direction, label)
         \\VALUES ('scoped-rule', 'ws_gap::core', 'ws_gap', 'unit', 'part_of', 'out', 'Scoped');
     );
