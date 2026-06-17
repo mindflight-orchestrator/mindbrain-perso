@@ -2489,26 +2489,150 @@ pub fn shortestPathToonWorkspace(
     const target = try loadTraverseEntityByRef(db, allocator, workspace_id, target_ref);
     defer deinitTraverseEntitySummary(allocator, target);
 
-    const path = (try runtime.shortestPath(
+    const runtime_path = (try runtime.shortestPath(
         allocator,
         source.entity_id,
         target.entity_id,
         .{ .edge_types = edge_types },
         max_depth,
-    )) orelse {
-        const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
-        defer toon_exports.deinitOwnedValue(allocator, root);
-        return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
-    };
-    defer allocator.free(path);
+    )) orelse null;
 
-    var result = try buildPathResult(db, allocator, path);
+    var fallback_path: ?[]graph_store.PathEdge = null;
+    defer if (fallback_path) |path| allocator.free(path);
+
+    var result: GraphPathResult = if (runtime_path) |path| result: {
+        defer allocator.free(path);
+        break :result buildPathResult(db, allocator, path) catch |err| switch (err) {
+            error.MissingRow => {
+                fallback_path = try shortestPathSqlFallback(
+                    db,
+                    allocator,
+                    workspace_id,
+                    source.entity_id,
+                    target.entity_id,
+                    edge_types,
+                    max_depth,
+                );
+                const fallback = fallback_path orelse {
+                    const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
+                    defer toon_exports.deinitOwnedValue(allocator, root);
+                    return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
+                };
+                break :result try buildPathResult(db, allocator, fallback);
+            },
+            else => return err,
+        };
+    } else result: {
+        fallback_path = try shortestPathSqlFallback(
+            db,
+            allocator,
+            workspace_id,
+            source.entity_id,
+            target.entity_id,
+            edge_types,
+            max_depth,
+        );
+        const fallback = fallback_path orelse {
+            const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
+            defer toon_exports.deinitOwnedValue(allocator, root);
+            return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
+        };
+        break :result try buildPathResult(db, allocator, fallback);
+    };
     defer result.deinit(allocator);
 
     const root = try buildGraphPathValue(allocator, source_ref, target_ref, result);
     defer toon_exports.deinitOwnedValue(allocator, root);
 
     return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
+}
+
+fn shortestPathSqlFallback(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    source_id: u32,
+    target_id: u32,
+    edge_types: ?[]const []const u8,
+    max_depth: usize,
+) !?[]graph_store.PathEdge {
+    if (source_id == target_id) return try allocator.dupe(graph_store.PathEdge, &.{});
+    if (max_depth == 0) return null;
+
+    var frontier = std.ArrayList(u32).empty;
+    defer frontier.deinit(allocator);
+    try frontier.append(allocator, source_id);
+
+    var visited = std.AutoHashMap(u32, void).init(allocator);
+    defer visited.deinit();
+    try visited.put(source_id, {});
+
+    var predecessors = std.AutoHashMap(u32, graph_store.PathEdge).init(allocator);
+    defer predecessors.deinit();
+
+    var depth: usize = 0;
+    while (depth < max_depth and frontier.items.len != 0) : (depth += 1) {
+        var next_frontier = std.ArrayList(u32).empty;
+        defer next_frontier.deinit(allocator);
+
+        for (frontier.items) |node_id| {
+            const neighbors = try loadTraverseNeighbors(
+                db,
+                allocator,
+                node_id,
+                .outbound,
+                .{ .edge_types = edge_types },
+                workspace_id,
+            );
+            defer {
+                for (neighbors) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
+                allocator.free(neighbors);
+            }
+
+            for (neighbors) |neighbor| {
+                const next_id = neighbor.entity.entity_id;
+                if (visited.contains(next_id)) continue;
+                try visited.put(next_id, {});
+                try predecessors.put(next_id, .{
+                    .from_node = node_id,
+                    .to_node = next_id,
+                    .relation_id = neighbor.relation_id,
+                });
+                if (next_id == target_id) {
+                    return try buildSqlFallbackPath(allocator, &predecessors, source_id, target_id);
+                }
+                try next_frontier.append(allocator, next_id);
+            }
+        }
+
+        frontier.clearRetainingCapacity();
+        try frontier.appendSlice(allocator, next_frontier.items);
+    }
+
+    return null;
+}
+
+fn buildSqlFallbackPath(
+    allocator: std.mem.Allocator,
+    predecessors: *std.AutoHashMap(u32, graph_store.PathEdge),
+    source_id: u32,
+    target_id: u32,
+) ![]graph_store.PathEdge {
+    var reversed = std.ArrayList(graph_store.PathEdge).empty;
+    defer reversed.deinit(allocator);
+
+    var current = target_id;
+    while (current != source_id) {
+        const edge = predecessors.get(current) orelse return error.MissingRow;
+        try reversed.append(allocator, edge);
+        current = edge.from_node;
+    }
+
+    const path = try allocator.alloc(graph_store.PathEdge, reversed.items.len);
+    for (reversed.items, 0..) |edge, index| {
+        path[path.len - 1 - index] = edge;
+    }
+    return path;
 }
 
 fn buildGraphPathValue(

@@ -5309,10 +5309,9 @@ fn encodeGraphSubgraphJsonBody(allocator: std.mem.Allocator, events: []const gra
     try out.writer.writeAll("[");
     for (events, 0..) |event, i| {
         if (i > 0) try out.writer.writeAll(",");
-        try out.writer.print("{{\"seq\":{d},\"kind\":{f},\"payload\":", .{
-            event.seq,
-            std.json.fmt(event.kind, .{}),
-        });
+        try out.writer.print("{{\"seq\":{d},\"kind\":", .{event.seq});
+        try writeOptionalJsonString(&out.writer, event.kind);
+        try out.writer.writeAll(",\"payload\":");
         try out.writer.writeAll(event.payload);
         try out.writer.writeAll("}");
     }
