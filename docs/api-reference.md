@@ -9,7 +9,7 @@ It is derived from the active entrypoints:
 
 MindBrain is SQLite-first in this repository. The operational API that
 applications call in this checkout is the standalone SQLite CLI plus the local
-HTTP server.
+HTTP server. Runtime capabilities currently report `mindbrain_version: "1.7.2"`.
 
 ## HTTP server
 
@@ -27,7 +27,7 @@ Environment and CLI options:
 | Option | Meaning | Default |
 |--------|---------|---------|
 | `--addr <ip:port>` / `MINDBRAIN_HTTP_ADDR` | Listen address. Use bracketed IPv6, for example `[::1]:8091`. | `127.0.0.1:8091` |
-| `--db <sqlite_path>` / `MINDBRAIN_DB_PATH` | SQLite database path. Parent directories are created. | `data/mindbrain.sqlite` |
+| `--db <sqlite_path>` / `--mindbrain-db <sqlite_path>` / `MINDBRAIN_DB_PATH` | SQLite database path. Parent directories are created. | `data/mindbrain.sqlite` |
 | `--static-dir <dir>` / `MINDBRAIN_STATIC_DIR` | Directory for static assets. Unknown GET/HEAD paths fall through to this directory. | `dashboard/dist` |
 | `--init-only` | Initialize the database schema and exit without listening. | off |
 | `MINDBRAIN_HTTP_MAX_BODY_BYTES` | Maximum JSON body size for SQL requests. | `1048576` |
@@ -52,6 +52,9 @@ the server bound to loopback or place it behind an external auth/proxy layer.
 - Successful JSON endpoints use `application/json; charset=utf-8`.
 - TOON/text endpoints use `text/plain; charset=utf-8`.
 - Event streams use `text/event-stream; charset=utf-8`.
+- `/api/events`, `/api/mindbrain/events`, and `/api/mindbrain/simulate` are
+  lab/demo routes. The standalone `mindbrain-http` binary enables them; embedded
+  production apps can initialize `MindbrainHttpApp` with `enable_lab_routes=false`.
 
 ### SQL endpoints
 
@@ -69,9 +72,10 @@ server executes it through SQLite `exec` and returns only mutation metadata.
 
 Standalone HTTP serializes writes through one writer connection using WAL,
 `busy_timeout`, and `synchronous=NORMAL`. SQL writes, SQL sessions, fact writes,
-and `/api/mindbrain/simulate` use that writer lane; read-only SQL uses separate
-read connections. `/api/mindbrain/sql/write-status` reports the current writer
-mode, active SQL session if any, and completed/failed writer operation counters.
+ontology writes, reindex writes, graph gap-rule writes, quality writes, and lab
+simulation use that writer lane; read-only SQL uses separate read connections.
+`/api/mindbrain/sql/write-status` reports the current writer mode, active SQL
+session if any, and completed/failed writer operation counters.
 
 SQL execution failures return JSON with `ok:false` and an `error` object that
 contains the MindBrain operation name, SQLite primary and extended result codes,
@@ -110,12 +114,14 @@ collection table.
 
 | Method | Path | Body | Response |
 |--------|------|------|----------|
-| `POST` | `/api/mindbrain/facts/write` | `{ "workspace_id": "default", "schema_id": "...", "content": "...", "facets_json": "{}", "source_ref": "...", "created_by": "...", "valid_from_unix": 0, "valid_until_unix": 0 }` | `{ ok, id, doc_id, created, updated }` |
+| `POST` | `/api/mindbrain/facts/write` | `{ "workspace_id": "default", "schema_id": "...", "content": "...", "facets_json": "{}", "embedding": [0.1], "embedding_blob": "...", "source_ref": "...", "created_by": "...", "valid_from_unix": 0, "valid_until_unix": 0 }` | `{ ok, id, doc_id, created, updated }` |
 
 Required fields are `schema_id` and `content`; both must be non-empty.
 `workspace_id` defaults to `default`. `facets_json` defaults to `{}` and must
 parse as a JSON object text. `source_ref` is optional; an empty string is
-normalized to null by the HTTP layer.
+normalized to null by the HTTP layer. `embedding` is a JSON number array; when
+present, it is copied as finite `f32` values into `search_embeddings` for search
+table `1`.
 
 The endpoint is the standalone durable fact-store write API. It writes to the
 `facets` table and keeps the legacy `facets` text column and `facets_json`
@@ -156,15 +162,47 @@ when the target ontology has `frozen=true`.
 
 Required string fields must be non-empty. `value_id` must be non-negative.
 
+### Search and graph write endpoints
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/api/mindbrain/search-embedding-upsert` | `{ "table_id": 77, "doc_id": 123, "embedding": [0.1, 0.2] }` | `{ ok, table_id, doc_id, dimensions, bytes }` |
+| `POST` | `/api/mindbrain/ghostcrab/search` | `{ "workspace_id": "ws", "query": "...", "embedding": [...], "vector_weight": 0.5, "limit": 50, "table_id": 77, "collection_id": "ws::docs" }` | JSON fused BM25/vector matches |
+| `POST` | `/api/mindbrain/graph/pattern-query` | `{ "query": "WORKSPACE ws ...", "backend": "sqlite"\|"postgres", "options": {}, "debug": false }` | JSON GPQ result; `503` when the Postgres backend cannot execute |
+
+`search-embedding-upsert` and `ghostcrab/search` accept JSON number arrays and
+convert them to packed little-endian `f32` vectors. `ghostcrab/search` requires
+a non-empty `workspace_id`, `limit` in `1..1000`, and `vector_weight` in
+`0..1`. If both text query and embedding are supplied, results are hybrid
+BM25/vector; with only one input, the route runs the corresponding retrieval
+mode.
+
+### Quality endpoints
+
+| Method | Path | Body or query | Response |
+|--------|------|---------------|----------|
+| `POST` | `/api/mindbrain/quality/convergence/run` | `{ "workspace_id", "ontology_id" optional, "persist" optional default true, "limit" optional, "component_small_max" optional }` | JSON convergence report; persisted by default |
+| `GET`/`HEAD` | `/api/mindbrain/quality/convergence/runs` | `workspace_id`, `limit` optional | JSON persisted run list |
+| `GET`/`HEAD` | `/api/mindbrain/quality/convergence/run` | `run_id` | JSON persisted run detail |
+| `GET`/`HEAD` | `/api/mindbrain/quality/remediation/actions` | `run_id`, `status` optional | JSON remediation action list |
+| `POST` | `/api/mindbrain/quality/remediation/decision` | `{ "action_id", "decision": "approved"\|"rejected", "actor" optional, "note" optional }` | `{ "ok": true, ... }` |
+| `POST` | `/api/mindbrain/quality/remediation/status` | `{ "action_id", "status": "proposed"\|"approved"\|"rejected"\|"applied"\|"failed"\|"skipped", "result_json" optional }` | `{ "ok": true, ... }` |
+
+Quality convergence compares registry/schema hints, native ontology rows,
+graph state, coverage, diagnostics, and projection state. It proposes
+remediation actions only; execution belongs to a separate approved operator or
+tool flow.
+
 ### Read endpoints
 
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
 | `GET`/`HEAD` | `/health` | none | `ok\n` |
-| `GET`/`HEAD` | `/api/mindbrain/capabilities` | none | JSON runtime feature flags: `mindbrain_version`, graph/gap-rules routes, ontology import routes |
-| `GET`/`HEAD` | `/api/mindbrain/simulate` | none | JSON simulation event summary; also writes to `demo_firehose` |
-| `GET` | `/api/events` | none | Long-lived SSE stream reading `demo_firehose` |
-| `GET` | `/api/mindbrain/events` | none | Alias of `/api/events` |
+| `GET`/`HEAD` | `/api/mindbrain/capabilities` | none | JSON runtime feature flags, `mindbrain_version`, and bitmap-mode status |
+| `GET`/`HEAD` | `/api/mindbrain/schema/status` | none | JSON schema status with applied additive migrations and missing columns |
+| `GET`/`HEAD` | `/api/mindbrain/simulate` | none | Lab route: JSON simulation event summary; also writes to `demo_firehose` |
+| `GET` | `/api/events` | none | Lab route: long-lived SSE stream reading `demo_firehose` |
+| `GET` | `/api/mindbrain/events` | none | Lab route: alias of `/api/events` |
 | `GET`/`HEAD` | `/api/mindbrain/search-compact-info` | none | TOON compact search snapshot |
 | `GET`/`HEAD` | `/api/mindbrain/coverage` | `workspace_id`, repeated `entity_type` optional | TOON coverage report |
 | `GET`/`HEAD` | `/api/mindbrain/coverage-by-domain` | `domain_or_workspace`, repeated `entity_type` optional | TOON coverage report after workspace resolution |
@@ -174,6 +212,8 @@ Required string fields must be non-empty. `value_id` must be non-negative.
 | `GET`/`HEAD` | `/api/mindbrain/ontology/graph` | `workspace_id` optional, `ontology_id` optional | JSON ontology schema graph: entity types, edge types, seed nodes/edges |
 | `GET`/`HEAD` | `/api/mindbrain/ontology/type` | `ontology_id`, `kind=entity\|edge`, `type` | JSON entity-type or edge-type detail plus related triples |
 | `GET`/`HEAD` | `/api/mindbrain/ontology/taxonomy` | `ontology_id`, `workspace_id` optional | JSON SKOS-style dimensions and values for one ontology |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/inspect` | `ontology_id`, `workspace_id` optional | JSON ontology inspection bundle for schema/taxonomy consumers |
+| `GET`/`HEAD` | `/api/mindbrain/ontology/reconciliation` | `workspace_id`, `ontology_id` optional, `limit` optional | JSON reconciliation report across ontology, graph, and coverage surfaces |
 | `GET`/`HEAD` | `/api/mindbrain/workspace/list` | none | JSON workspace catalog with entity counts and default ontology ids |
 | `GET`/`HEAD` | `/api/mindbrain/graph/type-counts` | `workspace_id` | JSON per-type instance counts with ontology labels |
 | `GET`/`HEAD` | `/api/mindbrain/graph/diagnostics` | `workspace_id`, `ontology_id` optional, `limit` optional, `component_small_max` optional | JSON graph diagnostics report for gaps, anomalies, evidence, and coverage |
@@ -197,6 +237,7 @@ GhostCrab SQLite integrations can consume MindBrain-owned read behavior.
 | Method | Path | Query | Response |
 |--------|------|-------|----------|
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/pack-projections` | `agent_id`, `query` optional, `scope` optional, `limit` optional | JSON projection rows for packed context; rows include `artifact_kind: "analysis_plan"`, `legacy_kind: "projection_type_a"`, and `public_label` |
+| `POST` | `/api/mindbrain/ghostcrab/search` | JSON body, see search write endpoints | JSON fused search matches for GhostCrab SQLite integrations |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projections/relevance` | `agent_id`, `entity_name`, `query` optional, `scope` optional, `limit` optional | JSON projection rows ranked by graph-context relevance |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, `collection_id` optional, `include_evidence` optional, `include_deltas` optional | JSON projection result bundle with `artifact_kind: "answer_snapshot"` and `legacy_kind: "projection_type_b"`, plus linked evidence, deltas, and report |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}` | none | JSON answer artifact registry row |
@@ -217,7 +258,8 @@ Build:
 
 Use any equivalent Zig 0.16.0 binary if your local path differs.
 
-Run with no arguments to print the source-defined usage. Current commands:
+Run with no arguments to print the source-defined usage. Current printed
+commands:
 
 ```text
 mindbrain-standalone-tool traverse --db <sqlite_path> --start <node_id> [--direction outbound|inbound] [--depth <n>] [--target <node_id>] [--edge-label <label> ...]
@@ -230,6 +272,9 @@ mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id>
 mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
 mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
 mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
+mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
+mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
+mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
 mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
@@ -247,6 +292,10 @@ mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <i
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
 mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
 mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
+mindbrain-standalone-tool quality-convergence --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--no-persist] [--limit <n>]
+mindbrain-standalone-tool quality-remediation-list --db <sqlite_path> --run-id <id> [--status <status>]
+mindbrain-standalone-tool quality-remediation-decision --db <sqlite_path> --action-id <id> --decision approved|rejected [--actor <id>] [--note <text>]
+mindbrain-standalone-tool quality-remediation-status --db <sqlite_path> --action-id <id> --status proposed|approved|rejected|applied|failed|skipped [--result-json <json>]
 mindbrain-standalone-tool search-compact-info --db <sqlite_path>
 mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
 mindbrain-standalone-tool seed-demo --db <sqlite_path>
@@ -260,17 +309,35 @@ mindbrain-standalone-tool queue-read --db <sqlite_path> --queue <name> [--vt <se
 mindbrain-standalone-tool queue-archive --db <sqlite_path> --queue <name> --msg-id <id>
 mindbrain-standalone-tool queue-delete --db <sqlite_path> --queue <name> --msg-id <id>
 mindbrain-standalone-tool simulate
+mindbrain-standalone-tool structured-import-validate [--model <contract.json>] [--mapping <mapping.json>] [--input <dir>]
+mindbrain-standalone-tool structured-import-dry-run [--facets <csv>] [--edges <csv>]
+mindbrain-standalone-tool structured-import-apply --db <sqlite> --workspace-id <id> [--ontology-id <id>] [--mode reset|append|ignore-duplicates] --facets <csv> [--edges <csv>]
+mindbrain-standalone-tool structured-import-project --db <sqlite> --workspace-id <id> --model <contract.json> --mapping <mapping.json> [--input <dir>] [--mode reset|append|ignore-duplicates]
+mindbrain-standalone-tool structured-import-reindex --db <sqlite> --workspace-id <id> [--scope graph|facets|all]
+mindbrain-standalone-tool structured-import-profile --input <csv> --output <profile.json>
+mindbrain-standalone-tool structured-import-infer --model <contract.json> [--mapping <mapping.json>] [--input <csv>] [--output <infer.json>]
+mindbrain-standalone-tool structured-import-register-semantics --db <sqlite> --workspace-id <id> (--proposal <infer.json> | --model <contract.json> [--mapping <mapping.json>])
+mindbrain-standalone-tool structured-import-validate-provenance --db <sqlite> --workspace-id <id> [--source-tag <tag>]
+```
+
+Advanced command implemented in `tool.zig` but not currently printed by the
+usage banner:
+
+```text
+mindbrain-standalone-tool document-business-extract --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> (--input-json <file> | --expected-coverage-json <file>) [--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--api-key <key>] [--model <name>] [--output <file>] [--raw-output <file>] [--request-output <file>] [--reindex none|graph] [--limit <n>] [--batch-size <n>] [--llm-parallel <n>] [--context-budget-json <file>] [--temperature <n>] [--max-tokens <n>]
 ```
 
 Command families:
 
 | Family | Commands |
 |--------|----------|
-| Workspace and collections | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import`, `backup-load` |
-| Ontology | `ontology-register`, `ontology-attach`, `ontology-import`, `ontology-export`, `ontology-compile-linkml`, `ontology-export-linkml`, `coverage`, `coverage-by-domain` |
-| Documents and chunks | `document-ingest`, `document-by-nanoid`, `document-normalize`, `external-link-add` |
+| Workspace, collections, and backup | `workspace-create`, `workspace-export`, `workspace-export-by-domain`, `collection-create`, `collection-export`, `collection-import`, `backup-export`, `backup-load` |
+| Ontology and qualification | `ontology-register`, `ontology-attach`, `ontology-import`, `ontology-export`, `ontology-compile-linkml`, `ontology-export-linkml`, `qualification-vocab-list`, `document-qualify`, `coverage`, `coverage-by-domain` |
+| Documents, chunks, and extraction | `document-ingest`, `document-by-nanoid`, `document-normalize`, `document-business-extract`, `external-link-add` |
 | LLM profile and retrieval | `document-profile`, `document-profile-enqueue`, `document-profile-worker`, `contextual-search`, `search-embedding-batch` |
 | Graph | `traverse`, `graph-path`, `graph-diagnostics`, `graph-gap-rules-import` |
+| Quality | `quality-convergence`, `quality-remediation-list`, `quality-remediation-decision`, `quality-remediation-status` |
+| Structured import | `structured-import-validate`, `structured-import-dry-run`, `structured-import-apply`, `structured-import-project`, `structured-import-reindex`, `structured-import-profile`, `structured-import-infer`, `structured-import-register-semantics`, `structured-import-validate-provenance` |
 | Search and context | `search-compact-info`, `pack` |
 | Queue | `queue-send`, `queue-read`, `queue-archive`, `queue-delete` |
 | Demo and maintenance | `seed-demo`, `bootstrap-from-sql`, `artifact-migrate`, `benchmark-db`, `corpus-eval`, `simulate` |
@@ -303,4 +370,4 @@ Function-level SQL behavior is documented in the topic pages:
 - [workspace.md](workspace.md)
 - [collections.md](collections.md)
 - [projections.md](projections.md)
-- [dev/sqlite-parity.md](dev/sqlite-parity.md)
+- [native-reference.md](native-reference.md)

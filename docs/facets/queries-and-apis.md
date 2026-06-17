@@ -9,7 +9,8 @@ and search APIs that compose with BM25/vector retrieval.
 | --- | --- | --- |
 | `GET` | `/api/mindbrain/collections/facet-search` | Search raw/derived collection facets by workspace, collection, optional table id, namespace, dimension, value, and limit. |
 | `GET` | `/api/mindbrain/search-compact-info` | TOON snapshot of compact search artifacts. |
-| `POST` | `/api/mindbrain/search-embedding-upsert` | Store JSON embedding arrays into `search_embeddings.embedding_blob`. |
+| `POST` | `/api/mindbrain/search-embedding-upsert` | Store `{table_id, doc_id, embedding}` JSON arrays into `search_embeddings.embedding_blob` as little-endian `f32` bytes. |
+| `POST` | `/api/mindbrain/ghostcrab/search` | Resolve a workspace search table, run BM25, vector, or hybrid retrieval, and return fused JSON matches for GhostCrab SQLite consumers. |
 
 `/api/mindbrain/collections/facet-search` accepts:
 
@@ -21,12 +22,19 @@ and search APIs that compose with BM25/vector retrieval.
 - optional `value`
 - optional `limit`
 
+`/api/mindbrain/ghostcrab/search` accepts a JSON body with required
+`workspace_id`, optional `query`, optional `embedding`, optional `table_id` or
+`collection_id`, optional `vector_weight` in `0..1`, and optional `limit` in
+`1..1000`. It reports the selected `retrieval_mode` as `bm25`, `vector`,
+`hybrid_bm25_vector`, or `empty`.
+
 ## CLI surfaces
 
 | Command | Purpose |
 | --- | --- |
 | `document-ingest` | Persist raw document/chunk rows and facet assignments. |
 | `document-profile-worker` | Optional contextual retrieval indexing and embedding writes. |
+| `document-qualify` / `qualification-vocab-list` | LLM-assisted facet/taxonomy qualification and vocabulary discovery. |
 | `contextual-search` | BM25 search, optional vector fusion, optional rerank. |
 | `search-embedding-batch` | Backfill indexed embeddings for `search_documents`. |
 | `search-compact-info` | Inspect compact BM25/search artifact counts. |

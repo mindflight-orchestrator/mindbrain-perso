@@ -10,10 +10,13 @@ For focused subsystem documentation, see [graphs/README.md](graphs/README.md),
 [facets/README.md](facets/README.md), [pragma/README.md](pragma/README.md),
 and [ontology/README.md](ontology/README.md).
 
-## v1.4.0 Runtime Notes
+## Runtime Notes
 
-`v1.4.0` keeps the standalone CLI and HTTP surface stable, but changes the
-runtime cost profile of search and graph operations:
+The standalone runtime currently reports `mindbrain_version: "1.7.2"` from
+`GET /api/mindbrain/capabilities`. The `v1.4.x` performance work remains part
+of the baseline, and later releases add graph diagnostics, ontology inspection
+and reconciliation, quality convergence, GhostCrab compatibility, and
+structured-import operations. The current runtime cost profile includes:
 
 - search store loads now bulk-build BM25 state once, instead of rebuilding on
   every loaded document;
@@ -73,6 +76,9 @@ Treat `mindbrain-http` as a **trusted-local admin surface**, not a public API. T
 | `POST /api/mindbrain/facts/write` | High | Durable fact-store mutation. Allocates `doc_id` and writes `facets` rows for downstream retrieval/packing clients. |
 | `POST /api/mindbrain/reindex/*` | High | Rebuilds derived BM25, facet, and graph indexes from raw workspace/collection tables. |
 | `GET /api/mindbrain/sql/write-status` | Medium | Reports serialized writer-lane status and counters. |
+| `POST /api/mindbrain/search-embedding-upsert`, `POST /api/mindbrain/ghostcrab/search` | Medium | Vector write/search and fused BM25/vector retrieval for trusted local clients. |
+| `POST /api/mindbrain/graph/pattern-query` | Medium | Read-only graph query proxy; `backend=postgres` depends on external Postgres environment. |
+| `POST /api/mindbrain/quality/*` | High | Persists quality runs or changes remediation action state. |
 | `GET /api/mindbrain/workspace-export*` | High | Full workspace model export. |
 | `GET /api/mindbrain/pack`, `GET /api/mindbrain/ghostcrab/pack-projections`, `GET /api/mindbrain/ghostcrab/projection-get`, `/api/mindbrain/ghostcrab/artifact/*` | High | Retrieval/projection/artifact output can expose packed context, evidence, operational projection rows, artifact payloads, and retained update events. |
 | `GET /api/mindbrain/coverage*`, `GET /api/mindbrain/graph-*`, `GET /api/mindbrain/traverse`, `GET /api/mindbrain/collections/facet-search`, `GET /api/mindbrain/ghostcrab/graph-search`, `GET /api/events`, `GET /api/mindbrain/search-compact-info`, `GET /api/mindbrain/simulate` | Medium | Read-heavy operational and graph/search surfaces; still avoid exposing to untrusted callers. |
@@ -84,24 +90,39 @@ gap rules for an ontology or workspace. The read side is
 `GET /api/mindbrain/graph/gap-rules` for the configured rules and
 `GET /api/mindbrain/graph/diagnostics` for the current report.
 
+Ontology inspection and reconciliation are exposed through
+`GET /api/mindbrain/ontology/inspect` and
+`GET /api/mindbrain/ontology/reconciliation`. Quality convergence is exposed
+through `/api/mindbrain/quality/*`; it proposes remediation actions but does
+not execute them.
+
 Downstream clients (GhostCrab MCP, smoke scripts) can probe
 `GET /api/mindbrain/capabilities` to detect stale binaries that still answer
 `/health` but lack graph diagnostics routes.
 
 ## CLI: `mindbrain-standalone-tool`
 
-Usage strings from the tool:
+The exhaustive CLI contract is maintained in [api-reference.md](api-reference.md).
+The main operational families are:
 
 ```text
 mindbrain-standalone-tool traverse --db <sqlite_path> --start <node_id> [--direction outbound|inbound] [--depth <n>] [--target <node_id>] [--edge-label <label> ...]
-mindbrain-standalone-tool workspace-export --db <sqlite_path> --workspace-id <id>
 mindbrain-standalone-tool workspace-create --db <sqlite_path> --workspace-id <id> [--label <text>] [--description <text>] [--profile <name>]
 mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
+mindbrain-standalone-tool workspace-export --db <sqlite_path> --workspace-id <id>
+mindbrain-standalone-tool workspace-export-by-domain --db <sqlite_path> --domain-or-workspace <id>
+mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
+mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
 mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
+mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
+mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
+mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
+mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
+mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
+mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> ...
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
-mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool artifact-migrate --db <sqlite_path> (--dry-run | --repair)
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>
@@ -116,11 +137,17 @@ mindbrain-standalone-tool external-link-add --db <sqlite_path> --workspace-id <i
 mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
 mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
 mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
+mindbrain-standalone-tool quality-convergence --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--no-persist] [--limit <n>]
+mindbrain-standalone-tool quality-remediation-list --db <sqlite_path> --run-id <id> [--status <status>]
+mindbrain-standalone-tool quality-remediation-decision --db <sqlite_path> --action-id <id> --decision approved|rejected [--actor <id>] [--note <text>]
+mindbrain-standalone-tool quality-remediation-status --db <sqlite_path> --action-id <id> --status proposed|approved|rejected|applied|failed|skipped [--result-json <json>]
+mindbrain-standalone-tool structured-import-apply --db <sqlite> --workspace-id <id> [--ontology-id <id>] [--mode reset|append|ignore-duplicates] --facets <csv> [--edges <csv>]
+mindbrain-standalone-tool structured-import-project --db <sqlite> --workspace-id <id> --model <contract.json> --mapping <mapping.json> [--input <dir>] [--mode reset|append|ignore-duplicates]
+mindbrain-standalone-tool structured-import-reindex --db <sqlite> --workspace-id <id> [--scope graph|facets|all]
 mindbrain-standalone-tool search-compact-info --db <sqlite_path>
 mindbrain-standalone-tool benchmark-db [--db <sqlite_path>] [--query-iterations <n>] [--mutation-iterations <n>]
 mindbrain-standalone-tool seed-demo --db <sqlite_path>
 mindbrain-standalone-tool bootstrap-from-sql --db <sqlite_path> --sql-file <path>
-mindbrain-standalone-tool workspace-export-by-domain --db <sqlite_path> --domain-or-workspace <id>
 mindbrain-standalone-tool coverage --db <sqlite_path> --workspace-id <id> [--entity-type <type> ...]
 mindbrain-standalone-tool coverage-by-domain --db <sqlite_path> --domain-or-workspace <id> [--entity-type <type> ...]
 mindbrain-standalone-tool pack --db <sqlite_path> --user-id <id> --query <text> [--scope <scope>] [--limit <n>]
@@ -131,12 +158,12 @@ mindbrain-standalone-tool queue-delete --db <sqlite_path> --queue <name> --msg-i
 mindbrain-standalone-tool simulate
 ```
 
-Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argument) to print the full usage list to stderr, matching [tool.zig](../src/standalone/tool.zig) `printUsage`.
+Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argument) to print the source usage list to stderr, matching [tool.zig](../src/standalone/tool.zig) `printUsage`. `document-business-extract` is an advanced implemented command documented in [api-reference.md](api-reference.md), but it is not currently printed by that usage banner.
 
 - **`traverse`** — Graph walk from a start node; prints JSON (`target_found`, `rows`).
 - **`workspace-export`** — Emits **TOON** workspace model export to stdout.
 - **`workspace-create` / `collection-create` / `collection-export` / `collection-import`** — Workspace and collection lifecycle plus portable JSON bundle export/import.
-- **`backup-load --reindex`** — Load a bundle and optionally rebuild graph-only or all derived graph/facet/BM25 indexes for the bundle workspace.
+- **`backup-export` / `backup-load --reindex`** — Export portable workspace/taxonomy/collection bundles, then load a bundle and optionally rebuild graph-only or all derived graph/facet/BM25 indexes for the bundle workspace.
 - **`artifact-migrate --dry-run | --repair`** — Inspect or rebuild answer artifact registry rows from legacy `projections` and `ProjectionResult` graph entities. Repair is idempotent and preserves existing registry rows by `legacy_ref`.
 - **`ontology-register` / `ontology-attach`** — Register workspace-scoped ontologies and attach them to collections.
 - **`ontology-import` / `ontology-export`** — Import normalized OWL2/RDF
@@ -146,11 +173,14 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`ontology-compile-linkml` / `ontology-export-linkml`** — Compile LinkML
   schemas into native ontology bundles or export native ontology rows back to
   LinkML. See [ontology/linkml-and-owl2.md](ontology/linkml-and-owl2.md).
+- **`qualification-vocab-list` / `document-qualify`** — Discover taxonomy/facet vocabulary and apply LLM-assisted document or chunk qualification.
 - **`graph-path`** — Path finding between named nodes.
 - **`graph-diagnostics` / `graph-gap-rules-import`** — Import closed-world gap
   rules and emit a basic graph diagnostics report for missing required
   relations, cardinality violations, isolated entities, small components,
   ontology edge-type mismatches, evidence gaps, and ontology coverage gaps.
+- **`quality-convergence` / `quality-remediation-*`** — Run native quality convergence and manage remediation action decision/status state.
+- **`structured-import-*`** — Validate, infer, apply, project, reindex, and audit structured CSV/contract imports.
 - **`benchmark-db`** — Runs facet and graph query/mutation benchmarks against a SQLite database and returns JSON with embedded TOON payloads for the facet and graph query results.
 - **`graph/subgraph`** — SSE graph stream for browser clients (`seed_node`, `node`, `edge`, `done`).
 - **`coverage` / `coverage-by-domain`** — Emits a TOON `coverage_report` with a summary and per-gap rows for ontology or taxonomy nodes that are not currently covered by the graph.

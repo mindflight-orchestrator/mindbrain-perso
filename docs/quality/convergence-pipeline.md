@@ -24,19 +24,23 @@ quality and remediation loop, not to user-facing generated answers.
 
 HTTP endpoints:
 
-- `POST /api/mindbrain/quality/convergence/run`
-- `GET /api/mindbrain/quality/convergence/runs?workspace_id=...`
-- `GET /api/mindbrain/quality/convergence/run?run_id=...`
-- `GET /api/mindbrain/quality/remediation/actions?run_id=...`
-- `POST /api/mindbrain/quality/remediation/decision`
-- `POST /api/mindbrain/quality/remediation/status`
+| Method | Route | Contract |
+|--------|-------|----------|
+| `POST` | `/api/mindbrain/quality/convergence/run` | Body: `workspace_id`, optional `ontology_id`, optional `persist` defaulting true, optional `limit`, optional `component_small_max`. |
+| `GET` | `/api/mindbrain/quality/convergence/runs` | Query: required `workspace_id`, optional `limit`; returns persisted run summaries. |
+| `GET` | `/api/mindbrain/quality/convergence/run` | Query: required `run_id`; returns one persisted run. |
+| `GET` | `/api/mindbrain/quality/remediation/actions` | Query: required `run_id`, optional `status`; returns proposed actions. |
+| `POST` | `/api/mindbrain/quality/remediation/decision` | Body: `action_id`, `decision=approved|rejected`, optional `actor`, optional `note`. |
+| `POST` | `/api/mindbrain/quality/remediation/status` | Body: `action_id`, `status=proposed|approved|rejected|applied|failed|skipped`, optional `result_json`. |
 
 Standalone CLI commands:
 
-- `quality-convergence`
-- `quality-remediation-list`
-- `quality-remediation-decision`
-- `quality-remediation-status`
+```text
+mindbrain-standalone-tool quality-convergence --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--no-persist] [--limit <n>]
+mindbrain-standalone-tool quality-remediation-list --db <sqlite_path> --run-id <id> [--status <status>]
+mindbrain-standalone-tool quality-remediation-decision --db <sqlite_path> --action-id <id> --decision approved|rejected [--actor <id>] [--note <text>]
+mindbrain-standalone-tool quality-remediation-status --db <sqlite_path> --action-id <id> --status proposed|approved|rejected|applied|failed|skipped [--result-json <json>]
+```
 
 ## Analysis Contract
 

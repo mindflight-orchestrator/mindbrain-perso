@@ -2,12 +2,13 @@
 
 This repository ships a **SQLite-first** knowledge engine with faceted search, BM25, graph traversal, pragma helpers, workspace registry, and a small CLI.
 
-## Current release
+## Current runtime
 
-`v1.4.0` is a performance and correctness release for the standalone runtime.
-It keeps the public CLI/HTTP shape stable while improving graph ingestion,
-graph stream expansion, BM25/hybrid search hot paths, compact-store lookup
-speed, and vector result scoping by `table_id`.
+The standalone HTTP capabilities endpoint currently reports
+`mindbrain_version: "1.7.2"`. This checkout is a post-`v1.4.x` SQLite-first
+runtime with graph diagnostics, graph gap rules, ontology import/inspection,
+quality convergence, GhostCrab compatibility routes, structured import helpers,
+and hybrid BM25/vector search.
 
 ## Current ontology work
 
@@ -27,7 +28,6 @@ the SQLite MVP; follow-up work is tracked in
 | [overview.md](overview.md) | What the system contains and how the pieces fit together |
 | [installation.md](installation.md) | Dependencies, build, and installing the runtime |
 | [api-reference.md](api-reference.md) | Current HTTP routes, CLI commands, and native/SQL surface boundaries |
-| [comparison/README.md](comparison/README.md) | API and SQL migration comparison with the sibling `pg_mindbrain` PostgreSQL extension |
 | [facets/README.md](facets/README.md) | Complete facets documentation: raw assignments, bitmap storage, BM25/FTS5, hybrid search, APIs |
 | [facets.md](facets.md) | Legacy facets pointer kept for existing links |
 | [faceted-hybrid-search.md](faceted-hybrid-search.md) | Legacy process view for facets, FTS5 BM25, indexed embeddings, hybrid search, and optional reranking |
@@ -47,10 +47,7 @@ the SQLite MVP; follow-up work is tracked in
 | [source/README.md](source/README.md) | Official OWL2 source references and local N-Triples fixtures used by ontology import tests |
 | [native-reference.md](native-reference.md) | Native Zig symbol reference |
 | [third-party.md](third-party.md) | Bundled native dependencies (attribution) |
-| [dev/sqlite-backport-plan.md](dev/sqlite-backport-plan.md) | SQLite-first port plan for newer graph/facet behavior |
-| [dev/sqlite-vector-search-testing.md](dev/sqlite-vector-search-testing.md) | How to test SQLite embedding search, including fillable `.env` variables |
-| [dev/sqlite-parity.md](dev/sqlite-parity.md) | API-identical SQLite-backed contract (parity with `pg_mindbrain`) |
-| [dev/api-parity-inventory.md](dev/api-parity-inventory.md) | Per-function `pg_mindbrain` → `mindbrain` parity matrix |
+| [dev/mb-documents-llm-test-env.md](dev/mb-documents-llm-test-env.md) | Local LLM document test environment notes |
 
 ## Source of truth
 

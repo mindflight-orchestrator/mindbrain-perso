@@ -68,14 +68,25 @@ The standalone Zig library also exposes repository-style interfaces from
 not exported C symbols, but they are the public in-repo contract used by the
 SQLite search, vector, fixture, and PostgreSQL adapter layers.
 
-`v1.4.0` adds batch BM25 read hooks and scoped vector requests:
+Current public interface groups:
 
 | Interface item | Purpose |
 |----------------|---------|
+| `DocId`, `NodeId`, `VectorId` | Shared integer identity aliases for document, graph, and vector surfaces. |
+| `HybridSearchRequest` / `HybridSearchMatch` | BM25/vector fusion request and result rows. |
+| `VectorSearchRequest` / `VectorSearchMatch` / `EmbeddingRecord` | Exact-vector search and embedding exchange contract. |
+| `GraphEdgeFilter`, `RelationPropertyPredicate`, `GraphNeighborStep` | Graph traversal and relation-property filtering contract. |
+| `FacetTableConfig`, `FacetValueFilter`, `FacetPosting`, `FacetCount`, `FacetValueNode` | Facet table, value, count, and posting exchange rows. |
+| `CollectionStats`, `DocumentStats`, `TermStat`, `TermFrequency` | BM25 statistics exchange rows. |
 | `DocumentTermFrequency` | Batch row carrying `doc_id`, `term_hash`, and `frequency`. |
+| `FacetRepository` | Facet table/config/value/posting repository callbacks. |
+| `Bm25Repository` | BM25 statistics, postings, document upsert/delete callbacks. |
 | `Bm25Repository.getDocumentStatsBatchFn` | Load stats for a set of candidate document IDs. |
 | `Bm25Repository.getTermFrequenciesBatchFn` | Load term frequencies for a set of candidate document IDs and query terms. |
+| `GraphRepository` | Edge expansion, filtering, and frontier projection callbacks. |
+| `VectorRepository` | Embedding dimension lookup, nearest search, upsert, and delete callbacks. |
 | `VectorSearchRequest.table_id` | Optional logical search table scope for in-memory vector stores. |
+| `OntologyRepository` | Workspace resolution callback for ontology-aware callers. |
 
 Hybrid search uses these hooks to avoid one BM25 lookup per candidate and to
 keep vector results isolated to the same logical table as the BM25 request.

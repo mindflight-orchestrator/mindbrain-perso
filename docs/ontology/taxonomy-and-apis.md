@@ -1,7 +1,7 @@
 # Taxonomy And APIs
 
 The standalone HTTP server exposes ontology catalog, schema graph, type detail,
-taxonomy, and schema write routes.
+taxonomy, import/compile, inspection, reconciliation, and schema write routes.
 
 ## Read Routes
 
@@ -11,6 +11,8 @@ taxonomy, and schema write routes.
 | `GET /api/mindbrain/ontology/graph` | optional `workspace_id`, optional `ontology_id` | Entity types, edge types, seed nodes, seed edges. |
 | `GET /api/mindbrain/ontology/type` | `ontology_id`, `kind=entity|edge`, `type` | Type detail and related triples. |
 | `GET /api/mindbrain/ontology/taxonomy` | `ontology_id`, optional `workspace_id` | Namespaced dimensions and values. |
+| `GET /api/mindbrain/ontology/inspect` | `ontology_id`, optional `workspace_id` | Inspection bundle for Studio/schema consumers. |
+| `GET /api/mindbrain/ontology/reconciliation` | `workspace_id`, optional `ontology_id`, optional `limit` | Compare native ontology, graph, evidence, and coverage-derived state. |
 | `GET /api/mindbrain/workspace/list` | none | Workspaces, entity counts, default ontology ids. |
 | `GET /api/mindbrain/graph/type-counts` | `workspace_id` | Instance counts by entity type with ontology labels. |
 
@@ -26,6 +28,8 @@ ontologies with HTTP 409.
 
 | Route | Body | Purpose |
 |-------|------|---------|
+| `POST /api/mindbrain/ontology/import` | `workspace_id`, `ontology_id`, `input_path`, optional `name`, optional `materialize_graph` | Import normalized RDF/N-Triples and optionally materialize object triples into graph rows. |
+| `POST /api/mindbrain/ontology/compile-linkml` | `workspace_id`, `ontology_id`, `input_path`, optional `name`, optional `profile`, optional `materialize_graph` | Compile a LinkML schema into native ontology rows; `profile` currently accepts `syndic`. |
 | `POST /api/mindbrain/ontology/taxonomy/dimension` | `ontology_id`, `namespace`, `dimension`, optional type flags, metadata | Upsert a dimension. |
 | `POST /api/mindbrain/ontology/taxonomy/value` | `ontology_id`, `namespace`, `dimension`, `value_id`, `value`, optional parent/label/metadata | Upsert a controlled value. |
 | `POST /api/mindbrain/ontology/entity-type` | `ontology_id`, `entity_type`, optional label/metadata/parent | Upsert an entity type and optional subclass triple. |
@@ -52,7 +56,8 @@ changed by Studio/UI write surfaces.
 | `http_app.zig` | Route dispatch, JSON parsing, writer-lane calls. |
 | `collections_io.zig` | Taxonomy selectors for dimensions and values. |
 | `collections_sqlite.zig` | Upsert helpers and frozen checks. |
-| `ontology_sqlite.zig` | Coverage and projection relevance helpers. |
+| `ontology_sqlite.zig` | Ontology graph/type/taxonomy reads, coverage, projection relevance helpers. |
+| `owl2_import.zig` / `linkml_interchange.zig` | Import and LinkML compile/export helpers. |
 
 ## Studio / Browser Boundary
 
