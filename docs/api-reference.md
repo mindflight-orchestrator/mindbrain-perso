@@ -9,7 +9,7 @@ It is derived from the active entrypoints:
 
 MindBrain is SQLite-first in this repository. The operational API that
 applications call in this checkout is the standalone SQLite CLI plus the local
-HTTP server. Runtime capabilities currently report `mindbrain_version: "1.7.2"`.
+HTTP server. Runtime capabilities currently report `mindbrain_version: "1.7.3"`.
 
 ## HTTP server
 

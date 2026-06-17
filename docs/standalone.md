@@ -12,7 +12,7 @@ and [ontology/README.md](ontology/README.md).
 
 ## Runtime Notes
 
-The standalone runtime currently reports `mindbrain_version: "1.7.2"` from
+The standalone runtime currently reports `mindbrain_version: "1.7.3"` from
 `GET /api/mindbrain/capabilities`. The `v1.4.x` performance work remains part
 of the baseline, and later releases add graph diagnostics, ontology inspection
 and reconciliation, quality convergence, GhostCrab compatibility, and

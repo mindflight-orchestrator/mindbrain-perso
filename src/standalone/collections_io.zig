@@ -3094,7 +3094,7 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"kind\": \"ghostcrab_backup_bundle\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"schema_version\": \"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"exported_with\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_version\": \"1.7.2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_version\": \"1.7.3\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"ontology_values\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "confidence_note") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle, "\"mindbrain_answer_artifacts\"") != null);
