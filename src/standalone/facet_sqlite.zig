@@ -140,6 +140,7 @@ pub const Database = struct {
         try self.applyRawGraphAutoincrementMigration();
         try self.applyGraphGapRulesMigration();
         try self.applyGraphGapRulesWorkspaceStrictMigration();
+        try self.applyGraphRuleEvaluationEventsMigration();
         try self.applyAgentFactsTableRenameMigration();
         try self.applyAnswerArtifactsWorkspaceStrictMigration();
     }
@@ -748,6 +749,65 @@ pub const Database = struct {
             \\
             \\CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
             \\    ON graph_gap_rules(ontology_id, workspace_id, enabled);
+        );
+
+        try self.markMigrationApplied(applied_id);
+    }
+
+    fn applyGraphRuleEvaluationEventsMigration(self: Database) Error!void {
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mindbrain_schema_migrations (
+            \\    id TEXT PRIMARY KEY,
+            \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            \\);
+        );
+
+        const applied_id = "2026-06-17-graph-rule-evaluation-events-applied";
+        if (try self.migrationApplied(applied_id)) return;
+
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS graph_rule_evaluations (
+            \\    workspace_id TEXT NOT NULL,
+            \\    ontology_id TEXT NOT NULL,
+            \\    rule_id TEXT NOT NULL,
+            \\    subject_entity_id INTEGER NOT NULL,
+            \\    state TEXT NOT NULL CHECK(state IN ('valid', 'invalid')),
+            \\    observed_count INTEGER NOT NULL,
+            \\    expected_min INTEGER NOT NULL,
+            \\    expected_max INTEGER,
+            \\    last_evaluated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    PRIMARY KEY(workspace_id, ontology_id, rule_id, subject_entity_id),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+            \\    FOREIGN KEY(rule_id) REFERENCES graph_gap_rules(rule_id),
+            \\    FOREIGN KEY(subject_entity_id) REFERENCES graph_entity(entity_id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS graph_rule_evaluations_state_idx
+            \\    ON graph_rule_evaluations(workspace_id, ontology_id, state);
+            \\
+            \\CREATE TABLE IF NOT EXISTS graph_rule_events (
+            \\    event_id TEXT PRIMARY KEY,
+            \\    workspace_id TEXT NOT NULL,
+            \\    ontology_id TEXT NOT NULL,
+            \\    rule_id TEXT NOT NULL,
+            \\    subject_entity_id INTEGER NOT NULL,
+            \\    from_state TEXT NOT NULL CHECK(from_state IN ('unknown', 'valid', 'invalid')),
+            \\    to_state TEXT NOT NULL CHECK(to_state IN ('valid', 'invalid')),
+            \\    observed_count INTEGER NOT NULL,
+            \\    expected_min INTEGER NOT NULL,
+            \\    expected_max INTEGER,
+            \\    idempotency_key TEXT NOT NULL,
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+            \\    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+            \\    FOREIGN KEY(rule_id) REFERENCES graph_gap_rules(rule_id),
+            \\    FOREIGN KEY(subject_entity_id) REFERENCES graph_entity(entity_id)
+            \\);
+            \\CREATE UNIQUE INDEX IF NOT EXISTS graph_rule_events_idempotency_idx
+            \\    ON graph_rule_events(workspace_id, idempotency_key);
+            \\CREATE INDEX IF NOT EXISTS graph_rule_events_lookup_idx
+            \\    ON graph_rule_events(workspace_id, ontology_id, rule_id, created_at_unix DESC);
         );
 
         try self.markMigrationApplied(applied_id);

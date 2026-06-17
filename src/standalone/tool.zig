@@ -216,6 +216,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "graph-rule-evaluations-run")) {
+        try runGraphRuleEvaluationsRunCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "graph-rule-evaluations")) {
+        try runGraphRuleEvaluationsCommand(allocator, args[2..]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "graph-rule-events")) {
+        try runGraphRuleEventsCommand(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "quality-convergence")) {
         try runQualityConvergenceCommand(allocator, args[2..]);
         return;
@@ -472,6 +487,9 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool graph-path --db <sqlite_path> --source <name> --target <name> [--edge-label <label> ...] [--max-depth <n>]
         \\  mindbrain-standalone-tool graph-diagnostics --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--component-small-max <n>] [--format json|toon]
         \\  mindbrain-standalone-tool graph-gap-rules-import --db <sqlite_path> --input <rules.json>
+        \\  mindbrain-standalone-tool graph-rule-evaluations-run --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>] [--no-remediation-actions]
+        \\  mindbrain-standalone-tool graph-rule-evaluations --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>]
+        \\  mindbrain-standalone-tool graph-rule-events --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--limit <n>]
         \\  mindbrain-standalone-tool quality-convergence --db <sqlite_path> --workspace-id <id> [--ontology-id <id>] [--no-persist] [--limit <n>]
         \\  mindbrain-standalone-tool quality-remediation-list --db <sqlite_path> --run-id <id> [--status <status>]
         \\  mindbrain-standalone-tool quality-remediation-decision --db <sqlite_path> --action-id <id> --decision approved|rejected [--actor <id>] [--note <text>]
@@ -819,6 +837,117 @@ fn runGraphGapRulesImportCommand(allocator: Allocator, args: []const []const u8)
 
     const imported = try graph_diagnostics.importRulesJson(db, allocator, json);
     try writeStdout("{f}\n", .{std.json.fmt(.{ .ok = true, .imported = imported }, .{})});
+}
+
+fn runGraphRuleEvaluationsRunCommand(allocator: Allocator, args: []const []const u8) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var limit: usize = 200;
+    var create_remediation_actions = true;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--workspace-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            workspace_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--ontology-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            ontology_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--no-remediation-actions")) {
+            create_remediation_actions = false;
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var run = try graph_diagnostics.runRuleEvaluations(db, allocator, .{
+        .workspace_id = workspace_id.?,
+        .ontology_id = ontology_id,
+        .limit = limit,
+        .create_remediation_actions = create_remediation_actions,
+    });
+    defer run.deinit(allocator);
+    const payload = try graph_diagnostics.ruleEvaluationRunJson(allocator, run);
+    defer allocator.free(payload);
+    try writeStdout("{s}\n", .{payload});
+}
+
+fn runGraphRuleEvaluationsCommand(allocator: Allocator, args: []const []const u8) !void {
+    try runGraphRuleEvaluationReadCommand(allocator, args, .evaluations);
+}
+
+fn runGraphRuleEventsCommand(allocator: Allocator, args: []const []const u8) !void {
+    try runGraphRuleEvaluationReadCommand(allocator, args, .events);
+}
+
+const GraphRuleEvaluationReadMode = enum { evaluations, events };
+
+fn runGraphRuleEvaluationReadCommand(allocator: Allocator, args: []const []const u8, mode: GraphRuleEvaluationReadMode) !void {
+    var db_path: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var ontology_id: ?[]const u8 = null;
+    var limit: usize = 200;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--db")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            db_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--workspace-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            workspace_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--ontology-id")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            ontology_id = args[index];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArguments;
+            limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else {
+            return CliError.InvalidArguments;
+        }
+    }
+
+    if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
+
+    var db = try facet_sqlite.Database.open(db_path.?);
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const options = graph_diagnostics.RuleEvaluationOptions{
+        .workspace_id = workspace_id.?,
+        .ontology_id = ontology_id,
+        .limit = limit,
+        .create_remediation_actions = false,
+    };
+    const payload = switch (mode) {
+        .evaluations => try graph_diagnostics.ruleEvaluationsJson(db, allocator, options),
+        .events => try graph_diagnostics.ruleEventsJson(db, allocator, options),
+    };
+    defer allocator.free(payload);
+    try writeStdout("{s}\n", .{payload});
 }
 
 fn runQualityConvergenceCommand(allocator: Allocator, args: []const []const u8) !void {

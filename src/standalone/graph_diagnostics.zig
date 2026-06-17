@@ -142,6 +142,52 @@ pub const ReconciliationOptions = struct {
     limit: usize = 200,
 };
 
+pub const RuleEvaluationOptions = struct {
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8 = null,
+    limit: usize = 200,
+    create_remediation_actions: bool = true,
+};
+
+pub const RuleEvent = struct {
+    event_id: []u8,
+    rule_id: []u8,
+    subject_entity_id: u64,
+    from_state: []u8,
+    to_state: []u8,
+    observed_count: i64,
+    expected_min: i64,
+    expected_max: ?i64,
+    idempotency_key: []u8,
+    created_at_unix: i64,
+
+    fn deinit(self: RuleEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_id);
+        allocator.free(self.rule_id);
+        allocator.free(self.from_state);
+        allocator.free(self.to_state);
+        allocator.free(self.idempotency_key);
+    }
+};
+
+pub const RuleEvaluationRun = struct {
+    workspace_id: []u8,
+    ontology_id: []u8,
+    evaluated: usize,
+    changed: usize,
+    events_created: usize,
+    invalid_count: usize,
+    remediation_actions_created: usize,
+    events: []RuleEvent,
+
+    pub fn deinit(self: RuleEvaluationRun, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.ontology_id);
+        for (self.events) |event| event.deinit(allocator);
+        allocator.free(self.events);
+    }
+};
+
 pub fn resolveOntologyId(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, explicit: ?[]const u8) ![]u8 {
     if (explicit) |ontology_id| return try allocator.dupe(u8, ontology_id);
     const stmt = try facet_sqlite.prepare(db, "SELECT default_ontology_id FROM workspace_settings WHERE workspace_id = ?1 AND default_ontology_id IS NOT NULL");
@@ -476,6 +522,446 @@ pub fn buildReport(db: Database, allocator: std.mem.Allocator, options: Diagnost
         .summary = summary,
         .issues = try issues.toOwnedSlice(allocator),
     };
+}
+
+pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: RuleEvaluationOptions) !RuleEvaluationRun {
+    const ontology_id = try resolveOntologyId(db, allocator, options.workspace_id, options.ontology_id);
+    defer allocator.free(ontology_id);
+
+    const rules = try loadRules(db, allocator, ontology_id, options.workspace_id);
+    defer {
+        for (rules) |rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    const run_id = try std.fmt.allocPrint(allocator, "graph_rule_eval__{s}__{d}", .{ options.workspace_id, try currentUnix(db) });
+    defer allocator.free(run_id);
+    try ensureQualityRunForRuleEvaluation(db, options.workspace_id, ontology_id, run_id);
+
+    var events = std.ArrayList(RuleEvent).empty;
+    defer {
+        for (events.items) |event| event.deinit(allocator);
+        events.deinit(allocator);
+    }
+
+    var evaluated: usize = 0;
+    var changed: usize = 0;
+    var events_created: usize = 0;
+    var invalid_count: usize = 0;
+    var remediation_actions_created: usize = 0;
+
+    for (rules) |rule| {
+        const entity_stmt = try facet_sqlite.prepare(db,
+            \\SELECT entity_id, metadata_json
+            \\FROM graph_entity
+            \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
+            \\ORDER BY entity_id
+        );
+        defer facet_sqlite.finalize(entity_stmt);
+        try facet_sqlite.bindText(entity_stmt, 1, options.workspace_id);
+        try facet_sqlite.bindText(entity_stmt, 2, rule.entity_type);
+        while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW) {
+            const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
+            const entity_metadata = columnText(entity_stmt, 1);
+            if (!try entityMatchesRuleFilter(allocator, entity_metadata, rule.metadata_json)) continue;
+
+            const observed = try countRuleRelations(db, options.workspace_id, entity_id, rule);
+            const state = ruleState(observed, rule);
+            if (std.mem.eql(u8, state, "invalid")) invalid_count += 1;
+            evaluated += 1;
+
+            const previous_state = try loadEvaluationState(db, allocator, options.workspace_id, ontology_id, rule.rule_id, entity_id);
+            defer if (previous_state) |value| allocator.free(value);
+            const from_state = previous_state orelse "unknown";
+
+            try upsertEvaluationState(db, options.workspace_id, ontology_id, rule, entity_id, state, observed);
+            if (previous_state == null or !std.mem.eql(u8, previous_state.?, state)) {
+                changed += 1;
+                const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, rule, entity_id, from_state, state, observed);
+                events_created += 1;
+                if (options.create_remediation_actions and std.mem.eql(u8, from_state, "invalid") and std.mem.eql(u8, state, "valid")) {
+                    if (try maybeCreateRemediationAction(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, event.idempotency_key)) {
+                        remediation_actions_created += 1;
+                    }
+                }
+                if (events.items.len < options.limit) {
+                    try events.append(allocator, event);
+                } else {
+                    event.deinit(allocator);
+                }
+            }
+        }
+    }
+
+    return .{
+        .workspace_id = try allocator.dupe(u8, options.workspace_id),
+        .ontology_id = try allocator.dupe(u8, ontology_id),
+        .evaluated = evaluated,
+        .changed = changed,
+        .events_created = events_created,
+        .invalid_count = invalid_count,
+        .remediation_actions_created = remediation_actions_created,
+        .events = try events.toOwnedSlice(allocator),
+    };
+}
+
+pub fn ruleEvaluationRunJson(allocator: std.mem.Allocator, run: RuleEvaluationRun) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"graph_rule_evaluation_run\"");
+    try out.writer.writeAll(",\"workspace_id\":");
+    try out.writer.print("{f}", .{std.json.fmt(run.workspace_id, .{})});
+    try out.writer.writeAll(",\"ontology_id\":");
+    try out.writer.print("{f}", .{std.json.fmt(run.ontology_id, .{})});
+    try out.writer.print(
+        ",\"evaluated\":{},\"changed\":{},\"events_created\":{},\"invalid_count\":{},\"remediation_actions_created\":{}",
+        .{ run.evaluated, run.changed, run.events_created, run.invalid_count, run.remediation_actions_created },
+    );
+    try out.writer.writeAll(",\"events\":[");
+    for (run.events, 0..) |event, index| {
+        if (index > 0) try out.writer.writeAll(",");
+        try writeRuleEventJson(&out.writer, event);
+    }
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn ruleEvaluationsJson(db: Database, allocator: std.mem.Allocator, options: RuleEvaluationOptions) ![]u8 {
+    const ontology_id = try resolveOntologyId(db, allocator, options.workspace_id, options.ontology_id);
+    defer allocator.free(ontology_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"graph_rule_evaluations\",\"workspace_id\":");
+    try out.writer.print("{f},\"ontology_id\":{f},\"evaluations\":[", .{
+        std.json.fmt(options.workspace_id, .{}),
+        std.json.fmt(ontology_id, .{}),
+    });
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT rule_id, subject_entity_id, state, observed_count, expected_min, expected_max,
+        \\       last_evaluated_at_unix, updated_at_unix
+        \\FROM graph_rule_evaluations
+        \\WHERE workspace_id = ?1 AND ontology_id = ?2
+        \\ORDER BY updated_at_unix DESC, rule_id, subject_entity_id
+        \\LIMIT ?3
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, options.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(options.limit)));
+
+    var first = true;
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        if (!first) try out.writer.writeAll(",");
+        first = false;
+        try out.writer.writeAll("{");
+        try writeJsonField(&out.writer, "rule_id", columnText(stmt, 0));
+        try out.writer.print(",\"subject_entity_id\":{},", .{c.sqlite3_column_int64(stmt, 1)});
+        try writeJsonField(&out.writer, "state", columnText(stmt, 2));
+        try out.writer.print(
+            ",\"observed_count\":{},\"expected_min\":{},\"expected_max\":",
+            .{ c.sqlite3_column_int64(stmt, 3), c.sqlite3_column_int64(stmt, 4) },
+        );
+        try writeOptionalColumnInt(&out.writer, stmt, 5);
+        try out.writer.print(",\"last_evaluated_at_unix\":{},\"updated_at_unix\":{}", .{
+            c.sqlite3_column_int64(stmt, 6),
+            c.sqlite3_column_int64(stmt, 7),
+        });
+        try out.writer.writeAll("}");
+    }
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn ruleEventsJson(db: Database, allocator: std.mem.Allocator, options: RuleEvaluationOptions) ![]u8 {
+    const ontology_id = try resolveOntologyId(db, allocator, options.workspace_id, options.ontology_id);
+    defer allocator.free(ontology_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"graph_rule_events\",\"workspace_id\":");
+    try out.writer.print("{f},\"ontology_id\":{f},\"events\":[", .{
+        std.json.fmt(options.workspace_id, .{}),
+        std.json.fmt(ontology_id, .{}),
+    });
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT event_id, rule_id, subject_entity_id, from_state, to_state,
+        \\       observed_count, expected_min, expected_max, idempotency_key, created_at_unix
+        \\FROM graph_rule_events
+        \\WHERE workspace_id = ?1 AND ontology_id = ?2
+        \\ORDER BY created_at_unix DESC, event_id DESC
+        \\LIMIT ?3
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, options.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(options.limit)));
+
+    var first = true;
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        if (!first) try out.writer.writeAll(",");
+        first = false;
+        try out.writer.writeAll("{");
+        try writeJsonField(&out.writer, "event_id", columnText(stmt, 0));
+        try out.writer.writeAll(",");
+        try writeJsonField(&out.writer, "rule_id", columnText(stmt, 1));
+        try out.writer.print(",\"subject_entity_id\":{},", .{c.sqlite3_column_int64(stmt, 2)});
+        try writeJsonField(&out.writer, "from_state", columnText(stmt, 3));
+        try out.writer.writeAll(",");
+        try writeJsonField(&out.writer, "to_state", columnText(stmt, 4));
+        try out.writer.print(
+            ",\"observed_count\":{},\"expected_min\":{},\"expected_max\":",
+            .{ c.sqlite3_column_int64(stmt, 5), c.sqlite3_column_int64(stmt, 6) },
+        );
+        try writeOptionalColumnInt(&out.writer, stmt, 7);
+        try out.writer.writeAll(",");
+        try writeJsonField(&out.writer, "idempotency_key", columnText(stmt, 8));
+        try out.writer.print(",\"created_at_unix\":{}", .{c.sqlite3_column_int64(stmt, 9)});
+        try out.writer.writeAll("}");
+    }
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+fn currentUnix(db: Database) !i64 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT unixepoch()");
+    defer facet_sqlite.finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn randomToken(db: Database, allocator: std.mem.Allocator) ![]u8 {
+    const stmt = try facet_sqlite.prepare(db, "SELECT lower(hex(randomblob(8)))");
+    defer facet_sqlite.finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return try dupeColumnText(allocator, stmt, 0);
+}
+
+fn ensureQualityRunForRuleEvaluation(db: Database, workspace_id: []const u8, ontology_id: []const u8, run_id: []const u8) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO quality_convergence_run(run_id, workspace_id, ontology_id, run_kind, status, canonical_layer, input_fingerprint, summary_json, report_json)
+        \\VALUES (?1, ?2, ?3, 'graph_rule_evaluation', 'completed', 'runtime_graph', ?4, '{}', '{}')
+        \\ON CONFLICT(run_id) DO UPDATE SET status = excluded.status, updated_at_unix = unixepoch()
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, run_id);
+    try facet_sqlite.bindText(stmt, 2, workspace_id);
+    try facet_sqlite.bindText(stmt, 3, ontology_id);
+    try facet_sqlite.bindText(stmt, 4, run_id);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn ruleState(observed: i64, rule: GapRule) []const u8 {
+    if (observed < rule.min_count) return "invalid";
+    if (rule.max_count) |max_count| {
+        if (observed > max_count) return "invalid";
+    }
+    return "valid";
+}
+
+fn loadEvaluationState(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rule_id: []const u8, subject_entity_id: u64) !?[]u8 {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT state
+        \\FROM graph_rule_evaluations
+        \\WHERE workspace_id = ?1 AND ontology_id = ?2 AND rule_id = ?3 AND subject_entity_id = ?4
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    try facet_sqlite.bindText(stmt, 3, rule_id);
+    try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(subject_entity_id)));
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return try dupeColumnText(allocator, stmt, 0);
+}
+
+fn upsertEvaluationState(db: Database, workspace_id: []const u8, ontology_id: []const u8, rule: GapRule, subject_entity_id: u64, state: []const u8, observed: i64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_rule_evaluations(
+        \\  workspace_id, ontology_id, rule_id, subject_entity_id, state,
+        \\  observed_count, expected_min, expected_max, last_evaluated_at_unix, updated_at_unix
+        \\)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), unixepoch())
+        \\ON CONFLICT(workspace_id, ontology_id, rule_id, subject_entity_id) DO UPDATE SET
+        \\  state = excluded.state,
+        \\  observed_count = excluded.observed_count,
+        \\  expected_min = excluded.expected_min,
+        \\  expected_max = excluded.expected_max,
+        \\  last_evaluated_at_unix = unixepoch(),
+        \\  updated_at_unix = unixepoch()
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, ontology_id);
+    try facet_sqlite.bindText(stmt, 3, rule.rule_id);
+    try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(subject_entity_id)));
+    try facet_sqlite.bindText(stmt, 5, state);
+    try facet_sqlite.bindInt64(stmt, 6, observed);
+    try facet_sqlite.bindInt64(stmt, 7, rule.min_count);
+    if (rule.max_count) |value| try facet_sqlite.bindInt64(stmt, 8, value) else try facet_sqlite.bindNull(stmt, 8);
+    try facet_sqlite.stepDone(stmt);
+}
+
+fn insertRuleEvent(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    rule: GapRule,
+    subject_entity_id: u64,
+    from_state: []const u8,
+    to_state: []const u8,
+    observed: i64,
+) !RuleEvent {
+    const now = try currentUnix(db);
+    const token = try randomToken(db, allocator);
+    defer allocator.free(token);
+    const event_id = try std.fmt.allocPrint(allocator, "graph_rule_event__{s}__{s}__{d}__{s}", .{ workspace_id, rule.rule_id, subject_entity_id, token });
+    errdefer allocator.free(event_id);
+    const idempotency_key = try std.fmt.allocPrint(allocator, "graph_rule_transition__{s}__{s}__{d}__{s}__{s}__{s}", .{ workspace_id, rule.rule_id, subject_entity_id, from_state, to_state, token });
+    errdefer allocator.free(idempotency_key);
+
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_rule_events(
+        \\  event_id, workspace_id, ontology_id, rule_id, subject_entity_id,
+        \\  from_state, to_state, observed_count, expected_min, expected_max,
+        \\  idempotency_key, created_at_unix
+        \\)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, event_id);
+    try facet_sqlite.bindText(stmt, 2, workspace_id);
+    try facet_sqlite.bindText(stmt, 3, ontology_id);
+    try facet_sqlite.bindText(stmt, 4, rule.rule_id);
+    try facet_sqlite.bindInt64(stmt, 5, @as(i64, @intCast(subject_entity_id)));
+    try facet_sqlite.bindText(stmt, 6, from_state);
+    try facet_sqlite.bindText(stmt, 7, to_state);
+    try facet_sqlite.bindInt64(stmt, 8, observed);
+    try facet_sqlite.bindInt64(stmt, 9, rule.min_count);
+    if (rule.max_count) |value| try facet_sqlite.bindInt64(stmt, 10, value) else try facet_sqlite.bindNull(stmt, 10);
+    try facet_sqlite.bindText(stmt, 11, idempotency_key);
+    try facet_sqlite.bindInt64(stmt, 12, now);
+    try facet_sqlite.stepDone(stmt);
+
+    return .{
+        .event_id = event_id,
+        .rule_id = try allocator.dupe(u8, rule.rule_id),
+        .subject_entity_id = subject_entity_id,
+        .from_state = try allocator.dupe(u8, from_state),
+        .to_state = try allocator.dupe(u8, to_state),
+        .observed_count = observed,
+        .expected_min = rule.min_count,
+        .expected_max = rule.max_count,
+        .idempotency_key = idempotency_key,
+        .created_at_unix = now,
+    };
+}
+
+fn metadataStringField(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) !?[]u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| try allocator.dupe(u8, text),
+        else => null,
+    };
+}
+
+fn metadataFloatField(object: std.json.ObjectMap, field: []const u8, fallback: f64) f64 {
+    const value = object.get(field) orelse return fallback;
+    return switch (value) {
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        else => fallback,
+    };
+}
+
+fn metadataJsonField(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![]u8 {
+    const value = object.get(field) orelse return try allocator.dupe(u8, "{}");
+    if (value == .string) return try allocator.dupe(u8, value.string);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{f}", .{std.json.fmt(value, .{})});
+    return try out.toOwnedSlice();
+}
+
+fn maybeCreateRemediationAction(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    ontology_id: []const u8,
+    run_id: []const u8,
+    rule: GapRule,
+    subject_entity_id: u64,
+    event_idempotency_key: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, rule.metadata_json, .{
+        .allocate = .alloc_if_needed,
+    }) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const action_value = parsed.value.object.get("remediation_action") orelse return false;
+    if (action_value != .object) return false;
+    const action_object = action_value.object;
+
+    const action_base = try metadataStringField(allocator, action_object, "action_id") orelse try allocator.dupe(u8, rule.rule_id);
+    defer allocator.free(action_base);
+    const action_id = try std.fmt.allocPrint(allocator, "graph_rule_action__{s}__{d}", .{ action_base, subject_entity_id });
+    defer allocator.free(action_id);
+    const idempotency_key = try std.fmt.allocPrint(allocator, "graph_rule_action__{s}__{s}__{s}__{d}", .{ workspace_id, ontology_id, rule.rule_id, subject_entity_id });
+    defer allocator.free(idempotency_key);
+    const reason = try metadataStringField(allocator, action_object, "reason") orelse try allocator.dupe(u8, rule.label);
+    defer allocator.free(reason);
+    const execution_mode = try metadataStringField(allocator, action_object, "execution_mode") orelse try allocator.dupe(u8, "manual");
+    defer allocator.free(execution_mode);
+    const mcp_tool = try metadataStringField(allocator, action_object, "mcp_tool");
+    defer if (mcp_tool) |value| allocator.free(value);
+    const tool_args_json = try metadataJsonField(allocator, action_object, "tool_args_json");
+    defer allocator.free(tool_args_json);
+    const evidence_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"rule_id\":{f},\"subject_entity_id\":{},\"event_idempotency_key\":{f}}}",
+        .{ std.json.fmt(rule.rule_id, .{}), subject_entity_id, std.json.fmt(event_idempotency_key, .{}) },
+    );
+    defer allocator.free(evidence_json);
+
+    try ensureQualityRunForRuleEvaluation(db, workspace_id, ontology_id, run_id);
+    const stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO quality_remediation_action(
+        \\  action_id, run_id, workspace_id, ontology_id, issue_type, severity,
+        \\  confidence, reason, schema_id, entity_type, projection_id,
+        \\  evidence_json, mcp_tool, tool_args_json, execution_mode, idempotency_key, status
+        \\)
+        \\VALUES (?1, ?2, ?3, ?4, 'graph_rule_valid_transition', ?5, ?6, ?7, NULL, ?8, NULL, ?9, ?10, ?11, ?12, ?13, 'proposed')
+        \\ON CONFLICT(action_id) DO UPDATE SET
+        \\  run_id = excluded.run_id,
+        \\  severity = excluded.severity,
+        \\  confidence = excluded.confidence,
+        \\  reason = excluded.reason,
+        \\  evidence_json = excluded.evidence_json,
+        \\  mcp_tool = excluded.mcp_tool,
+        \\  tool_args_json = excluded.tool_args_json,
+        \\  execution_mode = excluded.execution_mode,
+        \\  idempotency_key = excluded.idempotency_key,
+        \\  updated_at_unix = unixepoch()
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, action_id);
+    try facet_sqlite.bindText(stmt, 2, run_id);
+    try facet_sqlite.bindText(stmt, 3, workspace_id);
+    try facet_sqlite.bindText(stmt, 4, ontology_id);
+    try facet_sqlite.bindText(stmt, 5, rule.severity);
+    if (c.sqlite3_bind_double(stmt, 6, metadataFloatField(action_object, "confidence", 0.75)) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 7, reason);
+    try facet_sqlite.bindText(stmt, 8, rule.entity_type);
+    try facet_sqlite.bindText(stmt, 9, evidence_json);
+    if (mcp_tool) |value| try facet_sqlite.bindText(stmt, 10, value) else try facet_sqlite.bindNull(stmt, 10);
+    try facet_sqlite.bindText(stmt, 11, tool_args_json);
+    try facet_sqlite.bindText(stmt, 12, execution_mode);
+    try facet_sqlite.bindText(stmt, 13, idempotency_key);
+    try facet_sqlite.stepDone(stmt);
+    return c.sqlite3_changes(db.handle) > 0;
 }
 
 const ReconciliationWriter = struct {
@@ -1231,6 +1717,23 @@ fn writeIssueJson(writer: *std.Io.Writer, issue: Issue) !void {
     try writer.writeAll("}");
 }
 
+fn writeRuleEventJson(writer: *std.Io.Writer, event: RuleEvent) !void {
+    try writer.writeAll("{");
+    try writeJsonField(writer, "event_id", event.event_id);
+    try writer.writeAll(",");
+    try writeJsonField(writer, "rule_id", event.rule_id);
+    try writer.print(",\"subject_entity_id\":{},", .{event.subject_entity_id});
+    try writeJsonField(writer, "from_state", event.from_state);
+    try writer.writeAll(",");
+    try writeJsonField(writer, "to_state", event.to_state);
+    try writer.print(",\"observed_count\":{},\"expected_min\":{},\"expected_max\":", .{ event.observed_count, event.expected_min });
+    try writeOptionalSignedInt(writer, event.expected_max);
+    try writer.writeAll(",");
+    try writeJsonField(writer, "idempotency_key", event.idempotency_key);
+    try writer.print(",\"created_at_unix\":{}", .{event.created_at_unix});
+    try writer.writeAll("}");
+}
+
 fn writeJsonField(writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
     try writer.print("\"{s}\":{f}", .{ key, std.json.fmt(value, .{}) });
 }
@@ -1412,6 +1915,76 @@ test "strict gap rule import validates ontology references" {
         \\{"ontology_id":"ws_strict::core","workspace_id":"ws_strict","validation_mode":"warn","rules":[{"rule_id":"bad-edge","entity_type":"unit","relation_type":"missing_edge","direction":"out","label":"Bad edge"}]}
     );
     try std.testing.expectEqual(@as(usize, 1), imported);
+}
+
+test "rule evaluations persist state and emit events only on transitions" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_rule_eval', 'ws_rule_eval', 'Rule Eval');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_rule_eval::core', 'ws_rule_eval', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_rule_eval', 'ws_rule_eval::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_rule_eval::core', 'unit', 'Unit');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_rule_eval::core', 'person', 'Person');
+        \\INSERT INTO ontology_edge_types(ontology_id, edge_type, source_entity_type, target_entity_type) VALUES ('ws_rule_eval::core', 'owns', 'person', 'unit');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (1, 'ws_rule_eval', 'unit', 'A1');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (2, 'ws_rule_eval', 'person', 'Owner');
+    );
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_rule_eval::core","workspace_id":"ws_rule_eval","rules":[{"rule_id":"unit-has-owner","entity_type":"unit","relation_type":"owns","direction":"in","target_entity_type":"person","min_count":1,"severity":"error","label":"Unit must have owner","metadata_json":"{\"remediation_action\":{\"action_id\":\"confirm-owner\",\"mcp_tool\":\"ghostcrab_graph_edge_confirm\",\"tool_args_json\":{\"relation_type\":\"owns\"},\"execution_mode\":\"manual\",\"confidence\":0.8}}"}]}
+    );
+
+    var first = try runRuleEvaluations(db, std.testing.allocator, .{
+        .workspace_id = "ws_rule_eval",
+        .limit = 10,
+    });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.evaluated);
+    try std.testing.expectEqual(@as(usize, 1), first.changed);
+    try std.testing.expectEqual(@as(usize, 1), first.events_created);
+    try std.testing.expectEqual(@as(usize, 1), first.invalid_count);
+    try std.testing.expectEqual(@as(usize, 0), first.remediation_actions_created);
+    try std.testing.expectEqualStrings("invalid", first.events[0].to_state);
+
+    var second = try runRuleEvaluations(db, std.testing.allocator, .{
+        .workspace_id = "ws_rule_eval",
+        .limit = 10,
+    });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second.evaluated);
+    try std.testing.expectEqual(@as(usize, 0), second.changed);
+    try std.testing.expectEqual(@as(usize, 0), second.events_created);
+    try std.testing.expectEqual(@as(usize, 1), second.invalid_count);
+
+    try db.exec("INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id) VALUES (10, 'ws_rule_eval', 'owns', 2, 1);");
+    var third = try runRuleEvaluations(db, std.testing.allocator, .{
+        .workspace_id = "ws_rule_eval",
+        .limit = 10,
+    });
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), third.evaluated);
+    try std.testing.expectEqual(@as(usize, 1), third.changed);
+    try std.testing.expectEqual(@as(usize, 1), third.events_created);
+    try std.testing.expectEqual(@as(usize, 0), third.invalid_count);
+    try std.testing.expectEqual(@as(usize, 1), third.remediation_actions_created);
+    try std.testing.expectEqualStrings("invalid", third.events[0].from_state);
+    try std.testing.expectEqualStrings("valid", third.events[0].to_state);
+
+    const evaluations_json = try ruleEvaluationsJson(db, std.testing.allocator, .{
+        .workspace_id = "ws_rule_eval",
+        .limit = 10,
+    });
+    defer std.testing.allocator.free(evaluations_json);
+    try std.testing.expect(std.mem.indexOf(u8, evaluations_json, "\"state\":\"valid\"") != null);
+
+    const events_json = try ruleEventsJson(db, std.testing.allocator, .{
+        .workspace_id = "ws_rule_eval",
+        .limit = 10,
+    });
+    defer std.testing.allocator.free(events_json);
+    try std.testing.expect(std.mem.indexOf(u8, events_json, "\"from_state\":\"invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_json, "\"to_state\":\"valid\"") != null);
 }
 
 test "ontology reconciliation reports registry and graph drift" {

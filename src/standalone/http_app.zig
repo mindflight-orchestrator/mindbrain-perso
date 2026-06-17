@@ -205,6 +205,13 @@ const QualityConvergenceRunRequest = struct {
     component_small_max: usize = 2,
 };
 
+const GraphRuleEvaluationRunRequest = struct {
+    workspace_id: []const u8,
+    ontology_id: ?[]const u8 = null,
+    limit: usize = 200,
+    create_remediation_actions: bool = true,
+};
+
 const QualityRemediationDecisionRequest = struct {
     action_id: []const u8,
     decision: []const u8,
@@ -1082,6 +1089,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleGraphGapRulesDelete(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/rule-evaluations/run")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGraphRuleEvaluationsRun(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/pattern-query")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleGraphPatternQuery(allocator, request, body_buffer);
@@ -1178,6 +1190,12 @@ pub const MindbrainHttpApp = struct {
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/gap-rules")) {
             return self.handleGraphGapRules(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/rule-evaluations")) {
+            return self.handleGraphRuleEvaluations(allocator, query);
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/rule-events")) {
+            return self.handleGraphRuleEvents(allocator, query);
         }
         if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/runs")) {
             return self.handleQualityConvergenceRuns(allocator, query);
@@ -2406,6 +2424,82 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    fn handleGraphRuleEvaluations(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try parseQueryInt(usize, value)
+        else
+            200;
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.ruleEvaluationsJson(db, allocator, .{
+                .workspace_id = workspace_id,
+                .ontology_id = ontology_id,
+                .limit = limit,
+                .create_remediation_actions = false,
+            }),
+        };
+    }
+
+    fn handleGraphRuleEvents(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
+        var db = try self.openDb();
+        defer db.close();
+
+        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
+        const limit = if (try queryValue(allocator, query, "limit")) |value|
+            try parseQueryInt(usize, value)
+        else
+            200;
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.ruleEventsJson(db, allocator, .{
+                .workspace_id = workspace_id,
+                .ontology_id = ontology_id,
+                .limit = limit,
+                .create_remediation_actions = false,
+            }),
+        };
+    }
+
+    fn handleGraphRuleEvaluationsRun(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const run_request = try self.parseGraphRuleEvaluationRunRequest(allocator, request, body_buffer);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writer_active_session_id != null) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        var run = graph_diagnostics.runRuleEvaluations(self.writer_db, allocator, .{
+            .workspace_id = run_request.workspace_id,
+            .ontology_id = run_request.ontology_id,
+            .limit = run_request.limit,
+            .create_remediation_actions = run_request.create_remediation_actions,
+        }) catch |err| {
+            self.writer_failed += 1;
+            self.recordWriterError(self.writer_db, "graph.rule_evaluations.run", err);
+            return err;
+        };
+        defer run.deinit(allocator);
+        self.writer_completed += 1;
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try graph_diagnostics.ruleEvaluationRunJson(allocator, run),
+        };
+    }
+
     fn handleQualityConvergenceRun(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -3156,6 +3250,21 @@ pub const MindbrainHttpApp = struct {
         );
     }
 
+    fn parseGraphRuleEvaluationRunRequest(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !GraphRuleEvaluationRunRequest {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return try std.json.parseFromSliceLeaky(
+            GraphRuleEvaluationRunRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        );
+    }
+
     fn parseQualityRemediationDecisionRequest(
         self: *MindbrainHttpApp,
         allocator: std.mem.Allocator,
@@ -3390,6 +3499,9 @@ pub const MindbrainHttpApp = struct {
             .graph_gap_rules = @hasDecl(@This(), "handleGraphGapRules"),
             .graph_gap_rules_import = @hasDecl(@This(), "handleGraphGapRulesImport"),
             .graph_gap_rules_delete = @hasDecl(@This(), "handleGraphGapRulesDelete"),
+            .graph_rule_evaluations = @hasDecl(@This(), "handleGraphRuleEvaluations"),
+            .graph_rule_evaluations_run = @hasDecl(@This(), "handleGraphRuleEvaluationsRun"),
+            .graph_rule_events = @hasDecl(@This(), "handleGraphRuleEvents"),
             .graph_pattern_query = @hasDecl(@This(), "handleGraphPatternQuery"),
             .ontology_import = @hasDecl(@This(), "handleOntologyImportPost"),
             .ontology_compile_linkml = @hasDecl(@This(), "handleOntologyCompileLinkmlPost"),
@@ -3400,7 +3512,7 @@ pub const MindbrainHttpApp = struct {
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -3408,6 +3520,9 @@ pub const MindbrainHttpApp = struct {
                 features.graph_gap_rules,
                 features.graph_gap_rules_import,
                 features.graph_gap_rules_delete,
+                features.graph_rule_evaluations,
+                features.graph_rule_evaluations_run,
+                features.graph_rule_events,
                 features.graph_pattern_query,
                 features.ontology_import,
                 features.ontology_compile_linkml,
@@ -4678,6 +4793,9 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/graph/gap-rules?workspace_id=...
         \\  POST /api/mindbrain/graph/gap-rules/import
         \\  POST /api/mindbrain/graph/gap-rules/delete
+        \\  POST /api/mindbrain/graph/rule-evaluations/run
+        \\  GET /api/mindbrain/graph/rule-evaluations?workspace_id=...
+        \\  GET /api/mindbrain/graph/rule-events?workspace_id=...
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
         \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...

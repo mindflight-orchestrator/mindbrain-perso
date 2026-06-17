@@ -174,6 +174,8 @@ test "sqlite schema is loaded from the canonical install file" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_knowledge_patch") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_entity_degree") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_gap_rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_rule_evaluations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS graph_rule_events") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS quality_convergence_run") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS quality_remediation_action") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "CREATE TABLE IF NOT EXISTS agent_facts") != null);

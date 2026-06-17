@@ -369,6 +369,52 @@ CREATE TABLE IF NOT EXISTS graph_gap_rules (
 CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
     ON graph_gap_rules(ontology_id, workspace_id, enabled);
 
+CREATE TABLE IF NOT EXISTS graph_rule_evaluations (
+    workspace_id TEXT NOT NULL,
+    ontology_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    subject_entity_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('valid', 'invalid')),
+    observed_count INTEGER NOT NULL,
+    expected_min INTEGER NOT NULL,
+    expected_max INTEGER,
+    last_evaluated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY(workspace_id, ontology_id, rule_id, subject_entity_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+    FOREIGN KEY(rule_id) REFERENCES graph_gap_rules(rule_id),
+    FOREIGN KEY(subject_entity_id) REFERENCES graph_entity(entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS graph_rule_evaluations_state_idx
+    ON graph_rule_evaluations(workspace_id, ontology_id, state);
+
+CREATE TABLE IF NOT EXISTS graph_rule_events (
+    event_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    ontology_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    subject_entity_id INTEGER NOT NULL,
+    from_state TEXT NOT NULL CHECK(from_state IN ('unknown', 'valid', 'invalid')),
+    to_state TEXT NOT NULL CHECK(to_state IN ('valid', 'invalid')),
+    observed_count INTEGER NOT NULL,
+    expected_min INTEGER NOT NULL,
+    expected_max INTEGER,
+    idempotency_key TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id),
+    FOREIGN KEY(ontology_id) REFERENCES ontologies(ontology_id),
+    FOREIGN KEY(rule_id) REFERENCES graph_gap_rules(rule_id),
+    FOREIGN KEY(subject_entity_id) REFERENCES graph_entity(entity_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS graph_rule_events_idempotency_idx
+    ON graph_rule_events(workspace_id, idempotency_key);
+
+CREATE INDEX IF NOT EXISTS graph_rule_events_lookup_idx
+    ON graph_rule_events(workspace_id, ontology_id, rule_id, created_at_unix DESC);
+
 CREATE TABLE IF NOT EXISTS quality_convergence_run (
     run_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
