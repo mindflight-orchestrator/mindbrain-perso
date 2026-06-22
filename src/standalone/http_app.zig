@@ -3833,6 +3833,7 @@ pub const MindbrainHttpApp = struct {
 
         const agent_id = (try queryValue(allocator, query, "agent_id")) orelse return error.BadRequest;
         const query_text = (try queryValue(allocator, query, "query")) orelse "";
+        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
@@ -3843,6 +3844,7 @@ pub const MindbrainHttpApp = struct {
             db,
             allocator,
             agent_id,
+            workspace_id,
             scope,
             query_text,
             limit,
@@ -3878,6 +3880,7 @@ pub const MindbrainHttpApp = struct {
 
         const payload = .{
             .agent_id = agent_id,
+            .workspace_id = workspace_id,
             .query = query_text,
             .scope = scope,
             .rows = response_rows,
@@ -5667,6 +5670,7 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
         \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, confidence, metadata_json) VALUES (3, 'ws_api', 'ProjectionResult', 'Ownership snapshot', 0.97, '{"projection_id":"proj-snapshot","collection_id":"registry"}');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-pack', 'agent-studio', 'ws_api', 'FACT', 'Ada owns Unit 1', 1.0, 'active');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-other', 'agent-studio', 'ws_api', 'FACT', 'Other context', 0.9, 'active');
+        \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-foreign', 'agent-studio', 'ws_other', 'FACT', 'Foreign workspace context', 2.0, 'active');
         \\INSERT INTO mindbrain_answer_artifacts(artifact_id, slug, workspace_id, artifact_kind, public_label, lifecycle, state, payload_json) VALUES ('live_answer_view__ws_api', 'ws_api', 'ws_api', 'live_answer_view', 'API live view', 'stale', 'dirty', '{}');
     );
 
@@ -5704,8 +5708,10 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
     try std.testing.expect(std.mem.indexOf(u8, type_counts.body, "\"label\":\"Personne\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, type_counts.body, "\"entity_type\":\"unit\"") != null);
 
-    const pack = try app.handleGhostcrabPackProjections(arena, "agent_id=agent-studio");
+    const pack = try app.handleGhostcrabPackProjections(arena, "agent_id=agent-studio&workspace_id=ws_api");
     try std.testing.expect(std.mem.indexOf(u8, pack.body, "Ada owns Unit 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.body, "Foreign workspace context") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pack.body, "\"workspace_id\":\"ws_api\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.body, "\"artifact_kind\":\"analysis_plan\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pack.body, "\"legacy_kind\":\"projection_type_a\"") != null);
 

@@ -248,6 +248,7 @@ pub fn materializePackProjections(
     db: Database,
     allocator: std.mem.Allocator,
     agent_id: []const u8,
+    workspace_id: ?[]const u8,
     scope: ?[]const u8,
     query: []const u8,
     limit_n: usize,
@@ -263,6 +264,7 @@ pub fn materializePackProjections(
 
     for (rows) |row| {
         if (!std.mem.eql(u8, row.status, "active") and !std.mem.eql(u8, row.status, "blocking")) continue;
+        if (!matchesProjectionScope(workspace_id, row.scope)) continue;
         if (!matchesPackScope(scope, row.scope)) continue;
         if (!matchesProjectionQuery(row.content, query)) continue;
 
