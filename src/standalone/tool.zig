@@ -46,6 +46,8 @@ const Allocator = std.mem.Allocator;
 
 const CliError = error{
     InvalidArguments,
+    ConfirmationRequired,
+    WorkspaceAlreadyExists,
 };
 
 const BusinessReindexMode = enum { none, graph };
@@ -470,7 +472,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool qualification-vocab-list --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--taxonomies <id,id>] [--facets <namespace.dimension,...>]
         \\  mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id> --collection-id <id> --taxonomies <id,id> --facets <namespace.dimension,...> ([--llm-provider openai|openrouter|anthropic] [--base-url <url>] [--model <name>] [--api-key <key>] | --mock-qualification-json <path> | --dry-run) [--limit <n>] [--target doc|chunk|both]
         \\  mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
-        \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
+        \\  mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--overwrite --confirm] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
         \\  mindbrain-standalone-tool artifact-migrate --db <sqlite_path> (--dry-run | --repair)
         \\  mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
         \\  mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
@@ -5071,11 +5073,13 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     var document_table_id: ?u64 = null;
     var collection_id: ?[]const u8 = null;
     var table_id: ?u64 = null;
+    var overwrite = false;
+    var confirm = false;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--reindex")) {
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--bundle")) bundle_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true else if (std.mem.eql(u8, arg, "--overwrite")) overwrite = true else if (std.mem.eql(u8, arg, "--confirm")) confirm = true else if (std.mem.eql(u8, arg, "--reindex")) {
             const mode = try requireArg(args, &index);
             if (std.mem.eql(u8, mode, "none")) reindex_mode = .none else if (std.mem.eql(u8, mode, "graph")) reindex_mode = .graph else if (std.mem.eql(u8, mode, "all")) reindex_mode = .all else return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--document-table-id")) {
@@ -5087,6 +5091,7 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
         } else return CliError.InvalidArguments;
     }
     if (db_path == null or bundle_path == null) return CliError.InvalidArguments;
+    if (overwrite != confirm) return CliError.ConfirmationRequired;
 
     const buf = try std.Io.Dir.cwd().readFileAlloc(mindbrain.zig16_compat.io(), bundle_path.?, allocator, .unlimited);
     defer allocator.free(buf);
@@ -5104,11 +5109,13 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
             allocator.free(items);
         };
 
+        var workspace_exists = false;
         if (db_path) |path| {
             var db = try facet_sqlite.Database.open(path);
             defer db.close();
             try db.applyStandaloneSchema();
             missing_columns = try schema_column_migrations.findMissingColumns(allocator, db);
+            workspace_exists = try collections_sqlite.workspaceExists(db, summary.workspace_id);
         }
 
         var preflight = std.ArrayList(struct { table: []const u8, column: []const u8 }).empty;
@@ -5145,6 +5152,12 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
                 .missing_columns = preflight.items,
                 .ready = preflight.items.len == 0,
             },
+            .workspace_import = .{
+                .workspace_exists = workspace_exists,
+                .overwrite_requested = overwrite,
+                .overwrite_confirmed = confirm,
+                .would_block = workspace_exists and !overwrite,
+            },
             .reindex = @tagName(reindex_mode),
         }, .{})});
         return;
@@ -5158,7 +5171,15 @@ fn runBackupLoadCommand(allocator: Allocator, args: []const []const u8) !void {
     const summary = try collections_io.summarizeBundleJson(allocator, buf);
     defer summary.deinit(allocator);
 
-    try collections_io.importBundleJson(db, allocator, buf);
+    const workspace_exists = try collections_sqlite.workspaceExists(db, summary.workspace_id);
+    if (workspace_exists and !overwrite) {
+        try writeStdout("backup-load refused: workspace {s} already exists; pass --overwrite --confirm to replace it\n", .{summary.workspace_id});
+        return CliError.WorkspaceAlreadyExists;
+    }
+
+    try collections_io.importBundleJsonWithOptions(db, allocator, buf, .{
+        .overwrite_existing_workspace = overwrite,
+    });
     try writeStdout("loaded backup bundle from {s}\n", .{bundle_path.?});
 
     switch (reindex_mode) {

@@ -112,7 +112,7 @@ mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <i
 mindbrain-standalone-tool workspace-export --db <sqlite_path> --workspace-id <id>
 mindbrain-standalone-tool workspace-export-by-domain --db <sqlite_path> --domain-or-workspace <id>
 mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
-mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
+mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--overwrite --confirm] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
 mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
 mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
@@ -163,7 +163,7 @@ Run `mindbrain-standalone-tool` with no arguments (or with an unknown first argu
 - **`traverse`** — Graph walk from a start node; prints JSON (`target_found`, `rows`).
 - **`workspace-export`** — Emits **TOON** workspace model export to stdout.
 - **`workspace-create` / `collection-create` / `collection-export` / `collection-import`** — Workspace and collection lifecycle plus portable JSON bundle export/import.
-- **`backup-export` / `backup-load --reindex`** — Export portable workspace/taxonomy/collection bundles, then load a bundle and optionally rebuild graph-only or all derived graph/facet/BM25 indexes for the bundle workspace.
+- **`backup-export` / `backup-load --reindex`** — Export portable workspace/taxonomy/collection bundles, then load a bundle and optionally rebuild graph-only or all derived graph/facet/BM25 indexes for the bundle workspace. `backup-load` refuses to import when the bundle workspace already exists unless both `--overwrite --confirm` are passed.
 - **`artifact-migrate --dry-run | --repair`** — Inspect or rebuild answer artifact registry rows from legacy `projections` and `ProjectionResult` graph entities. Repair is idempotent and preserves existing registry rows by `legacy_ref`.
 - **`ontology-register` / `ontology-attach`** — Register workspace-scoped ontologies and attach them to collections.
 - **`ontology-import` / `ontology-export`** — Import normalized OWL2/RDF

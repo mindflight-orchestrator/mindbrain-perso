@@ -277,7 +277,7 @@ mindbrain-standalone-tool document-qualify --db <sqlite_path> --workspace-id <id
 mindbrain-standalone-tool backup-export --db <sqlite_path> --workspace-id <id> [--scope workspace|taxonomies|collection] [--collection-id <id>] [--output <file>] [--no-vectors]
 mindbrain-standalone-tool collection-export --db <sqlite_path> --workspace-id <id> [--collection-id <id>] [--output <file>]
 mindbrain-standalone-tool collection-import --db <sqlite_path> --bundle <file>
-mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
+mindbrain-standalone-tool backup-load --db <sqlite_path> --bundle <file> [--dry-run] [--overwrite --confirm] [--reindex none|graph|all] [--document-table-id N] [--collection-id <id>] [--table-id N]
 mindbrain-standalone-tool artifact-migrate --db <sqlite_path> (--dry-run | --repair)
 mindbrain-standalone-tool document-ingest --db <sqlite_path> --workspace-id <id> --collection-id <id> --doc-id <n> [--nanoid <id>] [--source-ref <uri>] [--language <lang>] [--ingested-at <iso>] [--ontology-id <id>] [--strategy fixed_token|sentence|paragraph|recursive_character|structure_aware] [--target-tokens <n>] [--overlap-tokens <n>] [--max-chars <n>] [--min-chars <n>] (--content <text> | --content-file <path>)
 mindbrain-standalone-tool document-by-nanoid --db <sqlite_path> --nanoid <id>

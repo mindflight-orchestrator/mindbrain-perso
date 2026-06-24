@@ -23,6 +23,10 @@ pub const ExportOptions = struct {
     include_vectors: bool = true,
 };
 
+pub const ImportOptions = struct {
+    overwrite_existing_workspace: bool = false,
+};
+
 pub const BundleSummary = struct {
     kind: []const u8,
     schema_version: []const u8,
@@ -630,6 +634,10 @@ pub fn exportToJsonWithOptions(allocator: Allocator, db: Database, scope: Scope,
 // ---- Import ---------------------------------------------------------------
 
 pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const u8) !void {
+    try importBundleJsonWithOptions(db, allocator, json_bytes, .{});
+}
+
+pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_bytes: []const u8, options: ImportOptions) !void {
     const parsed = try std.json.parseFromSlice(Bundle, allocator, json_bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -641,6 +649,10 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     errdefer db.exec("ROLLBACK") catch |rollback_err| {
         std.log.warn("collections import rollback failed: {s}", .{@errorName(rollback_err)});
     };
+
+    if (options.overwrite_existing_workspace) {
+        try purgeBundleWorkspaceInOpenTransaction(db, bundle.scope.workspace_id);
+    }
 
     for (bundle.workspaces) |row| {
         try collections_sqlite.ensureWorkspace(db, .{
@@ -1069,6 +1081,131 @@ pub fn importBundleJson(db: Database, allocator: Allocator, json_bytes: []const 
     }
 
     try db.exec("COMMIT");
+}
+
+fn purgeBundleWorkspaceInOpenTransaction(db: Database, workspace_id: []const u8) !void {
+    const statements = [_][]const u8{
+        \\DELETE FROM mindbrain_answer_events
+        \\WHERE artifact_id IN (
+        \\  SELECT artifact_id FROM mindbrain_answer_artifacts WHERE workspace_id = ?1
+        \\)
+        ,
+        "DELETE FROM mindbrain_answer_artifacts WHERE workspace_id = ?1",
+        "DELETE FROM quality_remediation_action WHERE workspace_id = ?1",
+        "DELETE FROM quality_convergence_run WHERE workspace_id = ?1",
+        "DELETE FROM graph_rule_events WHERE workspace_id = ?1",
+        "DELETE FROM graph_rule_evaluations WHERE workspace_id = ?1",
+        "DELETE FROM graph_gap_rules WHERE workspace_id = ?1",
+        \\DELETE FROM graph_lj_out
+        \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM graph_lj_in
+        \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM graph_entity_document
+        \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+        \\   OR table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM graph_entity_alias
+        \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM graph_relation_property
+        \\WHERE relation_id IN (SELECT relation_id FROM graph_relation WHERE workspace_id = ?1)
+        ,
+        "DELETE FROM graph_relation WHERE workspace_id = ?1",
+        "DELETE FROM graph_entity_chunk WHERE workspace_id = ?1",
+        \\DELETE FROM graph_entity_degree
+        \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+        ,
+        "DELETE FROM graph_entity WHERE workspace_id = ?1",
+        \\DELETE FROM facet_postings
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM facet_deltas
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM facet_value_nodes
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM facet_definitions
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM facet_tables
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_embeddings
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_fts
+        \\WHERE rowid IN (
+        \\  SELECT fts_rowid FROM search_fts_docs
+        \\  WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        \\)
+        ,
+        \\DELETE FROM search_fts_docs
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_documents
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_document_stats
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_collection_stats
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_term_stats
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_term_frequencies
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM search_postings
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        \\DELETE FROM bm25_sync_triggers
+        \\WHERE table_id IN (SELECT table_id FROM table_semantics WHERE workspace_id = ?1)
+        ,
+        "DELETE FROM external_links_raw WHERE workspace_id = ?1",
+        "DELETE FROM document_links_raw WHERE workspace_id = ?1",
+        "DELETE FROM entity_chunks_raw WHERE workspace_id = ?1",
+        "DELETE FROM entity_documents_raw WHERE workspace_id = ?1",
+        "DELETE FROM relation_properties_raw WHERE workspace_id = ?1",
+        "DELETE FROM relations_raw WHERE workspace_id = ?1",
+        "DELETE FROM entity_aliases_raw WHERE workspace_id = ?1",
+        "DELETE FROM entities_raw WHERE workspace_id = ?1",
+        "DELETE FROM facet_assignments_raw WHERE workspace_id = ?1",
+        "DELETE FROM chunks_raw_vector WHERE workspace_id = ?1",
+        "DELETE FROM documents_raw_vector WHERE workspace_id = ?1",
+        "DELETE FROM chunks_raw WHERE workspace_id = ?1",
+        "DELETE FROM documents_raw WHERE workspace_id = ?1",
+        "DELETE FROM agent_facts WHERE workspace_id = ?1",
+        "DELETE FROM structured_import_provenance WHERE workspace_id = ?1",
+        "DELETE FROM source_mappings WHERE workspace_id = ?1",
+        "DELETE FROM relation_semantics WHERE workspace_id = ?1",
+        "DELETE FROM column_semantics WHERE workspace_id = ?1",
+        "DELETE FROM collection_ontologies WHERE workspace_id = ?1",
+        "DELETE FROM workspace_settings WHERE workspace_id = ?1",
+        "DELETE FROM collections WHERE workspace_id = ?1",
+        "DELETE FROM ontology_triples_raw WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_relations_raw WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_entities_raw WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_edge_types WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_entity_types WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_values WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_dimensions WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontology_namespaces WHERE ontology_id IN (SELECT ontology_id FROM ontologies WHERE workspace_id = ?1)",
+        "DELETE FROM ontologies WHERE workspace_id = ?1",
+        "DELETE FROM pending_migrations WHERE workspace_id = ?1",
+        "DELETE FROM table_semantics WHERE workspace_id = ?1",
+        "DELETE FROM workspaces WHERE workspace_id = ?1",
+    };
+    for (statements) |sql| {
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, workspace_id);
+        try execPreparedDone(stmt);
+    }
 }
 
 fn upsertQualityConvergenceRun(db: Database, row: QualityConvergenceRunRow) !void {
@@ -3177,6 +3314,74 @@ test "legacy database missing additive columns imports bundle after schema apply
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     const summary_ptr = c.sqlite3_column_text(stmt, 0) orelse return error.MissingRow;
     try std.testing.expectEqualStrings("short", std.mem.span(summary_ptr));
+}
+
+test "overwrite import replaces only the bundle workspace" {
+    var source = try Database.openInMemory();
+    defer source.close();
+    try source.applyStandaloneSchema();
+
+    try collections_sqlite.ensureWorkspace(source, .{ .workspace_id = "ws_a", .label = "A restored" });
+    try collections_sqlite.ensureCollection(source, .{
+        .workspace_id = "ws_a",
+        .collection_id = "ws_a::docs",
+        .name = "docs",
+    });
+    try collections_sqlite.upsertDocumentRaw(source, .{
+        .workspace_id = "ws_a",
+        .collection_id = "ws_a::docs",
+        .doc_id = 1,
+        .content = "restored",
+    });
+
+    const bundle = try exportToJson(std.testing.allocator, source, .{ .workspace = "ws_a" });
+    defer std.testing.allocator.free(bundle);
+
+    var dest = try Database.openInMemory();
+    defer dest.close();
+    try dest.applyStandaloneSchema();
+
+    try collections_sqlite.ensureWorkspace(dest, .{ .workspace_id = "ws_a", .label = "A stale" });
+    try collections_sqlite.ensureCollection(dest, .{
+        .workspace_id = "ws_a",
+        .collection_id = "ws_a::stale",
+        .name = "stale",
+    });
+    try collections_sqlite.upsertDocumentRaw(dest, .{
+        .workspace_id = "ws_a",
+        .collection_id = "ws_a::stale",
+        .doc_id = 99,
+        .content = "stale",
+    });
+    try collections_sqlite.ensureWorkspace(dest, .{ .workspace_id = "ws_a_extra", .label = "A extra" });
+    try collections_sqlite.ensureCollection(dest, .{
+        .workspace_id = "ws_a_extra",
+        .collection_id = "ws_a_extra::docs",
+        .name = "docs",
+    });
+    try collections_sqlite.upsertDocumentRaw(dest, .{
+        .workspace_id = "ws_a_extra",
+        .collection_id = "ws_a_extra::docs",
+        .doc_id = 1,
+        .content = "neighbor",
+    });
+
+    try importBundleJsonWithOptions(dest, std.testing.allocator, bundle, .{
+        .overwrite_existing_workspace = true,
+    });
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw WHERE workspace_id = 'ws_a' AND collection_id = 'ws_a::docs' AND content = 'restored'"));
+    try std.testing.expectEqual(@as(i64, 0), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw WHERE workspace_id = 'ws_a' AND collection_id = 'ws_a::stale'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM documents_raw WHERE workspace_id = 'ws_a_extra' AND collection_id = 'ws_a_extra::docs' AND content = 'neighbor'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = 'ws_a_extra'"));
 }
 
 test "taxonomies-only bundle round-trips ontology body without documents" {
