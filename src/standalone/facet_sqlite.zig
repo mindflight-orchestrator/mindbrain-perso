@@ -234,17 +234,23 @@ pub const Database = struct {
         try self.markMigrationApplied(applied_id);
     }
 
-    fn rawGraphHasExternalIds(self: Database) Error!bool {
-        const stmt = try prepare(self, "PRAGMA table_info(entities_raw)");
+    fn tableCreateSqlContains(self: Database, table_name: []const u8, needle: []const u8) Error!bool {
+        const stmt = try prepare(
+            self,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        );
         defer finalize(stmt);
-        while (true) {
-            const rc = c.sqlite3_step(stmt);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) return error.StepFailed;
-            const name = std.mem.span(c.sqlite3_column_text(stmt, 1) orelse continue);
-            if (std.mem.eql(u8, name, "external_id")) return true;
-        }
-        return false;
+        try bindText(stmt, 1, table_name);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const create_sql = std.mem.span(c.sqlite3_column_text(stmt, 0) orelse return false);
+        return std.mem.indexOf(u8, create_sql, needle) != null;
+    }
+
+    fn rawGraphAutoincrementSchemaReady(self: Database) Error!bool {
+        return (try self.tableCreateSqlContains("entities_raw", "entity_id INTEGER PRIMARY KEY AUTOINCREMENT")) and
+            (try self.tableCreateSqlContains("entities_raw", "UNIQUE(workspace_id, external_id)")) and
+            (try self.tableCreateSqlContains("relations_raw", "relation_id INTEGER PRIMARY KEY AUTOINCREMENT")) and
+            (try self.tableCreateSqlContains("relations_raw", "UNIQUE(workspace_id, external_id)"));
     }
 
     fn answerArtifactsWorkspaceStrict(self: Database) Error!bool {
@@ -420,15 +426,42 @@ pub const Database = struct {
         );
 
         const applied_id = "2026-05-24-raw-graph-autoincrement-applied";
-        if (try self.migrationApplied(applied_id)) return;
-
-        if (try self.rawGraphHasExternalIds()) {
+        if (try self.rawGraphAutoincrementSchemaReady()) {
             try self.markMigrationApplied(applied_id);
             return;
         }
 
         try self.exec(
             \\PRAGMA foreign_keys = OFF;
+            \\
+            \\DROP TABLE IF EXISTS entity_chunks_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS entity_documents_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS relation_properties_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS entity_aliases_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS relations_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS entities_raw__autoinc_new;
+            \\DROP TABLE IF EXISTS raw_graph_entity_id_map;
+            \\DROP TABLE IF EXISTS raw_graph_relation_id_map;
+            \\DROP TABLE IF EXISTS raw_graph_entity_source;
+            \\DROP TABLE IF EXISTS raw_graph_relation_source;
+            \\
+            \\CREATE TEMP TABLE raw_graph_entity_source AS
+            \\SELECT
+            \\    e.workspace_id AS workspace_id,
+            \\    e.entity_id AS old_entity_id,
+            \\    CASE
+            \\        WHEN e.external_id IS NOT NULL
+            \\         AND e.external_id != ''
+            \\         AND (
+            \\             SELECT COUNT(*)
+            \\             FROM entities_raw dup
+            \\             WHERE dup.workspace_id = e.workspace_id
+            \\               AND dup.external_id = e.external_id
+            \\         ) = 1
+            \\        THEN e.external_id
+            \\        ELSE 'legacy:entity:' || e.workspace_id || ':' || e.entity_id
+            \\    END AS new_external_id
+            \\FROM entities_raw e;
             \\
             \\CREATE TABLE entities_raw__autoinc_new (
             \\    workspace_id TEXT NOT NULL,
@@ -451,11 +484,15 @@ pub const Database = struct {
             \\    confidence, metadata_json, created_at
             \\)
             \\SELECT
-            \\    workspace_id, ontology_id,
-            \\    'legacy:entity:' || workspace_id || ':' || entity_id,
-            \\    entity_type, name, confidence, metadata_json, created_at
+            \\    entities_raw.workspace_id, entities_raw.ontology_id,
+            \\    src.new_external_id,
+            \\    entities_raw.entity_type, entities_raw.name, entities_raw.confidence,
+            \\    entities_raw.metadata_json, entities_raw.created_at
             \\FROM entities_raw
-            \\ORDER BY workspace_id, entity_id;
+            \\JOIN raw_graph_entity_source src
+            \\  ON src.workspace_id = entities_raw.workspace_id
+            \\ AND src.old_entity_id = entities_raw.entity_id
+            \\ORDER BY entities_raw.workspace_id, entities_raw.entity_id;
             \\
             \\CREATE TEMP TABLE raw_graph_entity_id_map AS
             \\SELECT
@@ -463,9 +500,30 @@ pub const Database = struct {
             \\    old.entity_id AS old_entity_id,
             \\    new.entity_id AS new_entity_id
             \\FROM entities_raw old
+            \\JOIN raw_graph_entity_source src
+            \\  ON src.workspace_id = old.workspace_id
+            \\ AND src.old_entity_id = old.entity_id
             \\JOIN entities_raw__autoinc_new new
             \\  ON new.workspace_id = old.workspace_id
-            \\ AND new.external_id = 'legacy:entity:' || old.workspace_id || ':' || old.entity_id;
+            \\ AND new.external_id = src.new_external_id;
+            \\
+            \\CREATE TEMP TABLE raw_graph_relation_source AS
+            \\SELECT
+            \\    r.workspace_id AS workspace_id,
+            \\    r.relation_id AS old_relation_id,
+            \\    CASE
+            \\        WHEN r.external_id IS NOT NULL
+            \\         AND r.external_id != ''
+            \\         AND (
+            \\             SELECT COUNT(*)
+            \\             FROM relations_raw dup
+            \\             WHERE dup.workspace_id = r.workspace_id
+            \\               AND dup.external_id = r.external_id
+            \\         ) = 1
+            \\        THEN r.external_id
+            \\        ELSE 'legacy:relation:' || r.workspace_id || ':' || r.relation_id
+            \\    END AS new_external_id
+            \\FROM relations_raw r;
             \\
             \\CREATE TABLE relations_raw__autoinc_new (
             \\    workspace_id TEXT NOT NULL,
@@ -494,12 +552,15 @@ pub const Database = struct {
             \\)
             \\SELECT
             \\    r.workspace_id, r.ontology_id,
-            \\    'legacy:relation:' || r.workspace_id || ':' || r.relation_id,
+            \\    rel_src.new_external_id,
             \\    r.edge_type,
             \\    src.new_entity_id,
             \\    dst.new_entity_id,
             \\    r.valid_from, r.valid_to, r.confidence, r.metadata_json, r.created_at
             \\FROM relations_raw r
+            \\JOIN raw_graph_relation_source rel_src
+            \\  ON rel_src.workspace_id = r.workspace_id
+            \\ AND rel_src.old_relation_id = r.relation_id
             \\JOIN raw_graph_entity_id_map src
             \\  ON src.workspace_id = r.workspace_id AND src.old_entity_id = r.source_entity_id
             \\JOIN raw_graph_entity_id_map dst
@@ -512,9 +573,12 @@ pub const Database = struct {
             \\    old.relation_id AS old_relation_id,
             \\    new.relation_id AS new_relation_id
             \\FROM relations_raw old
+            \\JOIN raw_graph_relation_source src
+            \\  ON src.workspace_id = old.workspace_id
+            \\ AND src.old_relation_id = old.relation_id
             \\JOIN relations_raw__autoinc_new new
             \\  ON new.workspace_id = old.workspace_id
-            \\ AND new.external_id = 'legacy:relation:' || old.workspace_id || ':' || old.relation_id;
+            \\ AND new.external_id = src.new_external_id;
             \\
             \\CREATE TABLE entity_aliases_raw__autoinc_new (
             \\    workspace_id TEXT NOT NULL,
@@ -626,6 +690,8 @@ pub const Database = struct {
             \\
             \\DROP TABLE raw_graph_entity_id_map;
             \\DROP TABLE raw_graph_relation_id_map;
+            \\DROP TABLE raw_graph_entity_source;
+            \\DROP TABLE raw_graph_relation_source;
             \\PRAGMA foreign_keys = ON;
         );
 
@@ -2491,6 +2557,214 @@ test "sqlite-backed facet repository traverses hierarchy children" {
     try std.testing.expectEqual(@as(usize, 2), children.len);
     try std.testing.expectEqualStrings("physics", children[0].facet_value);
     try std.testing.expectEqualStrings("chemistry", children[1].facet_value);
+}
+
+test "raw graph autoincrement migration repairs legacy external-id schema despite stale marker" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE mindbrain_schema_migrations (
+        \\    id TEXT PRIMARY KEY,
+        \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\INSERT INTO mindbrain_schema_migrations(id)
+        \\VALUES ('2026-05-24-raw-graph-autoincrement-applied');
+        \\
+        \\CREATE TABLE workspaces (
+        \\    id TEXT PRIMARY KEY,
+        \\    workspace_id TEXT UNIQUE,
+        \\    label TEXT NOT NULL DEFAULT 'GhostCrab Operating Model',
+        \\    pg_schema TEXT NOT NULL DEFAULT 'main',
+        \\    description TEXT,
+        \\    created_by TEXT,
+        \\    status TEXT NOT NULL DEFAULT 'active',
+        \\    domain_profile TEXT,
+        \\    domain_profile_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\CREATE TABLE ontologies (
+        \\    ontology_id TEXT PRIMARY KEY,
+        \\    workspace_id TEXT,
+        \\    name TEXT NOT NULL,
+        \\    version TEXT NOT NULL DEFAULT '1.0.0',
+        \\    frozen INTEGER NOT NULL DEFAULT 0,
+        \\    source_kind TEXT NOT NULL DEFAULT 'constructed',
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    UNIQUE(workspace_id, name),
+        \\    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+        \\);
+        \\CREATE TABLE documents_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    collection_id TEXT NOT NULL,
+        \\    doc_id INTEGER NOT NULL,
+        \\    doc_nanoid TEXT NOT NULL DEFAULT '',
+        \\    content TEXT NOT NULL DEFAULT '',
+        \\    language TEXT,
+        \\    source_ref TEXT,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY(workspace_id, collection_id, doc_id)
+        \\);
+        \\CREATE TABLE chunks_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    collection_id TEXT NOT NULL,
+        \\    doc_id INTEGER NOT NULL,
+        \\    chunk_index INTEGER NOT NULL,
+        \\    content TEXT NOT NULL DEFAULT '',
+        \\    language TEXT,
+        \\    token_count INTEGER,
+        \\    offset_start INTEGER,
+        \\    offset_end INTEGER,
+        \\    parent_chunk_index INTEGER,
+        \\    strategy TEXT,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    PRIMARY KEY(workspace_id, collection_id, doc_id, chunk_index)
+        \\);
+        \\CREATE TABLE entities_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    ontology_id TEXT NOT NULL,
+        \\    entity_id INTEGER NOT NULL,
+        \\    external_id TEXT,
+        \\    entity_type TEXT NOT NULL,
+        \\    name TEXT NOT NULL,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY(workspace_id, entity_id)
+        \\);
+        \\CREATE TABLE entity_aliases_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    entity_id INTEGER NOT NULL,
+        \\    term TEXT NOT NULL,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    PRIMARY KEY(workspace_id, entity_id, term)
+        \\);
+        \\CREATE TABLE relations_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    ontology_id TEXT NOT NULL,
+        \\    relation_id INTEGER NOT NULL,
+        \\    external_id TEXT,
+        \\    edge_type TEXT NOT NULL,
+        \\    source_entity_id INTEGER NOT NULL,
+        \\    target_entity_id INTEGER NOT NULL,
+        \\    valid_from TEXT,
+        \\    valid_to TEXT,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY(workspace_id, relation_id)
+        \\);
+        \\CREATE TABLE relation_properties_raw (
+        \\    workspace_id  TEXT    NOT NULL,
+        \\    relation_id   INTEGER NOT NULL,
+        \\    property_key  TEXT    NOT NULL,
+        \\    value_type    TEXT    NOT NULL CHECK(value_type IN (
+        \\                      'text', 'number', 'percentage_bp', 'money_minor',
+        \\                      'date_unix', 'doc_ref', 'uri')),
+        \\    value_text    TEXT,
+        \\    value_number  REAL,
+        \\    value_integer INTEGER,
+        \\    ref_doc_id    INTEGER,
+        \\    currency      TEXT,
+        \\    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY (workspace_id, relation_id, property_key)
+        \\);
+        \\CREATE TABLE entity_documents_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    entity_id INTEGER NOT NULL,
+        \\    collection_id TEXT NOT NULL,
+        \\    doc_id INTEGER NOT NULL,
+        \\    role TEXT,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id)
+        \\);
+        \\CREATE TABLE entity_chunks_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    entity_id INTEGER NOT NULL,
+        \\    collection_id TEXT NOT NULL,
+        \\    doc_id INTEGER NOT NULL,
+        \\    chunk_index INTEGER NOT NULL,
+        \\    role TEXT,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    PRIMARY KEY(workspace_id, entity_id, collection_id, doc_id, chunk_index)
+        \\);
+        \\
+        \\INSERT INTO workspaces(id, workspace_id, label)
+        \\VALUES ('ws_legacy', 'ws_legacy', 'Legacy Workspace');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name)
+        \\VALUES ('ws_legacy::core', 'ws_legacy', 'core');
+        \\INSERT INTO documents_raw(workspace_id, collection_id, doc_id, content)
+        \\VALUES ('ws_legacy', 'docs', 7, 'legacy document');
+        \\INSERT INTO chunks_raw(workspace_id, collection_id, doc_id, chunk_index, content)
+        \\VALUES ('ws_legacy', 'docs', 7, 0, 'legacy chunk');
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, external_id, entity_type, name)
+        \\VALUES
+        \\  ('ws_legacy', 'ws_legacy::core', 1, 'person:ada', 'person', 'Ada'),
+        \\  ('ws_legacy', 'ws_legacy::core', 2, 'unit:a1', 'unit', 'Unit A1');
+        \\INSERT INTO entity_aliases_raw(workspace_id, entity_id, term)
+        \\VALUES ('ws_legacy', 1, 'Ada Lovelace');
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id)
+        \\VALUES ('ws_legacy', 'ws_legacy::core', 1, 'owns:ada:a1', 'owns', 1, 2);
+        \\INSERT INTO relation_properties_raw(workspace_id, relation_id, property_key, value_type, value_integer)
+        \\VALUES ('ws_legacy', 1, 'share_bp', 'percentage_bp', 10000);
+        \\INSERT INTO entity_documents_raw(workspace_id, entity_id, collection_id, doc_id, role)
+        \\VALUES ('ws_legacy', 1, 'docs', 7, 'source');
+        \\INSERT INTO entity_chunks_raw(workspace_id, entity_id, collection_id, doc_id, chunk_index, role)
+        \\VALUES ('ws_legacy', 2, 'docs', 7, 0, 'mention');
+    );
+
+    try std.testing.expect(!try db.rawGraphAutoincrementSchemaReady());
+    try db.applyStandaloneSchema();
+    try std.testing.expect(try db.rawGraphAutoincrementSchemaReady());
+
+    try db.exec(
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_id, external_id, entity_type, name)
+        \\VALUES ('ws_legacy', 'ws_legacy::core', 1, 'person:ada', 'person', 'Ada Updated')
+        \\ON CONFLICT(entity_id) DO UPDATE SET name = excluded.name;
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, relation_id, external_id, edge_type, source_entity_id, target_entity_id)
+        \\VALUES ('ws_legacy', 'ws_legacy::core', 1, 'owns:ada:a1', 'owns', 1, 2)
+        \\ON CONFLICT(relation_id) DO UPDATE SET edge_type = excluded.edge_type;
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name)
+        \\VALUES ('ws_legacy', 'ws_legacy::core', 'unit:a1', 'unit', 'Unit A1 Updated')
+        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET name = excluded.name;
+        \\INSERT INTO relations_raw(workspace_id, ontology_id, external_id, edge_type, source_entity_id, target_entity_id)
+        \\VALUES ('ws_legacy', 'ws_legacy::core', 'owns:ada:a1', 'owns', 1, 2)
+        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET edge_type = excluded.edge_type;
+    );
+
+    const stmt = try prepare(db,
+        \\SELECT
+        \\  (SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws_legacy'),
+        \\  (SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws_legacy'),
+        \\  (SELECT entity_id FROM entities_raw WHERE workspace_id = 'ws_legacy' AND external_id = 'person:ada'),
+        \\  (SELECT source_entity_id FROM relations_raw WHERE workspace_id = 'ws_legacy' AND external_id = 'owns:ada:a1'),
+        \\  (SELECT relation_id FROM relations_raw WHERE workspace_id = 'ws_legacy' AND external_id = 'owns:ada:a1'),
+        \\  (SELECT entity_id FROM entity_aliases_raw WHERE workspace_id = 'ws_legacy' AND term = 'Ada Lovelace'),
+        \\  (SELECT relation_id FROM relation_properties_raw WHERE workspace_id = 'ws_legacy' AND property_key = 'share_bp'),
+        \\  (SELECT entity_id FROM entity_documents_raw WHERE workspace_id = 'ws_legacy' AND collection_id = 'docs' AND doc_id = 7),
+        \\  (SELECT entity_id FROM entity_chunks_raw WHERE workspace_id = 'ws_legacy' AND collection_id = 'docs' AND doc_id = 7 AND chunk_index = 0),
+        \\  (SELECT name FROM entities_raw WHERE workspace_id = 'ws_legacy' AND external_id = 'unit:a1')
+    );
+    defer finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 1));
+    const ada_id = c.sqlite3_column_int64(stmt, 2);
+    try std.testing.expect(ada_id > 0);
+    try std.testing.expectEqual(ada_id, c.sqlite3_column_int64(stmt, 3));
+    const relation_id = c.sqlite3_column_int64(stmt, 4);
+    try std.testing.expect(relation_id > 0);
+    try std.testing.expectEqual(ada_id, c.sqlite3_column_int64(stmt, 5));
+    try std.testing.expectEqual(relation_id, c.sqlite3_column_int64(stmt, 6));
+    try std.testing.expect(c.sqlite3_column_int64(stmt, 7) > 0);
+    try std.testing.expect(c.sqlite3_column_int64(stmt, 8) > 0);
+    try std.testing.expectEqualStrings("Unit A1 Updated", std.mem.span(c.sqlite3_column_text(stmt, 9)));
+
+    try db.applyStandaloneSchema();
+    try std.testing.expect(try db.rawGraphAutoincrementSchemaReady());
 }
 
 test "answer artifact workspace strict migration backfills analysis plans from scope" {

@@ -2,7 +2,7 @@ const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
 const manifest = @import("schema_column_manifest.generated.zig");
 
-pub const mindbrain_version = "1.7.4";
+pub const mindbrain_version = "1.7.6";
 
 const Database = facet_sqlite.Database;
 const c = facet_sqlite.c;

@@ -2165,3 +2165,86 @@ test "applyFromWsTables streams ws rows into facts and provenance" {
     try std.testing.expectEqual(@as(u64, 2), try countRows(db, "SELECT COUNT(*) FROM agent_facts WHERE workspace_id = 'ws-test'"));
     try std.testing.expectEqual(@as(u64, 2), try countRows(db, "SELECT COUNT(*) FROM structured_import_provenance WHERE workspace_id = 'ws-test'"));
 }
+
+test "applyFromWsTables works after stale raw graph migration marker repair" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.exec(
+        \\CREATE TABLE mindbrain_schema_migrations (
+        \\    id TEXT PRIMARY KEY,
+        \\    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\);
+        \\INSERT INTO mindbrain_schema_migrations(id)
+        \\VALUES ('2026-05-24-raw-graph-autoincrement-applied');
+        \\
+        \\CREATE TABLE entities_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    ontology_id TEXT NOT NULL,
+        \\    entity_id INTEGER NOT NULL,
+        \\    external_id TEXT,
+        \\    entity_type TEXT NOT NULL,
+        \\    name TEXT NOT NULL,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY(workspace_id, entity_id)
+        \\);
+        \\CREATE TABLE relations_raw (
+        \\    workspace_id TEXT NOT NULL,
+        \\    ontology_id TEXT NOT NULL,
+        \\    relation_id INTEGER NOT NULL,
+        \\    external_id TEXT,
+        \\    edge_type TEXT NOT NULL,
+        \\    source_entity_id INTEGER NOT NULL,
+        \\    target_entity_id INTEGER NOT NULL,
+        \\    valid_from TEXT,
+        \\    valid_to TEXT,
+        \\    confidence REAL NOT NULL DEFAULT 1.0,
+        \\    metadata_json TEXT NOT NULL DEFAULT '{}',
+        \\    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\    PRIMARY KEY(workspace_id, relation_id)
+        \\);
+    );
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-legacy-import", .label = "ws-legacy-import" });
+    try collections_sqlite.ensureOntology(db, .{ .workspace_id = "ws-legacy-import", .ontology_id = "onto-legacy-import", .name = "onto-legacy-import" });
+
+    try workspace_sqlite.upsertWorkspace(db, "ws-legacy-import", "{\"domain\":\"test\"}");
+    try workspace_sqlite.upsertTableSemanticFull(db, .{
+        .table_id = 101,
+        .workspace_id = "ws-legacy-import",
+        .schema_name = "structured",
+        .table_name = "lot",
+        .key_column = "record_id",
+        .content_column = "content",
+        .notes = "{\"schema_id\":\"test:lot\",\"entity_family\":\"test\"}",
+    });
+    try workspace_sqlite.upsertColumnSemanticFull(db, .{
+        .column_semantic_id = 101,
+        .table_id = 101,
+        .column_name = "record_id",
+        .column_role = "primary_key",
+        .data_type = "text",
+    });
+
+    try db.exec(
+        \\CREATE TABLE ws_lot(record_id TEXT PRIMARY KEY, content TEXT, status TEXT);
+        \\INSERT INTO ws_lot(record_id, content, status) VALUES ('001', 'Lot legacy 001', 'active');
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"entities":{"lot":{"schema_id":"test:lot"}}}
+    , .{});
+    defer parsed.deinit();
+
+    const report = try applyFromWsTables(std.testing.allocator, db, .{
+        .workspace_id = "ws-legacy-import",
+        .ontology_id = "onto-legacy-import",
+        .data_plane = "ws",
+    }, &[_]ContractRelation{}, parsed.value, null);
+
+    try std.testing.expectEqual(@as(u64, 1), report.facets_inserted);
+    try std.testing.expectEqual(@as(u64, 1), report.entities_upserted);
+    try std.testing.expectEqual(@as(u64, 1), try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-legacy-import'"));
+    try std.testing.expectEqual(@as(u64, 1), try countRows(db, "SELECT COUNT(*) FROM structured_import_provenance WHERE workspace_id = 'ws-legacy-import'"));
+}
