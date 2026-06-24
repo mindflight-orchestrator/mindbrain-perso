@@ -757,7 +757,7 @@ fn findGraphEntityId(
 }
 
 fn loadWorkspaceProjectionCount(db: Database, workspace_id: []const u8) !usize {
-    const stmt = try prepare(db, "SELECT COUNT(*) FROM projections WHERE scope = ?1 OR scope IS NULL");
+    const stmt = try prepare(db, "SELECT COUNT(*) FROM projections WHERE scope = ?1 OR scope LIKE ?1 || ':%' OR scope IS NULL");
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
@@ -773,7 +773,10 @@ fn matchesEntityTypes(entity_types: ?[]const []const u8, entity_type: []const u8
 fn matchesProjectionScope(workspace_id: ?[]const u8, scope: ?[]const u8) bool {
     if (workspace_id == null or workspace_id.?.len == 0) return true;
     if (scope == null) return true;
-    return std.mem.eql(u8, workspace_id.?, scope.?);
+    if (std.mem.eql(u8, workspace_id.?, scope.?)) return true;
+    return scope.?.len > workspace_id.?.len and
+        scope.?[workspace_id.?.len] == ':' and
+        std.mem.startsWith(u8, scope.?, workspace_id.?);
 }
 
 fn matchesPackScope(requested_scope: ?[]const u8, scope: ?[]const u8) bool {
