@@ -660,6 +660,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .label = row.label,
             .description = row.description,
             .domain_profile = row.domain_profile,
+            .bootstrap_default_ontology = false,
         });
     }
 
@@ -3268,6 +3269,46 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE artifact_kind = 'analysis_plan' AND workspace_id = 'ws_round' AND scope = 'ws_round:production:round_scoped'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'analysis_plan__round_scoped'"));
+}
+
+test "backup import does not synthesize an auto default ontology" {
+    var source = try Database.openInMemory();
+    defer source.close();
+    try source.applyStandaloneSchema();
+
+    try collections_sqlite.ensureWorkspace(source, .{ .workspace_id = "ws_restore_exact", .label = "Restore exact" });
+    try collections_sqlite.ensureOntology(source, .{
+        .ontology_id = "ws_restore_exact::core",
+        .workspace_id = "ws_restore_exact",
+        .name = "core",
+        .source_kind = "linkml",
+    });
+    try collections_sqlite.setDefaultOntology(source, "ws_restore_exact", "ws_restore_exact::core");
+    try source.exec(
+        \\DELETE FROM ontology_namespaces WHERE ontology_id = 'ws_restore_exact::default';
+        \\DELETE FROM ontologies WHERE ontology_id = 'ws_restore_exact::default';
+    );
+
+    const bundle = try exportToJson(std.testing.allocator, source, .{ .workspace = "ws_restore_exact" });
+    defer std.testing.allocator.free(bundle);
+    try std.testing.expect(std.mem.indexOf(u8, bundle, "ws_restore_exact::default") == null);
+
+    var dest = try Database.openInMemory();
+    defer dest.close();
+    try dest.applyStandaloneSchema();
+
+    try importBundleJson(dest, std.testing.allocator, bundle);
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 0), try Counts.one(dest, "SELECT COUNT(*) FROM ontologies WHERE ontology_id = 'ws_restore_exact::default' AND source_kind = 'auto'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM workspace_settings WHERE workspace_id = 'ws_restore_exact' AND default_ontology_id = 'ws_restore_exact::core'"));
 }
 
 test "legacy database missing additive columns imports bundle after schema apply" {

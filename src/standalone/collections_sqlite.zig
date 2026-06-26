@@ -27,6 +27,7 @@ pub const WorkspaceSpec = struct {
     label: ?[]const u8 = null,
     description: ?[]const u8 = null,
     domain_profile: ?[]const u8 = null,
+    bootstrap_default_ontology: bool = true,
 };
 
 pub const CollectionSpec = struct {
@@ -331,24 +332,26 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
     try facet_sqlite.bindText(settings_stmt, 1, spec.workspace_id);
     try facet_sqlite.stepDone(settings_stmt);
 
-    // Bootstrap the per-workspace default ontology so that the built-in
-    // `source.*` namespace is always available, even before any explicit
-    // ontology has been declared. Idempotent.
-    var default_id_buf: [256]u8 = undefined;
-    const default_id_slice = try formatDefaultOntologyId(&default_id_buf, spec.workspace_id);
-    try ensureOntology(db, .{
-        .ontology_id = default_id_slice,
-        .workspace_id = spec.workspace_id,
-        .name = "default",
-        .source_kind = "auto",
-    });
-    // Only bootstrap default_ontology_id on first workspace creation. Later
-    // ensureWorkspace calls (e.g. document-ingest) must not clobber an explicit
-    // default such as ws::core set by ontology-compile-linkml.
-    if (try defaultOntologyIsUnset(db, spec.workspace_id)) {
-        try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+    if (spec.bootstrap_default_ontology) {
+        // Bootstrap the per-workspace default ontology so that the built-in
+        // `source.*` namespace is always available, even before any explicit
+        // ontology has been declared. Idempotent.
+        var default_id_buf: [256]u8 = undefined;
+        const default_id_slice = try formatDefaultOntologyId(&default_id_buf, spec.workspace_id);
+        try ensureOntology(db, .{
+            .ontology_id = default_id_slice,
+            .workspace_id = spec.workspace_id,
+            .name = "default",
+            .source_kind = "auto",
+        });
+        // Only bootstrap default_ontology_id when none is set. Later
+        // ensureWorkspace calls (e.g. document-ingest) must not clobber an explicit
+        // default such as ws::core set by ontology-compile-linkml.
+        if (try defaultOntologyIsUnset(db, spec.workspace_id)) {
+            try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+        }
+        try ensureSourceNamespace(db, default_id_slice);
     }
-    try ensureSourceNamespace(db, default_id_slice);
 }
 
 fn defaultOntologyIsUnset(db: Database, workspace_id: []const u8) !bool {
