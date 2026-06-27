@@ -193,7 +193,33 @@ pub fn resolveOntologyId(db: Database, allocator: std.mem.Allocator, workspace_i
     const stmt = try facet_sqlite.prepare(db, "SELECT default_ontology_id FROM workspace_settings WHERE workspace_id = ?1 AND default_ontology_id IS NOT NULL");
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.NotFound;
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) return try dupeColumnText(allocator, stmt, 0);
+    if (try fallbackOntologyId(db, allocator, workspace_id)) |ontology_id| return ontology_id;
+    return try std.fmt.allocPrint(allocator, "{s}::default", .{workspace_id});
+}
+
+fn fallbackOntologyId(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) !?[]u8 {
+    const core_id = try std.fmt.allocPrint(allocator, "{s}::core", .{workspace_id});
+    defer allocator.free(core_id);
+    const default_id = try std.fmt.allocPrint(allocator, "{s}::default", .{workspace_id});
+    defer allocator.free(default_id);
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT ontology_id
+        \\FROM ontologies
+        \\WHERE workspace_id = ?1
+        \\ORDER BY CASE
+        \\  WHEN ontology_id = ?1 THEN 0
+        \\  WHEN ontology_id = ?2 THEN 1
+        \\  WHEN ontology_id = ?3 THEN 2
+        \\  ELSE 3
+        \\END, ontology_id
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, core_id);
+    try facet_sqlite.bindText(stmt, 3, default_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
     return try dupeColumnText(allocator, stmt, 0);
 }
 
@@ -510,6 +536,16 @@ pub fn buildReport(db: Database, allocator: std.mem.Allocator, options: Diagnost
     };
     errdefer summary.deinit(allocator);
 
+    if (!try ontologyExists(db, ontology_id)) {
+        const label = try std.fmt.allocPrint(allocator, "Workspace {s} has no default ontology configured or imported for {s}", .{ options.workspace_id, ontology_id });
+        defer allocator.free(label);
+        try appendIssue(allocator, &issues, .{
+            .kind = "workspace_default_ontology_missing",
+            .severity = "error",
+            .label = label,
+            .suggested_action = "set_workspace_default_ontology_or_import_ontology",
+        });
+    }
     try evaluateRules(db, allocator, options, rules, &issues, &summary);
     try evaluateRelationTypeMismatches(db, allocator, options, ontology_id, &issues, &summary);
     try evaluateIsolatedEntities(db, allocator, options, &issues, &summary);
@@ -527,6 +563,19 @@ pub fn buildReport(db: Database, allocator: std.mem.Allocator, options: Diagnost
 pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: RuleEvaluationOptions) !RuleEvaluationRun {
     const ontology_id = try resolveOntologyId(db, allocator, options.workspace_id, options.ontology_id);
     defer allocator.free(ontology_id);
+
+    if (!try ontologyExists(db, ontology_id)) {
+        return .{
+            .workspace_id = try allocator.dupe(u8, options.workspace_id),
+            .ontology_id = try allocator.dupe(u8, ontology_id),
+            .evaluated = 0,
+            .changed = 0,
+            .events_created = 0,
+            .invalid_count = 0,
+            .remediation_actions_created = 0,
+            .events = try allocator.alloc(RuleEvent, 0),
+        };
+    }
 
     const rules = try loadRules(db, allocator, ontology_id, options.workspace_id);
     defer {
@@ -1829,6 +1878,61 @@ test "graph diagnostics report finds rule cardinality type evidence and componen
     try std.testing.expect(report.summary.isolated_entities >= 1);
     try std.testing.expect(report.summary.small_components >= 1);
     try std.testing.expect(report.summary.evidence_gaps >= 1);
+}
+
+test "resolveOntologyId falls back to workspace aggregate ontology when default is missing" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('serenity-production-v6', 'serenity-production-v6', 'Serenity');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('serenity-production-v6::administrative', 'serenity-production-v6', 'administrative');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('serenity-production-v6', 'serenity-production-v6', 'core');
+    );
+
+    const ontology_id = try resolveOntologyId(db, std.testing.allocator, "serenity-production-v6", null);
+    defer std.testing.allocator.free(ontology_id);
+    try std.testing.expectEqualStrings("serenity-production-v6", ontology_id);
+}
+
+test "diagnostics without default ontology returns issue instead of NotFound" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_no_default', 'ws_no_default', 'No Default');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (1, 'ws_no_default', 'unit', 'A1');
+    );
+
+    var report = try buildReport(db, std.testing.allocator, .{
+        .workspace_id = "ws_no_default",
+        .limit = 10,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("ws_no_default::default", report.summary.ontology_id.?);
+    try std.testing.expect(report.summary.issues_total >= 1);
+    try std.testing.expectEqualStrings("workspace_default_ontology_missing", report.issues[0].kind);
+}
+
+test "rule evaluations without default ontology return empty run instead of NotFound" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_eval_no_default', 'ws_eval_no_default', 'No Default');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (1, 'ws_eval_no_default', 'unit', 'A1');
+    );
+
+    var run = try runRuleEvaluations(db, std.testing.allocator, .{
+        .workspace_id = "ws_eval_no_default",
+        .limit = 10,
+    });
+    defer run.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("ws_eval_no_default::default", run.ontology_id);
+    try std.testing.expectEqual(@as(usize, 0), run.evaluated);
+    try std.testing.expectEqual(@as(usize, 0), run.events.len);
 }
 
 test "entity_filter excludes vacant units from syndic rules" {

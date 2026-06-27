@@ -1099,8 +1099,7 @@ pub const MindbrainHttpApp = struct {
             return try self.handleGraphPatternQuery(allocator, request, body_buffer);
         }
 
-        if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/run")) {
-            if (request.head.method != .POST) return error.MethodNotAllowed;
+        if (std.mem.eql(u8, path, "/api/mindbrain/quality/convergence/run") and request.head.method == .POST) {
             return try self.handleQualityConvergenceRun(allocator, request, body_buffer);
         }
 
@@ -5799,6 +5798,47 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"too_many_relations\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"rule_id\":\"unit-one-building\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"artifact_kind\"") == null);
+}
+
+test "graph gap endpoints do not 404 when workspace default ontology is missing" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-graph-gap-no-default-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    try app.writer_db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_gap_no_default', 'ws_gap_no_default', 'Gap No Default');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (1, 'ws_gap_no_default', 'unit', 'A1', '{}');
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = try app.handleGraphGapRules(arena, "workspace_id=ws_gap_no_default");
+    try std.testing.expect(rules.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"kind\":\"graph_gap_rules\"") != null);
+
+    const diagnostics = try app.handleGraphDiagnostics(arena, "workspace_id=ws_gap_no_default&limit=25");
+    try std.testing.expect(diagnostics.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"kind\":\"graph_diagnostics_report\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.body, "\"workspace_default_ontology_missing\"") != null);
+
+    const evaluations = try app.handleGraphRuleEvaluations(arena, "workspace_id=ws_gap_no_default");
+    try std.testing.expect(evaluations.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, evaluations.body, "\"kind\":\"graph_rule_evaluations\"") != null);
+
+    const events = try app.handleGraphRuleEvents(arena, "workspace_id=ws_gap_no_default");
+    try std.testing.expect(events.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, events.body, "\"kind\":\"graph_rule_events\"") != null);
 }
 
 test "graph gap rules import and delete HTTP handlers accept contract payloads" {
