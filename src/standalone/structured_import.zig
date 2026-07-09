@@ -534,25 +534,75 @@ fn parseCsv(allocator: std.mem.Allocator, content: []const u8) !CsvTable {
         rows_list.deinit(allocator);
     }
 
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var first = true;
-    while (line_iter.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, "\r");
-        if (line.len == 0) continue;
-        var fields = try parseCsvLine(allocator, line);
-        defer {
-            for (fields.items) |f| allocator.free(f);
-            fields.deinit(allocator);
-        }
-        if (first) {
-            first = false;
-            for (fields.items) |f| try headers_list.append(allocator, try allocator.dupe(u8, f));
+    // Whole-buffer RFC-4180 state machine: quoted cells may contain commas
+    // and newlines. Splitting on '\n' before quote parsing tore multi-line
+    // cells into malformed rows and silently mis-assigned their columns.
+    var fields = std.ArrayList([]const u8).empty;
+    defer {
+        for (fields.items) |f| allocator.free(f);
+        fields.deinit(allocator);
+    }
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    var first_row = true;
+    var in_quotes = false;
+    var cell_quoted = false;
+    var row_started = false;
+
+    var index: usize = 0;
+    while (index < content.len) : (index += 1) {
+        const ch = content[index];
+        if (in_quotes) {
+            if (ch == '"') {
+                if (index + 1 < content.len and content[index + 1] == '"') {
+                    try buf.append(allocator, '"');
+                    index += 1;
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                try buf.append(allocator, ch);
+            }
+            row_started = true;
             continue;
         }
-        const row = try allocator.alloc([]const u8, fields.items.len);
-        for (fields.items, 0..) |f, i| row[i] = try allocator.dupe(u8, f);
-        try rows_list.append(allocator, row);
+        switch (ch) {
+            '"' => {
+                if (!cell_quoted and std.mem.trim(u8, buf.items, " \t").len == 0) {
+                    buf.clearRetainingCapacity();
+                    in_quotes = true;
+                    cell_quoted = true;
+                } else {
+                    try buf.append(allocator, ch);
+                }
+                row_started = true;
+            },
+            ',' => {
+                try appendCsvCell(allocator, &fields, &buf, cell_quoted);
+                cell_quoted = false;
+                row_started = true;
+            },
+            '\r' => {},
+            '\n' => {
+                if (row_started) {
+                    try appendCsvCell(allocator, &fields, &buf, cell_quoted);
+                    cell_quoted = false;
+                    try finishCsvRow(allocator, &headers_list, &rows_list, &fields, &first_row);
+                }
+                row_started = false;
+            },
+            else => {
+                try buf.append(allocator, ch);
+                row_started = true;
+            },
+        }
     }
+    if (row_started) {
+        try appendCsvCell(allocator, &fields, &buf, cell_quoted);
+        try finishCsvRow(allocator, &headers_list, &rows_list, &fields, &first_row);
+    }
+
     if (headers_list.items.len == 0) return error.EmptyCsv;
     return .{
         .headers = try headers_list.toOwnedSlice(allocator),
@@ -560,43 +610,42 @@ fn parseCsv(allocator: std.mem.Allocator, content: []const u8) !CsvTable {
     };
 }
 
-fn parseCsvLine(allocator: std.mem.Allocator, line: []const u8) !std.ArrayList([]const u8) {
-    var out = std.ArrayList([]const u8).empty;
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == '"') {
-            i += 1;
-            var start = i;
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(allocator);
-            while (i < line.len) {
-                if (line[i] == '"') {
-                    if (i + 1 < line.len and line[i + 1] == '"') {
-                        try buf.appendSlice(allocator, line[start..i]);
-                        try buf.append(allocator, '"');
-                        i += 2;
-                        start = i;
-                        continue;
-                    }
-                    try buf.appendSlice(allocator, line[start..i]);
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            try out.append(allocator, try buf.toOwnedSlice(allocator));
-            if (i < line.len and line[i] == ',') i += 1;
-            continue;
-        }
-        const comma = std.mem.indexOfScalar(u8, line[i..], ',') orelse line.len - i;
-        const end = i + comma;
-        try out.append(allocator, try allocator.dupe(u8, std.mem.trim(u8, line[i..end], " \t")));
-        i = if (comma == line.len - i) line.len else end + 1;
+fn appendCsvCell(
+    allocator: std.mem.Allocator,
+    fields: *std.ArrayList([]const u8),
+    buf: *std.ArrayList(u8),
+    quoted: bool,
+) !void {
+    const cell = if (quoted)
+        try allocator.dupe(u8, buf.items)
+    else
+        try allocator.dupe(u8, std.mem.trim(u8, buf.items, " \t"));
+    errdefer allocator.free(cell);
+    try fields.append(allocator, cell);
+    buf.clearRetainingCapacity();
+}
+
+fn finishCsvRow(
+    allocator: std.mem.Allocator,
+    headers_list: *std.ArrayList([]const u8),
+    rows_list: *std.ArrayList([]const []const u8),
+    fields: *std.ArrayList([]const u8),
+    first_row: *bool,
+) !void {
+    if (first_row.*) {
+        first_row.* = false;
+        for (fields.items) |f| try headers_list.append(allocator, try allocator.dupe(u8, f));
+        for (fields.items) |f| allocator.free(f);
+        fields.clearRetainingCapacity();
+        return;
     }
-    if (line.len > 0 and line[line.len - 1] == ',') {
-        try out.append(allocator, try allocator.dupe(u8, ""));
-    }
-    return out;
+    const row = try allocator.alloc([]const u8, fields.items.len);
+    for (fields.items, 0..) |f, cell_index| row[cell_index] = f;
+    rows_list.append(allocator, row) catch |err| {
+        allocator.free(row);
+        return err;
+    };
+    fields.clearRetainingCapacity();
 }
 
 pub fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -1084,7 +1133,8 @@ fn buildFacetsJsonFromWsRow(
     for (columns, values) |col, val| {
         if (wrote_any) try buf.writer.writeAll(",");
         wrote_any = true;
-        try buf.writer.print("\"{s}\":", .{col});
+        // Column names come from CSV headers; they need escaping too.
+        try buf.writer.print("{f}:", .{std.json.fmt(col, .{})});
         try buf.writer.print("{f}", .{std.json.fmt(val, .{})});
     }
 
@@ -1585,17 +1635,17 @@ fn mergeImportMetadata(
 ) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .ignore_unknown_fields = true }) catch {
         if (target_endpoint) |target| {
-            return try std.fmt.allocPrint(allocator, "{{\"source\":\"{s}\",\"source_endpoint\":\"{s}\",\"target_endpoint\":\"{s}\"}}", .{ tag, source_endpoint, target });
+            return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f},\"target_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}), std.json.fmt(target, .{}) });
         }
-        return try std.fmt.allocPrint(allocator, "{{\"source\":\"{s}\",\"source_endpoint\":\"{s}\"}}", .{ tag, source_endpoint });
+        return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}) });
     };
     defer parsed.deinit();
 
     if (parsed.value != .object) {
         if (target_endpoint) |target| {
-            return try std.fmt.allocPrint(allocator, "{{\"source\":\"{s}\",\"source_endpoint\":\"{s}\",\"target_endpoint\":\"{s}\"}}", .{ tag, source_endpoint, target });
+            return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f},\"target_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}), std.json.fmt(target, .{}) });
         }
-        return try std.fmt.allocPrint(allocator, "{{\"source\":\"{s}\",\"source_endpoint\":\"{s}\"}}", .{ tag, source_endpoint });
+        return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}) });
     }
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
@@ -2021,6 +2071,14 @@ fn jsonAppendEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text
     for (text) |c| switch (c) {
         '"' => try buf.appendSlice(allocator, "\\\""),
         '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => |ctrl| {
+            var esc_buf: [6]u8 = undefined;
+            const esc = std.fmt.bufPrint(&esc_buf, "\\u{x:0>4}", .{ctrl}) catch unreachable;
+            try buf.appendSlice(allocator, esc);
+        },
         else => try buf.append(allocator, c),
     };
 }
@@ -2086,6 +2144,17 @@ test "parseCsv reads header and rows" {
     try std.testing.expectEqual(@as(usize, 2), table.headers.len);
     try std.testing.expectEqual(@as(usize, 2), table.rows.len);
     try std.testing.expectEqualStrings("entity:1", table.cell(0, "source_ref").?);
+}
+
+test "parseCsv keeps newlines, commas, and escaped quotes inside quoted cells" {
+    const csv = "source_ref,content\r\nentity:1,\"line one\nline two, with comma\"\r\nentity:2,\"say \"\"hi\"\"\"\r\n";
+    var table = try parseCsv(std.testing.allocator, csv);
+    defer table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), table.headers.len);
+    try std.testing.expectEqual(@as(usize, 2), table.rows.len);
+    try std.testing.expectEqualStrings("line one\nline two, with comma", table.cell(0, "content").?);
+    try std.testing.expectEqualStrings("say \"hi\"", table.cell(1, "content").?);
+    try std.testing.expectEqualStrings("entity:2", table.cell(1, "source_ref").?);
 }
 
 test "stableFactId is deterministic" {

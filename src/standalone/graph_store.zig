@@ -378,6 +378,11 @@ fn filterEdges(
     edges: roaring.Bitmap,
     filter: interfaces.GraphEdgeFilter,
 ) anyerror!roaring.Bitmap {
+    // Parity with DurableRepository.filterEdges: silently ignoring these
+    // fields returned unfiltered edges to callers that set them.
+    if (filter.property_predicates != null or filter.sort_by_property != null) {
+        return error.PropertyPredicatesNotImplemented;
+    }
     const self: *Store = @ptrCast(@alignCast(ctx));
     const edge_ids = try edges.toArray(allocator);
     defer allocator.free(edge_ids);

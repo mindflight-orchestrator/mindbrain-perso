@@ -351,9 +351,30 @@ fn chunkRecursive(
 
     if (pieces.items.len == 0) return allocator.alloc(Chunk, 0);
 
-    var chunks = try allocator.alloc(Chunk, pieces.items.len);
+    // splitRecursive emits one span per separator hit however tiny; pack
+    // adjacent spans back up to max_chars and fold a trailing span shorter
+    // than min_chars into its predecessor.
+    var merged = std.ArrayList(TokenSpan).empty;
+    defer merged.deinit(allocator);
+    var current = pieces.items[0];
+    for (pieces.items[1..]) |span| {
+        if (span.end - current.start <= options.max_chars) {
+            current.end = span.end;
+        } else {
+            try merged.append(allocator, current);
+            current = span;
+        }
+    }
+    if (merged.items.len > 0 and (current.end - current.start) < options.min_chars) {
+        merged.items[merged.items.len - 1].end = current.end;
+    } else {
+        try merged.append(allocator, current);
+    }
+
+    var chunks = try allocator.alloc(Chunk, merged.items.len);
     var idx: u32 = 0;
-    for (pieces.items) |span| {
+    for (merged.items) |raw_span| {
+        const span = trimSpan(text, raw_span.start, raw_span.end);
         const slice = text[span.start..span.end];
         chunks[idx] = .{
             .index = idx,
@@ -381,19 +402,35 @@ fn splitRecursive(
     const slice_len = end - start;
     if (slice_len == 0) return;
 
-    if (slice_len <= options.max_chars or depth >= separators.len) {
+    if (slice_len <= options.max_chars) {
         const trimmed = trimSpan(text, start, end);
         if (trimmed.end > trimmed.start) try out.append(allocator, trimmed);
+        return;
+    }
+
+    if (depth >= separators.len) {
+        // No separator matched (CJK prose, base64 blobs): hard-split at
+        // codepoint boundaries so max_chars still holds instead of emitting
+        // the whole oversized slice.
+        var piece_start = start;
+        const step = @max(options.max_chars, 4);
+        while (piece_start < end) {
+            var piece_end = @min(piece_start + step, end);
+            while (piece_end > piece_start + 1 and piece_end < end and (text[piece_end] & 0xC0) == 0x80) {
+                piece_end -= 1;
+            }
+            const trimmed = trimSpan(text, piece_start, piece_end);
+            if (trimmed.end > trimmed.start) try out.append(allocator, trimmed);
+            piece_start = piece_end;
+        }
         return;
     }
 
     const sep = separators[depth];
     var cursor = start;
     var current_start = start;
-    var any_split = false;
     while (cursor + sep.len <= end) {
         if (std.mem.startsWith(u8, text[cursor..end], sep)) {
-            any_split = true;
             const piece_end = cursor + sep.len;
             try splitRecursive(allocator, text, current_start, piece_end, options, separators, depth + 1, out);
             current_start = piece_end;
@@ -402,11 +439,11 @@ fn splitRecursive(
             cursor += 1;
         }
     }
+    // Note: when no separator matched, the tail recursion below covers the
+    // whole [start, end) range at the next depth; a second "no split"
+    // recursion here used to emit every span twice.
     if (current_start < end) {
         try splitRecursive(allocator, text, current_start, end, options, separators, depth + 1, out);
-    }
-    if (!any_split) {
-        try splitRecursive(allocator, text, start, end, options, separators, depth + 1, out);
     }
 }
 

@@ -938,17 +938,24 @@ pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !searc
 }
 
 pub fn compactSearchSnapshot(db: Database, allocator: std.mem.Allocator) !CompactSearchSnapshot {
-    var store = try loadCompactSearchStore(db, allocator);
-    defer store.deinit();
-
+    _ = allocator;
+    // Six COUNT(*) statements; loading the compact store deserialized every
+    // posting bitmap and embedding just to report row counts.
     return .{
-        .collection_stats = store.collection_stats.items.len,
-        .document_stats = store.document_stats.items.len,
-        .term_stats = store.term_stats.items.len,
-        .term_frequencies = store.term_frequencies.items.len,
-        .postings = store.postings.items.len,
-        .embeddings = store.embeddings.items.len,
+        .collection_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_collection_stats"),
+        .document_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_document_stats"),
+        .term_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_term_stats"),
+        .term_frequencies = try countTableRows(db, "SELECT COUNT(*) FROM search_term_frequencies"),
+        .postings = try countTableRows(db, "SELECT COUNT(*) FROM search_postings"),
+        .embeddings = try countTableRows(db, "SELECT COUNT(*) FROM search_embeddings"),
     };
+}
+
+fn countTableRows(db: Database, sql: []const u8) !usize {
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
 }
 
 pub fn compactSearchSnapshotToon(db: Database, allocator: std.mem.Allocator) ![]u8 {

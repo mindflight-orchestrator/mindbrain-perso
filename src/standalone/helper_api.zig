@@ -79,7 +79,18 @@ pub fn stepRow(stmt: *c.sqlite3_stmt) !bool {
     return error.StepFailed;
 }
 
+pub fn isSqlIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return !std.ascii.isDigit(name[0]);
+}
+
 pub fn countTable(db: facet_sqlite.Database, table: []const u8) !i64 {
+    // The table name is spliced into the SQL; refuse anything that is not
+    // a plain identifier so a caller can never smuggle statements through.
+    if (!isSqlIdentifier(table)) return error.PrepareFailed;
     const sql = try std.fmt.allocPrint(std.heap.page_allocator, "SELECT COUNT(*) FROM {s}", .{table});
     defer std.heap.page_allocator.free(sql);
     const stmt = try prepare(db, sql);
