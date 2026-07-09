@@ -423,6 +423,16 @@ pub const Pipeline = struct {
             break :blk generated_nanoid.?;
         } else opts.doc_nanoid;
 
+        // documents_raw references workspaces and collections; materialize
+        // the parents so a first ingest into a fresh database succeeds.
+        try collections_sqlite.ensureWorkspace(self.db.*, .{ .workspace_id = opts.workspace_id });
+        try collections_sqlite.ensureCollection(self.db.*, .{
+            .workspace_id = opts.workspace_id,
+            .collection_id = opts.collection_id,
+            .name = opts.collection_id,
+            .default_language = opts.language,
+        });
+
         try collections_sqlite.upsertDocumentRaw(self.db.*, .{
             .workspace_id = opts.workspace_id,
             .collection_id = opts.collection_id,

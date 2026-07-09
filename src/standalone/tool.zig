@@ -7003,6 +7003,16 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
     var ingest_tx = try facet_sqlite.Transaction.begin(db);
     defer ingest_tx.deinit();
 
+    // documents_raw references workspaces and collections; materialize the
+    // parents so a first ingest into a fresh database succeeds.
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = workspace_id.? });
+    try collections_sqlite.ensureCollection(db, .{
+        .workspace_id = workspace_id.?,
+        .collection_id = collection_id.?,
+        .name = collection_id.?,
+        .default_language = language,
+    });
+
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
