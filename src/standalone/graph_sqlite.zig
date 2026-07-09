@@ -2177,15 +2177,24 @@ fn rebuildLjForEntitiesNoTransaction(
         const relation_id = try columnU32(rel_stmt, 0);
         const source_id = try columnU32(rel_stmt, 1);
         const target_id = try columnU32(rel_stmt, 2);
-        if (!target_set.contains(source_id) and !target_set.contains(target_id)) continue;
+        const source_in_set = target_set.contains(source_id);
+        const target_in_set = target_set.contains(target_id);
+        if (!source_in_set and !target_in_set) continue;
 
-        const outgoing_entry = try outgoing.getOrPut(source_id);
-        if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
-        try outgoing_entry.value_ptr.append(allocator, relation_id);
+        // Only accumulate rows for entities being rebuilt: writing a
+        // neighbor's row here would replace its full adjacency with just
+        // the relations incident to this rebuild's entity set.
+        if (source_in_set) {
+            const outgoing_entry = try outgoing.getOrPut(source_id);
+            if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+            try outgoing_entry.value_ptr.append(allocator, relation_id);
+        }
 
-        const incoming_entry = try incoming.getOrPut(target_id);
-        if (!incoming_entry.found_existing) incoming_entry.value_ptr.* = .empty;
-        try incoming_entry.value_ptr.append(allocator, relation_id);
+        if (target_in_set) {
+            const incoming_entry = try incoming.getOrPut(target_id);
+            if (!incoming_entry.found_existing) incoming_entry.value_ptr.* = .empty;
+            try incoming_entry.value_ptr.append(allocator, relation_id);
+        }
     }
 
     for (entity_ids) |entity_id| {
@@ -2280,7 +2289,9 @@ pub fn buildPathResult(
     }
 
     for (path, 0..) |edge, index| {
-        const relation = (try loadRelation(db, allocator, edge.relation_id)).?;
+        // A stale adjacency bitmap can reference a hard-deleted relation;
+        // callers handle MissingRow by falling back to the SQL path.
+        const relation = (try loadRelation(db, allocator, edge.relation_id)) orelse return error.MissingRow;
         errdefer allocator.free(relation.relation_type);
         const source = try loadEntity(db, allocator, edge.from_node);
         errdefer {
@@ -4255,6 +4266,48 @@ test "sqlite-backed graph repository performs k-hop traversal" {
     defer std.testing.allocator.free(ids);
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4 }, ids);
+}
+
+test "scoped adjacency rebuild preserves untouched neighbors' rows" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "entity", "A");
+    try insertEntity(db, 2, "entity", "B");
+    try insertEntity(db, 3, "entity", "C");
+    try insertEntity(db, 4, "entity", "D");
+
+    try insertRelation(db, .{ .relation_id = 20, .source_id = 2, .target_id = 3, .relation_type = "rel", .confidence = 0.9 });
+    try insertRelation(db, .{ .relation_id = 21, .source_id = 2, .target_id = 4, .relation_type = "rel", .confidence = 0.9 });
+    try insertRelation(db, .{ .relation_id = 22, .source_id = 1, .target_id = 3, .relation_type = "rel", .confidence = 0.9 });
+
+    try insertAdjacency(db, "graph_lj_out", 1, &.{22}, std.testing.allocator);
+    try insertAdjacency(db, "graph_lj_out", 2, &.{ 20, 21 }, std.testing.allocator);
+    try insertAdjacency(db, "graph_lj_in", 3, &.{ 20, 22 }, std.testing.allocator);
+    try insertAdjacency(db, "graph_lj_in", 4, &.{21}, std.testing.allocator);
+
+    // Rebuild only {A, C}: B's rows must keep the relation to D, which has
+    // no endpoint in the rebuilt set.
+    try rebuildLjForEntities(db, &.{ 1, 3 }, std.testing.allocator);
+
+    var b_out = try loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_out", 2);
+    defer b_out.deinit();
+    const b_ids = try b_out.toArray(std.testing.allocator);
+    defer std.testing.allocator.free(b_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, b_ids);
+
+    var c_in = try loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_in", 3);
+    defer c_in.deinit();
+    const c_ids = try c_in.toArray(std.testing.allocator);
+    defer std.testing.allocator.free(c_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 22 }, c_ids);
+
+    var a_out = try loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_out", 1);
+    defer a_out.deinit();
+    const a_ids = try a_out.toArray(std.testing.allocator);
+    defer std.testing.allocator.free(a_ids);
+    try std.testing.expectEqualSlices(u32, &.{22}, a_ids);
 }
 
 test "sqlite graph traverse returns outbound rows with metadata and paths" {

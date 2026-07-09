@@ -142,13 +142,18 @@ fn collectObservedFromDir(
     errors: *std.ArrayList([]const u8),
 ) !void {
     _ = errors;
+    // The parsed tree must outlive the directory loop below, which reads
+    // strings borrowed from it.
+    var mapping_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (mapping_parsed) |*parsed| parsed.deinit();
     var mapping_value: ?std.json.Value = null;
     if (mapping_path) |mp| {
         const mapping_text = try structured_import.readJsonFile(allocator, mp);
         defer allocator.free(mapping_text);
-        var mapping = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{});
-        defer mapping.deinit();
-        mapping_value = mapping.value;
+        mapping_parsed = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{
+            .allocate = .alloc_always,
+        });
+        mapping_value = mapping_parsed.?.value;
     }
     var dir = try std.Io.Dir.cwd().openDir(zig16_compat.io(), input_dir, .{ .iterate = true });
     defer dir.close(zig16_compat.io());

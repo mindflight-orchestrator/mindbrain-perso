@@ -2740,14 +2740,21 @@ fn computePromptDocumentLimits(
 }
 
 fn mergeQualificationEnvelopes(allocator: Allocator, parts: []const []const u8) ![]u8 {
+    // The assignment rows borrow strings from their part's parse arena, so
+    // every Parsed must stay alive until after the final stringify.
+    var parsed_parts = std.ArrayList(std.json.Parsed(QualificationEnvelope)).empty;
+    defer {
+        for (parsed_parts.items) |*parsed| parsed.deinit();
+        parsed_parts.deinit(allocator);
+    }
     var merged = std.ArrayList(QualificationAssignmentRow).empty;
-    errdefer merged.deinit(allocator);
+    defer merged.deinit(allocator);
     for (parts) |json| {
-        var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
+        const parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
-        defer parsed.deinit();
+        try parsed_parts.append(allocator, parsed);
         try merged.appendSlice(allocator, parsed.value.assignments);
     }
     return try std.json.Stringify.valueAlloc(allocator, .{ .assignments = merged.items }, .{});
@@ -3431,7 +3438,13 @@ fn freeExtractBatchJobParts(allocator: Allocator, jobs: []ExtractBatchJob) void 
 
 fn transferExtractBatchJobPart(allocator: Allocator, job: *ExtractBatchJob) !void {
     const staged = job.part orelse return error.InvalidLlmBusinessExtractionResponse;
-    const owned = try allocator.dupe(u8, staged);
+    const owned = allocator.dupe(u8, staged) catch |err| {
+        // Keep ownership consistent: job.part must never hold smp-owned
+        // memory once an error escapes, the caller frees with `allocator`.
+        std.heap.smp_allocator.free(staged);
+        job.part = null;
+        return err;
+    };
     std.heap.smp_allocator.free(staged);
     job.part = owned;
 }
@@ -3850,12 +3863,16 @@ fn businessExtractLlmWorker(ctx: *LlmWorkerCtx) void {
     const thread_alloc = arena.allocator();
     runOneExtractBatchLlm(thread_alloc, ctx.opts, ctx.job, ctx.docs_rows, ctx.batch_total) catch |err| {
         ctx.job.llm_err = err;
+        // job.part (if already set) points into the arena that dies with
+        // this worker; never let it escape.
+        ctx.job.part = null;
         return;
     };
     const part = ctx.job.part orelse return;
     // Thread-safe staging buffer; main thread copies into parent_allocator after join.
     const owned = std.heap.smp_allocator.dupe(u8, part) catch |err| {
         ctx.job.llm_err = err;
+        ctx.job.part = null;
         return;
     };
     ctx.job.part = owned;
@@ -3895,12 +3912,12 @@ fn runExtractBatchLlmJobs(
     defer allocator.free(parallel_detail);
     try writeBusinessExtractProgress("llm_parallelism", 0, jobs.len, 0, "", 0, parallel_detail);
 
+    errdefer freeExtractBatchJobParts(allocator, jobs);
     if (parallel == 1) {
         for (jobs) |*job| {
             try runOneExtractBatchLlm(allocator, opts, job, docs_rows, jobs.len);
         }
     } else {
-        errdefer freeExtractBatchJobParts(allocator, jobs);
         var wave_start: usize = 0;
         while (wave_start < jobs.len) {
             const wave_len = @min(parallel, jobs.len - wave_start);
@@ -3922,11 +3939,28 @@ fn runExtractBatchLlmJobs(
             for (threads[0..wave_len]) |*thread| {
                 thread.join();
             }
+            var wave_err: ?anyerror = null;
             for (0..wave_len) |w| {
                 const job = &jobs[wave_start + w];
-                if (job.llm_err) |err| return err;
-                try transferExtractBatchJobPart(allocator, job);
+                if (wave_err != null) {
+                    // A previous job in this wave failed: release the
+                    // remaining smp-owned staging buffers now so the
+                    // parent-allocator errdefer only sees transferred parts.
+                    if (job.part) |staged| {
+                        std.heap.smp_allocator.free(staged);
+                        job.part = null;
+                    }
+                    continue;
+                }
+                if (job.llm_err) |err| {
+                    wave_err = err;
+                    continue;
+                }
+                transferExtractBatchJobPart(allocator, job) catch |err| {
+                    wave_err = err;
+                };
             }
+            if (wave_err) |err| return err;
             wave_start += wave_len;
         }
     }

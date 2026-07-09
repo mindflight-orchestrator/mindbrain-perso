@@ -726,7 +726,7 @@ fn loadWorkspaceGraphEntities(
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
-        const entity_type = try dupeColumnText(allocator, stmt, 1);
+        const entity_type = try dupeColumnText(allocator, stmt, 2);
         errdefer allocator.free(entity_type);
         if (!matchesEntityTypes(entity_types, entity_type)) {
             allocator.free(entity_type);
@@ -1343,6 +1343,63 @@ test "taxonomy projections and coverage report derive from imported taxonomy row
     try std.testing.expectEqualStrings("acme", report.gaps[0].id);
     try std.testing.expect(report.gaps[0].decayed_confidence == null);
     try std.testing.expectEqual(@as(usize, 2), report.summary.projection_rows);
+}
+
+test "coverage report entity type filter matches graph entities by type" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try importTaxonomyIntoFacets(
+        db,
+        std.testing.allocator,
+        500,
+        "public",
+        "taxonomy",
+        4,
+        &.{
+            .{
+                .id = "tax-1",
+                .workspace_id = "default",
+                .doc_id = 1,
+                .node_id = "ada",
+                .label = "Ada",
+                .schema_id = "ghostcrab:taxonomy",
+                .entity_type = "person",
+                .levels = &.{
+                    .{ .facet_id = 1, .facet_name = "domain", .facet_value = "science" },
+                },
+            },
+            .{
+                .id = "tax-2",
+                .workspace_id = "default",
+                .doc_id = 2,
+                .node_id = "acme",
+                .label = "Acme",
+                .schema_id = "ghostcrab:taxonomy",
+                .entity_type = "company",
+                .levels = &.{
+                    .{ .facet_id = 1, .facet_name = "domain", .facet_value = "industry" },
+                },
+            },
+        },
+    );
+
+    try db.exec("INSERT INTO graph_entity(entity_id, entity_type, name, metadata_json) VALUES (1, 'person', 'ada', '{\"workspace_id\":\"default\"}')");
+
+    // Filtering on the graph side must compare against entity_type, not the
+    // entity name: 'ada' is a person, so it stays and covers the tax-1 node.
+    const report = try coverageReport(db, std.testing.allocator, "default", &.{"person"});
+    defer {
+        std.testing.allocator.free(report.summary.workspace_id);
+        for (report.gaps) |gap| deinitCoverageGap(std.testing.allocator, gap);
+        std.testing.allocator.free(report.gaps);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), report.summary.total_nodes);
+    try std.testing.expectEqual(@as(usize, 1), report.summary.covered_nodes);
+    try std.testing.expectEqual(@as(usize, 0), report.gaps.len);
+    try std.testing.expectEqual(@as(usize, 1), report.summary.graph_entities);
 }
 
 test "materializeRelevanceProjections ranks entity matches above query-only matches" {

@@ -523,7 +523,9 @@ fn slugTakenByOtherLegacy(db: Database, candidate: Candidate, slug: []const u8) 
     const rc = c.sqlite3_step(stmt);
     if (rc == c.SQLITE_DONE) return false;
     if (rc != c.SQLITE_ROW) return error.StepFailed;
-    const existing = std.mem.span(c.sqlite3_column_text(stmt, 0));
+    // A NULL legacy_ref means the slug is held by a non-legacy row.
+    const text_ptr = c.sqlite3_column_text(stmt, 0) orelse return true;
+    const existing = std.mem.span(text_ptr);
     return !std.mem.eql(u8, existing, candidate.legacy_ref);
 }
 
