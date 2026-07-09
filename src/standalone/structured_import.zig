@@ -1384,6 +1384,7 @@ const DeriveEdgeContext = struct {
 
 fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: CsvTable, row_idx: usize, opts: ApplyOptions, batch: ?*ApplyBatch) !bool {
     const workspace_id = edges.cell(row_idx, "workspace_id") orelse return error.InvalidEdgesCsv;
+    if (!std.mem.eql(u8, workspace_id, opts.workspace_id)) return error.WorkspaceMismatch;
     const source = edges.cell(row_idx, "source") orelse return error.InvalidEdgesCsv;
     const target = edges.cell(row_idx, "target") orelse return error.InvalidEdgesCsv;
     const label = edges.cell(row_idx, "label") orelse return error.InvalidEdgesCsv;
@@ -1406,7 +1407,7 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         if (exists) return false;
     }
 
-    const source_id = try collections_sqlite.upsertEntityRawAuto(db, .{
+    const source_id = try collections_sqlite.ensureEntityRawAuto(db, .{
         .workspace_id = workspace_id,
         .ontology_id = opts.ontology_id,
         .external_id = source,
@@ -1415,7 +1416,7 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         .confidence = confidence,
         .metadata_json = metadata,
     });
-    const target_id = try collections_sqlite.upsertEntityRawAuto(db, .{
+    const target_id = try collections_sqlite.ensureEntityRawAuto(db, .{
         .workspace_id = workspace_id,
         .ontology_id = opts.ontology_id,
         .external_id = target,
@@ -1479,7 +1480,7 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
         const target_type = try entityTypeFromSourceRef(allocator, ctx.workspace_id, target_external);
         defer allocator.free(target_type);
 
-        const source_id = try collections_sqlite.upsertEntityRawAuto(db, .{
+        const source_id = try collections_sqlite.ensureEntityRawAuto(db, .{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
             .external_id = source_external,
@@ -1488,7 +1489,7 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
             .confidence = 0.85,
             .metadata_json = metadata,
         });
-        const target_id = try collections_sqlite.upsertEntityRawAuto(db, .{
+        const target_id = try collections_sqlite.ensureEntityRawAuto(db, .{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
             .external_id = target_external,

@@ -972,6 +972,38 @@ pub fn upsertEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
     return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
 }
 
+/// Insert-if-missing variant for relation endpoints: resolves the entity id
+/// without overwriting name/metadata that the facet pass (or a previous
+/// import) already wrote. The full upsert would clobber a human-readable
+/// name with the edge's raw external id.
+pub fn ensureEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
+    const existing_id = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
+            error.NotFound => null,
+            else => return natural_err,
+        },
+        else => return err,
+    };
+    if (existing_id) |id| return id;
+
+    const sql =
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
+        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\ON CONFLICT DO NOTHING
+    ;
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, spec.external_id);
+    try facet_sqlite.bindText(stmt, 4, spec.entity_type);
+    try facet_sqlite.bindText(stmt, 5, spec.name);
+    if (c.sqlite3_bind_double(stmt, 6, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+    try facet_sqlite.bindText(stmt, 7, spec.metadata_json);
+    try facet_sqlite.stepDone(stmt);
+    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+}
+
 fn updateEntityRawAutoById(db: Database, entity_id: u64, spec: EntityRawAutoSpec) !void {
     const sql =
         \\UPDATE entities_raw
@@ -1474,6 +1506,46 @@ pub fn ensureDefaultOntology(
 }
 
 // ---- Tests ---------------------------------------------------------------
+
+test "ensureEntityRawAuto keeps the name and metadata written by the facet pass" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "wsE" });
+    try ensureOntology(db, .{ .ontology_id = "wsE::core", .workspace_id = "wsE", .name = "core" });
+
+    // Facet pass writes the human-readable name.
+    const id = try upsertEntityRawAuto(db, .{
+        .workspace_id = "wsE",
+        .ontology_id = "wsE::core",
+        .external_id = "lot:0001",
+        .entity_type = "lot",
+        .name = "Lot 1 - Maison Bleue",
+        .confidence = 1.0,
+        .metadata_json = "{\"kind\":\"facet\"}",
+    });
+
+    // Edge pass resolves the endpoint with the raw external id as name;
+    // it must not clobber the existing row.
+    const resolved = try ensureEntityRawAuto(db, .{
+        .workspace_id = "wsE",
+        .ontology_id = "wsE::core",
+        .external_id = "lot:0001",
+        .entity_type = "lot",
+        .name = "lot:0001",
+        .confidence = 0.85,
+        .metadata_json = "{\"kind\":\"edge\"}",
+    });
+    try std.testing.expectEqual(id, resolved);
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT name, metadata_json FROM entities_raw WHERE entity_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindInt64(stmt, 1, id);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("Lot 1 - Maison Bleue", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expectEqualStrings("{\"kind\":\"facet\"}", std.mem.span(c.sqlite3_column_text(stmt, 1)));
+}
 
 test "ensureWorkspace bootstraps the default ontology with the source.* namespace" {
     var db = try Database.openInMemory();

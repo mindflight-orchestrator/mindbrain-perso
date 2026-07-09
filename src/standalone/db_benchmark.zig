@@ -149,10 +149,10 @@ fn seedBenchmarkState(db: facet_sqlite.Database, allocator: std.mem.Allocator, o
     try facet_sqlite.upsertPostingBitmap(db, allocator, opts.facet_table_id, 2, "us", 0, region_us);
 
     const entity_ids = .{
-        try graph_sqlite.upsertEntityNatural(db, allocator, "benchmark_node", "bench-start", 1.0, "{}"),
-        try graph_sqlite.upsertEntityNatural(db, allocator, "benchmark_node", "bench-mid-a", 1.0, "{}"),
-        try graph_sqlite.upsertEntityNatural(db, allocator, "benchmark_node", "bench-mid-b", 1.0, "{}"),
-        try graph_sqlite.upsertEntityNatural(db, allocator, "benchmark_node", "bench-end", 1.0, "{}"),
+        try graph_sqlite.upsertEntityNatural(db, allocator, "default", "benchmark_node", "bench-start", 1.0, "{}"),
+        try graph_sqlite.upsertEntityNatural(db, allocator, "default", "benchmark_node", "bench-mid-a", 1.0, "{}"),
+        try graph_sqlite.upsertEntityNatural(db, allocator, "default", "benchmark_node", "bench-mid-b", 1.0, "{}"),
+        try graph_sqlite.upsertEntityNatural(db, allocator, "default", "benchmark_node", "bench-end", 1.0, "{}"),
     };
 
     const relation_ids = .{ 88_101, 88_102, 88_103 };
@@ -282,7 +282,7 @@ fn facetBatchUpdate(ctx: *const BenchmarkContext) !void {
 fn graphSingleAdd(ctx: *const BenchmarkContext) !void {
     const relation_id: u32 = 88_201;
     const source_id = ctx.bench_entity_ids[3];
-    const target_id = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "benchmark_node", "bench-extra-a", 1.0, "{}");
+    const target_id = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "default", "benchmark_node", "bench-extra-a", 1.0, "{}");
     try graph_sqlite.upsertRelation(ctx.db, .{
         .relation_id = relation_id,
         .source_id = source_id,
@@ -315,8 +315,8 @@ fn graphSingleUpdate(ctx: *const BenchmarkContext) !void {
 }
 
 fn graphBatchUpdate(ctx: *const BenchmarkContext) !void {
-    const extra_a = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "benchmark_node", "bench-extra-b", 1.0, "{}");
-    const extra_b = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "benchmark_node", "bench-extra-c", 1.0, "{}");
+    const extra_a = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "default", "benchmark_node", "bench-extra-b", 1.0, "{}");
+    const extra_b = try graph_sqlite.upsertEntityNatural(ctx.db, ctx.allocator, "default", "benchmark_node", "bench-extra-c", 1.0, "{}");
     const batch_source = ctx.bench_entity_ids[0];
     const relation_a: u32 = 88_202;
     const relation_b: u32 = 88_203;

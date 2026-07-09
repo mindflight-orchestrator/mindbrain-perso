@@ -617,24 +617,29 @@ pub fn resolveWorkspace(
     domain_or_workspace: []const u8,
 ) !?[]const u8 {
     if (domain_or_workspace.len == 0) return null;
-    const stmt = try prepare(db, "SELECT workspace_id, domain_profile_json FROM workspaces");
-    defer finalize(stmt);
 
-    while (true) {
+    // Exact workspace id wins; otherwise match the declared domain by
+    // equality with a deterministic tie-break. Substring matching against
+    // the raw profile JSON resolved arbitrary workspaces for inputs like
+    // "domain" or "{".
+    {
+        const stmt = try prepare(db, "SELECT workspace_id FROM workspaces WHERE workspace_id = ?1 LIMIT 1");
+        defer finalize(stmt);
+        try bindText(stmt, 1, domain_or_workspace);
         const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
-
-        const workspace_id = try dupeColumnText(allocator, stmt, 0);
-        errdefer allocator.free(workspace_id);
-        const profile = try dupeColumnText(allocator, stmt, 1);
-        defer allocator.free(profile);
-
-        if (std.mem.eql(u8, workspace_id, domain_or_workspace) or std.mem.indexOf(u8, profile, domain_or_workspace) != null) {
-            return workspace_id;
-        }
-        allocator.free(workspace_id);
+        if (rc == c.SQLITE_ROW) return try dupeColumnText(allocator, stmt, 0);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
+
+    const stmt = try prepare(
+        db,
+        "SELECT workspace_id FROM workspaces WHERE json_extract(domain_profile_json, '$.domain') = ?1 OR domain_profile = ?1 ORDER BY workspace_id ASC LIMIT 1",
+    );
+    defer finalize(stmt);
+    try bindText(stmt, 1, domain_or_workspace);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return try dupeColumnText(allocator, stmt, 0);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
     return null;
 }
 

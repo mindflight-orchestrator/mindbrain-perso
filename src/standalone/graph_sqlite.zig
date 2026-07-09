@@ -1007,6 +1007,7 @@ pub fn upsertEntityChunk(
 pub fn upsertEntityNatural(
     db: Database,
     allocator: std.mem.Allocator,
+    workspace_id: []const u8,
     entity_type: []const u8,
     name: []const u8,
     confidence: f32,
@@ -1015,13 +1016,14 @@ pub fn upsertEntityNatural(
     _ = allocator;
     const stmt = try prepare(
         db,
-        "INSERT INTO graph_entity(workspace_id, entity_type, name, confidence, metadata_json, deprecated_at) VALUES ('default', ?1, ?2, ?3, ?4, NULL) " ++ "ON CONFLICT(workspace_id, entity_type, name) DO UPDATE SET confidence = MAX(graph_entity.confidence, excluded.confidence), " ++ "metadata_json = CASE " ++ "WHEN graph_entity.metadata_json = '{}' THEN excluded.metadata_json " ++ "WHEN excluded.metadata_json = '{}' THEN graph_entity.metadata_json " ++ "ELSE excluded.metadata_json END, " ++ "deprecated_at = NULL " ++ "RETURNING entity_id",
+        "INSERT INTO graph_entity(workspace_id, entity_type, name, confidence, metadata_json, deprecated_at) VALUES (?5, ?1, ?2, ?3, ?4, NULL) " ++ "ON CONFLICT(workspace_id, entity_type, name) DO UPDATE SET confidence = MAX(graph_entity.confidence, excluded.confidence), " ++ "metadata_json = CASE " ++ "WHEN graph_entity.metadata_json = '{}' THEN excluded.metadata_json " ++ "WHEN excluded.metadata_json = '{}' THEN graph_entity.metadata_json " ++ "ELSE excluded.metadata_json END, " ++ "deprecated_at = NULL " ++ "RETURNING entity_id",
     );
     defer finalize(stmt);
     try bindText(stmt, 1, entity_type);
     try bindText(stmt, 2, name);
     if (c.sqlite3_bind_double(stmt, 3, confidence) != c.SQLITE_OK) return error.BindFailed;
     try bindText(stmt, 4, metadata_json);
+    try bindText(stmt, 5, workspace_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
     return try columnU32(stmt, 0);
 }
@@ -1376,10 +1378,11 @@ pub fn countEntitiesByWorkspace(
     return try columnU64(stmt, 0);
 }
 
-pub fn loadEntityIdByName(db: Database, name: []const u8) !u32 {
-    const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE name = ?1 AND deprecated_at IS NULL LIMIT 1");
+pub fn loadEntityIdByName(db: Database, workspace_id: []const u8, name: []const u8) !u32 {
+    const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE workspace_id = ?1 AND name = ?2 AND deprecated_at IS NULL ORDER BY entity_id ASC LIMIT 1");
     defer finalize(stmt);
-    try bindText(stmt, 1, name);
+    try bindText(stmt, 1, workspace_id);
+    try bindText(stmt, 2, name);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
     return try columnU32(stmt, 0);
 }
@@ -1699,7 +1702,7 @@ pub fn confidenceDecayByName(
     name: []const u8,
     half_life_days: usize,
 ) !?f32 {
-    const id = loadEntityIdByName(db, name) catch |err| switch (err) {
+    const id = loadEntityIdByName(db, "default", name) catch |err| switch (err) {
         error.MissingRow => return null,
         else => return err,
     };
@@ -1798,6 +1801,7 @@ pub fn entityNeighborhood(
 pub fn learnFromRun(
     db: Database,
     allocator: std.mem.Allocator,
+    workspace_id: []const u8,
     run_key: []const u8,
     domain: []const u8,
     outcome: []const u8,
@@ -1830,13 +1834,13 @@ pub fn learnFromRun(
 
     for (concepts) |concept| {
         const metadata = concept.metadata_json orelse "{}";
-        const entity_id = try upsertEntityNatural(db, allocator, concept.entity_type, concept.name, concept.confidence, metadata);
+        const entity_id = try upsertEntityNatural(db, allocator, workspace_id, concept.entity_type, concept.name, concept.confidence, metadata);
         _ = try touched_entities.put(entity_id, {});
     }
 
     for (relations) |relation| {
-        const src_id = try loadEntityIdByName(db, relation.source);
-        const tgt_id = try loadEntityIdByName(db, relation.target);
+        const src_id = try loadEntityIdByName(db, workspace_id, relation.source);
+        const tgt_id = try loadEntityIdByName(db, workspace_id, relation.target);
         _ = try upsertRelationNatural(
             db,
             relation.relation_type,
@@ -1855,13 +1859,14 @@ pub fn learnFromRun(
 
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
-    try rebuildLjForEntitiesNoTransaction(db, touched_ids, null, allocator);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, workspace_id, allocator);
     return run_id;
 }
 
 pub fn applyKnowledgePatch(
     db: Database,
     allocator: std.mem.Allocator,
+    workspace_id: []const u8,
     patch_key: []const u8,
     domain: []const u8,
     confidence: f32,
@@ -1898,6 +1903,7 @@ pub fn applyKnowledgePatch(
             const entity_id = try upsertEntityNatural(
                 db,
                 allocator,
+                workspace_id,
                 artifact.entity_type.?,
                 artifact.name.?,
                 artifact.confidence orelse confidence,
@@ -1910,8 +1916,8 @@ pub fn applyKnowledgePatch(
 
         if (std.mem.eql(u8, artifact.action, "upsert_relation")) {
             if (artifact.relation_type == null or artifact.source == null or artifact.target == null) return error.MissingRow;
-            const src_id = try loadEntityIdByName(db, artifact.source.?);
-            const tgt_id = try loadEntityIdByName(db, artifact.target.?);
+            const src_id = try loadEntityIdByName(db, workspace_id, artifact.source.?);
+            const tgt_id = try loadEntityIdByName(db, workspace_id, artifact.target.?);
             _ = try upsertRelationNatural(
                 db,
                 artifact.relation_type.?,
@@ -1932,8 +1938,8 @@ pub fn applyKnowledgePatch(
 
         if (std.mem.eql(u8, artifact.action, "deprecate")) {
             if (artifact.relation_type == null or artifact.source == null or artifact.target == null) return error.MissingRow;
-            const src_id = try loadEntityIdByName(db, artifact.source.?);
-            const tgt_id = try loadEntityIdByName(db, artifact.target.?);
+            const src_id = try loadEntityIdByName(db, workspace_id, artifact.source.?);
+            const tgt_id = try loadEntityIdByName(db, workspace_id, artifact.target.?);
             const stmt = try prepare(
                 db,
                 "UPDATE graph_relation SET deprecated_at = unixepoch(), patch_id = ?4 WHERE relation_type = ?1 AND source_id = ?2 AND target_id = ?3 AND deprecated_at IS NULL",
@@ -1960,7 +1966,7 @@ pub fn applyKnowledgePatch(
 
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
-    try rebuildLjForEntitiesNoTransaction(db, touched_ids, null, allocator);
+    try rebuildLjForEntitiesNoTransaction(db, touched_ids, workspace_id, allocator);
     return applied_count;
 }
 
@@ -2406,7 +2412,7 @@ pub fn traverseWorkspace(
         next_frontier.clearRetainingCapacity();
 
         for (frontier.items) |node_id| {
-            const neighbors = try loadTraverseNeighbors(db, allocator, node_id, direction, filter, null);
+            const neighbors = try loadTraverseNeighbors(db, allocator, node_id, direction, filter, workspace_id);
             defer {
                 for (neighbors) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
                 allocator.free(neighbors);
@@ -3978,11 +3984,11 @@ fn loadTraverseNeighbors(
     workspace_id: ?[]const u8,
 ) ![]TraverseNeighbor {
     const sql = if (workspace_id == null) switch (direction) {
-        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 ORDER BY r.relation_id ASC",
-        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 ORDER BY r.relation_id ASC",
+        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
+        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
     } else switch (direction) {
-        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 ORDER BY r.relation_id ASC",
-        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 ORDER BY r.relation_id ASC",
+        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
+        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
     };
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
@@ -4266,6 +4272,31 @@ test "sqlite-backed graph repository performs k-hop traversal" {
     defer std.testing.allocator.free(ids);
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4 }, ids);
+}
+
+test "workspace traverse does not expand into other workspaces or deprecated edges" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "entity", "start");
+    try insertEntity(db, 2, "entity", "same-ws");
+    try db.exec("INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES (3, 'other', 'entity', 'other-ws', '{}')");
+    try insertEntity(db, 4, "entity", "deprecated-target");
+    try db.exec("UPDATE graph_entity SET deprecated_at = unixepoch() WHERE entity_id = 4");
+
+    try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "rel", .confidence = 0.9 });
+    // Cross-workspace edge: must not be expanded from the 'default' traversal.
+    try db.exec("INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence) VALUES (11, 'other', 'rel', 1, 3, 0.9)");
+    try insertRelation(db, .{ .relation_id = 12, .source_id = 1, .target_id = 4, .relation_type = "rel", .confidence = 0.9 });
+    try db.exec("UPDATE graph_relation SET deprecated_at = unixepoch() WHERE relation_id = 12");
+
+    var result = try traverseWorkspace(db, std.testing.allocator, "default", "start", .outbound, null, 3, null);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("start", result.rows[0].node_id);
+    try std.testing.expectEqualStrings("same-ws", result.rows[1].node_id);
 }
 
 test "scoped adjacency rebuild preserves untouched neighbors' rows" {
@@ -4903,8 +4934,8 @@ test "sqlite graph migration supports natural-key upserts and deprecation" {
     defer db.close();
     try db.applyStandaloneSchema();
 
-    const id1 = try upsertEntityNatural(db, std.testing.allocator, "skill", "zig", 0.7, "{\"domain\":\"systems\"}");
-    const id2 = try upsertEntityNatural(db, std.testing.allocator, "skill", "zig", 0.95, "{\"domain\":\"systems\"}");
+    const id1 = try upsertEntityNatural(db, std.testing.allocator, "default", "skill", "zig", 0.7, "{\"domain\":\"systems\"}");
+    const id2 = try upsertEntityNatural(db, std.testing.allocator, "default", "skill", "zig", 0.95, "{\"domain\":\"systems\"}");
     try std.testing.expectEqual(id1, id2);
 
     const active = try findEntitiesByType(db, std.testing.allocator, "skill");
@@ -4952,6 +4983,7 @@ test "sqlite graph migration supports learning, search, and analytics helpers" {
     const run_id = try learnFromRun(
         db,
         std.testing.allocator,
+        "default",
         "run-zig-1",
         "systems",
         "success",
@@ -4989,7 +5021,7 @@ test "sqlite graph migration supports learning, search, and analytics helpers" {
         try std.testing.expect(!std.mem.eql(u8, row.name, "orphan"));
     }
 
-    const deps = try skillDependencies(db, std.testing.allocator, try loadEntityIdByName(db, "zig"), 5, 0.0);
+    const deps = try skillDependencies(db, std.testing.allocator, try loadEntityIdByName(db, "default", "zig"), 5, 0.0);
     defer {
         for (deps) |dep| {
             std.testing.allocator.free(dep.dep_name);
@@ -5001,15 +5033,15 @@ test "sqlite graph migration supports learning, search, and analytics helpers" {
     try std.testing.expectEqual(@as(usize, 2), deps.len);
     try std.testing.expectEqualStrings("compile-time", deps[0].dep_name);
 
-    const decay = try confidenceDecay(db, try loadEntityIdByName(db, "zig"), 90);
+    const decay = try confidenceDecay(db, try loadEntityIdByName(db, "default", "zig"), 90);
     try std.testing.expect(decay >= 0.0);
 
-    const neighborhood = try entityNeighborhood(db, std.testing.allocator, try loadEntityIdByName(db, "zig"), 10, 10, 0.0);
+    const neighborhood = try entityNeighborhood(db, std.testing.allocator, try loadEntityIdByName(db, "default", "zig"), 10, 10, 0.0);
     defer std.testing.allocator.free(neighborhood);
     try std.testing.expect(std.mem.indexOf(u8, neighborhood, "\"zig\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, neighborhood, "\"outgoing\"") != null);
 
-    const inbound_neighborhood = try entityNeighborhood(db, std.testing.allocator, try loadEntityIdByName(db, "compile-time"), 10, 10, 0.0);
+    const inbound_neighborhood = try entityNeighborhood(db, std.testing.allocator, try loadEntityIdByName(db, "default", "compile-time"), 10, 10, 0.0);
     defer std.testing.allocator.free(inbound_neighborhood);
     try std.testing.expect(std.mem.indexOf(u8, inbound_neighborhood, "\"incoming\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, inbound_neighborhood, "\"zig\"") != null);
@@ -5023,6 +5055,7 @@ test "sqlite graph migration supports knowledge patch application" {
     _ = try learnFromRun(
         db,
         std.testing.allocator,
+        "default",
         "run-patch-1",
         "systems",
         "success",
@@ -5037,7 +5070,7 @@ test "sqlite graph migration supports knowledge patch application" {
         null,
     );
 
-    const zig_id = try loadEntityIdByName(db, "zig");
+    const zig_id = try loadEntityIdByName(db, "default", "zig");
     var before_out = try loadAdjacencyBitmap(db, std.testing.allocator, "graph_lj_out", zig_id);
     defer before_out.deinit();
     try std.testing.expect(before_out.contains(1));
@@ -5045,6 +5078,7 @@ test "sqlite graph migration supports knowledge patch application" {
     const patch_count = try applyKnowledgePatch(
         db,
         std.testing.allocator,
+        "default",
         "patch-1",
         "systems",
         0.8,
@@ -5092,6 +5126,7 @@ test "graph parity helpers cover bulk-name and metadata lookups, deprecation, de
     _ = try learnFromRun(
         db,
         std.testing.allocator,
+        "default",
         "run-parity-1",
         "systems",
         "success",
@@ -5136,8 +5171,8 @@ test "graph parity helpers cover bulk-name and metadata lookups, deprecation, de
     const by_decay_missing = try confidenceDecayByName(db, "no-such-entity", 90);
     try std.testing.expect(by_decay_missing == null);
 
-    const zig_id = try loadEntityIdByName(db, "zig");
-    const safety_id = try loadEntityIdByName(db, "memory-safety");
+    const zig_id = try loadEntityIdByName(db, "default", "zig");
+    const safety_id = try loadEntityIdByName(db, "default", "memory-safety");
     const before = try findRelationByIds(db, std.testing.allocator, zig_id, safety_id, "requires");
     defer if (before) |row| {
         std.testing.allocator.free(row.workspace_id);

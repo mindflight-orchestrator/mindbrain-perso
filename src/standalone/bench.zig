@@ -1551,6 +1551,7 @@ fn microGraphSingleRemove(allocator: std.mem.Allocator, node_count: usize, itera
                     _ = try graph_sqlite.applyKnowledgePatch(
                         inner.db,
                         inner.allocator,
+                        "default",
                         "bench-graph-single-remove",
                         "bench",
                         0.8,
@@ -1619,6 +1620,7 @@ fn microGraphBatchPatch(allocator: std.mem.Allocator, node_count: usize, iterati
                     _ = try graph_sqlite.applyKnowledgePatch(
                         inner.db,
                         inner.allocator,
+                        "default",
                         "bench-graph-batch",
                         "bench",
                         0.9,
