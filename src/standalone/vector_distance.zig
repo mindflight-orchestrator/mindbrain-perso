@@ -34,6 +34,9 @@ pub fn insertTopMatch(
     limit: usize,
 ) !void {
     if (limit == 0) return;
+    // A stored NaN embedding yields a NaN similarity, which breaks the heap
+    // and final-sort orderings; such candidates can never rank meaningfully.
+    if (!std.math.isFinite(candidate.similarity)) return;
     if (matches.items.len < limit) {
         try matches.append(allocator, candidate);
         siftUpWorstMatch(matches.items, matches.items.len - 1);

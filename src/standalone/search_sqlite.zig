@@ -572,6 +572,15 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
     defer doc_lengths.deinit();
     var term_doc_freq = std.AutoHashMap(u128, u64).init(allocator);
     defer term_doc_freq.deinit();
+    // Postings must be rebuilt alongside the stats: the incremental path
+    // maintains them, and the compact store's candidate generation returns
+    // nothing when a full rebuild leaves search_postings empty.
+    var term_postings = std.AutoHashMap(u128, std.ArrayList(u32)).init(allocator);
+    defer {
+        var posting_it = term_postings.iterator();
+        while (posting_it.next()) |entry| entry.value_ptr.deinit(allocator);
+        term_postings.deinit();
+    }
 
     while (true) {
         const rc = c.sqlite3_step(doc_stmt);
@@ -623,6 +632,11 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
             } else {
                 df_entry.value_ptr.* = 1;
             }
+
+            const posting_doc_id = std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange;
+            const posting_entry = try term_postings.getOrPut(key);
+            if (!posting_entry.found_existing) posting_entry.value_ptr.* = .empty;
+            try posting_entry.value_ptr.append(allocator, posting_doc_id);
         }
     }
 
@@ -636,6 +650,14 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
     while (df_it.next()) |entry| {
         const unpacked = unpackArtifactKey(entry.key_ptr.*);
         try writer.upsertTermStat(unpacked.table_id, unpacked.term_hash, entry.value_ptr.*);
+    }
+
+    var posting_write_it = term_postings.iterator();
+    while (posting_write_it.next()) |entry| {
+        const unpacked = unpackArtifactKey(entry.key_ptr.*);
+        var bitmap = try roaring.Bitmap.fromSlice(entry.value_ptr.items);
+        defer bitmap.deinit();
+        try upsertPosting(db, allocator, unpacked.table_id, unpacked.term_hash, bitmap);
     }
 }
 
@@ -1055,9 +1077,9 @@ fn reconcileTermArtifact(
 
     if (old_frequency == 0 and new_frequency > 0) {
         if (posting == null) posting = try roaring.Bitmap.empty();
-        posting.?.add(@intCast(doc_id));
+        posting.?.add(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
     } else if (old_frequency > 0 and new_frequency == 0) {
-        if (posting) |*bitmap| bitmap.remove(@intCast(doc_id));
+        if (posting) |*bitmap| bitmap.remove(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
     }
 
     if (posting) |bitmap| {
@@ -1662,7 +1684,7 @@ test "search sqlite compact snapshot reports persisted artifact counts" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.document_stats);
     try std.testing.expectEqual(@as(usize, 5), snapshot.term_stats);
     try std.testing.expectEqual(@as(usize, 6), snapshot.term_frequencies);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.postings);
+    try std.testing.expectEqual(@as(usize, 5), snapshot.postings);
     try std.testing.expectEqual(@as(usize, 2), snapshot.embeddings);
 
     const toon = try compactSearchSnapshotToon(db, std.testing.allocator);

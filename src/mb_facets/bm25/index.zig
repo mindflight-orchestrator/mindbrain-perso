@@ -51,6 +51,14 @@ pub fn indexDocument(table_id: c.Oid, doc_id: i64, text: []const u8, config_name
     // Get roaringbitmap OID once
     const roaringbitmap_oid = try getRoaringBitmapOid(allocator);
 
+    // Re-index hygiene: terms present in the previous version but absent
+    // from the new one would otherwise keep matching this doc forever and
+    // inflate their document frequency.
+    const old_doc_length = try loadExistingDocLength(table_id, doc_id, allocator);
+    if (old_doc_length != null) {
+        try purgeDocumentTerms(table_id, doc_id, allocator);
+    }
+
     // Tokenize document
     // Use helper that assumes SPI is already connected to avoid nested connections
     // Note: We don't defer free here because SPI memory context handles cleanup
@@ -59,7 +67,7 @@ pub fn indexDocument(table_id: c.Oid, doc_id: i64, text: []const u8, config_name
     if (tokens.items.len == 0) {
         // No tokens - just update document metadata with length 0
         const is_new_doc = try updateDocumentMetadata(table_id, doc_id, 0, config_name, allocator);
-        try updateStatisticsIncremental(table_id, 0, is_new_doc, allocator);
+        try updateStatisticsIncremental(table_id, 0, is_new_doc, old_doc_length, allocator);
         // Release savepoint if it was created
         if (savepoint_created) {
             const release_sql = "RELEASE SAVEPOINT bm25_index_doc";
@@ -86,7 +94,7 @@ pub fn indexDocument(table_id: c.Oid, doc_id: i64, text: []const u8, config_name
 
     if (term_freqs.count() == 0) {
         const is_new_doc = try updateDocumentMetadata(table_id, doc_id, 0, config_name, allocator);
-        try updateStatisticsIncremental(table_id, 0, is_new_doc, allocator);
+        try updateStatisticsIncremental(table_id, 0, is_new_doc, old_doc_length, allocator);
         if (savepoint_created) {
             const release_sql = "RELEASE SAVEPOINT bm25_index_doc";
             _ = c.SPI_execute(release_sql, false, 0);
@@ -135,7 +143,7 @@ pub fn indexDocument(table_id: c.Oid, doc_id: i64, text: []const u8, config_name
     const is_new_doc = try updateDocumentMetadata(table_id, doc_id, doc_length, config_name, allocator);
 
     // Update collection statistics incrementally (O(1) instead of O(n))
-    try updateStatisticsIncremental(table_id, doc_length, is_new_doc, allocator);
+    try updateStatisticsIncremental(table_id, doc_length, is_new_doc, old_doc_length, allocator);
 
     // ACID Compliance: Release savepoint on success (if it was created)
     if (savepoint_created) {
@@ -197,6 +205,44 @@ fn updateInvertedIndex(table_id: c.Oid, term_hash: i64, term_text: []const u8, d
     }
 }
 
+/// Returns the previous doc_length when the document is already indexed.
+fn loadExistingDocLength(table_id: c.Oid, doc_id: i64, allocator: std.mem.Allocator) !?i32 {
+    const query = try std.fmt.allocPrintSentinel(allocator, "SELECT doc_length FROM facets.bm25_documents WHERE table_id = {d} AND doc_id = {d}", .{ table_id, doc_id }, 0);
+    defer allocator.free(query);
+    const ret = c.SPI_execute(query.ptr, true, 1);
+    if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0 or c.SPI_tuptable == null) return null;
+    var isnull: bool = false;
+    const datum = c.SPI_getbinval(c.SPI_tuptable.*.vals[0], c.SPI_tuptable.*.tupdesc, 1, &isnull);
+    if (isnull) return 0;
+    return @intCast(c.DatumGetInt32(datum));
+}
+
+/// Removes the document's previous contributions from the inverted index
+/// (posting bitmaps and per-document frequencies).
+fn purgeDocumentTerms(table_id: c.Oid, doc_id: i64, allocator: std.mem.Allocator) !void {
+    const bitmap_query = try std.fmt.allocPrintSentinel(allocator,
+        \\UPDATE facets.bm25_index SET doc_ids = rb_remove(doc_ids, {d}::int)
+        \\WHERE table_id = {d} AND term_hash IN (
+        \\    SELECT term_hash FROM facets.bm25_term_frequencies
+        \\    WHERE table_id = {d} AND doc_id = {d}
+        \\)
+    , .{ doc_id, table_id, table_id, doc_id }, 0);
+    defer allocator.free(bitmap_query);
+    const bitmap_ret = c.SPI_execute(bitmap_query.ptr, false, 0);
+    if (bitmap_ret != c.SPI_OK_UPDATE) {
+        utils.elog(c.ERROR, "Failed to purge previous posting bitmaps for reindexed document");
+        return error.UpdateFailed;
+    }
+
+    const freq_query = try std.fmt.allocPrintSentinel(allocator, "DELETE FROM facets.bm25_term_frequencies WHERE table_id = {d} AND doc_id = {d}", .{ table_id, doc_id }, 0);
+    defer allocator.free(freq_query);
+    const freq_ret = c.SPI_execute(freq_query.ptr, false, 0);
+    if (freq_ret != c.SPI_OK_DELETE) {
+        utils.elog(c.ERROR, "Failed to purge previous term frequencies for reindexed document");
+        return error.UpdateFailed;
+    }
+}
+
 /// Update document metadata
 /// Returns true if this was a new document, false if it was an update
 fn updateDocumentMetadata(table_id: c.Oid, doc_id: i64, doc_length: i32, config_name: []const u8, allocator: std.mem.Allocator) !bool {
@@ -221,7 +267,7 @@ fn updateDocumentMetadata(table_id: c.Oid, doc_id: i64, doc_length: i32, config_
 
 /// Update collection statistics incrementally (O(1) instead of O(n))
 /// This is much faster than recalculating from scratch for each document
-fn updateStatisticsIncremental(table_id: c.Oid, new_doc_length: i32, is_new_doc: bool, allocator: std.mem.Allocator) !void {
+fn updateStatisticsIncremental(table_id: c.Oid, new_doc_length: i32, is_new_doc: bool, old_doc_length: ?i32, allocator: std.mem.Allocator) !void {
     if (is_new_doc) {
         // New document: increment count and update average incrementally
         // Formula: new_avg = (old_avg * old_count + new_length) / (old_count + 1)
@@ -243,9 +289,15 @@ fn updateStatisticsIncremental(table_id: c.Oid, new_doc_length: i32, is_new_doc:
             return error.UpdateFailed;
         }
     } else {
-        // Existing document update: just update the average
-        // This is an approximation - for exact values, use recalculateStatistics
-        const update_query = try std.fmt.allocPrintSentinel(allocator, "UPDATE facets.bm25_statistics SET last_updated = now() WHERE table_id = {d}", .{table_id}, 0);
+        // Existing document update: shift the running average by the
+        // length delta so it does not drift as documents are re-indexed.
+        const delta: i64 = @as(i64, new_doc_length) - @as(i64, old_doc_length orelse new_doc_length);
+        const update_query = try std.fmt.allocPrintSentinel(allocator,
+            \\UPDATE facets.bm25_statistics SET
+            \\    avg_document_length = avg_document_length + ({d})::float / GREATEST(total_documents, 1),
+            \\    last_updated = now()
+            \\WHERE table_id = {d}
+        , .{ delta, table_id }, 0);
         defer allocator.free(update_query);
         _ = c.SPI_execute(update_query.ptr, false, 0);
     }

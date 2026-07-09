@@ -1,42 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// AVX2-optimized hash function for lexemes
-/// Uses vectorized operations to process multiple bytes at a time
-/// Falls back to standard hash for small inputs or non-x86 targets
+/// Hash function for lexemes. Every indexing and query path must produce
+/// the same term_hash for the same lexeme; the previous "vectorized"
+/// variant folded 8-byte chunks, which is NOT byte-wise FNV-1a, so terms
+/// of 16+ chars got a different hash than tokenizer.zig's — splitting the
+/// index and silently losing recall. Databases indexed with the old
+/// chunked hash must be fully reindexed.
 pub fn hashLexemeAVX2(lexeme: []const u8) i64 {
-    // For small inputs, standard hash is faster (less overhead)
-    if (lexeme.len < 16) {
-        return hashLexemeStandard(lexeme);
-    }
-    
-    // FNV-1a 64-bit hash with vectorized optimization
-    // Process 8 bytes at a time (allows compiler to vectorize)
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    
-    var hash: u64 = FNV_OFFSET_BASIS;
-    var i: usize = 0;
-    
-    // Process 8-byte chunks (compiler can vectorize this on x86-64 with AVX2)
-    // This is faster than byte-by-byte for longer strings
-    while (i + 8 <= lexeme.len) : (i += 8) {
-        // Load 8 bytes as u64 (little-endian)
-        const chunk = std.mem.readInt(u64, lexeme[i..][0..8], .little);
-        hash ^= chunk;
-        hash *%= FNV_PRIME;
-    }
-    
-    // Handle remaining bytes (0-7 bytes)
-    while (i < lexeme.len) : (i += 1) {
-        hash ^= @as(u64, lexeme[i]);
-        hash *%= FNV_PRIME;
-    }
-    
-    // Ensure it fits in signed bigint range
-    const max_bigint: u64 = 0x7FFFFFFFFFFFFFFF;
-    const masked = hash % (max_bigint + 1);
-    return @as(i64, @intCast(masked));
+    return hashLexemeStandard(lexeme);
 }
 
 /// Standard FNV-1a hash (fallback)

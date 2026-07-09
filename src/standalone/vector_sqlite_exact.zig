@@ -172,21 +172,35 @@ pub const Repository = struct {
     }
 
     fn searchChunkVectorsAsDocuments(self: *const Repository, allocator: std.mem.Allocator, request: interfaces.VectorSearchRequest) ![]interfaces.VectorSearchMatch {
+        // Fetch more chunks than documents requested: a document whose
+        // chunks all rank highly must not occupy several result slots.
+        const chunk_limit = std.math.mul(usize, request.limit, 4) catch request.limit;
         const chunk_matches = try self.searchNearestChunks(allocator, .{
             .query_vector = request.query_vector,
-            .limit = request.limit,
+            .limit = chunk_limit,
             .metric = request.metric,
         });
         defer allocator.free(chunk_matches);
 
+        // Deduplicate by doc_id, keeping each document's best chunk score.
+        var best_by_doc = std.AutoHashMap(u64, interfaces.VectorSearchMatch).init(allocator);
+        defer best_by_doc.deinit();
+        for (chunk_matches) |match| {
+            const entry = try best_by_doc.getOrPut(match.doc_id);
+            if (!entry.found_existing or match.similarity > entry.value_ptr.similarity) {
+                entry.value_ptr.* = .{
+                    .doc_id = match.doc_id,
+                    .distance = match.distance,
+                    .similarity = match.similarity,
+                };
+            }
+        }
+
         var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
         defer matches.deinit(allocator);
-        for (chunk_matches) |match| {
-            try insertTopDocumentMatch(allocator, &matches, .{
-                .doc_id = match.doc_id,
-                .distance = match.distance,
-                .similarity = match.similarity,
-            }, request.limit);
+        var it = best_by_doc.valueIterator();
+        while (it.next()) |match| {
+            try insertTopDocumentMatch(allocator, &matches, match.*, request.limit);
         }
         sortDocumentMatches(matches.items);
         return matches.toOwnedSlice(allocator);

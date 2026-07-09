@@ -2031,6 +2031,11 @@ pub fn filterDocumentsByFacetsBitmap(
 ) !roaring.Bitmap {
     if (filters.len == 0) return try roaring.Bitmap.empty();
 
+    // Postings are chunked with the table's configured chunk_bits;
+    // reconstructing with any other shift maps doc ids to the wrong
+    // documents (false intersections, dropped matches).
+    const chunk_bits = try loadChunkBitsForTableId(db, table_id);
+
     var combined: ?roaring.Bitmap = null;
     errdefer if (combined) |*bitmap| bitmap.deinit();
 
@@ -2045,23 +2050,9 @@ pub fn filterDocumentsByFacetsBitmap(
         }
         try appendPostingsForValue(db, allocator, &postings, table_id, filter.facet_id, filter.facet_value);
 
-        var union_bm = try roaring.Bitmap.empty();
+        var union_bm = (try reconstructFacetBitmapFromPostings(allocator, chunk_bits, postings.items)) orelse
+            try roaring.Bitmap.empty();
         defer union_bm.deinit();
-        for (postings.items) |posting| {
-            const shift: u6 = @intCast(@as(u8, 16));
-            _ = shift;
-            // Postings are already in dense, chunk-local IDs; combine across chunks
-            // by treating each posting's chunk_id as a high-order offset to keep
-            // results unique. Compose into a single bitmap so AND across filters works.
-            const ids = try posting.bitmap.toArray(allocator);
-            defer allocator.free(ids);
-            const chunk_offset: u32 = posting.chunk_id;
-            for (ids) |id| {
-                const composed: u64 = (@as(u64, chunk_offset) << 16) | @as(u64, id);
-                if (composed > std.math.maxInt(u32)) continue;
-                union_bm.add(@intCast(composed));
-            }
-        }
 
         if (combined == null) {
             combined = union_bm;
@@ -2072,6 +2063,14 @@ pub fn filterDocumentsByFacetsBitmap(
     }
 
     return combined orelse try roaring.Bitmap.empty();
+}
+
+fn loadChunkBitsForTableId(db: Database, table_id: u64) !u8 {
+    const stmt = try prepare(db, "SELECT chunk_bits FROM facet_tables WHERE table_id = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    return try columnU8(stmt, 0);
 }
 
 /// Document IDs that satisfy every facet filter, parity for

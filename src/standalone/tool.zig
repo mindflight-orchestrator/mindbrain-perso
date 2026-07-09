@@ -6184,7 +6184,7 @@ fn indexContextualChunk(
 ) !void {
     if (!options.enabled) return;
     const table_id = options.search_table_id orelse return CliError.InvalidArguments;
-    const synthetic_id = chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
+    const synthetic_id = try chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
 
     try search_sqlite.syncSearchDocument(
         db,
@@ -6235,7 +6235,11 @@ fn embedContextualText(
     return try allocator.dupe(f32, response.vectors[0].values);
 }
 
-fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) u64 {
+fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) !u64 {
+    // Unchecked composition would silently collide: chunk 2^bits of doc N
+    // becomes chunk 0 of doc N+1 in the search index.
+    if (chunk_index >= (@as(u64, 1) << chunk_bits)) return error.ChunkIndexExceedsChunkBits;
+    if (doc_id > (@as(u64, std.math.maxInt(u64)) >> chunk_bits)) return error.DocIdExceedsChunkBits;
     return (doc_id << chunk_bits) | @as(u64, chunk_index);
 }
 

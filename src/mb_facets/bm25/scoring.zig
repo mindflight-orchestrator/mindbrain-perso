@@ -60,7 +60,10 @@ pub fn calculateBM25ByHash(
     b: f64
 ) f64 {
     var score: f64 = 0.0;
-    const avgdl = stats.avg_document_length;
+    // Guard against a missing/empty statistics row: avgdl == 0 turns the
+    // denominator into inf (score 0) and doc_len == 0 into 0/0 == NaN.
+    var avgdl = stats.avg_document_length;
+    if (!(avgdl > 0.0)) avgdl = 1.0;
     const doc_len = @as(f64, @floatFromInt(doc_length));
     
     for (query_term_hashes) |term_hash| {

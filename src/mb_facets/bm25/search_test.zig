@@ -185,3 +185,29 @@ test "HashMap to ArrayList conversion preserves data" {
 
     try std.testing.expectEqual(@as(usize, 3), results.items.len);
 }
+
+test "lexeme hash parity across tokenizer implementations for 1..64 char inputs" {
+    // tokenizer.zig (SPI-coupled, not importable here) hashes with
+    // std.hash.Fnv1a_64 masked into the signed bigint range; the native and
+    // pure tokenizers route through avx2_utils. All indexing and query paths
+    // must agree for every length or the term index silently splits.
+    const avx2_utils = @import("avx2_utils.zig");
+
+    var buf: [64]u8 = undefined;
+    var len: usize = 1;
+    while (len <= buf.len) : (len += 1) {
+        for (0..len) |i| {
+            buf[i] = 'a' + @as(u8, @intCast((i * 7 + len) % 26));
+        }
+        const lexeme = buf[0..len];
+
+        const reference_u64 = std.hash.Fnv1a_64.hash(lexeme);
+        const max_bigint: u64 = 0x7FFFFFFFFFFFFFFF;
+        const reference: i64 = @intCast(reference_u64 % (max_bigint + 1));
+
+        // tokenizer_native routes through avx2_utils.hashLexemeAVX2 as well,
+        // but imports pg headers and cannot be compiled in this suite.
+        try std.testing.expectEqual(reference, avx2_utils.hashLexemeAVX2(lexeme));
+        try std.testing.expectEqual(reference, tokenizer_pure.hashLexeme(lexeme));
+    }
+}

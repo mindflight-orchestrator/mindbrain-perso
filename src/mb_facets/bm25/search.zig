@@ -182,7 +182,8 @@ fn calculateDocumentScore(table_id: c.Oid, doc_id: i64, expanded_hashes: []i64, 
 
     // Calculate BM25 score manually using stack arrays
     var score: f64 = 0.0;
-    const avgdl = stats.avg_document_length;
+    var avgdl = stats.avg_document_length;
+    if (!(avgdl > 0.0)) avgdl = 1.0;
     const doc_len_f = @as(f64, @floatFromInt(doc_length));
 
     // For each query term hash, calculate BM25 component

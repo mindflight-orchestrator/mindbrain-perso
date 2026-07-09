@@ -467,7 +467,7 @@ pub const Pipeline = struct {
             }
 
             if (opts.chunk_bm25_table_id) |chunk_tid| {
-                const synthetic_id = chunkSyntheticId(opts.doc_id, ch.index, opts.chunk_bits);
+                const synthetic_id = try chunkSyntheticId(opts.doc_id, ch.index, opts.chunk_bits);
                 try self.search.upsertDocument(.{
                     .table_id = chunk_tid,
                     .doc_id = synthetic_id,
@@ -601,7 +601,7 @@ pub const Pipeline = struct {
                 const language = try facet_sqlite.dupeColumnText(self.allocator, stmt, 3);
                 defer self.allocator.free(language);
 
-                const synthetic_id = chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
+                const synthetic_id = try chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
                 try self.search.upsertDocument(.{
                     .table_id = chunk_tid,
                     .doc_id = synthetic_id,
@@ -965,7 +965,11 @@ pub const Pipeline = struct {
     }
 };
 
-fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) u64 {
+fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) !u64 {
+    // Unchecked composition would silently collide: chunk 2^bits of doc N
+    // becomes chunk 0 of doc N+1 in the search index.
+    if (chunk_index >= (@as(u64, 1) << chunk_bits)) return error.ChunkIndexExceedsChunkBits;
+    if (doc_id > (@as(u64, std.math.maxInt(u64)) >> chunk_bits)) return error.DocIdExceedsChunkBits;
     return (doc_id << chunk_bits) | @as(u64, chunk_index);
 }
 
