@@ -364,11 +364,14 @@ pub const DurableRepository = struct {
         var result = try roaring.Bitmap.empty();
         errdefer result.deinit();
 
-        for (edge_ids) |edge_id| {
-            const relation = try loadRelation(self.db.*, allocator, edge_id) orelse continue;
-            defer allocator.free(relation.relation_type);
+        const relations = try loadRelationsBatch(self.db.*, allocator, edge_ids);
+        defer {
+            for (relations) |relation| allocator.free(relation.relation_type);
+            allocator.free(relations);
+        }
+        for (relations) |relation| {
             if (!passesFilter(relation, filter)) continue;
-            result.add(edge_id);
+            result.add(relation.relation_id);
         }
         return result;
     }
@@ -386,9 +389,12 @@ pub const DurableRepository = struct {
         var result = try roaring.Bitmap.empty();
         errdefer result.deinit();
 
-        for (edge_ids) |edge_id| {
-            const relation = try loadRelation(self.db.*, allocator, edge_id) orelse continue;
-            defer allocator.free(relation.relation_type);
+        const relations = try loadRelationsBatch(self.db.*, allocator, edge_ids);
+        defer {
+            for (relations) |relation| allocator.free(relation.relation_type);
+            allocator.free(relations);
+        }
+        for (relations) |relation| {
             if (frontier.contains(relation.source_id)) result.add(relation.target_id);
             if (frontier.contains(relation.target_id)) result.add(relation.source_id);
         }
@@ -408,10 +414,12 @@ pub const DurableRepository = struct {
         var steps = std.ArrayList(interfaces.GraphNeighborStep).empty;
         defer steps.deinit(allocator);
 
-        for (edge_ids) |edge_id| {
-            const relation = try loadRelation(self.db.*, allocator, edge_id) orelse continue;
-            defer allocator.free(relation.relation_type);
-
+        const relations = try loadRelationsBatch(self.db.*, allocator, edge_ids);
+        defer {
+            for (relations) |relation| allocator.free(relation.relation_type);
+            allocator.free(relations);
+        }
+        for (relations) |relation| {
             if (frontier.contains(relation.source_id)) {
                 try steps.append(allocator, .{
                     .from_node = relation.source_id,
@@ -1398,15 +1406,39 @@ pub fn entityFtsSearch(
 ) ![]EntitySearchResult {
     if (limit == 0) return allocator.alloc(EntitySearchResult, 0);
 
-    const stmt = try prepare(
-        db,
-        "SELECT entity_id, entity_type, name, confidence, metadata_json, COALESCE(json_extract(metadata_json, '$.domain'), '') FROM graph_entity WHERE deprecated_at IS NULL AND confidence >= ?1 ORDER BY confidence DESC, name ASC",
-    );
-    defer finalize(stmt);
-    if (c.sqlite3_bind_double(stmt, 1, min_confidence) != c.SQLITE_OK) return error.BindFailed;
-
     const query_score_terms = try splitSearchTerms(allocator, query);
     defer deinitStringSlice(allocator, query_score_terms);
+    if (query_score_terms.len == 0) return allocator.alloc(EntitySearchResult, 0);
+
+    // SQL prefilter: a row can only score > 0 when at least one query term
+    // occurs in one of the scored fields, so let SQLite skip the rest
+    // instead of duping + tokenizing every entity on every search. The
+    // candidate cap bounds pathological matches; ranking stays in Zig.
+    const max_prefilter_terms: usize = 8;
+    const term_count = @min(query_score_terms.len, max_prefilter_terms);
+    var sql_buf = std.ArrayList(u8).empty;
+    defer sql_buf.deinit(allocator);
+    try sql_buf.appendSlice(allocator, "SELECT entity_id, entity_type, name, confidence, metadata_json, COALESCE(json_extract(metadata_json, '$.domain'), '') FROM graph_entity WHERE deprecated_at IS NULL AND confidence >= ?1 AND (");
+    for (0..term_count) |term_index| {
+        if (term_index != 0) try sql_buf.appendSlice(allocator, " OR ");
+        const clause = try std.fmt.allocPrint(
+            allocator,
+            "name LIKE ?{d} OR entity_type LIKE ?{d} OR metadata_json LIKE ?{d}",
+            .{ term_index + 2, term_index + 2, term_index + 2 },
+        );
+        defer allocator.free(clause);
+        try sql_buf.appendSlice(allocator, clause);
+    }
+    try sql_buf.appendSlice(allocator, ") ORDER BY confidence DESC, name ASC LIMIT 5000");
+
+    const stmt = try prepare(db, sql_buf.items);
+    defer finalize(stmt);
+    if (c.sqlite3_bind_double(stmt, 1, min_confidence) != c.SQLITE_OK) return error.BindFailed;
+    for (0..term_count) |term_index| {
+        const pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{query_score_terms[term_index]});
+        defer allocator.free(pattern);
+        try bindText(stmt, @intCast(term_index + 2), pattern);
+    }
 
     var results = std.ArrayList(EntitySearchResult).empty;
     defer {
@@ -1499,18 +1531,9 @@ pub fn marketplaceSearch(
     limit: usize,
 ) ![]MarketplaceResult {
     const marketplace_edge_types = [_][]const u8{ "related_to", "requires", "improves", "supersedes", "contains" };
-    const seeds = try entityFtsSearch(db, allocator, query, null, domain_filter, min_confidence, 200);
-    defer {
-        for (seeds) |seed| {
-            allocator.free(seed.name);
-            allocator.free(seed.entity_type);
-            allocator.free(seed.metadata_json);
-        }
-        allocator.free(seeds);
-    }
-
-    if (seeds.len == 0) return allocator.alloc(MarketplaceResult, 0);
-
+    // Single scan: the seeds are the confidence-filtered prefix of the same
+    // ranked candidate list; a second entityFtsSearch pass re-scanned and
+    // re-tokenized the whole store.
     const candidate_hits = try entityFtsSearch(db, allocator, query, null, domain_filter, 0.0, 1000);
     defer {
         for (candidate_hits) |hit| {
@@ -1521,12 +1544,20 @@ pub fn marketplaceSearch(
         allocator.free(candidate_hits);
     }
 
+    var seed_ids_list = std.ArrayList(u32).empty;
+    defer seed_ids_list.deinit(allocator);
+    for (candidate_hits) |hit| {
+        if (hit.confidence >= min_confidence) {
+            try seed_ids_list.append(allocator, hit.entity_id);
+            if (seed_ids_list.items.len >= 200) break;
+        }
+    }
+    if (seed_ids_list.items.len == 0) return allocator.alloc(MarketplaceResult, 0);
+
     var runtime = try loadRuntime(db, allocator);
     defer runtime.deinit();
 
-    var seed_ids = try allocator.alloc(u32, seeds.len);
-    defer allocator.free(seed_ids);
-    for (seeds, 0..) |seed, index| seed_ids[index] = seed.entity_id;
+    const seed_ids = seed_ids_list.items;
 
     var reachable = try runtime.kHops(allocator, seed_ids, max_hops, .{ .edge_types = marketplace_edge_types[0..] });
     defer reachable.deinit();
@@ -1534,26 +1565,15 @@ pub fn marketplaceSearch(
     const reachable_ids = try reachable.toArray(allocator);
     defer allocator.free(reachable_ids);
 
-    var reachable_set = std.AutoHashMap(u32, void).init(allocator);
-    defer reachable_set.deinit();
-    for (reachable_ids) |id| _ = try reachable_set.put(id, {});
-
     var seed_set = std.AutoHashMap(u32, void).init(allocator);
     defer seed_set.deinit();
-    for (seeds) |seed| _ = try seed_set.put(seed.entity_id, {});
+    for (seed_ids) |id| _ = try seed_set.put(id, {});
 
     var candidate_rank = std.AutoHashMap(u32, f32).init(allocator);
     defer candidate_rank.deinit();
     for (candidate_hits) |hit| {
         _ = try candidate_rank.put(hit.entity_id, hit.fts_rank);
     }
-
-    const stmt = try prepare(
-        db,
-        "SELECT entity_id, name, entity_type, confidence, metadata_json, COALESCE((SELECT total_degree FROM graph_entity_degree d WHERE d.entity_id = graph_entity.entity_id), 0) FROM graph_entity WHERE deprecated_at IS NULL AND confidence >= ?1 ORDER BY confidence DESC, name ASC",
-    );
-    defer finalize(stmt);
-    if (c.sqlite3_bind_double(stmt, 1, min_confidence) != c.SQLITE_OK) return error.BindFailed;
 
     var results = std.ArrayList(MarketplaceResult).empty;
     defer {
@@ -1565,42 +1585,65 @@ pub fn marketplaceSearch(
         results.deinit(allocator);
     }
 
-    while (true) {
-        const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
+    // Fetch only the reachable candidates in id batches; the previous pass
+    // scanned every entity (with a correlated degree subquery per row) and
+    // discarded all but the reachable ones in Zig.
+    var chunk_start: usize = 0;
+    while (chunk_start < reachable_ids.len) {
+        const chunk_end = @min(chunk_start + 500, reachable_ids.len);
+        const chunk = reachable_ids[chunk_start..chunk_end];
+        chunk_start = chunk_end;
 
-        const entity_id = try columnU32(stmt, 0);
-        if (!reachable_set.contains(entity_id)) continue;
-
-        const name = try dupeColumnText(allocator, stmt, 1);
-        const entity_type = try dupeColumnText(allocator, stmt, 2);
-        const metadata_json = try dupeColumnText(allocator, stmt, 4);
-        const fts_rank = candidate_rank.get(entity_id) orelse 0.0;
-        const confidence: f32 = @floatCast(c.sqlite3_column_double(stmt, 3));
-        const total_degree: f32 = @floatCast(c.sqlite3_column_double(stmt, 5));
-        const degree_log = std.math.log(f64, std.math.e, @as(f64, total_degree) + 1.0);
-        const hub_score: f32 = @floatCast(@min(1.0, degree_log / 4.0));
-        const direct_boost: f32 = if (seed_set.contains(entity_id)) 1.5 else 1.0;
-        const hub_boost: f32 = @floatCast(@min(0.5, degree_log / 8.0));
-        const composite_score = (if (fts_rank > 0) fts_rank else 0.1) * confidence * direct_boost * (1.0 + hub_boost);
-        if (composite_score <= 0) {
-            allocator.free(name);
-            allocator.free(entity_type);
-            allocator.free(metadata_json);
-            continue;
+        var sql_buf = std.ArrayList(u8).empty;
+        defer sql_buf.deinit(allocator);
+        try sql_buf.appendSlice(allocator, "SELECT e.entity_id, e.name, e.entity_type, e.confidence, e.metadata_json, COALESCE(d.total_degree, 0) FROM graph_entity e LEFT JOIN graph_entity_degree d ON d.entity_id = e.entity_id WHERE e.deprecated_at IS NULL AND e.confidence >= ?1 AND e.entity_id IN (");
+        for (chunk, 0..) |id, index| {
+            if (index != 0) try sql_buf.appendSlice(allocator, ",");
+            const id_text = try std.fmt.allocPrint(allocator, "{d}", .{id});
+            defer allocator.free(id_text);
+            try sql_buf.appendSlice(allocator, id_text);
         }
-        try results.append(allocator, .{
-            .entity_id = entity_id,
-            .name = name,
-            .entity_type = entity_type,
-            .confidence = confidence,
-            .fts_rank = fts_rank,
-            .is_direct_match = seed_set.contains(entity_id),
-            .hub_score = hub_score,
-            .composite_score = composite_score,
-            .metadata_json = metadata_json,
-        });
+        try sql_buf.appendSlice(allocator, ")");
+
+        const stmt = try prepare(db, sql_buf.items);
+        defer finalize(stmt);
+        if (c.sqlite3_bind_double(stmt, 1, min_confidence) != c.SQLITE_OK) return error.BindFailed;
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            const entity_id = try columnU32(stmt, 0);
+            const name = try dupeColumnText(allocator, stmt, 1);
+            const entity_type = try dupeColumnText(allocator, stmt, 2);
+            const metadata_json = try dupeColumnText(allocator, stmt, 4);
+            const fts_rank = candidate_rank.get(entity_id) orelse 0.0;
+            const confidence: f32 = @floatCast(c.sqlite3_column_double(stmt, 3));
+            const total_degree: f32 = @floatCast(c.sqlite3_column_double(stmt, 5));
+            const degree_log = std.math.log(f64, std.math.e, @as(f64, total_degree) + 1.0);
+            const hub_score: f32 = @floatCast(@min(1.0, degree_log / 4.0));
+            const direct_boost: f32 = if (seed_set.contains(entity_id)) 1.5 else 1.0;
+            const hub_boost: f32 = @floatCast(@min(0.5, degree_log / 8.0));
+            const composite_score = (if (fts_rank > 0) fts_rank else 0.1) * confidence * direct_boost * (1.0 + hub_boost);
+            if (composite_score <= 0) {
+                allocator.free(name);
+                allocator.free(entity_type);
+                allocator.free(metadata_json);
+                continue;
+            }
+            try results.append(allocator, .{
+                .entity_id = entity_id,
+                .name = name,
+                .entity_type = entity_type,
+                .confidence = confidence,
+                .fts_rank = fts_rank,
+                .is_direct_match = seed_set.contains(entity_id),
+                .hub_score = hub_score,
+                .composite_score = composite_score,
+                .metadata_json = metadata_json,
+            });
+        }
     }
 
     std.mem.sort(MarketplaceResult, results.items, {}, struct {
@@ -2227,9 +2270,17 @@ fn rebuildLjForEntitiesNoTransaction(
 
 pub fn refreshEntityDegree(db: Database) !void {
     try db.exec("DELETE FROM graph_entity_degree");
+    // Two GROUP BY passes over graph_relation instead of four correlated
+    // COUNT(*) subqueries per entity (out-degree was even computed twice).
     const stmt = try prepare(
         db,
-        "INSERT INTO graph_entity_degree(entity_id, name, entity_type, confidence, out_degree, in_degree, total_degree) " ++ "SELECT e.entity_id, e.name, e.entity_type, e.confidence, " ++ "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.source_id = e.entity_id AND r.deprecated_at IS NULL), 0), " ++ "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.target_id = e.entity_id AND r.deprecated_at IS NULL), 0), " ++ "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.source_id = e.entity_id AND r.deprecated_at IS NULL), 0) + " ++ "COALESCE((SELECT COUNT(*) FROM graph_relation r WHERE r.target_id = e.entity_id AND r.deprecated_at IS NULL), 0) " ++ "FROM graph_entity e WHERE e.deprecated_at IS NULL",
+        "INSERT INTO graph_entity_degree(entity_id, name, entity_type, confidence, out_degree, in_degree, total_degree) " ++
+            "SELECT e.entity_id, e.name, e.entity_type, e.confidence, " ++
+            "COALESCE(o.cnt, 0), COALESCE(i.cnt, 0), COALESCE(o.cnt, 0) + COALESCE(i.cnt, 0) " ++
+            "FROM graph_entity e " ++
+            "LEFT JOIN (SELECT source_id AS entity_id, COUNT(*) AS cnt FROM graph_relation WHERE deprecated_at IS NULL GROUP BY source_id) o ON o.entity_id = e.entity_id " ++
+            "LEFT JOIN (SELECT target_id AS entity_id, COUNT(*) AS cnt FROM graph_relation WHERE deprecated_at IS NULL GROUP BY target_id) i ON i.entity_id = e.entity_id " ++
+            "WHERE e.deprecated_at IS NULL",
     );
     defer finalize(stmt);
     try stepDone(stmt);
@@ -2498,64 +2549,32 @@ pub fn shortestPathToonWorkspace(
     edge_types: ?[]const []const u8,
     max_depth: usize,
 ) ![]u8 {
-    var runtime = try loadRuntime(db, allocator);
-    defer runtime.deinit();
-
     const source = try loadTraverseEntityByRef(db, allocator, workspace_id, source_ref);
     defer deinitTraverseEntitySummary(allocator, source);
     const target = try loadTraverseEntityByRef(db, allocator, workspace_id, target_ref);
     defer deinitTraverseEntitySummary(allocator, target);
 
-    const runtime_path = (try runtime.shortestPath(
+    // The SQL BFS is O(visited nodes) and workspace-scoped; the previous
+    // in-memory runtime path deserialized every relation and adjacency
+    // bitmap in the database per request and could route through other
+    // workspaces' edges.
+    var sql_path: ?[]graph_store.PathEdge = null;
+    defer if (sql_path) |path| allocator.free(path);
+    sql_path = try shortestPathSqlFallback(
+        db,
         allocator,
+        workspace_id,
         source.entity_id,
         target.entity_id,
-        .{ .edge_types = edge_types },
+        edge_types,
         max_depth,
-    )) orelse null;
-
-    var fallback_path: ?[]graph_store.PathEdge = null;
-    defer if (fallback_path) |path| allocator.free(path);
-
-    var result: GraphPathResult = if (runtime_path) |path| result: {
-        defer allocator.free(path);
-        break :result buildPathResult(db, allocator, path) catch |err| switch (err) {
-            error.MissingRow => {
-                fallback_path = try shortestPathSqlFallback(
-                    db,
-                    allocator,
-                    workspace_id,
-                    source.entity_id,
-                    target.entity_id,
-                    edge_types,
-                    max_depth,
-                );
-                const fallback = fallback_path orelse {
-                    const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
-                    defer toon_exports.deinitOwnedValue(allocator, root);
-                    return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
-                };
-                break :result try buildPathResult(db, allocator, fallback);
-            },
-            else => return err,
-        };
-    } else result: {
-        fallback_path = try shortestPathSqlFallback(
-            db,
-            allocator,
-            workspace_id,
-            source.entity_id,
-            target.entity_id,
-            edge_types,
-            max_depth,
-        );
-        const fallback = fallback_path orelse {
-            const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
-            defer toon_exports.deinitOwnedValue(allocator, root);
-            return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
-        };
-        break :result try buildPathResult(db, allocator, fallback);
+    );
+    const path = sql_path orelse {
+        const root = try buildGraphPathValue(allocator, source_ref, target_ref, null);
+        defer toon_exports.deinitOwnedValue(allocator, root);
+        return try toon_exports.encodeValueAlloc(allocator, root, toon_exports.default_options);
     };
+    var result = try buildPathResult(db, allocator, path);
     defer result.deinit(allocator);
 
     const root = try buildGraphPathValue(allocator, source_ref, target_ref, result);
@@ -3598,6 +3617,54 @@ const TraverseNeighbor = struct {
     entity: TraverseEntitySummary,
 };
 
+/// Batch variant of loadRelation: one IN(...) statement per 500 ids
+/// instead of one prepared statement per edge. Caller frees each
+/// relation_type and the slice.
+fn loadRelationsBatch(db: Database, allocator: std.mem.Allocator, relation_ids: []const u32) ![]graph_store.RelationRecord {
+    var rows = std.ArrayList(graph_store.RelationRecord).empty;
+    errdefer {
+        for (rows.items) |row| allocator.free(row.relation_type);
+        rows.deinit(allocator);
+    }
+
+    var chunk_start: usize = 0;
+    while (chunk_start < relation_ids.len) {
+        const chunk_end = @min(chunk_start + 500, relation_ids.len);
+        const chunk = relation_ids[chunk_start..chunk_end];
+        chunk_start = chunk_end;
+
+        var sql_buf = std.Io.Writer.Allocating.init(allocator);
+        defer sql_buf.deinit();
+        try sql_buf.writer.writeAll("SELECT relation_id, source_id, target_id, relation_type, valid_from_unix, valid_to_unix, confidence FROM graph_relation WHERE relation_id IN (");
+        for (chunk, 0..) |relation_id, index| {
+            if (index > 0) try sql_buf.writer.writeByte(',');
+            try sql_buf.writer.print("{d}", .{relation_id});
+        }
+        try sql_buf.writer.writeByte(')');
+        const sql = try sql_buf.toOwnedSlice();
+        defer allocator.free(sql);
+
+        const stmt = try prepare(db, sql);
+        defer finalize(stmt);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            try rows.append(allocator, .{
+                .relation_id = try columnU32(stmt, 0),
+                .source_id = try columnU32(stmt, 1),
+                .target_id = try columnU32(stmt, 2),
+                .relation_type = try dupeColumnText(allocator, stmt, 3),
+                .valid_from_unix = columnOptionalI64(stmt, 4),
+                .valid_to_unix = columnOptionalI64(stmt, 5),
+                .confidence = @floatCast(c.sqlite3_column_double(stmt, 6)),
+            });
+        }
+    }
+
+    return rows.toOwnedSlice(allocator);
+}
+
 fn loadRelation(db: Database, allocator: std.mem.Allocator, relation_id: u32) !?graph_store.RelationRecord {
     const stmt = try prepare(db, "SELECT relation_id, source_id, target_id, relation_type, valid_from_unix, valid_to_unix, confidence FROM graph_relation WHERE relation_id = ?1");
     defer finalize(stmt);
@@ -3868,9 +3935,12 @@ fn appendStepsForEdges(
     edge_ids: []const u32,
     filter: interfaces.GraphEdgeFilter,
 ) !void {
-    for (edge_ids) |edge_id| {
-        const relation = try loadRelation(db, allocator, edge_id) orelse continue;
-        defer allocator.free(relation.relation_type);
+    const relations = try loadRelationsBatch(db, allocator, edge_ids);
+    defer {
+        for (relations) |relation| allocator.free(relation.relation_type);
+        allocator.free(relations);
+    }
+    for (relations) |relation| {
         if (!passesFilter(relation, filter)) continue;
 
         if (frontier.contains(relation.source_id)) {

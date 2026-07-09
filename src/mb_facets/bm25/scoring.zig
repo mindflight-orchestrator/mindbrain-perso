@@ -94,7 +94,18 @@ pub fn hashTerm(term: []const u8) i64 {
 /// This version avoids all dynamic allocations during SPI operations
 pub fn loadStatistics(
     table_id: c.Oid,
-    allocator: std.mem.Allocator
+    allocator: std.mem.Allocator,
+) !CollectionStats {
+    return loadStatisticsForTerms(table_id, null, allocator);
+}
+
+/// Scoring only ever looks up the query's own term hashes; loading the
+/// document frequency of the entire vocabulary materialized every posting
+/// bitmap's cardinality on every search/score call.
+pub fn loadStatisticsForTerms(
+    table_id: c.Oid,
+    term_hashes: ?[]const i64,
+    allocator: std.mem.Allocator,
 ) !CollectionStats {
     var stats = CollectionStats.init(allocator);
     
@@ -140,10 +151,23 @@ pub fn loadStatistics(
     }
     
     // Load document frequencies - count first, then allocate and fill
+    var term_filter_buf = std.ArrayList(u8).empty;
+    defer term_filter_buf.deinit(allocator);
+    if (term_hashes) |hashes| {
+        try term_filter_buf.appendSlice(allocator, " AND term_hash IN (");
+        for (hashes, 0..) |hash, index| {
+            if (index != 0) try term_filter_buf.append(allocator, ',');
+            var num_buf: [24]u8 = undefined;
+            const text = try std.fmt.bufPrint(&num_buf, "{d}", .{hash});
+            try term_filter_buf.appendSlice(allocator, text);
+        }
+        try term_filter_buf.append(allocator, ')');
+    }
+
     const count_query = try std.fmt.allocPrintSentinel(
         allocator,
-        "SELECT COUNT(*) FROM facets.bm25_index WHERE table_id = {d}",
-        .{table_id}, 0);
+        "SELECT COUNT(*) FROM facets.bm25_index WHERE table_id = {d}{s}",
+        .{ table_id, term_filter_buf.items }, 0);
     defer allocator.free(count_query);
     
     const count_ret = c.SPI_execute(count_query.ptr, true, 1);
@@ -182,8 +206,8 @@ pub fn loadStatistics(
     // Load document frequencies
     const freq_query = try std.fmt.allocPrintSentinel(
         allocator,
-        "SELECT term_hash, rb_cardinality(doc_ids)::bigint AS doc_count FROM facets.bm25_index WHERE table_id = {d}",
-        .{table_id}, 0);
+        "SELECT term_hash, rb_cardinality(doc_ids)::bigint AS doc_count FROM facets.bm25_index WHERE table_id = {d}{s}",
+        .{ table_id, term_filter_buf.items }, 0);
     defer allocator.free(freq_query);
     
     const freq_ret = c.SPI_execute(freq_query.ptr, true, 0);

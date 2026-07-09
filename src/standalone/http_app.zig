@@ -1575,19 +1575,32 @@ pub const MindbrainHttpApp = struct {
             search_request.collection_id,
         )) orelse return error.BadRequest;
 
+        // Workspace scoping happens inside the candidate queries for the
+        // shared agent-facts table: post-filtering after top-k truncation
+        // lost recall for workspaces ranked below other tenants and probed
+        // agent_facts once per candidate.
         const candidate_limit = @min(@as(usize, 1000), search_request.limit * 4);
-        const raw_bm25_matches = if (search_request.query.len > 0)
-            try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit)
+        const bm25_matches = if (search_request.query.len == 0)
+            try allocator.alloc(search_sqlite.Bm25Match, 0)
+        else if (table_id == 1)
+            try search_sqlite.searchFts5Bm25Workspace(db, allocator, table_id, search_request.workspace_id, search_request.query, candidate_limit)
         else
-            try allocator.alloc(search_sqlite.Bm25Match, 0);
-        defer allocator.free(raw_bm25_matches);
-        const bm25_matches = if (table_id == 1)
-            try filterBm25MatchesByWorkspace(db, allocator, raw_bm25_matches, search_request.workspace_id)
-        else
-            raw_bm25_matches;
-        defer if (table_id == 1) allocator.free(bm25_matches);
+            try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit);
+        defer allocator.free(bm25_matches);
 
-        const raw_vector_matches = if (query_vector_f32.len > 0)
+        const vector_matches = if (query_vector_f32.len == 0)
+            try allocator.alloc(interfaces.VectorSearchMatch, 0)
+        else if (table_id == 1)
+            try search_sqlite.searchEmbeddingExactTopKWorkspace(
+                db,
+                allocator,
+                table_id,
+                search_request.workspace_id,
+                query_vector_f32,
+                candidate_limit,
+                .cosine,
+            )
+        else
             try search_sqlite.searchEmbeddingExactTopK(
                 db,
                 allocator,
@@ -1595,15 +1608,8 @@ pub const MindbrainHttpApp = struct {
                 query_vector_f32,
                 candidate_limit,
                 .cosine,
-            )
-        else
-            try allocator.alloc(interfaces.VectorSearchMatch, 0);
-        defer allocator.free(raw_vector_matches);
-        const vector_matches = if (table_id == 1)
-            try filterVectorMatchesByWorkspace(db, allocator, raw_vector_matches, search_request.workspace_id)
-        else
-            raw_vector_matches;
-        defer if (table_id == 1) allocator.free(vector_matches);
+            );
+        defer allocator.free(vector_matches);
 
         const matches = try hybrid_search.fusePreScored(
             allocator,

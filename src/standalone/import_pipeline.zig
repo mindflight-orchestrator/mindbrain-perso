@@ -76,6 +76,10 @@ pub const Pipeline = struct {
     /// When set together with `workspace_id`, ingestDocument also persists
     /// the document into `documents_raw` for this collection.
     collection_id: ?[]const u8 = null,
+    /// Bulk mode: queue facet deltas without merging per document; the
+    /// caller merges once at the end (see reindexFacets). A per-document
+    /// merge rewrites each posting blob once per document touching it.
+    defer_facet_merges: bool = false,
 
     // ---- Legacy registration / ingest (unchanged signatures) -------------
 
@@ -645,6 +649,12 @@ pub const Pipeline = struct {
         try facet_sqlite.bindText(stmt, 1, workspace_id);
         try facet_sqlite.bindText(stmt, 2, collection_id);
 
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
+        const previous_defer = self.defer_facet_merges;
+        self.defer_facet_merges = true;
+        defer self.defer_facet_merges = previous_defer;
+
         var current_doc: ?u64 = null;
         var pending = std.ArrayList(FacetAssignment).empty;
         defer {
@@ -685,6 +695,8 @@ pub const Pipeline = struct {
             total += 1;
         }
         if (current_doc) |cd| try flushFacetGroup(self, table_id, cd, &pending);
+        _ = try facet_sqlite.mergeDeltasSafe(self.db.*, table_id, null);
+        try tx.commit();
         return total;
     }
 
@@ -1036,7 +1048,11 @@ fn syncFacetAssignments(self: *Pipeline, table_id: u64, doc_id: u64, facets: []c
         };
     }
 
-    _ = try facet_sqlite.syncFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    if (self.defer_facet_merges) {
+        try facet_sqlite.queueFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    } else {
+        _ = try facet_sqlite.syncFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    }
 
     for (facets) |facet| {
         try self.facets.addPosting(table_id, facet.facet_id, facet.facet_value, chunk_id, &.{in_chunk_id});

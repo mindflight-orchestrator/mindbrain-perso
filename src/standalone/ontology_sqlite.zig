@@ -456,6 +456,7 @@ pub fn coverageReport(
     workspace_id: []const u8,
     entity_types: ?[]const []const u8,
 ) !CoverageReport {
+    const facet_rows_total = try countWorkspaceFacetRows(db, workspace_id);
     const facets = try loadWorkspaceFacets(db, allocator, workspace_id);
     defer {
         for (facets) |row| deinitFacetRecord(allocator, row);
@@ -468,6 +469,14 @@ pub fn coverageReport(
             allocator.free(entity.entity_type);
         }
         allocator.free(graph_entities);
+    }
+
+    // Name -> record map: the per-facet linear scans over all entities made
+    // the report O(facets x entities).
+    var entities_by_name = std.StringHashMap(GraphEntityRecord).init(allocator);
+    defer entities_by_name.deinit();
+    for (graph_entities) |entity| {
+        _ = try entities_by_name.put(entity.name, entity);
     }
 
     const projection_rows = try loadWorkspaceProjectionCount(db, workspace_id);
@@ -493,7 +502,7 @@ pub fn coverageReport(
         total_nodes += 1;
         const node_id = try extractFacetIdentity(allocator, facet);
         defer allocator.free(node_id);
-        if (containsGraphEntity(graph_entities, node_id)) {
+        if (entities_by_name.contains(node_id)) {
             covered += 1;
             continue;
         }
@@ -504,7 +513,7 @@ pub fn coverageReport(
         defer if (criticality) |value| allocator.free(value);
         const gap_label = label orelse facet.content;
         const gap_entity_type = maybe_entity_type orelse "unknown";
-        const decayed_confidence = if (findGraphEntityId(graph_entities, node_id, gap_label, gap_entity_type)) |entity_id|
+        const decayed_confidence = if (findGraphEntityIdByName(&entities_by_name, node_id, gap_label, gap_entity_type)) |entity_id|
             @as(f64, @floatCast(try graph_sqlite.confidenceDecay(db, entity_id, 90)))
         else
             null;
@@ -530,7 +539,7 @@ pub fn coverageReport(
             .covered_nodes = covered,
             .total_nodes = total_nodes,
             .graph_entities = graph_entities.len,
-            .facet_rows = facets.len,
+            .facet_rows = facet_rows_total,
             .projection_rows = projection_rows,
             .coverage_ratio = if (total_nodes == 0) null else @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_nodes)),
         },
@@ -696,8 +705,18 @@ fn loadAllProjections(db: Database, allocator: std.mem.Allocator) ![]ProjectionR
     return rows.toOwnedSlice(allocator);
 }
 
+fn countWorkspaceFacetRows(db: Database, workspace_id: []const u8) !usize {
+    const stmt = try prepare(db, "SELECT COUNT(*) FROM agent_facts WHERE workspace_id = ?1");
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
 fn loadWorkspaceFacets(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) ![]FacetRecord {
-    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM agent_facts WHERE workspace_id = ?1");
+    // Coverage only consumes ontology/taxonomy rows; filtering in SQL uses
+    // the (workspace_id, schema_id) index instead of duping every fact.
+    const stmt = try prepare(db, "SELECT id, schema_id, content, facets_json, workspace_id, doc_id, source_ref FROM agent_facts WHERE workspace_id = ?1 AND schema_id IN ('mindbrain:ontology', 'ghostcrab:ontology', 'ghostcrab:taxonomy')");
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     var rows = std.ArrayList(FacetRecord).empty;
@@ -754,6 +773,21 @@ fn loadWorkspaceGraphEntities(
         });
     }
     return rows.toOwnedSlice(allocator);
+}
+
+fn findGraphEntityIdByName(
+    entities_by_name: *const std.StringHashMap(GraphEntityRecord),
+    node_id: []const u8,
+    label: []const u8,
+    entity_type: []const u8,
+) ?u32 {
+    if (entities_by_name.get(node_id)) |entity| {
+        if (std.mem.eql(u8, entity.entity_type, entity_type)) return entity.entity_id;
+    }
+    if (entities_by_name.get(label)) |entity| {
+        if (std.mem.eql(u8, entity.entity_type, entity_type)) return entity.entity_id;
+    }
+    return null;
 }
 
 fn findGraphEntityId(
@@ -816,11 +850,7 @@ fn matchesSourceRefs(source_refs: ?[]const []const u8, source_ref: ?[]const u8) 
 
 fn matchesText(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return false;
-    const hay = lowerOwned(std.heap.page_allocator, haystack) catch return false;
-    defer std.heap.page_allocator.free(hay);
-    const ned = lowerOwned(std.heap.page_allocator, needle) catch return false;
-    defer std.heap.page_allocator.free(ned);
-    return std.mem.indexOf(u8, hay, ned) != null;
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 fn isOntologyOrTaxonomy(schema_id: []const u8) bool {

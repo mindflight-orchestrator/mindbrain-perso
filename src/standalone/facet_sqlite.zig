@@ -1314,6 +1314,20 @@ pub fn queueFacetDelta(
     try stepDone(stmt);
 }
 
+/// Queue-only variant for bulk imports: deltas accumulate and the caller
+/// runs one mergeDeltasSafe at the end instead of rewriting posting blobs
+/// once per document.
+pub fn queueFacetAssignments(
+    db: Database,
+    table_id: u64,
+    doc_id: u64,
+    assignments: []const FacetDocumentAssignment,
+) !void {
+    for (assignments) |assignment| {
+        try queueFacetDelta(db, table_id, assignment.facet_id, assignment.facet_value, doc_id, 1);
+    }
+}
+
 pub fn syncFacetAssignments(
     db: Database,
     table_id: u64,

@@ -6316,9 +6316,6 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
     defer if (owned_vector_matches) |matches| allocator.free(matches);
 
     if (semantic_enabled) {
-        var store = try search_sqlite.loadSearchStore(db, allocator);
-        defer store.deinit();
-
         const query_embedding = try embedContextualText(allocator, query.?, .{
             .enabled = true,
             .embedding_base_url = base_url,
@@ -6327,15 +6324,17 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
         });
         defer allocator.free(query_embedding);
 
-        const vector_repo = store.vectorRepository();
-        owned_vector_matches = try vector_repo.searchNearestFn(vector_repo.ctx, allocator, .{
-            .table_name = "search_embeddings",
-            .key_column = "doc_id",
-            .vector_column = "embedding_blob",
-            .query_vector = query_embedding,
-            .limit = retrieval_limit,
-            .table_id = table_id,
-        });
+        // Bounded exact top-k over the table's stored embeddings; loading
+        // the whole search store re-tokenized every document in every table
+        // just to answer one nearest-neighbor query.
+        owned_vector_matches = try search_sqlite.searchEmbeddingExactTopK(
+            db,
+            allocator,
+            table_id.?,
+            query_embedding,
+            retrieval_limit,
+            .cosine,
+        );
     }
 
     const vector_matches = owned_vector_matches orelse empty_vector_matches;

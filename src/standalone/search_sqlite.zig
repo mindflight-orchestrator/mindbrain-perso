@@ -345,6 +345,111 @@ pub fn searchEmbeddingExactTopK(
     return matches.toOwnedSlice(allocator);
 }
 
+/// Workspace-scoped BM25 candidates for the shared agent-facts table:
+/// scoping inside the query spends the LIMIT budget on the requested
+/// workspace instead of filtering candidates after truncation (recall
+/// loss) with one probe statement per candidate (N+1).
+pub fn searchFts5Bm25Workspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query: []const u8,
+    limit: usize,
+) ![]Bm25Match {
+    if (limit == 0) return allocator.alloc(Bm25Match, 0);
+
+    const match_query = try buildFts5OrQuery(allocator, query);
+    defer allocator.free(match_query);
+    if (match_query.len == 0) return allocator.alloc(Bm25Match, 0);
+
+    const sql =
+        \\SELECT d.doc_id, -bm25(search_fts) AS score
+        \\FROM search_fts
+        \\JOIN search_fts_docs d ON d.fts_rowid = search_fts.rowid
+        \\JOIN agent_facts af ON af.doc_id = d.doc_id
+        \\WHERE d.table_id = ?1 AND search_fts MATCH ?2
+        \\  AND af.workspace_id = ?3
+        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+        \\ORDER BY bm25(search_fts) ASC
+        \\LIMIT ?4
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    try bindInt64(stmt, 1, table_id);
+    try bindText(stmt, 2, match_query);
+    try bindText(stmt, 3, workspace_id);
+    try bindInt64(stmt, 4, limit);
+
+    var matches = std.ArrayList(Bm25Match).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try matches.append(allocator, .{
+            .doc_id = try columnDocId(stmt, 0),
+            .score = c.sqlite3_column_double(stmt, 1),
+        });
+    }
+
+    return matches.toOwnedSlice(allocator);
+}
+
+/// Workspace-scoped exact vector top-k over the shared agent-facts table;
+/// see searchFts5Bm25Workspace for why scoping happens inside the scan.
+pub fn searchEmbeddingExactTopKWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query_vector: []const f32,
+    limit: usize,
+    metric: interfaces.VectorDistanceMetric,
+) ![]interfaces.VectorSearchMatch {
+    if (limit == 0 or query_vector.len == 0) return allocator.alloc(interfaces.VectorSearchMatch, 0);
+
+    const sql =
+        \\SELECT e.doc_id, e.dimensions, e.embedding_blob
+        \\FROM search_embeddings e
+        \\JOIN agent_facts af ON af.doc_id = e.doc_id
+        \\WHERE e.table_id = ?1 AND e.dimensions = ?2
+        \\  AND af.workspace_id = ?3
+        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, query_vector.len);
+    try bindText(stmt, 3, workspace_id);
+
+    var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const doc_id = try columnDocId(stmt, 0);
+        const dimensions = try columnUsize(stmt, 1);
+        const values = try decodeEmbedding(allocator, stmt, 2, dimensions);
+        defer allocator.free(values);
+
+        const score = vector_distance.score(metric, query_vector, values);
+        try vector_distance.insertTopMatch(allocator, &matches, .{
+            .doc_id = doc_id,
+            .distance = score.distance,
+            .similarity = score.similarity,
+        }, limit);
+    }
+
+    std.mem.sort(interfaces.VectorSearchMatch, matches.items, {}, vector_distance.lessThan);
+    return matches.toOwnedSlice(allocator);
+}
+
 fn searchTableBelongsToWorkspace(db: Database, workspace_id: []const u8, table_id: u64) !bool {
     const stmt = try prepare(db, "SELECT 1 FROM table_semantics WHERE workspace_id = ?1 AND table_id = ?2 LIMIT 1");
     defer finalize(stmt);

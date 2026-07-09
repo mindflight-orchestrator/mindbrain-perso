@@ -421,11 +421,7 @@ fn packPriorityFor(index: *const ProjectionTypeIndex, projection_type: []const u
 
 fn matchesText(content: []const u8, query: []const u8) bool {
     if (query.len == 0) return true;
-    const hay = lowerOwned(std.heap.page_allocator, content) catch return false;
-    defer std.heap.page_allocator.free(hay);
-    const needle = lowerOwned(std.heap.page_allocator, query) catch return false;
-    defer std.heap.page_allocator.free(needle);
-    return std.mem.indexOf(u8, hay, needle) != null;
+    return std.ascii.indexOfIgnoreCase(content, query) != null;
 }
 
 fn jsonValueMatchesScope(value: std.json.Value, scope: []const u8, normalized: []const u8) bool {

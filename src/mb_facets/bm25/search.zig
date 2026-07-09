@@ -33,10 +33,14 @@ fn tokenizeQuery(query_text: []const u8, config_name: []const u8, allocator: std
 }
 
 /// Expand query terms to term hashes and combine document sets
-fn expandQueryTerms(table_id: c.Oid, query_tokens: std.ArrayList([]const u8), config_name: []const u8, options: SearchOptions, allocator: std.mem.Allocator) !?*c.roaring_bitmap_t {
+/// Expands the query into term hashes (written to out_hashes/out_count so
+/// scoring reuses them) and returns the OR of their document sets. The
+/// previous shape forced callers to run the whole expansion twice.
+fn expandQueryTerms(table_id: c.Oid, query_tokens: std.ArrayList([]const u8), config_name: []const u8, options: SearchOptions, allocator: std.mem.Allocator, out_hashes: *[64]i64, out_count: *usize) !?*c.roaring_bitmap_t {
     const MAX_QUERY_HASHES = 64;
-    var expanded_hashes_arr: [MAX_QUERY_HASHES]i64 = undefined;
+    const expanded_hashes_arr = out_hashes;
     var expanded_hashes_count: usize = 0;
+    out_count.* = 0;
 
     var combined_bitmap: ?*c.roaring_bitmap_t = null;
 
@@ -69,6 +73,7 @@ fn expandQueryTerms(table_id: c.Oid, query_tokens: std.ArrayList([]const u8), co
         }
     }
 
+    out_count.* = expanded_hashes_count;
     if (expanded_hashes_count == 0) {
         return null;
     }
@@ -245,52 +250,20 @@ pub fn search(table_id: c.Oid, query_text: []const u8, config_name: []const u8, 
         return std.ArrayList(SearchResult).empty;
     }
 
-    // Phase 2: Expand query terms and get document sets
-    const combined_bitmap = try expandQueryTerms(table_id, query_tokens, config_name, options, allocator);
+    // Phase 2: Expand query terms once; the hashes feed scoring below.
+    var expanded_hashes_arr: [64]i64 = undefined;
+    var expanded_hashes_count: usize = 0;
+    const combined_bitmap = try expandQueryTerms(table_id, query_tokens, config_name, options, allocator, &expanded_hashes_arr, &expanded_hashes_count);
     defer if (combined_bitmap) |bm| roaring_index.free(bm);
 
     if (combined_bitmap == null or roaring_index.isEmpty(combined_bitmap.?)) {
         return std.ArrayList(SearchResult).empty;
     }
 
-    // Get the expanded hashes slice for use in scoring
-    const MAX_QUERY_HASHES = 64;
-    var expanded_hashes_arr: [MAX_QUERY_HASHES]i64 = undefined;
-    var expanded_hashes_count: usize = 0;
-
-    // Re-expand to get hashes (we need this for scoring)
-    {
-        const conn_result = c.SPI_connect();
-        const need_finish = (conn_result == c.SPI_OK_CONNECT);
-        if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
-            return error.SPIConnectFailed;
-        }
-        defer if (need_finish) {
-            _ = c.SPI_finish();
-        };
-
-        var custom_stopwords = try stopwords.loadWithExistingConnection(config_name, allocator);
-        defer custom_stopwords.deinit();
-
-        for (query_tokens.items) |query_term| {
-            if (custom_stopwords.contains(query_term)) continue;
-
-            var matching_hashes = try findMatchingTermHashesInternal(table_id, query_term, options, allocator);
-            defer matching_hashes.deinit(allocator);
-
-            for (matching_hashes.items) |hash| {
-                if (expanded_hashes_count < MAX_QUERY_HASHES) {
-                    expanded_hashes_arr[expanded_hashes_count] = hash;
-                    expanded_hashes_count += 1;
-                }
-            }
-        }
-    }
-
     const expanded_hashes = expanded_hashes_arr[0..expanded_hashes_count];
 
-    // Phase 3: Load statistics
-    var stats = try scoring.loadStatistics(table_id, allocator);
+    // Phase 3: Load statistics scoped to the query's expanded terms
+    var stats = try scoring.loadStatisticsForTerms(table_id, expanded_hashes, allocator);
     defer stats.deinit();
 
     // Phase 4: Calculate BM25 scores
@@ -305,25 +278,25 @@ pub fn search(table_id: c.Oid, query_text: []const u8, config_name: []const u8, 
 /// Get roaring bitmap of documents matching query
 /// If SPI is already connected, use getMatchesBitmapWithExistingConnection instead
 pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []const u8, options: SearchOptions, allocator: std.mem.Allocator) !?*c.roaring_bitmap_t {
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Starting, table_id={d}, query_len={d}, config={s}", .{ table_id, query_text.len, config_name });
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Starting, table_id={d}, query_len={d}, config={s}", .{ table_id, query_text.len, config_name });
 
     // Connect to SPI first, then tokenize to avoid nested connections
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Connecting to SPI", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Connecting to SPI", .{});
     const conn_result = c.SPI_connect();
     const need_finish = (conn_result == c.SPI_OK_CONNECT);
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: SPI_connect result={d}, need_finish={}", .{ conn_result, need_finish });
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: SPI_connect result={d}, need_finish={}", .{ conn_result, need_finish });
     if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
         utils.elog(c.ERROR, "[TRACE] getMatchesBitmap: SPI_connect failed unexpectedly");
         return error.SPIConnectFailed;
     }
     defer if (need_finish) {
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: About to call SPI_finish (need_finish={})", .{need_finish});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: About to call SPI_finish (need_finish={})", .{need_finish});
         _ = c.SPI_finish();
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: SPI_finish completed", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: SPI_finish completed", .{});
     };
 
     // Phase 1: Tokenize query (assumes SPI is already connected)
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 1 - Tokenizing query", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 1 - Tokenizing query", .{});
     var query_tokens = try tokenizer.tokenizeWithExistingConnection(query_text, config_name, allocator);
     defer {
         for (query_tokens.items) |token| {
@@ -331,10 +304,10 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
         }
         query_tokens.deinit(allocator);
     }
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 1 - Tokenized, got {d} tokens", .{query_tokens.items.len});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 1 - Tokenized, got {d} tokens", .{query_tokens.items.len});
 
     if (query_tokens.items.len == 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: No tokens, returning null", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: No tokens, returning null", .{});
         return null;
     }
 
@@ -349,11 +322,11 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
     var combined_bitmap: ?*c.roaring_bitmap_t = null;
 
     // Expand query terms to hashes
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 2 - Expanding query terms to hashes", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 2 - Expanding query terms to hashes", .{});
     for (query_tokens.items) |query_term| {
         if (custom_stopwords.contains(query_term)) continue;
 
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Processing token: {s}", .{query_term});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Processing token: {s}", .{query_term});
         var matching_hashes = try findMatchingTermHashesInternal(table_id, query_term, options, allocator);
         defer matching_hashes.deinit(allocator);
 
@@ -364,46 +337,46 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
             }
         }
     }
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 2 - Expanded to {d} hashes", .{expanded_hashes_count});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 2 - Expanded to {d} hashes", .{expanded_hashes_count});
 
     if (expanded_hashes_count == 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: No matching hashes, returning null", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: No matching hashes, returning null", .{});
         return null;
     }
 
     // Get document sets for all term hashes and combine (OR operation)
     // IMPORTANT: Do this while SPI is still connected, then copy the result
-    utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3 - Getting document sets for {d} term hashes", .{expanded_hashes_count});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3 - Getting document sets for {d} term hashes", .{expanded_hashes_count});
     for (expanded_hashes_arr[0..expanded_hashes_count], 0..) |term_hash, idx| {
         const i = idx + 1;
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - Getting doc_set for hash={d}", .{ i, term_hash });
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - Getting doc_set for hash={d}", .{ i, term_hash });
         const doc_set = try getDocumentSetByHashInternal(table_id, term_hash, allocator);
 
         if (doc_set) |ds| {
             defer {
-                utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - Freeing doc_set={*}", .{ i, ds });
+                utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - Freeing doc_set={*}", .{ i, ds });
                 roaring_index.free(ds);
             }
-            utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - Got doc_set={*}, cardinality={d}", .{ i, ds, roaring_index.cardinality(ds) });
+            utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - Got doc_set={*}, cardinality={d}", .{ i, ds, roaring_index.cardinality(ds) });
             if (combined_bitmap) |combined| {
-                utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - ORing with existing bitmap", .{i});
+                utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - ORing with existing bitmap", .{i});
                 roaring_index.orInPlace(combined, ds);
             } else {
-                utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - Copying first bitmap", .{i});
+                utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - Copying first bitmap", .{i});
                 combined_bitmap = roaring_index.copy(ds);
-                utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - Copied bitmap={*}, cardinality={d}", .{ i, combined_bitmap.?, roaring_index.cardinality(combined_bitmap.?) });
+                utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - Copied bitmap={*}, cardinality={d}", .{ i, combined_bitmap.?, roaring_index.cardinality(combined_bitmap.?) });
             }
         } else {
-            utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Phase 3.{d} - No doc_set for hash={d}", .{ i, term_hash });
+            utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 3.{d} - No doc_set for hash={d}", .{ i, term_hash });
         }
     }
 
     // SPI_finish will be called here via defer, but combined_bitmap is already copied
     // and allocated with malloc, so it will persist after SPI_finish
     if (combined_bitmap) |bm| {
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Returning bitmap={*}, cardinality={d}", .{ bm, roaring_index.cardinality(bm) });
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Returning bitmap={*}, cardinality={d}", .{ bm, roaring_index.cardinality(bm) });
     } else {
-        utils.elogFmt(c.NOTICE, "[TRACE] getMatchesBitmap: Returning null (no bitmap)", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Returning null (no bitmap)", .{});
     }
     return combined_bitmap;
 }
@@ -466,36 +439,36 @@ fn findMatchingTermHashesInternal(table_id: c.Oid, query_term: []const u8, optio
 
 /// Internal version of getDocumentSetByHash (assumes SPI is connected)
 fn getDocumentSetByHashInternal(table_id: c.Oid, term_hash: i64, allocator: std.mem.Allocator) !?*c.roaring_bitmap_t {
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Starting, table_id={d}, term_hash={d}", .{ table_id, term_hash });
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Starting, table_id={d}, term_hash={d}", .{ table_id, term_hash });
 
     const query = try std.fmt.allocPrintSentinel(allocator, "SELECT doc_ids FROM facets.bm25_index WHERE table_id = {d} AND term_hash = {d}", .{ table_id, term_hash }, 0);
     defer allocator.free(query);
 
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Executing query: {s}", .{query});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Executing query: {s}", .{query});
     const ret = c.SPI_execute(query.ptr, true, 1);
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: SPI_execute result={d}, processed={d}", .{ ret, c.SPI_processed });
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: SPI_execute result={d}, processed={d}", .{ ret, c.SPI_processed });
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: No results, returning null", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: No results, returning null", .{});
         return null;
     }
 
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Got {d} rows, getting tuple", .{c.SPI_processed});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Got {d} rows, getting tuple", .{c.SPI_processed});
     const tuple = c.SPI_tuptable.*.vals[0];
     const tupdesc = c.SPI_tuptable.*.tupdesc;
 
     var isnull: bool = false;
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Getting doc_ids_datum from tuple", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Getting doc_ids_datum from tuple", .{});
     const doc_ids_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull);
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Got doc_ids_datum, isnull={}", .{isnull});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Got doc_ids_datum, isnull={}", .{isnull});
 
     if (isnull) {
-        utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: doc_ids_datum is null, returning null", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: doc_ids_datum is null, returning null", .{});
         return null;
     }
 
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: Calling datumToRoaringBitmap", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: Calling datumToRoaringBitmap", .{});
     const bitmap = try roaring_index.datumToRoaringBitmap(doc_ids_datum);
-    utils.elogFmt(c.NOTICE, "[TRACE] getDocumentSetByHashInternal: datumToRoaringBitmap returned bitmap={*}, cardinality={d}", .{ bitmap, roaring_index.cardinality(bitmap) });
+    utils.elogFmt(c.DEBUG3, "[TRACE] getDocumentSetByHashInternal: datumToRoaringBitmap returned bitmap={*}, cardinality={d}", .{ bitmap, roaring_index.cardinality(bitmap) });
 
     return bitmap;
 }
@@ -507,7 +480,7 @@ fn getDocumentSetByHashInternal(table_id: c.Oid, term_hash: i64, allocator: std.
 pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, config_name: []const u8, options: SearchOptions, allocator: std.mem.Allocator) !f64 {
     _ = config_name; // Not used with pure tokenizer
 
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Starting for doc_id={d}", .{doc_id});
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Starting for doc_id={d}", .{doc_id});
 
     // Phase 1: Tokenize query using PURE ZIG tokenizer (NO SPI!)
     // This is critical to avoid crashes when called from within EXECUTE statements
@@ -519,7 +492,7 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
         query_tokens.deinit(allocator);
     }
 
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Tokenized query into {d} tokens", .{query_tokens.items.len});
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Tokenized query into {d} tokens", .{query_tokens.items.len});
 
     if (query_tokens.items.len == 0) {
         return 0.0;
@@ -533,13 +506,13 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
         try query_hashes.append(allocator, tokenizer_pure.hashLexeme(term));
     }
 
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Generated {d} hashes", .{query_hashes.items.len});
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Generated {d} hashes", .{query_hashes.items.len});
 
     // Phase 2: Load statistics (uses SPI but handles connection safely)
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Loading statistics", .{});
-    var stats = try scoring.loadStatistics(table_id, allocator);
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Loading statistics", .{});
+    var stats = try scoring.loadStatisticsForTerms(table_id, query_hashes.items, allocator);
     defer stats.deinit();
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Statistics loaded, total_docs={d}", .{stats.total_documents});
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Statistics loaded, total_docs={d}", .{stats.total_documents});
 
     // Phase 3: Get term frequencies and document length (single SPI connection)
     var term_freqs = std.AutoHashMap(i64, i32).init(allocator);
@@ -550,22 +523,22 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
     try term_freqs.ensureTotalCapacity(@intCast(query_hashes.items.len));
 
     {
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Phase 3 - SPI_connect", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Phase 3 - SPI_connect", .{});
         // Try to connect - may already be connected from caller
         const conn_result3 = c.SPI_connect();
         const need_finish3 = (conn_result3 == c.SPI_OK_CONNECT);
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: SPI_connect result={d}, need_finish={}", .{ conn_result3, need_finish3 });
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: SPI_connect result={d}, need_finish={}", .{ conn_result3, need_finish3 });
         if (conn_result3 != c.SPI_OK_CONNECT and conn_result3 != c.SPI_ERROR_CONNECT) {
             utils.elog(c.ERROR, "SPI_connect failed");
             return error.SPIConnectFailed;
         }
         defer if (need_finish3) {
-            utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Calling SPI_finish", .{});
+            utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Calling SPI_finish", .{});
             _ = c.SPI_finish();
         };
 
         // Get term frequencies for this document
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Getting term frequencies", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Getting term frequencies", .{});
         for (query_hashes.items) |term_hash| {
             const freq = try getTermFrequencyByHashInternal(table_id, term_hash, doc_id, allocator);
             if (freq > 0) {
@@ -574,18 +547,18 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
         }
 
         // Get document length
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Getting document length", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Getting document length", .{});
         doc_length = try getDocumentLengthInternal(table_id, doc_id, allocator);
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: doc_length={d}", .{doc_length});
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: doc_length={d}", .{doc_length});
     }
 
     if (term_freqs.count() == 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: No matching terms, returning 0", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: No matching terms, returning 0", .{});
         return 0.0;
     }
 
     // Phase 4: Calculate BM25 score (no SPI needed)
-    utils.elogFmt(c.NOTICE, "[TRACE] calculateScore: Calculating BM25 score", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Calculating BM25 score", .{});
     return scoring.calculateBM25ByHash(query_hashes.items, term_freqs, doc_length, &stats, options.k1, options.b);
 }
 

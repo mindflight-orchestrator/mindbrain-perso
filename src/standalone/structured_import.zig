@@ -895,13 +895,17 @@ fn applyFacetRecord(
 ) !void {
     const workspace_id = effective.workspace_id;
 
-    const fact_exists = if (batch) |b|
-        b.factExistsBySourceRef(workspace_id, record.source_ref)
-    else
-        factExistsBySourceRef(db, workspace_id, record.source_ref);
-    if (effective.mode == .ignore_duplicates and fact_exists) {
-        report.facets_skipped += 1;
-        return;
+    // Only ignore_duplicates mode consults the dedup probe; other modes
+    // paid one indexed SELECT per row for nothing.
+    if (effective.mode == .ignore_duplicates) {
+        const fact_exists = if (batch) |b|
+            b.factExistsBySourceRef(workspace_id, record.source_ref)
+        else
+            factExistsBySourceRef(db, workspace_id, record.source_ref);
+        if (fact_exists) {
+            report.facets_skipped += 1;
+            return;
+        }
     }
 
     const facets_json = try normalizeFacetsJsonSource(allocator, record.facets_json_raw, effective.source_tag);
@@ -1466,13 +1470,15 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
 
         const edge_ext = try edgeExternalId(allocator, source_external, rel.edge_label, target_external);
         defer allocator.free(edge_ext);
-        const relation_exists = if (ctx.batch) |batch|
-            batch.relationExistsByExternalId(ctx.workspace_id, edge_ext)
-        else
-            relationExistsByExternalId(db, ctx.workspace_id, edge_ext);
-        if (ctx.mode == .ignore_duplicates and relation_exists) {
-            out.skipped += 1;
-            continue;
+        if (ctx.mode == .ignore_duplicates) {
+            const relation_exists = if (ctx.batch) |batch|
+                batch.relationExistsByExternalId(ctx.workspace_id, edge_ext)
+            else
+                relationExistsByExternalId(db, ctx.workspace_id, edge_ext);
+            if (relation_exists) {
+                out.skipped += 1;
+                continue;
+            }
         }
 
         const source_type = try entityTypeFromSourceRef(allocator, ctx.workspace_id, source_external);
