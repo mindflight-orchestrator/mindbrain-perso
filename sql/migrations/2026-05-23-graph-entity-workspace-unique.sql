@@ -60,9 +60,6 @@ DROP TABLE graph_entity;
 ALTER TABLE graph_entity__ws_unique_new RENAME TO graph_entity;
 
 CREATE INDEX IF NOT EXISTS graph_entity_name_idx ON graph_entity(name);
-CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
-    ON graph_entity(workspace_id, entity_type, name);
-CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx ON graph_entity(workspace_id);
 CREATE INDEX IF NOT EXISTS graph_entity_projection_id_idx
     ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.projection_id'))
     WHERE json_extract(metadata_json, '$.projection_id') IS NOT NULL;

@@ -156,6 +156,19 @@ pub const Database = struct {
         // schema exec: CREATE TABLE IF NOT EXISTS agent_facts would otherwise
         // create an empty table next to the legacy one and strand its data.
         try self.applyAgentFactsTableRenameMigration();
+        // Legacy cleanup: indexes made redundant by UNIQUE auto-indexes or
+        // composite replacements, and the ungated compat trigger (recreated
+        // below by the canonical schema with its WHEN gate).
+        try self.exec(
+            \\DROP INDEX IF EXISTS graph_entity_workspace_type_name_idx;
+            \\DROP INDEX IF EXISTS graph_entity_workspace_id_idx;
+            \\DROP INDEX IF EXISTS graph_entity_chunk_entity_idx;
+            \\DROP INDEX IF EXISTS agent_facts_workspace_id_idx;
+            \\DROP INDEX IF EXISTS agent_facts_source_ref_idx;
+            \\DROP INDEX IF EXISTS idx_agent_facts_source_ref_workspace;
+            \\DROP INDEX IF EXISTS ontology_values_value_idx;
+            \\DROP TRIGGER IF EXISTS trg_sync_agent_facts_compat_after_insert;
+        );
         const schema = try sqlite_schema.renderMetadataSchema(std.heap.page_allocator);
         defer std.heap.page_allocator.free(schema);
         try self.exec(schema);
@@ -276,9 +289,6 @@ pub const Database = struct {
             \\DROP TABLE graph_entity;
             \\ALTER TABLE graph_entity__ws_unique_new RENAME TO graph_entity;
             \\CREATE INDEX IF NOT EXISTS graph_entity_name_idx ON graph_entity(name);
-            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
-            \\    ON graph_entity(workspace_id, entity_type, name);
-            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx ON graph_entity(workspace_id);
             \\CREATE INDEX IF NOT EXISTS graph_entity_projection_id_idx
             \\    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.projection_id'))
             \\    WHERE json_extract(metadata_json, '$.projection_id') IS NOT NULL;
@@ -972,18 +982,16 @@ pub const Database = struct {
             \\DROP INDEX IF EXISTS facets_source_ref_idx;
             \\DROP INDEX IF EXISTS facets_source_ref_workspace_uniq;
             \\DROP INDEX IF EXISTS idx_facets_source_ref_workspace;
-            \\CREATE INDEX IF NOT EXISTS agent_facts_workspace_id_idx ON agent_facts(workspace_id);
-            \\CREATE INDEX IF NOT EXISTS agent_facts_source_ref_idx ON agent_facts(source_ref) WHERE source_ref IS NOT NULL;
             \\CREATE UNIQUE INDEX IF NOT EXISTS agent_facts_source_ref_workspace_uniq ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
-            \\CREATE INDEX IF NOT EXISTS idx_agent_facts_source_ref_workspace ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
             \\CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_insert
             \\AFTER INSERT ON agent_facts
+            \\WHEN NEW.doc_id IS NULL OR NEW.facets IS NOT NEW.facets_json
             \\BEGIN
             \\    UPDATE agent_facts
             \\    SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
             \\        facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
             \\        embedding = COALESCE(NEW.embedding, embedding),
-            \\        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts WHERE rowid <> NEW.rowid)),
+            \\        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts)),
             \\        updated_at = CURRENT_TIMESTAMP
             \\    WHERE rowid = NEW.rowid;
             \\END;
@@ -1020,6 +1028,33 @@ pub const Database = struct {
 
     pub fn applyStandaloneStopwordsSeed(self: Database) !void {
         try self.exec(bm25_stopwords_seed_sql);
+    }
+
+    /// Restores the constraints and indexes stripped by the import-mode
+    /// schema. Databases bootstrapped with applyStandaloneImportSchema never
+    /// regain graph_entity_alias's primary key on the runtime path (CREATE
+    /// TABLE IF NOT EXISTS keeps the loose shape), so duplicate alias rows
+    /// stay possible and term lookups stay unindexed until this runs.
+    pub fn finalizeStandaloneImportSchema(self: Database) !void {
+        if (!(try self.tableCreateSqlContains("graph_entity_alias", "PRIMARY KEY(term, entity_id)"))) {
+            try self.execRebuildScript(
+                \\CREATE TABLE graph_entity_alias__finalize_new (
+                \\    term TEXT NOT NULL,
+                \\    entity_id INTEGER NOT NULL,
+                \\    confidence REAL NOT NULL DEFAULT 1.0,
+                \\    PRIMARY KEY(term, entity_id),
+                \\    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
+                \\);
+                \\INSERT INTO graph_entity_alias__finalize_new(term, entity_id, confidence)
+                \\SELECT term, entity_id, MAX(confidence)
+                \\FROM graph_entity_alias
+                \\GROUP BY term, entity_id;
+                \\DROP TABLE graph_entity_alias;
+                \\ALTER TABLE graph_entity_alias__finalize_new RENAME TO graph_entity_alias;
+            );
+        }
+        // The runtime schema pass recreates every stripped index.
+        try self.applyStandaloneSchema();
     }
 };
 

@@ -23,14 +23,6 @@ fn renderImportSchema(allocator: std.mem.Allocator) ![]u8 {
     errdefer allocator.free(schema);
 
     try replaceSchemaFragment(allocator, &schema,
-        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
-        \\    UNIQUE(entity_type, name)
-    ,
-        \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
-        \\    UNIQUE(workspace_id, entity_type, name)
-    );
-
-    try replaceSchemaFragment(allocator, &schema,
         \\    confidence REAL NOT NULL DEFAULT 1.0,
         \\    PRIMARY KEY(term, entity_id),
         \\    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
@@ -49,12 +41,6 @@ fn renderImportSchema(allocator: std.mem.Allocator) ![]u8 {
     try replaceSchemaFragment(allocator, &schema,
         \\CREATE INDEX IF NOT EXISTS graph_entity_name_idx
         \\    ON graph_entity(name);
-    ,
-        \\
-    );
-    try replaceSchemaFragment(allocator, &schema,
-        \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx
-        \\    ON graph_entity(workspace_id);
     ,
         \\
     );

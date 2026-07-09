@@ -5162,17 +5162,33 @@ fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Datab
 fn writeEntityFacets(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
     const entity_text = try std.fmt.allocPrint(allocator, "{}", .{entity_id});
     defer allocator.free(entity_text);
+    // Three indexed probes (source_ref unique, doc_id unique, expression
+    // index on $.entity_id) instead of one OR over expressions that forced
+    // a full scan of the workspace's facts per rendered entity.
+    const doc_id_probe: ?i64 = std.fmt.parseInt(i64, entity_text, 10) catch null;
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT id, schema_id, content, facets_json, source_ref, doc_id
-        \\FROM agent_facts
-        \\WHERE workspace_id = ?1
-        \\  AND (source_ref = ?2 OR CAST(doc_id AS TEXT) = ?2 OR json_extract(facets_json, '$.entity_id') = ?2)
+        \\FROM (
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND source_ref = ?2
+        \\    UNION
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND doc_id = ?3
+        \\    UNION
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND json_extract(facets_json, '$.entity_id') = ?2
+        \\)
         \\ORDER BY updated_at_unix DESC, created_at_unix DESC
         \\LIMIT 10
     );
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, entity_text);
+    if (doc_id_probe) |doc_id_value| {
+        try facet_sqlite.bindInt64(stmt, 3, doc_id_value);
+    } else {
+        try facet_sqlite.bindNull(stmt, 3);
+    }
     var first = true;
     while (try helper_api.stepRow(stmt)) {
         if (!first) try writer.writeAll(",");
