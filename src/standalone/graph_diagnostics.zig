@@ -585,6 +585,12 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
 
     const run_id = try std.fmt.allocPrint(allocator, "graph_rule_eval__{s}__{d}", .{ options.workspace_id, try currentUnix(db) });
     defer allocator.free(run_id);
+
+    // ~5 statements per evaluated entity; one transaction for the whole run
+    // instead of one journal sync per statement.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try ensureQualityRunForRuleEvaluation(db, options.workspace_id, ontology_id, run_id);
 
     var events = std.ArrayList(RuleEvent).empty;
@@ -641,6 +647,8 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
             }
         }
     }
+
+    try tx.commit();
 
     return .{
         .workspace_id = try allocator.dupe(u8, options.workspace_id),

@@ -94,6 +94,11 @@ pub fn importTaxonomyIntoFacets(
     chunk_bits: u8,
     nodes: []const TaxonomyNodeImport,
 ) !void {
+    // ~6 statements per node incl. read-modify-write of posting bitmaps;
+    // run the import atomically instead of one fsync per statement.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try facet_sqlite.upsertFacetTable(db, table_id, schema_name, table_name, chunk_bits);
 
     for (nodes) |node| {
@@ -125,6 +130,8 @@ pub fn importTaxonomyIntoFacets(
             try appendFacetChildLink(db, allocator, table_id, parent_value_id, child_value_id);
         }
     }
+
+    try tx.commit();
 }
 
 pub fn insertProjection(db: Database, record: ProjectionRecord) !void {
@@ -412,6 +419,8 @@ pub fn materializeTaxonomyProjections(
     }
 
     var inserted: usize = 0;
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     for (rows) |row| {
         const node_id = try extractFacetIdentity(allocator, row);
         defer allocator.free(node_id);
@@ -436,6 +445,7 @@ pub fn materializeTaxonomyProjections(
         });
         inserted += 1;
     }
+    try tx.commit();
 
     return inserted;
 }

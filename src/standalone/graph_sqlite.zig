@@ -1814,6 +1814,9 @@ pub fn learnFromRun(
     const transcript_value = transcript orelse "";
     const metadata_value = metadata_json orelse "{}";
 
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     const insert_run = try prepare(
         db,
         "INSERT INTO graph_execution_run(run_key, domain, outcome, confidence, transcript, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " ++ "ON CONFLICT(run_key) DO UPDATE SET outcome = excluded.outcome, confidence = excluded.confidence, transcript = COALESCE(excluded.transcript, graph_execution_run.transcript), metadata_json = COALESCE(excluded.metadata_json, graph_execution_run.metadata_json) " ++ "RETURNING id",
@@ -1860,6 +1863,7 @@ pub fn learnFromRun(
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
     try rebuildLjForEntitiesNoTransaction(db, touched_ids, workspace_id, allocator);
+    try tx.commit();
     return run_id;
 }
 
@@ -1878,6 +1882,9 @@ pub fn applyKnowledgePatch(
     try artifacts_buf.writer.print("{f}", .{std.json.fmt(artifacts, .{})});
     const artifacts_json = try artifacts_buf.toOwnedSlice();
     defer allocator.free(artifacts_json);
+
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
 
     const insert_patch = try prepare(
         db,
@@ -1967,6 +1974,7 @@ pub fn applyKnowledgePatch(
     const touched_ids = try mapKeysToSlice(allocator, &touched_entities);
     defer allocator.free(touched_ids);
     try rebuildLjForEntitiesNoTransaction(db, touched_ids, workspace_id, allocator);
+    try tx.commit();
     return applied_count;
 }
 
@@ -2040,12 +2048,8 @@ pub fn deleteRelation(db: Database, relation_id: u32) !void {
 }
 
 pub fn rebuildAdjacency(db: Database, allocator: std.mem.Allocator) !void {
-    try db.exec("BEGIN IMMEDIATE");
-    errdefer {
-        db.exec("ROLLBACK") catch |rollback_err| {
-            std.log.warn("graph adjacency global rebuild rollback failed: {s}", .{@errorName(rollback_err)});
-        };
-    }
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
 
     try db.exec("DELETE FROM graph_lj_out");
     try db.exec("DELETE FROM graph_lj_in");
@@ -2096,7 +2100,7 @@ pub fn rebuildAdjacency(db: Database, allocator: std.mem.Allocator) !void {
     }
 
     try refreshEntityDegree(db);
-    try db.exec("COMMIT");
+    try tx.commit();
 }
 
 pub fn rebuildLjRelations(db: Database, allocator: std.mem.Allocator) !void {
@@ -2124,14 +2128,10 @@ fn rebuildLjForEntitiesInWorkspace(
 ) !void {
     if (entity_ids.len == 0) return;
 
-    try db.exec("BEGIN IMMEDIATE");
-    errdefer {
-        db.exec("ROLLBACK") catch |rollback_err| {
-            std.log.warn("graph adjacency scoped rebuild rollback failed: {s}", .{@errorName(rollback_err)});
-        };
-    }
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     try rebuildLjForEntitiesNoTransaction(db, entity_ids, workspace_id, allocator);
-    try db.exec("COMMIT");
+    try tx.commit();
 }
 
 fn rebuildLjForEntitiesNoTransaction(

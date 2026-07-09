@@ -160,6 +160,11 @@ pub fn loadWsFromBundle(
     mode: structured_import.ImportMode,
 ) !LoadWsReport {
     var report = LoadWsReport{};
+    // One transaction for the whole load: per-row autocommit fsyncs made
+    // bulk CSV loads orders of magnitude slower, and a reset-mode DELETE
+    // followed by a failing row left the table half-purged.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     for (bundle.tables) |named| {
         const ws_name = try wsTableName(allocator, named.name);
         defer allocator.free(ws_name);
@@ -179,6 +184,7 @@ pub fn loadWsFromBundle(
         }
         report.tables_loaded += 1;
     }
+    try tx.commit();
     return report;
 }
 

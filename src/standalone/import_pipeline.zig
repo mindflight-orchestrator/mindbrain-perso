@@ -408,6 +408,12 @@ pub const Pipeline = struct {
         var generated_nanoid: ?[]u8 = null;
         errdefer if (generated_nanoid) |b| self.allocator.free(b);
 
+        // One transaction per document: the per-chunk/per-facet autocommit
+        // pattern cost thousands of fsyncs per document and left partial
+        // documents behind on failure.
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
+
         const nanoid_value: []const u8 = if (opts.doc_nanoid.len == 0) blk: {
             generated_nanoid = try nanoid.generateDefault(self.allocator);
             break :blk generated_nanoid.?;
@@ -501,6 +507,8 @@ pub const Pipeline = struct {
                 opts.language,
             );
         }
+
+        try tx.commit();
 
         const owned_nanoid: []u8 = if (generated_nanoid) |b| blk: {
             generated_nanoid = null;
@@ -754,6 +762,12 @@ pub const Pipeline = struct {
         var workspace_entity_ids = std.ArrayList(u32).empty;
         defer workspace_entity_ids.deinit(self.allocator);
 
+        // Purge + replay must be atomic: a crash between the two used to
+        // leave the derived graph permanently empty while raw data was
+        // intact, and per-row autocommit made the replay fsync-bound.
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
+
         // Strict rebuild: clear the workspace's derived graph rows before
         // replaying *_raw so removed entities/relations do not linger.
         try self.purgeWorkspaceGraph(workspace_id);
@@ -950,6 +964,7 @@ pub const Pipeline = struct {
         // paying for a whole-graph wipe/rebuild on every tenant reindex.
         try graph_sqlite.rebuildAdjacencyForWorkspace(self.db.*, self.allocator, workspace_id, workspace_entity_ids.items);
 
+        try tx.commit();
         return projected_count;
     }
 

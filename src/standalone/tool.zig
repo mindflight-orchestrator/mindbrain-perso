@@ -6107,6 +6107,10 @@ fn persistProfiledDocument(
     const decision = chunking_policy.decide(profile);
     const metadata_json = try profileMetadataJson(allocator, profile_value, decision);
     defer allocator.free(metadata_json);
+    // One transaction per document (autocommit costs a journal sync per
+    // chunk/facet write and leaves partial documents on failure).
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = workspace_id,
         .collection_id = collection_id,
@@ -6168,6 +6172,7 @@ fn persistProfiledDocument(
         }
     }
 
+    try tx.commit();
     return .{ .chunk_count = chunks.len };
 }
 
@@ -6996,6 +7001,9 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
         break :blk generated_nanoid.?;
     } else nanoid_value;
 
+    var ingest_tx = try facet_sqlite.Transaction.begin(db);
+    defer ingest_tx.deinit();
+
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
@@ -7045,6 +7053,8 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
             try collections_sqlite.upsertFacetAssignmentRaw(db, row);
         }
     }
+
+    try ingest_tx.commit();
 
     try writeStdout("ingested doc_id={d} nanoid={s} chunks={d}\n", .{
         doc_id_opt.?, nanoid_final, total_chunks,
@@ -7115,7 +7125,11 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
     try db.applyStandaloneSchema();
 
     // When --link-id is omitted (or 0), allocate the next free id within the
-    // workspace so the caller does not have to track them manually.
+    // workspace so the caller does not have to track them manually. The
+    // MAX+1 read and the insert share a transaction so two writers cannot
+    // allocate the same id and silently overwrite each other.
+    var link_tx = try facet_sqlite.Transaction.begin(db);
+    defer link_tx.deinit();
     if (link_id == 0) {
         const sql = "SELECT COALESCE(MAX(link_id), 0) + 1 FROM external_links_raw WHERE workspace_id = ?1";
         const stmt = try facet_sqlite.prepare(db, sql);
@@ -7136,6 +7150,8 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
         .weight = weight,
         .metadata_json = metadata_json,
     });
+
+    try link_tx.commit();
 
     try writeStdout("external link {d} -> {s} ({s}) added\n", .{ link_id, target_uri.?, edge_type });
 }

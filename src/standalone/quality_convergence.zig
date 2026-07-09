@@ -127,10 +127,15 @@ pub fn runConvergence(db: Database, allocator: std.mem.Allocator, options: RunOp
     errdefer allocator.free(report_json);
 
     if (options.persist) {
+        // Run + actions must land together; a partial persist reported a
+        // completed run with missing remediation actions.
+        var tx = try facet_sqlite.Transaction.begin(db);
+        defer tx.deinit();
         try persistRun(db, run_id, options.workspace_id, ontology_id, fingerprint, summary_json, report_json);
         for (actions.items) |action| {
             try persistAction(db, run_id, options.workspace_id, ontology_id, action);
         }
+        try tx.commit();
     }
 
     return .{

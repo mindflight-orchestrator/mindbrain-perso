@@ -550,6 +550,11 @@ pub fn loadSearchStore(db: Database, allocator: std.mem.Allocator) !search_store
 }
 
 pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void {
+    // Atomic rebuild: a crash mid-way used to leave the index half-deleted,
+    // and per-statement autocommit journaled every document write.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try db.exec("DELETE FROM search_collection_stats");
     try db.exec("DELETE FROM search_document_stats");
     try db.exec("DELETE FROM search_term_stats");
@@ -659,6 +664,8 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
         defer bitmap.deinit();
         try upsertPosting(db, allocator, unpacked.table_id, unpacked.term_hash, bitmap);
     }
+
+    try tx.commit();
 }
 
 pub fn upsertSearchArtifactsForDocument(

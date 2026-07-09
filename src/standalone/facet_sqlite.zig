@@ -1023,6 +1023,37 @@ pub const Database = struct {
     }
 };
 
+/// Nesting-aware write transaction. Bulk write paths must run inside one
+/// transaction (SQLite otherwise journals/fsyncs every statement), but some
+/// callers already hold a transaction or savepoint — in that case the outer
+/// owner provides atomicity and this becomes a no-op.
+pub const Transaction = struct {
+    db: Database,
+    owns: bool,
+    done: bool = false,
+
+    pub fn begin(db: Database) Error!Transaction {
+        const owns = c.sqlite3_get_autocommit(db.handle) != 0;
+        if (owns) try db.exec("BEGIN IMMEDIATE");
+        return .{ .db = db, .owns = owns };
+    }
+
+    pub fn commit(self: *Transaction) Error!void {
+        if (self.owns and !self.done) try self.db.exec("COMMIT");
+        self.done = true;
+    }
+
+    /// Call via defer; rolls back when commit() was never reached.
+    pub fn deinit(self: *Transaction) void {
+        if (self.owns and !self.done) {
+            self.db.exec("ROLLBACK") catch {
+                std.log.warn("transaction rollback failed", .{});
+            };
+        }
+        self.done = true;
+    }
+};
+
 pub const Repository = struct {
     db: *const Database,
 
