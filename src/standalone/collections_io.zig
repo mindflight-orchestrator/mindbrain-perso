@@ -649,6 +649,9 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     errdefer db.exec("ROLLBACK") catch |rollback_err| {
         std.log.warn("collections import rollback failed: {s}", .{@errorName(rollback_err)});
     };
+    // Bundle tables are restored in bundle order, not FK dependency order;
+    // check constraints once at COMMIT instead of per statement.
+    try db.exec("PRAGMA defer_foreign_keys = ON");
 
     if (options.overwrite_existing_workspace) {
         try purgeBundleWorkspaceInOpenTransaction(db, bundle.scope.workspace_id);
@@ -663,6 +666,14 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .bootstrap_default_ontology = false,
         });
     }
+
+    // Older bundles can omit their workspaces rows while still carrying
+    // scoped children (ontologies, settings, facts); the scope workspace
+    // must exist for the deferred FK check at COMMIT.
+    try collections_sqlite.ensureWorkspace(db, .{
+        .workspace_id = bundle.scope.workspace_id,
+        .bootstrap_default_ontology = false,
+    });
 
     for (bundle.collections) |row| {
         try collections_sqlite.ensureCollection(db, .{
@@ -1081,7 +1092,29 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try upsertQualityRemediationAction(db, row);
     }
 
-    try db.exec("COMMIT");
+    db.exec("COMMIT") catch |err| {
+        logForeignKeyViolations(db);
+        return err;
+    };
+}
+
+/// Best-effort diagnostic when a deferred FK check rejects a bundle import.
+fn logForeignKeyViolations(db: Database) void {
+    const stmt = facet_sqlite.prepare(db, "PRAGMA foreign_key_check") catch return;
+    defer facet_sqlite.finalize(stmt);
+    var shown: usize = 0;
+    while (shown < 10) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_ROW) break;
+        const table = c.sqlite3_column_text(stmt, 0);
+        const parent = c.sqlite3_column_text(stmt, 2);
+        std.log.warn("bundle import FK violation: {s} -> {s} (rowid {d})", .{
+            if (table) |t| std.mem.span(t) else "?",
+            if (parent) |p| std.mem.span(p) else "?",
+            c.sqlite3_column_int64(stmt, 1),
+        });
+        shown += 1;
+    }
 }
 
 fn purgeBundleWorkspaceInOpenTransaction(db: Database, workspace_id: []const u8) !void {
@@ -3285,6 +3318,8 @@ test "backup import does not synthesize an auto default ontology" {
     });
     try collections_sqlite.setDefaultOntology(source, "ws_restore_exact", "ws_restore_exact::core");
     try source.exec(
+        \\DELETE FROM ontology_values WHERE ontology_id = 'ws_restore_exact::default';
+        \\DELETE FROM ontology_dimensions WHERE ontology_id = 'ws_restore_exact::default';
         \\DELETE FROM ontology_namespaces WHERE ontology_id = 'ws_restore_exact::default';
         \\DELETE FROM ontologies WHERE ontology_id = 'ws_restore_exact::default';
     );

@@ -1488,6 +1488,7 @@ test "ensureWorkspace bootstraps the default ontology with the source.* namespac
     defer std.testing.allocator.free(default_id);
     try std.testing.expectEqualStrings("wsX::default", default_id);
 
+    try ensureOntology(db, .{ .ontology_id = "wsX::core", .workspace_id = "wsX", .name = "core" });
     try setDefaultOntology(db, "wsX", "wsX::core");
     try ensureWorkspace(db, .{ .workspace_id = "wsX" });
     const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
@@ -1511,6 +1512,7 @@ test "ensureDefaultOntology preserves explicit workspace default" {
     defer db.close();
     try db.applyStandaloneSchema();
     try ensureWorkspace(db, .{ .workspace_id = "wsZ" });
+    try ensureOntology(db, .{ .ontology_id = "wsZ::core", .workspace_id = "wsZ", .name = "core" });
     try setDefaultOntology(db, "wsZ", "wsZ::core");
 
     const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsZ");
@@ -1974,6 +1976,7 @@ test "isOntologyFrozen reflects ontologies.frozen column" {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    try ensureWorkspace(db, .{ .workspace_id = "frozen_test" });
     try ensureOntology(db, .{
         .ontology_id = "frozen_test::core",
         .workspace_id = "frozen_test",

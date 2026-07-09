@@ -4,6 +4,10 @@
 -- and carried the workspace only by convention in scope. This migration accepts
 -- only rows whose scope maps to exactly one registered workspace_id.
 
+PRAGMA foreign_keys = OFF;
+
+BEGIN IMMEDIATE;
+
 CREATE TEMP TABLE IF NOT EXISTS answer_artifact_workspace_guard (
     must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
 );
@@ -134,3 +138,7 @@ CREATE INDEX IF NOT EXISTS mindbrain_answer_artifacts_workspace_idx
 
 CREATE INDEX IF NOT EXISTS mindbrain_answer_events_artifact_idx
     ON mindbrain_answer_events(artifact_id, created_at_unix DESC);
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;

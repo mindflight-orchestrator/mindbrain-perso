@@ -4586,6 +4586,9 @@ test "sqlite-backed graph path result fails cleanly when path metadata is missin
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // Fixture data intentionally omits parent rows (raw workspace/entity
+    // chains); disable FK enforcement for this connection like a legacy DB.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     try insertEntity(db, 1, "person", "Ada");
     try insertRelation(db, .{ .relation_id = 10, .source_id = 1, .target_id = 2, .relation_type = "works_for", .confidence = 0.9 });
@@ -5329,6 +5332,9 @@ test "projectRelationPropertiesForIds roundtrip — only specified relations lan
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // Fixture data intentionally omits parent rows (raw workspace/entity
+    // chains); disable FK enforcement for this connection like a legacy DB.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     // Three relations; FK enforcement is off so no workspace/ontology setup needed.
     try insertEntity(db, 1, "contact", "Alice");
@@ -5379,6 +5385,9 @@ test "projectRelationPropertiesForIds consistency boundary — raw write alone l
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // Fixture data intentionally omits parent rows (raw workspace/entity
+    // chains); disable FK enforcement for this connection like a legacy DB.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     try insertEntity(db, 1, "contact", "Alice");
     try insertEntity(db, 2, "bien", "Maison");
@@ -5414,6 +5423,9 @@ test "projectRelationPropertiesForIds chunk boundary — all 501 ids projected a
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // Fixture data intentionally omits parent rows (raw workspace/entity
+    // chains); disable FK enforcement for this connection like a legacy DB.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     // Shared source/target entities (FK enforcement is off so no raw-layer setup needed).
     try insertEntity(db, 1, "node", "A");

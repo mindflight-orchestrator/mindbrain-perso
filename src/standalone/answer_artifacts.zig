@@ -73,6 +73,9 @@ pub fn repairFromLegacy(db: Database, allocator: std.mem.Allocator) !RepairStats
     var stats: RepairStats = .{};
     try db.exec("BEGIN IMMEDIATE");
     errdefer db.exec("ROLLBACK") catch {};
+    // The repair renames artifact_ids while answer events still reference the
+    // old id; defer FK checks to COMMIT, after children are re-pointed.
+    try db.exec("PRAGMA defer_foreign_keys = ON");
 
     stats.projection_rows = try backfillProjections(db, allocator, &stats);
     stats.projection_result_rows = try backfillProjectionResults(db, allocator, &stats);

@@ -4,6 +4,10 @@
 -- rules. Personal runtime now requires every rule to be scoped by workspace.
 -- Rows that cannot be scoped are rejected instead of guessed.
 
+PRAGMA foreign_keys = OFF;
+
+BEGIN IMMEDIATE;
+
 CREATE TEMP TABLE IF NOT EXISTS graph_gap_rules_workspace_guard (
     must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
 );
@@ -56,3 +60,7 @@ DROP TABLE graph_gap_rules__legacy_workspace_nullable;
 
 CREATE INDEX IF NOT EXISTS graph_gap_rules_lookup_idx
     ON graph_gap_rules(ontology_id, workspace_id, enabled);
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;

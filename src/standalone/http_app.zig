@@ -508,6 +508,12 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
         try applyWriterConnectionPragmas(db, self.sqlite_busy_timeout_ms);
         try db.applyStandaloneSchema();
+        if (facet_sqlite.Database.foreignKeysRequested()) {
+            const fk_violations = db.foreignKeyViolationCount() catch 0;
+            if (fk_violations > 0) {
+                log.warn("database has {d} pre-existing foreign key violations; affected parent deletes will fail (set MINDBRAIN_SQLITE_FOREIGN_KEYS=off to bypass)", .{fk_violations});
+            }
+        }
         try workspace_sqlite.upsertWorkspace(
             db,
             self.default_workspace_id_owned,

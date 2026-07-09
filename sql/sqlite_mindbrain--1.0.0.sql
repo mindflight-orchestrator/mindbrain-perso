@@ -601,7 +601,7 @@ CREATE INDEX IF NOT EXISTS idx_proj_expires
 CREATE TABLE IF NOT EXISTS mindbrain_answer_artifacts (
     artifact_id TEXT PRIMARY KEY,
     slug TEXT NOT NULL,
-    workspace_id TEXT,
+    workspace_id TEXT NOT NULL,
     agent_id TEXT,
     scope TEXT,
     artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),

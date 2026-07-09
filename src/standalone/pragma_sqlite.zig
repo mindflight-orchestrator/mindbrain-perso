@@ -619,6 +619,9 @@ test "pragma sqlite has a TOON pack variant" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // memory_projections references memory_items; this fixture only exercises
+    // pack formatting, so run it like a legacy FK-off database.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     try insertMemoryProjection(db, .{
         .id = "p1",

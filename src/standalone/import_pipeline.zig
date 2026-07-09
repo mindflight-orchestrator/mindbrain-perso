@@ -694,24 +694,51 @@ pub const Pipeline = struct {
     /// (graph_lj_out/in) is dropped here for this workspace's entities and then
     /// fully rebuilt from graph_relation at the end of the reindex.
     fn purgeWorkspaceGraph(self: *Pipeline, workspace_id: []const u8) !void {
-        const statements = [_][]const u8{
+        const PurgeStatement = struct {
+            sql: []const u8,
+            // Rule/link tables are created by migrations and are absent from
+            // import-mode schemas; skip them when the table does not exist.
+            optional: bool = false,
+        };
+        const statements = [_]PurgeStatement{
+            .{ .sql =
             \\DELETE FROM graph_lj_out
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
             \\DELETE FROM graph_lj_in
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
             \\DELETE FROM graph_entity_alias
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
+            \\DELETE FROM graph_entity_degree
+            \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+            },
+            .{ .sql = "DELETE FROM graph_entity_chunk WHERE workspace_id = ?1", .optional = true },
+            .{
+                .sql =
+                \\DELETE FROM graph_entity_document
+                \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+                ,
+                .optional = true,
+            },
+            .{ .sql = "DELETE FROM graph_rule_evaluations WHERE workspace_id = ?1", .optional = true },
+            .{ .sql = "DELETE FROM graph_rule_events WHERE workspace_id = ?1", .optional = true },
+            .{ .sql =
             \\DELETE FROM graph_relation_property
             \\WHERE relation_id IN (SELECT relation_id FROM graph_relation WHERE workspace_id = ?1)
-            ,
-            "DELETE FROM graph_relation WHERE workspace_id = ?1",
-            "DELETE FROM graph_entity WHERE workspace_id = ?1",
+            },
+            .{ .sql = "DELETE FROM graph_relation WHERE workspace_id = ?1" },
+            .{ .sql = "DELETE FROM graph_entity WHERE workspace_id = ?1" },
         };
-        for (statements) |sql| {
-            const stmt = try facet_sqlite.prepare(self.db.*, sql);
+        for (statements) |entry| {
+            const stmt = facet_sqlite.prepare(self.db.*, entry.sql) catch |err| {
+                if (entry.optional and err == error.PrepareFailed) continue;
+                return err;
+            };
             defer facet_sqlite.finalize(stmt);
             try facet_sqlite.bindText(stmt, 1, workspace_id);
             try facet_sqlite.stepDone(stmt);

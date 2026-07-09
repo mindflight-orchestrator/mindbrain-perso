@@ -19,6 +19,8 @@ WHERE workspace_id = 'default'
 
 PRAGMA foreign_keys = OFF;
 
+BEGIN IMMEDIATE;
+
 DROP TABLE IF EXISTS graph_entity__ws_unique_new;
 
 CREATE TABLE graph_entity__ws_unique_new (
@@ -61,6 +63,14 @@ CREATE INDEX IF NOT EXISTS graph_entity_name_idx ON graph_entity(name);
 CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
     ON graph_entity(workspace_id, entity_type, name);
 CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx ON graph_entity(workspace_id);
+CREATE INDEX IF NOT EXISTS graph_entity_projection_id_idx
+    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.projection_id'))
+    WHERE json_extract(metadata_json, '$.projection_id') IS NOT NULL;
+CREATE INDEX IF NOT EXISTS graph_entity_metric_idx
+    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.metric'))
+    WHERE json_extract(metadata_json, '$.metric') IS NOT NULL;
+
+COMMIT;
 
 PRAGMA foreign_keys = ON;
 

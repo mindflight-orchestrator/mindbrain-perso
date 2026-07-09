@@ -1472,6 +1472,15 @@ test "search sqlite searches embeddings with bounded exact top-k" {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    for ([_]struct { table_id: u64, doc_id: u64 }{
+        .{ .table_id = 1, .doc_id = 7 },
+        .{ .table_id = 1, .doc_id = 9 },
+        .{ .table_id = 1, .doc_id = 11 },
+        .{ .table_id = 2, .doc_id = 13 },
+        .{ .table_id = 1, .doc_id = 15 },
+    }) |doc| {
+        try upsertSearchDocument(db, doc.table_id, doc.doc_id, "embedding fixture", "english");
+    }
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 1.0, 0.0 });
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 9, &.{ 0.5, 0.5 });
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 11, &.{ 0.0, 1.0 });
@@ -1492,6 +1501,7 @@ test "search sqlite stores search embeddings as packed f32 blobs" {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    try upsertSearchDocument(db, 1, 7, "embedding fixture", "english");
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 0.25, -0.5, 1.0 });
 
     const stmt = try prepare(db, "SELECT dimensions, length(embedding_blob), typeof(embedding_blob) FROM search_embeddings WHERE table_id = ?1 AND doc_id = ?2");
