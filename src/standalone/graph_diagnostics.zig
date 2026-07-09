@@ -585,6 +585,12 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
 
     const run_id = try std.fmt.allocPrint(allocator, "graph_rule_eval__{s}__{d}", .{ options.workspace_id, try currentUnix(db) });
     defer allocator.free(run_id);
+
+    // ~5 statements per evaluated entity; one transaction for the whole run
+    // instead of one journal sync per statement.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try ensureQualityRunForRuleEvaluation(db, options.workspace_id, ontology_id, run_id);
 
     var events = std.ArrayList(RuleEvent).empty;
@@ -626,7 +632,7 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
             try upsertEvaluationState(db, options.workspace_id, ontology_id, rule, entity_id, state, observed);
             if (previous_state == null or !std.mem.eql(u8, previous_state.?, state)) {
                 changed += 1;
-                const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, rule, entity_id, from_state, state, observed);
+                const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, from_state, state, observed);
                 events_created += 1;
                 if (options.create_remediation_actions and std.mem.eql(u8, from_state, "invalid") and std.mem.eql(u8, state, "valid")) {
                     if (try maybeCreateRemediationAction(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, event.idempotency_key)) {
@@ -641,6 +647,8 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
             }
         }
     }
+
+    try tx.commit();
 
     return .{
         .workspace_id = try allocator.dupe(u8, options.workspace_id),
@@ -858,6 +866,7 @@ fn insertRuleEvent(
     allocator: std.mem.Allocator,
     workspace_id: []const u8,
     ontology_id: []const u8,
+    run_id: []const u8,
     rule: GapRule,
     subject_entity_id: u64,
     from_state: []const u8,
@@ -869,7 +878,11 @@ fn insertRuleEvent(
     defer allocator.free(token);
     const event_id = try std.fmt.allocPrint(allocator, "graph_rule_event__{s}__{s}__{d}__{s}", .{ workspace_id, rule.rule_id, subject_entity_id, token });
     errdefer allocator.free(event_id);
-    const idempotency_key = try std.fmt.allocPrint(allocator, "graph_rule_transition__{s}__{s}__{d}__{s}__{s}__{s}", .{ workspace_id, rule.rule_id, subject_entity_id, from_state, to_state, token });
+    // Derived from the run + transition (not a random token): the unique
+    // index on (workspace_id, idempotency_key) can only deduplicate retried
+    // inserts when the key is reproducible, while a legitimately recurring
+    // transition in a later run still gets its own event.
+    const idempotency_key = try std.fmt.allocPrint(allocator, "graph_rule_transition__{s}__{s}__{s}__{d}__{s}__{s}", .{ run_id, workspace_id, rule.rule_id, subject_entity_id, from_state, to_state });
     errdefer allocator.free(idempotency_key);
 
     const stmt = try facet_sqlite.prepare(db,
@@ -1628,9 +1641,17 @@ fn loadEntityNodes(db: Database, allocator: std.mem.Allocator, workspace_id: []c
 }
 
 fn findParent(parent: []usize, index: usize) usize {
+    var root = index;
+    while (parent[root] != root) root = parent[root];
+    // Path compression keeps degenerate chains from turning component
+    // evaluation quadratic.
     var current = index;
-    while (parent[current] != current) current = parent[current];
-    return current;
+    while (parent[current] != root) {
+        const next = parent[current];
+        parent[current] = root;
+        current = next;
+    }
+    return root;
 }
 
 fn unionParents(parent: []usize, lhs: usize, rhs: usize) void {

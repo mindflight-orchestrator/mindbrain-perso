@@ -46,7 +46,7 @@ pub fn searchNative(
     limit: i32,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(SearchResult) {
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: Starting for table_id={d}, query='{s}'", .{ table_id, query_text });
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: Starting for table_id={d}, query='{s}'", .{ table_id, query_text });
 
     // All database operations in single SPI connection
     // Connect FIRST before tokenization to avoid nested SPI connections
@@ -63,10 +63,10 @@ pub fn searchNative(
     // Phase 1: Tokenize query using native tokenizer
     // Use helper that assumes SPI is already connected to avoid nested connections
     const query_tokens = try tokenizer_native.tokenizeNativeWithExistingConnection(query_text, config_name, allocator);
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: Tokenized into {d} tokens", .{query_tokens.items.len});
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: Tokenized into {d} tokens", .{query_tokens.items.len});
 
     if (query_tokens.items.len == 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] searchNative: No tokens, returning empty", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: No tokens, returning empty", .{});
         return std.ArrayList(SearchResult).empty;
     }
 
@@ -79,7 +79,7 @@ pub fn searchNative(
         if (custom_stopwords.contains(token.lexeme)) continue;
 
         const hash = tokenizer_native.hashLexeme(token.lexeme);
-        utils.elogFmt(c.NOTICE, "[TRACE] searchNative: Token '{s}' -> hash {d}", .{ token.lexeme, hash });
+        utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: Token '{s}' -> hash {d}", .{ token.lexeme, hash });
         try query_hashes.append(allocator, hash);
     }
 
@@ -94,7 +94,7 @@ pub fn searchNative(
     var avgdl: f64 = collection_stats.avg_document_length;
 
     if (total_docs <= 0) {
-        utils.elogFmt(c.NOTICE, "[TRACE] searchNative: No docs, returning empty", .{});
+        utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: No docs, returning empty", .{});
         return std.ArrayList(SearchResult).empty;
     }
 
@@ -107,7 +107,7 @@ pub fn searchNative(
         avgdl = 1.0;
     }
 
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: total_docs={d}, avgdl={d}", .{ total_docs, @as(i64, @intFromFloat(avgdl)) });
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: total_docs={d}, avgdl={d}", .{ total_docs, @as(i64, @intFromFloat(avgdl)) });
 
     // Phase 3: Get doc frequencies for IDF calculation
     var doc_freqs = std.AutoHashMap(i64, i64).init(allocator);
@@ -165,9 +165,9 @@ pub fn searchNative(
     var doc_lengths_map = std.AutoHashMap(i64, i32).init(allocator);
     defer doc_lengths_map.deinit();
 
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: Executing tf_query", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: Executing tf_query", .{});
     ret = c.SPI_execute(tf_query.ptr, true, 0);
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: tf_query ret={d}, processed={d}", .{ ret, c.SPI_processed });
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: tf_query ret={d}, processed={d}", .{ ret, c.SPI_processed });
     if (ret == c.SPI_OK_SELECT and c.SPI_processed > 0 and c.SPI_tuptable != null) {
         var i: u64 = 0;
         while (i < c.SPI_processed) : (i += 1) {
@@ -195,15 +195,15 @@ pub fn searchNative(
             // Store doc length
             try doc_lengths_map.put(doc_id, doc_length);
 
-            utils.elogFmt(c.NOTICE, "[TRACE] searchNative: tf row - hash={d}, doc_id={d}, tf={d}", .{ term_hash, doc_id, tf });
+            utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: tf row - hash={d}, doc_id={d}, tf={d}", .{ term_hash, doc_id, tf });
 
             // Calculate IDF
             const n_qi = doc_freqs.get(term_hash) orelse 0;
             if (n_qi == 0) {
-                utils.elogFmt(c.NOTICE, "[TRACE] searchNative: SKIPPING - no doc_freq for hash={d}", .{term_hash});
+                utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: SKIPPING - no doc_freq for hash={d}", .{term_hash});
                 continue;
             }
-            utils.elogFmt(c.NOTICE, "[TRACE] searchNative: doc_freq n_qi={d}", .{n_qi});
+            utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: doc_freq n_qi={d}", .{n_qi});
 
             const N = @as(f64, @floatFromInt(total_docs));
             const n = @as(f64, @floatFromInt(n_qi));
@@ -241,7 +241,7 @@ pub fn searchNative(
         }
     }.lessThan);
 
-    utils.elogFmt(c.NOTICE, "[TRACE] searchNative: query='{s}', Final results count={d}", .{ query_text, results.items.len });
+    utils.elogFmt(c.DEBUG3, "[TRACE] searchNative: query='{s}', Final results count={d}", .{ query_text, results.items.len });
     if (limit > 0) {
         const limit_usize: usize = @intCast(limit);
         if (results.items.len > limit_usize) {
@@ -373,12 +373,12 @@ pub fn bm25_search_native(fcinfo: c.FunctionCallInfo) callconv(.c) c.Datum {
     };
 
     // Perform search
-    utils.elogFmt(c.NOTICE, "[TRACE] bm25_search_native: calling searchNative for query='{s}'", .{query_text});
+    utils.elogFmt(c.DEBUG3, "[TRACE] bm25_search_native: calling searchNative for query='{s}'", .{query_text});
     const results = searchNative(table_id, query_text, language, options, limit, allocator) catch {
         utils.elogWithContext(c.ERROR, "bm25_search_native", "Native search failed");
         return c.PointerGetDatum(null);
     };
-    utils.elogFmt(c.NOTICE, "[TRACE] bm25_search_native: searchNative returned {d} results for query='{s}'", .{ results.items.len, query_text });
+    utils.elogFmt(c.DEBUG3, "[TRACE] bm25_search_native: searchNative returned {d} results for query='{s}'", .{ results.items.len, query_text });
 
     // Set up ReturnSetInfo
     const rsi_ptr = @as(?*c.ReturnSetInfo, @ptrCast(@alignCast(fcinfo.*.resultinfo)));
@@ -410,9 +410,9 @@ pub fn bm25_search_native(fcinfo: c.FunctionCallInfo) callconv(.c) c.Datum {
     rsi.setDesc = tupdesc;
 
     // Store results
-    utils.elogFmt(c.NOTICE, "[TRACE] bm25_search_native: Storing {d} results in tuplestore", .{results.items.len});
+    utils.elogFmt(c.DEBUG3, "[TRACE] bm25_search_native: Storing {d} results in tuplestore", .{results.items.len});
     for (results.items) |result| {
-        utils.elogFmt(c.NOTICE, "[TRACE] bm25_search_native: Storing doc_id={d}, score={d}", .{ result.doc_id, @as(i64, @intFromFloat(result.score * 1000)) });
+        utils.elogFmt(c.DEBUG3, "[TRACE] bm25_search_native: Storing doc_id={d}, score={d}", .{ result.doc_id, @as(i64, @intFromFloat(result.score * 1000)) });
         var values = [_]c.Datum{
             c.Int64GetDatum(result.doc_id),
             c.Float8GetDatum(result.score),
@@ -423,7 +423,7 @@ pub fn bm25_search_native(fcinfo: c.FunctionCallInfo) callconv(.c) c.Datum {
     }
 
     _ = c.MemoryContextSwitchTo(oldcontext);
-    utils.elogFmt(c.NOTICE, "[TRACE] bm25_search_native: Returning", .{});
+    utils.elogFmt(c.DEBUG3, "[TRACE] bm25_search_native: Returning", .{});
 
     return 0;
 }

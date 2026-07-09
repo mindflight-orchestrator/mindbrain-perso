@@ -83,6 +83,23 @@ const DeltaMap = std.HashMap(DeltaKey, DeltaValue, DeltaKeyContext, 80);
 pub const Database = struct {
     handle: *c.sqlite3,
 
+    /// Foreign key enforcement is on by default; MINDBRAIN_SQLITE_FOREIGN_KEYS=off
+    /// is the escape hatch for databases with pre-existing orphans.
+    pub fn foreignKeysRequested() bool {
+        const value = std.c.getenv("MINDBRAIN_SQLITE_FOREIGN_KEYS") orelse return true;
+        const text = std.mem.span(value);
+        return !(std.ascii.eqlIgnoreCase(text, "off") or
+            std.mem.eql(u8, text, "0") or
+            std.ascii.eqlIgnoreCase(text, "false"));
+    }
+
+    fn applyConnectionForeignKeys(self: Database) void {
+        if (!foreignKeysRequested()) return;
+        self.exec("PRAGMA foreign_keys = ON") catch {
+            std.log.warn("failed to enable sqlite foreign_keys on connection", .{});
+        };
+    }
+
     pub fn open(path: []const u8) Error!Database {
         const path_z = std.heap.c_allocator.dupeZ(u8, path) catch return error.OpenFailed;
         defer std.heap.c_allocator.free(path_z);
@@ -94,7 +111,9 @@ pub const Database = struct {
             }
             return error.OpenFailed;
         }
-        return .{ .handle = db_handle.? };
+        const db = Database{ .handle = db_handle.? };
+        db.applyConnectionForeignKeys();
+        return db;
     }
 
     pub fn openInMemory() Error!Database {
@@ -105,7 +124,9 @@ pub const Database = struct {
             }
             return error.OpenFailed;
         }
-        return .{ .handle = db_handle.? };
+        const db = Database{ .handle = db_handle.? };
+        db.applyConnectionForeignKeys();
+        return db;
     }
 
     pub fn close(self: *Database) void {
@@ -131,6 +152,23 @@ pub const Database = struct {
     }
 
     pub fn applyStandaloneSchema(self: Database) !void {
+        // The legacy facets->agent_facts rename must run before the canonical
+        // schema exec: CREATE TABLE IF NOT EXISTS agent_facts would otherwise
+        // create an empty table next to the legacy one and strand its data.
+        try self.applyAgentFactsTableRenameMigration();
+        // Legacy cleanup: indexes made redundant by UNIQUE auto-indexes or
+        // composite replacements, and the ungated compat trigger (recreated
+        // below by the canonical schema with its WHEN gate).
+        try self.exec(
+            \\DROP INDEX IF EXISTS graph_entity_workspace_type_name_idx;
+            \\DROP INDEX IF EXISTS graph_entity_workspace_id_idx;
+            \\DROP INDEX IF EXISTS graph_entity_chunk_entity_idx;
+            \\DROP INDEX IF EXISTS agent_facts_workspace_id_idx;
+            \\DROP INDEX IF EXISTS agent_facts_source_ref_idx;
+            \\DROP INDEX IF EXISTS idx_agent_facts_source_ref_workspace;
+            \\DROP INDEX IF EXISTS ontology_values_value_idx;
+            \\DROP TRIGGER IF EXISTS trg_sync_agent_facts_compat_after_insert;
+        );
         const schema = try sqlite_schema.renderMetadataSchema(std.heap.page_allocator);
         defer std.heap.page_allocator.free(schema);
         try self.exec(schema);
@@ -141,8 +179,35 @@ pub const Database = struct {
         try self.applyGraphGapRulesMigration();
         try self.applyGraphGapRulesWorkspaceStrictMigration();
         try self.applyGraphRuleEvaluationEventsMigration();
-        try self.applyAgentFactsTableRenameMigration();
         try self.applyAnswerArtifactsWorkspaceStrictMigration();
+    }
+
+    /// Runs a table-rebuild migration script atomically. Foreign keys are
+    /// disabled around the script so RENAME does not rewrite child tables'
+    /// REFERENCES clauses to the transient names, and the whole script runs
+    /// in one transaction so a crash leaves the previous schema intact.
+    fn execRebuildScript(self: Database, script: []const u8) Error!void {
+        try self.exec("PRAGMA foreign_keys = OFF");
+        try self.exec("BEGIN IMMEDIATE");
+        errdefer self.exec("ROLLBACK") catch {
+            std.log.warn("migration rollback failed", .{});
+        };
+        try self.exec(script);
+        try self.exec("COMMIT");
+        self.applyConnectionForeignKeys();
+    }
+
+    pub fn foreignKeyViolationCount(self: Database) Error!u64 {
+        const stmt = try prepare(self, "PRAGMA foreign_key_check");
+        defer finalize(stmt);
+        var count: u64 = 0;
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+            count += 1;
+        }
+        return count;
     }
 
     fn applyAdditiveColumnMigrations(self: Database) Error!void {
@@ -201,8 +266,7 @@ pub const Database = struct {
             return;
         }
 
-        try self.exec(
-            \\PRAGMA foreign_keys = OFF;
+        try self.execRebuildScript(
             \\CREATE TABLE graph_entity__ws_unique_new (
             \\    entity_id INTEGER PRIMARY KEY,
             \\    workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -225,10 +289,12 @@ pub const Database = struct {
             \\DROP TABLE graph_entity;
             \\ALTER TABLE graph_entity__ws_unique_new RENAME TO graph_entity;
             \\CREATE INDEX IF NOT EXISTS graph_entity_name_idx ON graph_entity(name);
-            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
-            \\    ON graph_entity(workspace_id, entity_type, name);
-            \\CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx ON graph_entity(workspace_id);
-            \\PRAGMA foreign_keys = ON;
+            \\CREATE INDEX IF NOT EXISTS graph_entity_projection_id_idx
+            \\    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.projection_id'))
+            \\    WHERE json_extract(metadata_json, '$.projection_id') IS NOT NULL;
+            \\CREATE INDEX IF NOT EXISTS graph_entity_metric_idx
+            \\    ON graph_entity(workspace_id, entity_type, json_extract(metadata_json, '$.metric'))
+            \\    WHERE json_extract(metadata_json, '$.metric') IS NOT NULL;
         );
 
         try self.markMigrationApplied(applied_id);
@@ -279,9 +345,7 @@ pub const Database = struct {
             return;
         }
 
-        try self.exec(
-            \\PRAGMA foreign_keys = OFF;
-            \\
+        try self.execRebuildScript(
             \\CREATE TEMP TABLE IF NOT EXISTS answer_artifact_workspace_guard (
             \\    must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
             \\);
@@ -431,9 +495,7 @@ pub const Database = struct {
             return;
         }
 
-        try self.exec(
-            \\PRAGMA foreign_keys = OFF;
-            \\
+        try self.execRebuildScript(
             \\DROP TABLE IF EXISTS entity_chunks_raw__autoinc_new;
             \\DROP TABLE IF EXISTS entity_documents_raw__autoinc_new;
             \\DROP TABLE IF EXISTS relation_properties_raw__autoinc_new;
@@ -692,10 +754,12 @@ pub const Database = struct {
             \\DROP TABLE raw_graph_relation_id_map;
             \\DROP TABLE raw_graph_entity_source;
             \\DROP TABLE raw_graph_relation_source;
-            \\PRAGMA foreign_keys = ON;
         );
 
-        try self.exec("PRAGMA foreign_key_check;");
+        const violations = try self.foreignKeyViolationCount();
+        if (violations > 0) {
+            std.log.warn("raw graph autoincrement migration left {d} foreign key violations", .{violations});
+        }
         try self.markMigrationApplied(applied_id);
     }
 
@@ -762,7 +826,7 @@ pub const Database = struct {
             return;
         }
 
-        try self.exec(
+        try self.execRebuildScript(
             \\CREATE TEMP TABLE IF NOT EXISTS graph_gap_rules_workspace_guard (
             \\    must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
             \\);
@@ -910,7 +974,7 @@ pub const Database = struct {
             return;
         }
 
-        try self.exec(
+        try self.execRebuildScript(
             \\DROP TRIGGER IF EXISTS trg_sync_facets_compat_after_insert;
             \\DROP TRIGGER IF EXISTS trg_sync_facets_compat_after_update;
             \\ALTER TABLE facets RENAME TO agent_facts;
@@ -918,18 +982,16 @@ pub const Database = struct {
             \\DROP INDEX IF EXISTS facets_source_ref_idx;
             \\DROP INDEX IF EXISTS facets_source_ref_workspace_uniq;
             \\DROP INDEX IF EXISTS idx_facets_source_ref_workspace;
-            \\CREATE INDEX IF NOT EXISTS agent_facts_workspace_id_idx ON agent_facts(workspace_id);
-            \\CREATE INDEX IF NOT EXISTS agent_facts_source_ref_idx ON agent_facts(source_ref) WHERE source_ref IS NOT NULL;
             \\CREATE UNIQUE INDEX IF NOT EXISTS agent_facts_source_ref_workspace_uniq ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
-            \\CREATE INDEX IF NOT EXISTS idx_agent_facts_source_ref_workspace ON agent_facts(source_ref, workspace_id) WHERE source_ref IS NOT NULL;
             \\CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_insert
             \\AFTER INSERT ON agent_facts
+            \\WHEN NEW.doc_id IS NULL OR NEW.facets IS NOT NEW.facets_json
             \\BEGIN
             \\    UPDATE agent_facts
             \\    SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
             \\        facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
             \\        embedding = COALESCE(NEW.embedding, embedding),
-            \\        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts WHERE rowid <> NEW.rowid)),
+            \\        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts)),
             \\        updated_at = CURRENT_TIMESTAMP
             \\    WHERE rowid = NEW.rowid;
             \\END;
@@ -943,9 +1005,16 @@ pub const Database = struct {
             \\        updated_at = CURRENT_TIMESTAMP
             \\    WHERE id = NEW.id;
             \\END;
-            \\UPDATE table_semantics SET table_name = 'agent_facts' WHERE table_name = 'facets';
-            \\UPDATE facet_tables SET table_name = 'agent_facts' WHERE table_name = 'facets';
         );
+
+        // This migration now runs before the canonical schema exec, so these
+        // registry tables may not exist yet on a minimal legacy database.
+        if (try self.sqliteTableExists("table_semantics")) {
+            try self.exec("UPDATE table_semantics SET table_name = 'agent_facts' WHERE table_name = 'facets'");
+        }
+        if (try self.sqliteTableExists("facet_tables")) {
+            try self.exec("UPDATE facet_tables SET table_name = 'agent_facts' WHERE table_name = 'facets'");
+        }
 
         try self.markMigrationApplied(applied_id);
     }
@@ -959,6 +1028,64 @@ pub const Database = struct {
 
     pub fn applyStandaloneStopwordsSeed(self: Database) !void {
         try self.exec(bm25_stopwords_seed_sql);
+    }
+
+    /// Restores the constraints and indexes stripped by the import-mode
+    /// schema. Databases bootstrapped with applyStandaloneImportSchema never
+    /// regain graph_entity_alias's primary key on the runtime path (CREATE
+    /// TABLE IF NOT EXISTS keeps the loose shape), so duplicate alias rows
+    /// stay possible and term lookups stay unindexed until this runs.
+    pub fn finalizeStandaloneImportSchema(self: Database) !void {
+        if (!(try self.tableCreateSqlContains("graph_entity_alias", "PRIMARY KEY(term, entity_id)"))) {
+            try self.execRebuildScript(
+                \\CREATE TABLE graph_entity_alias__finalize_new (
+                \\    term TEXT NOT NULL,
+                \\    entity_id INTEGER NOT NULL,
+                \\    confidence REAL NOT NULL DEFAULT 1.0,
+                \\    PRIMARY KEY(term, entity_id),
+                \\    FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
+                \\);
+                \\INSERT INTO graph_entity_alias__finalize_new(term, entity_id, confidence)
+                \\SELECT term, entity_id, MAX(confidence)
+                \\FROM graph_entity_alias
+                \\GROUP BY term, entity_id;
+                \\DROP TABLE graph_entity_alias;
+                \\ALTER TABLE graph_entity_alias__finalize_new RENAME TO graph_entity_alias;
+            );
+        }
+        // The runtime schema pass recreates every stripped index.
+        try self.applyStandaloneSchema();
+    }
+};
+
+/// Nesting-aware write transaction. Bulk write paths must run inside one
+/// transaction (SQLite otherwise journals/fsyncs every statement), but some
+/// callers already hold a transaction or savepoint — in that case the outer
+/// owner provides atomicity and this becomes a no-op.
+pub const Transaction = struct {
+    db: Database,
+    owns: bool,
+    done: bool = false,
+
+    pub fn begin(db: Database) Error!Transaction {
+        const owns = c.sqlite3_get_autocommit(db.handle) != 0;
+        if (owns) try db.exec("BEGIN IMMEDIATE");
+        return .{ .db = db, .owns = owns };
+    }
+
+    pub fn commit(self: *Transaction) Error!void {
+        if (self.owns and !self.done) try self.db.exec("COMMIT");
+        self.done = true;
+    }
+
+    /// Call via defer; rolls back when commit() was never reached.
+    pub fn deinit(self: *Transaction) void {
+        if (self.owns and !self.done) {
+            self.db.exec("ROLLBACK") catch {
+                std.log.warn("transaction rollback failed", .{});
+            };
+        }
+        self.done = true;
     }
 };
 
@@ -1054,6 +1181,27 @@ pub const Repository = struct {
     }
 };
 
+/// facet_tables.table_id references table_semantics, which itself references
+/// workspaces. Registering a facet table is the act that introduces the id,
+/// so materialize the registration parents when they are absent.
+fn ensureFacetTableParents(
+    db: Database,
+    table_id: u64,
+    schema_name: []const u8,
+    table_name: []const u8,
+) !void {
+    try db.exec("INSERT OR IGNORE INTO workspaces(id, workspace_id) VALUES('default', 'default')");
+    const stmt = try prepare(
+        db,
+        "INSERT OR IGNORE INTO table_semantics(table_id, workspace_id, table_schema, table_name) VALUES (?1, 'default', ?2, ?3)",
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindText(stmt, 2, schema_name);
+    try bindText(stmt, 3, table_name);
+    try stepDone(stmt);
+}
+
 pub fn insertFacetTable(
     db: Database,
     table_id: u64,
@@ -1061,6 +1209,7 @@ pub fn insertFacetTable(
     table_name: []const u8,
     chunk_bits: u8,
 ) !void {
+    try ensureFacetTableParents(db, table_id, schema_name, table_name);
     const sql =
         "INSERT INTO facet_tables(table_id, schema_name, table_name, chunk_bits) VALUES (?1, ?2, ?3, ?4)";
     const stmt = try prepare(db, sql);
@@ -1080,6 +1229,7 @@ pub fn upsertFacetTable(
     table_name: []const u8,
     chunk_bits: u8,
 ) !void {
+    try ensureFacetTableParents(db, table_id, schema_name, table_name);
     const sql =
         "INSERT OR REPLACE INTO facet_tables(table_id, schema_name, table_name, chunk_bits) VALUES (?1, ?2, ?3, ?4)";
     const stmt = try prepare(db, sql);
@@ -1162,6 +1312,20 @@ pub fn queueFacetDelta(
     try bindInt64(stmt, 4, posting_i64);
     try bindInt64(stmt, 5, delta);
     try stepDone(stmt);
+}
+
+/// Queue-only variant for bulk imports: deltas accumulate and the caller
+/// runs one mergeDeltasSafe at the end instead of rewriting posting blobs
+/// once per document.
+pub fn queueFacetAssignments(
+    db: Database,
+    table_id: u64,
+    doc_id: u64,
+    assignments: []const FacetDocumentAssignment,
+) !void {
+    for (assignments) |assignment| {
+        try queueFacetDelta(db, table_id, assignment.facet_id, assignment.facet_value, doc_id, 1);
+    }
 }
 
 pub fn syncFacetAssignments(
@@ -1947,6 +2111,11 @@ pub fn filterDocumentsByFacetsBitmap(
 ) !roaring.Bitmap {
     if (filters.len == 0) return try roaring.Bitmap.empty();
 
+    // Postings are chunked with the table's configured chunk_bits;
+    // reconstructing with any other shift maps doc ids to the wrong
+    // documents (false intersections, dropped matches).
+    const chunk_bits = try loadChunkBitsForTableId(db, table_id);
+
     var combined: ?roaring.Bitmap = null;
     errdefer if (combined) |*bitmap| bitmap.deinit();
 
@@ -1961,23 +2130,9 @@ pub fn filterDocumentsByFacetsBitmap(
         }
         try appendPostingsForValue(db, allocator, &postings, table_id, filter.facet_id, filter.facet_value);
 
-        var union_bm = try roaring.Bitmap.empty();
+        var union_bm = (try reconstructFacetBitmapFromPostings(allocator, chunk_bits, postings.items)) orelse
+            try roaring.Bitmap.empty();
         defer union_bm.deinit();
-        for (postings.items) |posting| {
-            const shift: u6 = @intCast(@as(u8, 16));
-            _ = shift;
-            // Postings are already in dense, chunk-local IDs; combine across chunks
-            // by treating each posting's chunk_id as a high-order offset to keep
-            // results unique. Compose into a single bitmap so AND across filters works.
-            const ids = try posting.bitmap.toArray(allocator);
-            defer allocator.free(ids);
-            const chunk_offset: u32 = posting.chunk_id;
-            for (ids) |id| {
-                const composed: u64 = (@as(u64, chunk_offset) << 16) | @as(u64, id);
-                if (composed > std.math.maxInt(u32)) continue;
-                union_bm.add(@intCast(composed));
-            }
-        }
 
         if (combined == null) {
             combined = union_bm;
@@ -1988,6 +2143,14 @@ pub fn filterDocumentsByFacetsBitmap(
     }
 
     return combined orelse try roaring.Bitmap.empty();
+}
+
+fn loadChunkBitsForTableId(db: Database, table_id: u64) !u8 {
+    const stmt = try prepare(db, "SELECT chunk_bits FROM facet_tables WHERE table_id = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    return try columnU8(stmt, 0);
 }
 
 /// Document IDs that satisfy every facet filter, parity for

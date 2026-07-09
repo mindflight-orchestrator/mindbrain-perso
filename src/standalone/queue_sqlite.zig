@@ -187,7 +187,12 @@ pub const QueueStore = struct {
                     std.log.warn("queue {s} handler failed: {s}", .{ queue_name, @errorName(err) });
                     continue;
                 };
-                _ = try self.archive(queue_name, msg.msg_id);
+                // A transient archive failure (e.g. SQLITE_BUSY) must not
+                // kill the polling thread; the message stays visible and is
+                // retried on the next poll.
+                _ = self.archive(queue_name, msg.msg_id) catch |err| {
+                    std.log.warn("queue {s} archive failed for msg {d}: {s}", .{ queue_name, msg.msg_id, @errorName(err) });
+                };
             }
         }
     }

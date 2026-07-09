@@ -368,11 +368,11 @@ pub const Store = struct {
             ts_entry.value_ptr.document_frequency += 1;
 
             if (self.posting_index_by_term.get(term_key)) |posting_idx| {
-                self.postings.items[posting_idx].bitmap.add(@intCast(doc_id));
+                self.postings.items[posting_idx].bitmap.add(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
             } else {
                 const posting_idx = self.postings.items.len;
                 var bitmap = try roaring.Bitmap.empty();
-                bitmap.add(@intCast(doc_id));
+                bitmap.add(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
                 try self.postings.append(self.allocator, .{
                     .table_id = table_id,
                     .term_hash = term_hash,
@@ -425,7 +425,7 @@ pub const Store = struct {
             }
 
             if (self.posting_index_by_term.get(term_key)) |posting_idx| {
-                self.postings.items[posting_idx].bitmap.remove(@intCast(doc_id));
+                self.postings.items[posting_idx].bitmap.remove(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
             }
         }
     }
@@ -505,7 +505,7 @@ pub const Store = struct {
 
                 const posting_entry = try posting_docs.getOrPut(key);
                 if (!posting_entry.found_existing) posting_entry.value_ptr.* = .empty;
-                try posting_entry.value_ptr.append(self.allocator, @intCast(doc.doc_id));
+                try posting_entry.value_ptr.append(self.allocator, std.math.cast(u32, doc.doc_id) orelse return error.ValueOutOfRange);
             }
         }
 

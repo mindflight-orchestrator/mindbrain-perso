@@ -48,6 +48,13 @@ pub fn seedSyndicProfile(
         .workspace_id = workspace_id,
         .domain_profile = "syndic",
     });
+    // The target ontology must exist before it can become the default.
+    try collections_sqlite.ensureOntology(db, .{
+        .ontology_id = ontology_id,
+        .workspace_id = workspace_id,
+        .name = ontology_id,
+        .source_kind = "seed",
+    });
     try collections_sqlite.setDefaultOntology(db, workspace_id, ontology_id);
 
     for (syndic_namespaces) |ns| {

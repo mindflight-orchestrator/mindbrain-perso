@@ -2740,14 +2740,21 @@ fn computePromptDocumentLimits(
 }
 
 fn mergeQualificationEnvelopes(allocator: Allocator, parts: []const []const u8) ![]u8 {
+    // The assignment rows borrow strings from their part's parse arena, so
+    // every Parsed must stay alive until after the final stringify.
+    var parsed_parts = std.ArrayList(std.json.Parsed(QualificationEnvelope)).empty;
+    defer {
+        for (parsed_parts.items) |*parsed| parsed.deinit();
+        parsed_parts.deinit(allocator);
+    }
     var merged = std.ArrayList(QualificationAssignmentRow).empty;
-    errdefer merged.deinit(allocator);
+    defer merged.deinit(allocator);
     for (parts) |json| {
-        var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
+        const parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
-        defer parsed.deinit();
+        try parsed_parts.append(allocator, parsed);
         try merged.appendSlice(allocator, parsed.value.assignments);
     }
     return try std.json.Stringify.valueAlloc(allocator, .{ .assignments = merged.items }, .{});
@@ -3431,7 +3438,13 @@ fn freeExtractBatchJobParts(allocator: Allocator, jobs: []ExtractBatchJob) void 
 
 fn transferExtractBatchJobPart(allocator: Allocator, job: *ExtractBatchJob) !void {
     const staged = job.part orelse return error.InvalidLlmBusinessExtractionResponse;
-    const owned = try allocator.dupe(u8, staged);
+    const owned = allocator.dupe(u8, staged) catch |err| {
+        // Keep ownership consistent: job.part must never hold smp-owned
+        // memory once an error escapes, the caller frees with `allocator`.
+        std.heap.smp_allocator.free(staged);
+        job.part = null;
+        return err;
+    };
     std.heap.smp_allocator.free(staged);
     job.part = owned;
 }
@@ -3850,12 +3863,16 @@ fn businessExtractLlmWorker(ctx: *LlmWorkerCtx) void {
     const thread_alloc = arena.allocator();
     runOneExtractBatchLlm(thread_alloc, ctx.opts, ctx.job, ctx.docs_rows, ctx.batch_total) catch |err| {
         ctx.job.llm_err = err;
+        // job.part (if already set) points into the arena that dies with
+        // this worker; never let it escape.
+        ctx.job.part = null;
         return;
     };
     const part = ctx.job.part orelse return;
     // Thread-safe staging buffer; main thread copies into parent_allocator after join.
     const owned = std.heap.smp_allocator.dupe(u8, part) catch |err| {
         ctx.job.llm_err = err;
+        ctx.job.part = null;
         return;
     };
     ctx.job.part = owned;
@@ -3895,12 +3912,12 @@ fn runExtractBatchLlmJobs(
     defer allocator.free(parallel_detail);
     try writeBusinessExtractProgress("llm_parallelism", 0, jobs.len, 0, "", 0, parallel_detail);
 
+    errdefer freeExtractBatchJobParts(allocator, jobs);
     if (parallel == 1) {
         for (jobs) |*job| {
             try runOneExtractBatchLlm(allocator, opts, job, docs_rows, jobs.len);
         }
     } else {
-        errdefer freeExtractBatchJobParts(allocator, jobs);
         var wave_start: usize = 0;
         while (wave_start < jobs.len) {
             const wave_len = @min(parallel, jobs.len - wave_start);
@@ -3922,11 +3939,28 @@ fn runExtractBatchLlmJobs(
             for (threads[0..wave_len]) |*thread| {
                 thread.join();
             }
+            var wave_err: ?anyerror = null;
             for (0..wave_len) |w| {
                 const job = &jobs[wave_start + w];
-                if (job.llm_err) |err| return err;
-                try transferExtractBatchJobPart(allocator, job);
+                if (wave_err != null) {
+                    // A previous job in this wave failed: release the
+                    // remaining smp-owned staging buffers now so the
+                    // parent-allocator errdefer only sees transferred parts.
+                    if (job.part) |staged| {
+                        std.heap.smp_allocator.free(staged);
+                        job.part = null;
+                    }
+                    continue;
+                }
+                if (job.llm_err) |err| {
+                    wave_err = err;
+                    continue;
+                }
+                transferExtractBatchJobPart(allocator, job) catch |err| {
+                    wave_err = err;
+                };
             }
+            if (wave_err) |err| return err;
             wave_start += wave_len;
         }
     }
@@ -6073,6 +6107,10 @@ fn persistProfiledDocument(
     const decision = chunking_policy.decide(profile);
     const metadata_json = try profileMetadataJson(allocator, profile_value, decision);
     defer allocator.free(metadata_json);
+    // One transaction per document (autocommit costs a journal sync per
+    // chunk/facet write and leaves partial documents on failure).
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = workspace_id,
         .collection_id = collection_id,
@@ -6134,6 +6172,7 @@ fn persistProfiledDocument(
         }
     }
 
+    try tx.commit();
     return .{ .chunk_count = chunks.len };
 }
 
@@ -6150,7 +6189,7 @@ fn indexContextualChunk(
 ) !void {
     if (!options.enabled) return;
     const table_id = options.search_table_id orelse return CliError.InvalidArguments;
-    const synthetic_id = chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
+    const synthetic_id = try chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
 
     try search_sqlite.syncSearchDocument(
         db,
@@ -6201,7 +6240,11 @@ fn embedContextualText(
     return try allocator.dupe(f32, response.vectors[0].values);
 }
 
-fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) u64 {
+fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) !u64 {
+    // Unchecked composition would silently collide: chunk 2^bits of doc N
+    // becomes chunk 0 of doc N+1 in the search index.
+    if (chunk_index >= (@as(u64, 1) << chunk_bits)) return error.ChunkIndexExceedsChunkBits;
+    if (doc_id > (@as(u64, std.math.maxInt(u64)) >> chunk_bits)) return error.DocIdExceedsChunkBits;
     return (doc_id << chunk_bits) | @as(u64, chunk_index);
 }
 
@@ -6273,9 +6316,6 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
     defer if (owned_vector_matches) |matches| allocator.free(matches);
 
     if (semantic_enabled) {
-        var store = try search_sqlite.loadSearchStore(db, allocator);
-        defer store.deinit();
-
         const query_embedding = try embedContextualText(allocator, query.?, .{
             .enabled = true,
             .embedding_base_url = base_url,
@@ -6284,15 +6324,17 @@ fn runContextualSearchCommand(allocator: Allocator, args: []const []const u8) !v
         });
         defer allocator.free(query_embedding);
 
-        const vector_repo = store.vectorRepository();
-        owned_vector_matches = try vector_repo.searchNearestFn(vector_repo.ctx, allocator, .{
-            .table_name = "search_embeddings",
-            .key_column = "doc_id",
-            .vector_column = "embedding_blob",
-            .query_vector = query_embedding,
-            .limit = retrieval_limit,
-            .table_id = table_id,
-        });
+        // Bounded exact top-k over the table's stored embeddings; loading
+        // the whole search store re-tokenized every document in every table
+        // just to answer one nearest-neighbor query.
+        owned_vector_matches = try search_sqlite.searchEmbeddingExactTopK(
+            db,
+            allocator,
+            table_id.?,
+            query_embedding,
+            retrieval_limit,
+            .cosine,
+        );
     }
 
     const vector_matches = owned_vector_matches orelse empty_vector_matches;
@@ -6958,6 +7000,19 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
         break :blk generated_nanoid.?;
     } else nanoid_value;
 
+    var ingest_tx = try facet_sqlite.Transaction.begin(db);
+    defer ingest_tx.deinit();
+
+    // documents_raw references workspaces and collections; materialize the
+    // parents so a first ingest into a fresh database succeeds.
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = workspace_id.? });
+    try collections_sqlite.ensureCollection(db, .{
+        .workspace_id = workspace_id.?,
+        .collection_id = collection_id.?,
+        .name = collection_id.?,
+        .default_language = language,
+    });
+
     try collections_sqlite.upsertDocumentRaw(db, .{
         .workspace_id = workspace_id.?,
         .collection_id = collection_id.?,
@@ -7007,6 +7062,8 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
             try collections_sqlite.upsertFacetAssignmentRaw(db, row);
         }
     }
+
+    try ingest_tx.commit();
 
     try writeStdout("ingested doc_id={d} nanoid={s} chunks={d}\n", .{
         doc_id_opt.?, nanoid_final, total_chunks,
@@ -7077,7 +7134,11 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
     try db.applyStandaloneSchema();
 
     // When --link-id is omitted (or 0), allocate the next free id within the
-    // workspace so the caller does not have to track them manually.
+    // workspace so the caller does not have to track them manually. The
+    // MAX+1 read and the insert share a transaction so two writers cannot
+    // allocate the same id and silently overwrite each other.
+    var link_tx = try facet_sqlite.Transaction.begin(db);
+    defer link_tx.deinit();
     if (link_id == 0) {
         const sql = "SELECT COALESCE(MAX(link_id), 0) + 1 FROM external_links_raw WHERE workspace_id = ?1";
         const stmt = try facet_sqlite.prepare(db, sql);
@@ -7098,6 +7159,8 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
         .weight = weight,
         .metadata_json = metadata_json,
     });
+
+    try link_tx.commit();
 
     try writeStdout("external link {d} -> {s} ({s}) added\n", .{ link_id, target_uri.?, edge_type });
 }

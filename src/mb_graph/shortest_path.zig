@@ -39,6 +39,103 @@ pub fn shortest_path_filtered_wrapper(fcinfo: c.FunctionCallInfo) c.Datum {
     }
 }
 
+const max_layer_slots: usize = 64;
+
+const SearchSide = struct {
+    depth: i32 = 0,
+    frontier: *c.roaring_bitmap_t,
+    closure: *c.roaring_bitmap_t,
+    // One bitmap per BFS layer so a meet with any layer of the opposite
+    // side yields the exact hop count; intersecting only the two current
+    // frontiers missed (or overestimated) meets with older layers when one
+    // side advanced several levels in a row.
+    layers: [max_layer_slots]?*c.roaring_bitmap_t = @splat(null),
+
+    fn deinit(self: *SearchSide) void {
+        c.roaring_bitmap_free(self.frontier);
+        c.roaring_bitmap_free(self.closure);
+        for (self.layers) |maybe_layer| {
+            if (maybe_layer) |layer| c.roaring_bitmap_free(layer);
+        }
+    }
+
+    /// Smallest opposite-layer depth intersecting `frontier`, if any.
+    fn meetDepth(self: *const SearchSide, frontier: *c.roaring_bitmap_t) ?i32 {
+        for (self.layers, 0..) |maybe_layer, layer_depth| {
+            const layer = maybe_layer orelse break;
+            const overlap = roaring_utils.bitmapAnd(frontier, layer);
+            defer c.roaring_bitmap_free(overlap);
+            if (!roaring_utils.isBitmapEmpty(overlap)) return @intCast(layer_depth);
+        }
+        return null;
+    }
+};
+
+fn initSide(start: i32) SearchSide {
+    var side = SearchSide{
+        .frontier = roaring_utils.createBitmapFromArray(&.{start}),
+        .closure = roaring_utils.createBitmapFromArray(&.{start}),
+    };
+    side.layers[0] = roaring_utils.createBitmapFromArray(&.{start});
+    return side;
+}
+
+/// Expands `side` one BFS level. Returns false when the search is exhausted.
+fn expandSide(
+    side: *SearchSide,
+    allowed: ?*c.roaring_bitmap_t,
+    has_meta_filters: bool,
+    after_date_datum: ?c.Datum,
+    before_date_datum: ?c.Datum,
+    conf_min: ?f32,
+    conf_max: ?f32,
+) bool {
+    const e_front = graph_traversal.getEdgesFromNodesBoth(side.frontier);
+    if (e_front == null or roaring_utils.isBitmapEmpty(e_front.?)) {
+        if (e_front) |bm| c.roaring_bitmap_free(bm);
+        return false;
+    }
+
+    const e_filt = if (allowed) |a| roaring_utils.bitmapAnd(e_front.?, a) else e_front.?;
+    if (allowed != null) c.roaring_bitmap_free(e_front.?);
+    defer if (allowed != null) c.roaring_bitmap_free(e_filt);
+
+    // filterEdgesMeta returns null both for "no result" and "no filters";
+    // only consult it when filters were actually supplied, otherwise every
+    // unfiltered call was treated as "no path".
+    var meta_owned: ?*c.roaring_bitmap_t = null;
+    defer if (meta_owned) |bm| c.roaring_bitmap_free(bm);
+    const edges = if (has_meta_filters) blk: {
+        meta_owned = graph_traversal.filterEdgesMeta(e_filt, after_date_datum, before_date_datum, conf_min, conf_max);
+        if (meta_owned == null or roaring_utils.isBitmapEmpty(meta_owned.?)) return false;
+        break :blk meta_owned.?;
+    } else e_filt;
+
+    const n_next = graph_traversal.getNextNodesFromEdges(side.frontier, edges);
+    defer if (n_next) |bm| c.roaring_bitmap_free(bm);
+    if (n_next == null or roaring_utils.isBitmapEmpty(n_next.?)) return false;
+
+    const fresh = roaring_utils.bitmapDifference(n_next.?, side.closure);
+    if (roaring_utils.isBitmapEmpty(fresh)) {
+        c.roaring_bitmap_free(fresh);
+        return false;
+    }
+
+    c.roaring_bitmap_free(side.frontier);
+    side.frontier = fresh;
+
+    const merged = roaring_utils.bitmapOr(side.closure, side.frontier);
+    c.roaring_bitmap_free(side.closure);
+    side.closure = merged;
+
+    side.depth += 1;
+    const slot: usize = @intCast(side.depth);
+    if (slot < max_layer_slots) {
+        side.layers[slot] = c.roaring_bitmap_copy(side.frontier);
+    }
+    return true;
+}
+
 /// Bidirectional BFS shortest path. Returns hop count or null if no path found.
 fn shortest_path_filtered(
     src: i32,
@@ -59,113 +156,36 @@ fn shortest_path_filtered(
         unreachable;
     }
 
-    var o_depth: i32 = 0;
-    var o_new = roaring_utils.createBitmapFromArray(&.{src});
-    var o_tc = roaring_utils.createBitmapFromArray(&.{src});
+    const depth_cap: i32 = @min(max_depth, @as(i32, max_layer_slots - 1));
 
-    var i_depth: i32 = 0;
-    var i_new = roaring_utils.createBitmapFromArray(&.{dest});
-    var i_tc = roaring_utils.createBitmapFromArray(&.{dest});
+    var outward = initSide(src);
+    var inward = initSide(dest);
+    const has_meta_filters = after_date_datum != null or before_date_datum != null or
+        conf_min != null or conf_max != null;
 
     const allowed = graph_traversal.getAllowedEdges(edge_types_datum, doc_types_datum, jurisdictions_datum);
 
     const result: ?i32 = blk: {
         while (true) {
-            const overlap = roaring_utils.bitmapAnd(i_new, o_new);
-            defer c.roaring_bitmap_free(overlap);
+            if (outward.depth + inward.depth >= depth_cap) break :blk null;
 
-            if (!roaring_utils.isBitmapEmpty(overlap)) {
-                break :blk i_depth + o_depth;
-            }
+            const expand_inward = roaring_utils.bitmapCardinality(inward.frontier) <
+                roaring_utils.bitmapCardinality(outward.frontier);
+            const side = if (expand_inward) &inward else &outward;
+            const opposite = if (expand_inward) &outward else &inward;
 
-            if (o_depth + i_depth >= max_depth) {
+            if (!expandSide(side, allowed, has_meta_filters, after_date_datum, before_date_datum, conf_min, conf_max)) {
                 break :blk null;
             }
-
-            const i_card = roaring_utils.bitmapCardinality(i_new);
-            const o_card = roaring_utils.bitmapCardinality(o_new);
-
-            if (i_card < o_card) {
-                // Expand inward frontier
-                const e_front = graph_traversal.getEdgesFromNodesBoth(i_new);
-                if (e_front == null or roaring_utils.isBitmapEmpty(e_front.?)) {
-                    if (e_front) |bm| c.roaring_bitmap_free(bm);
-                    break :blk null;
-                }
-
-                const e_filt = if (allowed) |a| roaring_utils.bitmapAnd(e_front.?, a) else e_front.?;
-                if (allowed != null) c.roaring_bitmap_free(e_front.?);
-                defer if (allowed != null) c.roaring_bitmap_free(e_filt);
-
-                const e_filt_meta = graph_traversal.filterEdgesMeta(e_filt, after_date_datum, before_date_datum, conf_min, conf_max);
-                defer if (e_filt_meta) |bm| c.roaring_bitmap_free(bm);
-
-                if (e_filt_meta == null or roaring_utils.isBitmapEmpty(e_filt_meta.?)) break :blk null;
-
-                const n_next = graph_traversal.getNextNodesFromEdges(i_new, e_filt_meta.?);
-                defer if (n_next) |bm| c.roaring_bitmap_free(bm);
-
-                if (n_next == null or roaring_utils.isBitmapEmpty(n_next.?)) break :blk null;
-
-                const i_new_filtered = roaring_utils.bitmapDifference(n_next.?, i_tc);
-                defer c.roaring_bitmap_free(i_new_filtered);
-
-                if (roaring_utils.isBitmapEmpty(i_new_filtered)) break :blk null;
-
-                const old_i_new = i_new;
-                i_new = roaring_utils.createEmptyBitmap();
-                roaring_utils.bitmapOrInplace(i_new, i_new_filtered);
-                c.roaring_bitmap_free(old_i_new);
-
-                const temp_i_tc = roaring_utils.bitmapOr(i_tc, i_new);
-                c.roaring_bitmap_free(i_tc);
-                i_tc = temp_i_tc;
-                i_depth += 1;
-            } else {
-                // Expand outward frontier
-                const e_front = graph_traversal.getEdgesFromNodesBoth(o_new);
-                if (e_front == null or roaring_utils.isBitmapEmpty(e_front.?)) {
-                    if (e_front) |bm| c.roaring_bitmap_free(bm);
-                    break :blk null;
-                }
-
-                const e_filt = if (allowed) |a| roaring_utils.bitmapAnd(e_front.?, a) else e_front.?;
-                if (allowed != null) c.roaring_bitmap_free(e_front.?);
-                defer if (allowed != null) c.roaring_bitmap_free(e_filt);
-
-                const e_filt_meta = graph_traversal.filterEdgesMeta(e_filt, after_date_datum, before_date_datum, conf_min, conf_max);
-                defer if (e_filt_meta) |bm| c.roaring_bitmap_free(bm);
-
-                if (e_filt_meta == null or roaring_utils.isBitmapEmpty(e_filt_meta.?)) break :blk null;
-
-                const n_next = graph_traversal.getNextNodesFromEdges(o_new, e_filt_meta.?);
-                defer if (n_next) |bm| c.roaring_bitmap_free(bm);
-
-                if (n_next == null or roaring_utils.isBitmapEmpty(n_next.?)) break :blk null;
-
-                const o_new_filtered = roaring_utils.bitmapDifference(n_next.?, o_tc);
-                defer c.roaring_bitmap_free(o_new_filtered);
-
-                if (roaring_utils.isBitmapEmpty(o_new_filtered)) break :blk null;
-
-                const old_o_new = o_new;
-                o_new = roaring_utils.createEmptyBitmap();
-                roaring_utils.bitmapOrInplace(o_new, o_new_filtered);
-                c.roaring_bitmap_free(old_o_new);
-
-                const temp_o_tc = roaring_utils.bitmapOr(o_tc, o_new);
-                c.roaring_bitmap_free(o_tc);
-                o_tc = temp_o_tc;
-                o_depth += 1;
+            if (opposite.meetDepth(side.frontier)) |met_depth| {
+                break :blk side.depth + met_depth;
             }
         }
     };
 
     if (allowed) |bm| c.roaring_bitmap_free(bm);
-    c.roaring_bitmap_free(o_new);
-    c.roaring_bitmap_free(o_tc);
-    c.roaring_bitmap_free(i_new);
-    c.roaring_bitmap_free(i_tc);
+    outward.deinit();
+    inward.deinit();
     _ = c.SPI_finish();
 
     return result;

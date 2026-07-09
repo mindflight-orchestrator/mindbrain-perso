@@ -278,6 +278,7 @@ pub const MindbrainHttpApp = struct {
     writer_db: facet_sqlite.Database,
     writer_mutex: std.Io.Mutex,
     writer_active_session_id: ?u64,
+    writer_session_last_activity_ms: i64,
     writer_completed: u64,
     writer_failed: u64,
     writer_last_error_operation: ?[]u8,
@@ -392,6 +393,7 @@ pub const MindbrainHttpApp = struct {
             .writer_db = writer_db,
             .writer_mutex = .init,
             .writer_active_session_id = null,
+            .writer_session_last_activity_ms = 0,
             .writer_completed = 0,
             .writer_failed = 0,
             .writer_last_error_operation = null,
@@ -508,6 +510,12 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
         try applyWriterConnectionPragmas(db, self.sqlite_busy_timeout_ms);
         try db.applyStandaloneSchema();
+        if (facet_sqlite.Database.foreignKeysRequested()) {
+            const fk_violations = db.foreignKeyViolationCount() catch 0;
+            if (fk_violations > 0) {
+                log.warn("database has {d} pre-existing foreign key violations; affected parent deletes will fail (set MINDBRAIN_SQLITE_FOREIGN_KEYS=off to bypass)", .{fk_violations});
+            }
+        }
         try workspace_sqlite.upsertWorkspace(
             db,
             self.default_workspace_id_owned,
@@ -616,7 +624,7 @@ pub const MindbrainHttpApp = struct {
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
 
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -638,6 +646,7 @@ pub const MindbrainHttpApp = struct {
         self.next_sql_session_id += 1;
         try self.sql_sessions.put(session_id, session);
         self.writer_active_session_id = session_id;
+        self.writer_session_last_activity_ms = milliTimestamp();
         self.writer_completed += 1;
 
         return toResponse(
@@ -721,6 +730,7 @@ pub const MindbrainHttpApp = struct {
             if (self.writer_active_session_id != session_id) {
                 return try self.writerSessionMismatchResponse(allocator, session_id);
             }
+            self.writer_session_last_activity_ms = milliTimestamp();
 
             const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
                 self.writer_failed += 1;
@@ -735,7 +745,7 @@ pub const MindbrainHttpApp = struct {
             self.writer_mutex.lockUncancelable(self.io);
             defer self.writer_mutex.unlock(self.io);
 
-            if (self.writer_active_session_id != null) {
+            if (self.writerSessionBlocking()) {
                 return try self.writerSessionBusyResponse(allocator);
             }
             const response = self.executeSql(allocator, self.writer_db, sql_request.sql, sql_request.params) catch |err| {
@@ -781,6 +791,29 @@ pub const MindbrainHttpApp = struct {
         defer self.sql_sessions_mutex.unlock(self.io);
 
         return self.sql_sessions.get(session_id) orelse error.NotFound;
+    }
+
+    const writer_session_idle_timeout_ms: i64 = 5 * 60 * 1000;
+
+    /// Returns true when a live writer session should still block other
+    /// writes. A session whose client vanished used to wedge every write
+    /// endpoint (503 sql_session_busy) until the server restarted; stale
+    /// sessions are rolled back and released after the idle timeout.
+    /// Caller must hold writer_mutex.
+    fn writerSessionBlocking(self: *MindbrainHttpApp) bool {
+        const active = self.writer_active_session_id orelse return false;
+        const now = milliTimestamp();
+        if (now - self.writer_session_last_activity_ms < writer_session_idle_timeout_ms) return true;
+
+        log.warn("sql session {d} idle past {d} ms; rolling back and releasing the writer", .{ active, writer_session_idle_timeout_ms });
+        self.writer_db.exec("ROLLBACK") catch |err| {
+            self.recordWriterError(self.writer_db, "ROLLBACK", err);
+        };
+        self.writer_active_session_id = null;
+        if (self.takeSqlSession(active)) |session| {
+            self.allocator.destroy(session);
+        } else |_| {}
+        return false;
     }
 
     fn takeSqlSession(self: *MindbrainHttpApp, session_id: u64) !*SqlSession {
@@ -1281,7 +1314,7 @@ pub const MindbrainHttpApp = struct {
         const source_ref = normalizeOptionalText(write_request.source_ref);
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -1361,7 +1394,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -1427,7 +1460,7 @@ pub const MindbrainHttpApp = struct {
     fn handleSimulate(self: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -1569,19 +1602,32 @@ pub const MindbrainHttpApp = struct {
             search_request.collection_id,
         )) orelse return error.BadRequest;
 
+        // Workspace scoping happens inside the candidate queries for the
+        // shared agent-facts table: post-filtering after top-k truncation
+        // lost recall for workspaces ranked below other tenants and probed
+        // agent_facts once per candidate.
         const candidate_limit = @min(@as(usize, 1000), search_request.limit * 4);
-        const raw_bm25_matches = if (search_request.query.len > 0)
-            try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit)
+        const bm25_matches = if (search_request.query.len == 0)
+            try allocator.alloc(search_sqlite.Bm25Match, 0)
+        else if (table_id == 1)
+            try search_sqlite.searchFts5Bm25Workspace(db, allocator, table_id, search_request.workspace_id, search_request.query, candidate_limit)
         else
-            try allocator.alloc(search_sqlite.Bm25Match, 0);
-        defer allocator.free(raw_bm25_matches);
-        const bm25_matches = if (table_id == 1)
-            try filterBm25MatchesByWorkspace(db, allocator, raw_bm25_matches, search_request.workspace_id)
-        else
-            raw_bm25_matches;
-        defer if (table_id == 1) allocator.free(bm25_matches);
+            try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit);
+        defer allocator.free(bm25_matches);
 
-        const raw_vector_matches = if (query_vector_f32.len > 0)
+        const vector_matches = if (query_vector_f32.len == 0)
+            try allocator.alloc(interfaces.VectorSearchMatch, 0)
+        else if (table_id == 1)
+            try search_sqlite.searchEmbeddingExactTopKWorkspace(
+                db,
+                allocator,
+                table_id,
+                search_request.workspace_id,
+                query_vector_f32,
+                candidate_limit,
+                .cosine,
+            )
+        else
             try search_sqlite.searchEmbeddingExactTopK(
                 db,
                 allocator,
@@ -1589,15 +1635,8 @@ pub const MindbrainHttpApp = struct {
                 query_vector_f32,
                 candidate_limit,
                 .cosine,
-            )
-        else
-            try allocator.alloc(interfaces.VectorSearchMatch, 0);
-        defer allocator.free(raw_vector_matches);
-        const vector_matches = if (table_id == 1)
-            try filterVectorMatchesByWorkspace(db, allocator, raw_vector_matches, search_request.workspace_id)
-        else
-            raw_vector_matches;
-        defer if (table_id == 1) allocator.free(vector_matches);
+            );
+        defer allocator.free(vector_matches);
 
         const matches = try hybrid_search.fusePreScored(
             allocator,
@@ -1707,7 +1746,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -1759,7 +1798,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -2481,7 +2520,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         var run = graph_diagnostics.runRuleEvaluations(self.writer_db, allocator, .{
@@ -2514,7 +2553,7 @@ pub const MindbrainHttpApp = struct {
         if (run_request.persist) {
             self.writer_mutex.lockUncancelable(self.io);
             defer self.writer_mutex.unlock(self.io);
-            if (self.writer_active_session_id != null) {
+            if (self.writerSessionBlocking()) {
                 return try self.writerSessionBusyResponse(allocator);
             }
             var result = quality_convergence.runConvergence(self.writer_db, allocator, .{
@@ -2604,7 +2643,7 @@ pub const MindbrainHttpApp = struct {
         const decision_request = try self.parseQualityRemediationDecisionRequest(allocator, request, body_buffer);
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         quality_convergence.decideAction(self.writer_db, decision_request.action_id, decision_request.decision, decision_request.actor, decision_request.note) catch |err| switch (err) {
@@ -2632,7 +2671,7 @@ pub const MindbrainHttpApp = struct {
         const status_request = try self.parseQualityRemediationStatusRequest(allocator, request, body_buffer);
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         quality_convergence.updateActionStatus(self.writer_db, status_request.action_id, status_request.status, status_request.result_json) catch |err| switch (err) {
@@ -2672,7 +2711,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try ontologyIsFrozenIfExists(self.writer_db, import_request.ontology_id)) {
@@ -2739,7 +2778,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try ontologyIsFrozenIfExists(self.writer_db, compile_request.ontology_id)) {
@@ -2780,7 +2819,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -2818,7 +2857,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -2857,7 +2896,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -2904,7 +2943,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -2936,7 +2975,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -2988,7 +3027,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         if (try collections_sqlite.isOntologyFrozen(self.writer_db, write_request.ontology_id)) {
@@ -3022,7 +3061,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -3041,7 +3080,7 @@ pub const MindbrainHttpApp = struct {
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
 
@@ -3919,7 +3958,7 @@ pub const MindbrainHttpApp = struct {
     fn handleGhostcrabArtifactRefresh(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8) !Response {
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writer_active_session_id != null) {
+        if (self.writerSessionBlocking()) {
             return try self.writerSessionBusyResponse(allocator);
         }
         const row = answer_artifacts.refreshLiveAnswerView(self.writer_db, allocator, artifact_id) catch |err| switch (err) {
@@ -5156,17 +5195,33 @@ fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Datab
 fn writeEntityFacets(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
     const entity_text = try std.fmt.allocPrint(allocator, "{}", .{entity_id});
     defer allocator.free(entity_text);
+    // Three indexed probes (source_ref unique, doc_id unique, expression
+    // index on $.entity_id) instead of one OR over expressions that forced
+    // a full scan of the workspace's facts per rendered entity.
+    const doc_id_probe: ?i64 = std.fmt.parseInt(i64, entity_text, 10) catch null;
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT id, schema_id, content, facets_json, source_ref, doc_id
-        \\FROM agent_facts
-        \\WHERE workspace_id = ?1
-        \\  AND (source_ref = ?2 OR CAST(doc_id AS TEXT) = ?2 OR json_extract(facets_json, '$.entity_id') = ?2)
+        \\FROM (
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND source_ref = ?2
+        \\    UNION
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND doc_id = ?3
+        \\    UNION
+        \\    SELECT id, schema_id, content, facets_json, source_ref, doc_id, updated_at_unix, created_at_unix
+        \\    FROM agent_facts WHERE workspace_id = ?1 AND json_extract(facets_json, '$.entity_id') = ?2
+        \\)
         \\ORDER BY updated_at_unix DESC, created_at_unix DESC
         \\LIMIT 10
     );
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, entity_text);
+    if (doc_id_probe) |doc_id_value| {
+        try facet_sqlite.bindInt64(stmt, 3, doc_id_value);
+    } else {
+        try facet_sqlite.bindNull(stmt, 3);
+    }
     var first = true;
     while (try helper_api.stepRow(stmt)) {
         if (!first) try writer.writeAll(",");
@@ -5996,6 +6051,7 @@ test "ontology import HTTP handlers reject busy frozen and invalid requests" {
     try std.testing.expect(std.mem.indexOf(u8, frozen_linkml.body, "ontology_frozen") != null);
 
     app.writer_active_session_id = 42;
+    app.writer_session_last_activity_ms = milliTimestamp();
     defer app.writer_active_session_id = null;
     const busy = try app.runOntologyImportRequest(arena, .{
         .workspace_id = "ws_busy_http",

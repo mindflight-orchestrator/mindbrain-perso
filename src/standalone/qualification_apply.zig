@@ -49,6 +49,10 @@ pub fn applyQualificationEnvelope(allocator: Allocator, db: facet_sqlite.Databas
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
+    // All-or-nothing: a rejected assignment mid-envelope used to leave the
+    // earlier assignments committed while reporting the envelope as failed.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     var accepted: usize = 0;
     for (parsed.value.assignments, 0..) |row, row_index| {
         const normalized = qualification_normalize.normalizeQualificationFacet(
@@ -91,6 +95,7 @@ pub fn applyQualificationEnvelope(allocator: Allocator, db: facet_sqlite.Databas
         }
         accepted += 1;
     }
+    try tx.commit();
     return accepted;
 }
 

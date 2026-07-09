@@ -345,6 +345,111 @@ pub fn searchEmbeddingExactTopK(
     return matches.toOwnedSlice(allocator);
 }
 
+/// Workspace-scoped BM25 candidates for the shared agent-facts table:
+/// scoping inside the query spends the LIMIT budget on the requested
+/// workspace instead of filtering candidates after truncation (recall
+/// loss) with one probe statement per candidate (N+1).
+pub fn searchFts5Bm25Workspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query: []const u8,
+    limit: usize,
+) ![]Bm25Match {
+    if (limit == 0) return allocator.alloc(Bm25Match, 0);
+
+    const match_query = try buildFts5OrQuery(allocator, query);
+    defer allocator.free(match_query);
+    if (match_query.len == 0) return allocator.alloc(Bm25Match, 0);
+
+    const sql =
+        \\SELECT d.doc_id, -bm25(search_fts) AS score
+        \\FROM search_fts
+        \\JOIN search_fts_docs d ON d.fts_rowid = search_fts.rowid
+        \\JOIN agent_facts af ON af.doc_id = d.doc_id
+        \\WHERE d.table_id = ?1 AND search_fts MATCH ?2
+        \\  AND af.workspace_id = ?3
+        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+        \\ORDER BY bm25(search_fts) ASC
+        \\LIMIT ?4
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+
+    try bindInt64(stmt, 1, table_id);
+    try bindText(stmt, 2, match_query);
+    try bindText(stmt, 3, workspace_id);
+    try bindInt64(stmt, 4, limit);
+
+    var matches = std.ArrayList(Bm25Match).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try matches.append(allocator, .{
+            .doc_id = try columnDocId(stmt, 0),
+            .score = c.sqlite3_column_double(stmt, 1),
+        });
+    }
+
+    return matches.toOwnedSlice(allocator);
+}
+
+/// Workspace-scoped exact vector top-k over the shared agent-facts table;
+/// see searchFts5Bm25Workspace for why scoping happens inside the scan.
+pub fn searchEmbeddingExactTopKWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query_vector: []const f32,
+    limit: usize,
+    metric: interfaces.VectorDistanceMetric,
+) ![]interfaces.VectorSearchMatch {
+    if (limit == 0 or query_vector.len == 0) return allocator.alloc(interfaces.VectorSearchMatch, 0);
+
+    const sql =
+        \\SELECT e.doc_id, e.dimensions, e.embedding_blob
+        \\FROM search_embeddings e
+        \\JOIN agent_facts af ON af.doc_id = e.doc_id
+        \\WHERE e.table_id = ?1 AND e.dimensions = ?2
+        \\  AND af.workspace_id = ?3
+        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+    ;
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindInt64(stmt, 2, query_vector.len);
+    try bindText(stmt, 3, workspace_id);
+
+    var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
+    defer matches.deinit(allocator);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+        const doc_id = try columnDocId(stmt, 0);
+        const dimensions = try columnUsize(stmt, 1);
+        const values = try decodeEmbedding(allocator, stmt, 2, dimensions);
+        defer allocator.free(values);
+
+        const score = vector_distance.score(metric, query_vector, values);
+        try vector_distance.insertTopMatch(allocator, &matches, .{
+            .doc_id = doc_id,
+            .distance = score.distance,
+            .similarity = score.similarity,
+        }, limit);
+    }
+
+    std.mem.sort(interfaces.VectorSearchMatch, matches.items, {}, vector_distance.lessThan);
+    return matches.toOwnedSlice(allocator);
+}
+
 fn searchTableBelongsToWorkspace(db: Database, workspace_id: []const u8, table_id: u64) !bool {
     const stmt = try prepare(db, "SELECT 1 FROM table_semantics WHERE workspace_id = ?1 AND table_id = ?2 LIMIT 1");
     defer finalize(stmt);
@@ -550,6 +655,11 @@ pub fn loadSearchStore(db: Database, allocator: std.mem.Allocator) !search_store
 }
 
 pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void {
+    // Atomic rebuild: a crash mid-way used to leave the index half-deleted,
+    // and per-statement autocommit journaled every document write.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try db.exec("DELETE FROM search_collection_stats");
     try db.exec("DELETE FROM search_document_stats");
     try db.exec("DELETE FROM search_term_stats");
@@ -572,6 +682,15 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
     defer doc_lengths.deinit();
     var term_doc_freq = std.AutoHashMap(u128, u64).init(allocator);
     defer term_doc_freq.deinit();
+    // Postings must be rebuilt alongside the stats: the incremental path
+    // maintains them, and the compact store's candidate generation returns
+    // nothing when a full rebuild leaves search_postings empty.
+    var term_postings = std.AutoHashMap(u128, std.ArrayList(u32)).init(allocator);
+    defer {
+        var posting_it = term_postings.iterator();
+        while (posting_it.next()) |entry| entry.value_ptr.deinit(allocator);
+        term_postings.deinit();
+    }
 
     while (true) {
         const rc = c.sqlite3_step(doc_stmt);
@@ -623,6 +742,11 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
             } else {
                 df_entry.value_ptr.* = 1;
             }
+
+            const posting_doc_id = std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange;
+            const posting_entry = try term_postings.getOrPut(key);
+            if (!posting_entry.found_existing) posting_entry.value_ptr.* = .empty;
+            try posting_entry.value_ptr.append(allocator, posting_doc_id);
         }
     }
 
@@ -637,6 +761,16 @@ pub fn rebuildSearchArtifacts(db: Database, allocator: std.mem.Allocator) !void 
         const unpacked = unpackArtifactKey(entry.key_ptr.*);
         try writer.upsertTermStat(unpacked.table_id, unpacked.term_hash, entry.value_ptr.*);
     }
+
+    var posting_write_it = term_postings.iterator();
+    while (posting_write_it.next()) |entry| {
+        const unpacked = unpackArtifactKey(entry.key_ptr.*);
+        var bitmap = try roaring.Bitmap.fromSlice(entry.value_ptr.items);
+        defer bitmap.deinit();
+        try upsertPosting(db, allocator, unpacked.table_id, unpacked.term_hash, bitmap);
+    }
+
+    try tx.commit();
 }
 
 pub fn upsertSearchArtifactsForDocument(
@@ -804,17 +938,24 @@ pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !searc
 }
 
 pub fn compactSearchSnapshot(db: Database, allocator: std.mem.Allocator) !CompactSearchSnapshot {
-    var store = try loadCompactSearchStore(db, allocator);
-    defer store.deinit();
-
+    _ = allocator;
+    // Six COUNT(*) statements; loading the compact store deserialized every
+    // posting bitmap and embedding just to report row counts.
     return .{
-        .collection_stats = store.collection_stats.items.len,
-        .document_stats = store.document_stats.items.len,
-        .term_stats = store.term_stats.items.len,
-        .term_frequencies = store.term_frequencies.items.len,
-        .postings = store.postings.items.len,
-        .embeddings = store.embeddings.items.len,
+        .collection_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_collection_stats"),
+        .document_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_document_stats"),
+        .term_stats = try countTableRows(db, "SELECT COUNT(*) FROM search_term_stats"),
+        .term_frequencies = try countTableRows(db, "SELECT COUNT(*) FROM search_term_frequencies"),
+        .postings = try countTableRows(db, "SELECT COUNT(*) FROM search_postings"),
+        .embeddings = try countTableRows(db, "SELECT COUNT(*) FROM search_embeddings"),
     };
+}
+
+fn countTableRows(db: Database, sql: []const u8) !usize {
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
 }
 
 pub fn compactSearchSnapshotToon(db: Database, allocator: std.mem.Allocator) ![]u8 {
@@ -1055,9 +1196,9 @@ fn reconcileTermArtifact(
 
     if (old_frequency == 0 and new_frequency > 0) {
         if (posting == null) posting = try roaring.Bitmap.empty();
-        posting.?.add(@intCast(doc_id));
+        posting.?.add(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
     } else if (old_frequency > 0 and new_frequency == 0) {
-        if (posting) |*bitmap| bitmap.remove(@intCast(doc_id));
+        if (posting) |*bitmap| bitmap.remove(std.math.cast(u32, doc_id) orelse return error.ValueOutOfRange);
     }
 
     if (posting) |bitmap| {
@@ -1472,6 +1613,15 @@ test "search sqlite searches embeddings with bounded exact top-k" {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    for ([_]struct { table_id: u64, doc_id: u64 }{
+        .{ .table_id = 1, .doc_id = 7 },
+        .{ .table_id = 1, .doc_id = 9 },
+        .{ .table_id = 1, .doc_id = 11 },
+        .{ .table_id = 2, .doc_id = 13 },
+        .{ .table_id = 1, .doc_id = 15 },
+    }) |doc| {
+        try upsertSearchDocument(db, doc.table_id, doc.doc_id, "embedding fixture", "english");
+    }
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 1.0, 0.0 });
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 9, &.{ 0.5, 0.5 });
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 11, &.{ 0.0, 1.0 });
@@ -1492,6 +1642,7 @@ test "search sqlite stores search embeddings as packed f32 blobs" {
     defer db.close();
     try db.applyStandaloneSchema();
 
+    try upsertSearchDocument(db, 1, 7, "embedding fixture", "english");
     try upsertSearchEmbedding(db, std.testing.allocator, 1, 7, &.{ 0.25, -0.5, 1.0 });
 
     const stmt = try prepare(db, "SELECT dimensions, length(embedding_blob), typeof(embedding_blob) FROM search_embeddings WHERE table_id = ?1 AND doc_id = ?2");
@@ -1652,7 +1803,7 @@ test "search sqlite compact snapshot reports persisted artifact counts" {
     try std.testing.expectEqual(@as(usize, 2), snapshot.document_stats);
     try std.testing.expectEqual(@as(usize, 5), snapshot.term_stats);
     try std.testing.expectEqual(@as(usize, 6), snapshot.term_frequencies);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.postings);
+    try std.testing.expectEqual(@as(usize, 5), snapshot.postings);
     try std.testing.expectEqual(@as(usize, 2), snapshot.embeddings);
 
     const toon = try compactSearchSnapshotToon(db, std.testing.allocator);

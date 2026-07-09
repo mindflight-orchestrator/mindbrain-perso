@@ -160,6 +160,11 @@ pub fn loadWsFromBundle(
     mode: structured_import.ImportMode,
 ) !LoadWsReport {
     var report = LoadWsReport{};
+    // One transaction for the whole load: per-row autocommit fsyncs made
+    // bulk CSV loads orders of magnitude slower, and a reset-mode DELETE
+    // followed by a failing row left the table half-purged.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     for (bundle.tables) |named| {
         const ws_name = try wsTableName(allocator, named.name);
         defer allocator.free(ws_name);
@@ -179,6 +184,7 @@ pub fn loadWsFromBundle(
         }
         report.tables_loaded += 1;
     }
+    try tx.commit();
     return report;
 }
 
@@ -352,6 +358,14 @@ const WsUpsertBatch = struct {
             return error.MissingPrimaryKey;
         };
 
+        // Headers come straight from the CSV and are spliced into SQL;
+        // refuse anything that is not a plain identifier (a crafted header
+        // could otherwise smuggle statements, and spaces/reserved words
+        // produce confusing prepare errors).
+        for (headers) |header| {
+            if (!isPlainIdentifier(header)) return error.InvalidColumnName;
+        }
+
         var sql = std.ArrayList(u8).empty;
         defer sql.deinit(allocator);
         try sql.appendSlice(allocator, "INSERT OR REPLACE INTO ");
@@ -392,7 +406,16 @@ const WsUpsertBatch = struct {
 };
 
 fn wsTableName(allocator: std.mem.Allocator, entity_name: []const u8) ![]const u8 {
+    if (!isPlainIdentifier(entity_name)) return error.InvalidTableName;
     return try std.fmt.allocPrint(allocator, "ws_{s}", .{entity_name});
+}
+
+fn isPlainIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
 }
 
 pub fn readDataPlane(mapping_path: []const u8, allocator: std.mem.Allocator) ![]const u8 {

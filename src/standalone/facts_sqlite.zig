@@ -435,6 +435,8 @@ test "standalone schema allocates legacy agent_facts doc_id and has source_ref i
             if (std.mem.eql(u8, name, "idx_agent_facts_source_ref_workspace")) found_legacy_compat = true;
         }
         try std.testing.expect(found_canonical);
-        try std.testing.expect(found_legacy_compat);
+        // The legacy duplicate of the unique index is dropped by the schema
+        // cleanup pass; only the canonical unique index must remain.
+        try std.testing.expect(!found_legacy_compat);
     }
 }

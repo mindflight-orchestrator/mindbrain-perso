@@ -7,7 +7,7 @@ pub const Error = error{
 
 const CandidateScore = struct {
     bm25_score: f64 = 0.0,
-    vector_score: f64 = 0.0,
+    vector_score: f64 = -std.math.inf(f64),
 };
 
 pub fn search(
@@ -78,7 +78,9 @@ pub fn search(
 
             for (vector_matches) |match| {
                 const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
-                if (match.similarity > entry.vector_score) {
+                // -inf sentinel: negative similarities (anti-correlated docs)
+                // must not be silently collapsed to the 0.0 default.
+                if (entry.vector_score == -std.math.inf(f64) or match.similarity > entry.vector_score) {
                     entry.vector_score = match.similarity;
                 }
             }
@@ -182,7 +184,7 @@ pub fn fusePreScored(
 
     for (vector_matches) |match| {
         const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
-        if (match.similarity > entry.vector_score) entry.vector_score = match.similarity;
+        if (entry.vector_score == -std.math.inf(f64) or match.similarity > entry.vector_score) entry.vector_score = match.similarity;
     }
 
     var results = std.ArrayList(interfaces.HybridSearchMatch).empty;

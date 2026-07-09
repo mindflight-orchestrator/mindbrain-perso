@@ -16,6 +16,8 @@ pub const RunOptions = struct {
 };
 
 const Counts = struct {
+    coverage_available: bool = true,
+    diagnostics_available: bool = true,
     registry_schemas: u64 = 0,
     registry_graph_node_schemas: u64 = 0,
     registry_graph_edge_schemas: u64 = 0,
@@ -83,7 +85,13 @@ pub fn runConvergence(db: Database, allocator: std.mem.Allocator, options: RunOp
 
     var counts = try loadCounts(db, options.workspace_id, ontology_id);
 
-    const coverage = ontology_sqlite.coverageReport(db, allocator, options.workspace_id, null) catch null;
+    // A failed sub-report must not read as "no issues": record that the
+    // signal was unavailable instead of persisting zeros.
+    const coverage = ontology_sqlite.coverageReport(db, allocator, options.workspace_id, null) catch |err| blk: {
+        std.log.warn("convergence coverage report unavailable: {s}", .{@errorName(err)});
+        counts.coverage_available = false;
+        break :blk null;
+    };
     defer if (coverage) |report| deinitCoverageReport(allocator, report);
     if (coverage) |report| {
         counts.coverage_total_nodes = report.summary.total_nodes;
@@ -96,7 +104,11 @@ pub fn runConvergence(db: Database, allocator: std.mem.Allocator, options: RunOp
         .ontology_id = ontology_id,
         .limit = options.limit,
         .component_small_max = options.component_small_max,
-    }) catch null;
+    }) catch |err| blk: {
+        std.log.warn("convergence diagnostics report unavailable: {s}", .{@errorName(err)});
+        counts.diagnostics_available = false;
+        break :blk null;
+    };
     defer if (diagnostics) |*report| report.deinit(allocator);
     if (diagnostics) |report| counts.diagnostics_issues = report.issues.len;
 
@@ -127,10 +139,15 @@ pub fn runConvergence(db: Database, allocator: std.mem.Allocator, options: RunOp
     errdefer allocator.free(report_json);
 
     if (options.persist) {
+        // Run + actions must land together; a partial persist reported a
+        // completed run with missing remediation actions.
+        var tx = try facet_sqlite.Transaction.begin(db);
+        defer tx.deinit();
         try persistRun(db, run_id, options.workspace_id, ontology_id, fingerprint, summary_json, report_json);
         for (actions.items) |action| {
             try persistAction(db, run_id, options.workspace_id, ontology_id, action);
         }
+        try tx.commit();
     }
 
     return .{
@@ -199,9 +216,9 @@ pub fn getRunJson(db: Database, allocator: std.mem.Allocator, run_id: []const u8
 pub fn actionsJson(db: Database, allocator: std.mem.Allocator, run_id: []const u8, status: ?[]const u8) ![]const u8 {
     const sql =
         if (status) |_|
-            "SELECT action_id, issue_type, severity, confidence, reason, schema_id, entity_type, projection_id, evidence_json, mcp_tool, tool_args_json, execution_mode, idempotency_key, status, decision_actor, decision_note, result_json, created_at_unix, updated_at_unix FROM quality_remediation_action WHERE run_id = ?1 AND status = ?2 ORDER BY severity DESC, action_id"
+            "SELECT action_id, issue_type, severity, confidence, reason, schema_id, entity_type, projection_id, evidence_json, mcp_tool, tool_args_json, execution_mode, idempotency_key, status, decision_actor, decision_note, result_json, created_at_unix, updated_at_unix FROM quality_remediation_action WHERE run_id = ?1 AND status = ?2 ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'warning' THEN 2 ELSE 3 END, action_id"
         else
-            "SELECT action_id, issue_type, severity, confidence, reason, schema_id, entity_type, projection_id, evidence_json, mcp_tool, tool_args_json, execution_mode, idempotency_key, status, decision_actor, decision_note, result_json, created_at_unix, updated_at_unix FROM quality_remediation_action WHERE run_id = ?1 ORDER BY severity DESC, action_id";
+            "SELECT action_id, issue_type, severity, confidence, reason, schema_id, entity_type, projection_id, evidence_json, mcp_tool, tool_args_json, execution_mode, idempotency_key, status, decision_actor, decision_note, result_json, created_at_unix, updated_at_unix FROM quality_remediation_action WHERE run_id = ?1 ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'warning' THEN 2 ELSE 3 END, action_id";
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindText(stmt, 1, run_id);
@@ -239,6 +256,7 @@ pub fn decideAction(db: Database, action_id: []const u8, decision: []const u8, a
     if (actor) |value| try bindText(stmt, 3, value) else try bindNull(stmt, 3);
     if (note) |value| try bindText(stmt, 4, value) else try bindNull(stmt, 4);
     try stepDone(stmt);
+    if (c.sqlite3_changes(db.handle) == 0) return error.NotFound;
 }
 
 pub fn updateActionStatus(db: Database, action_id: []const u8, status: []const u8, result_json: ?[]const u8) !void {
@@ -256,6 +274,7 @@ pub fn updateActionStatus(db: Database, action_id: []const u8, status: []const u
     try bindText(stmt, 2, status);
     try bindText(stmt, 3, result_json orelse "{}");
     try stepDone(stmt);
+    if (c.sqlite3_changes(db.handle) == 0) return error.NotFound;
 }
 
 fn loadCounts(db: Database, workspace_id: []const u8, ontology_id: []const u8) !Counts {
@@ -374,8 +393,8 @@ fn renderSummaryJson(allocator: std.mem.Allocator, counts: Counts) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.print(
-        "{{\"registry_schemas\":{},\"registry_graph_node_schemas\":{},\"registry_graph_edge_schemas\":{},\"registry_facet_definitions\":{},\"native_entity_types\":{},\"native_edge_types\":{},\"native_unique_edge_labels\":{},\"graph_entities\":{},\"graph_relations\":{},\"coverage_gaps\":{},\"diagnostics_issues\":{},\"projection_results\":{}}}",
-        .{ counts.registry_schemas, counts.registry_graph_node_schemas, counts.registry_graph_edge_schemas, counts.registry_facet_definitions, counts.native_entity_types, counts.native_edge_types, counts.native_unique_edge_labels, counts.graph_entities, counts.graph_relations, counts.coverage_gaps, counts.diagnostics_issues, counts.projection_results },
+        "{{\"registry_schemas\":{},\"registry_graph_node_schemas\":{},\"registry_graph_edge_schemas\":{},\"registry_facet_definitions\":{},\"native_entity_types\":{},\"native_edge_types\":{},\"native_unique_edge_labels\":{},\"graph_entities\":{},\"graph_relations\":{},\"coverage_gaps\":{},\"coverage_available\":{},\"diagnostics_issues\":{},\"diagnostics_available\":{},\"projection_results\":{}}}",
+        .{ counts.registry_schemas, counts.registry_graph_node_schemas, counts.registry_graph_edge_schemas, counts.registry_facet_definitions, counts.native_entity_types, counts.native_edge_types, counts.native_unique_edge_labels, counts.graph_entities, counts.graph_relations, counts.coverage_gaps, counts.coverage_available, counts.diagnostics_issues, counts.diagnostics_available, counts.projection_results },
     );
     return try out.toOwnedSlice();
 }

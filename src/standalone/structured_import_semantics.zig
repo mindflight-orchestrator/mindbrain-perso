@@ -97,6 +97,10 @@ pub fn registerSemanticsJson(
 ) !RegisterReport {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, proposal_json, .{});
     defer parsed.deinit();
+    // One transaction: the MAX+1 id allocators and their inserts must not
+    // interleave with another writer, and per-row autocommit is slow.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     try workspace_sqlite.upsertWorkspace(db, workspace_id, "{\"domain\":\"structured_import\"}");
 
     var report = RegisterReport{};
@@ -217,6 +221,7 @@ pub fn registerSemanticsJson(
         }
     }
 
+    try tx.commit();
     return report;
 }
 

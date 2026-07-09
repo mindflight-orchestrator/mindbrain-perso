@@ -76,11 +76,37 @@ function isTableLevelConstraint(line) {
   );
 }
 
+function defaultLiteralForType(ddl) {
+  const upper = ddl.toUpperCase();
+  if (/\bINT/.test(upper)) return "0";
+  if (/\b(REAL|FLOA|DOUB)/.test(upper)) return "0";
+  if (/\bBLOB\b/.test(upper)) return "X''";
+  return "''";
+}
+
 function sanitizeDdlForAlter(ddl) {
   let out = ddl.replace(/\s+/g, " ").trim();
   out = out.replace(/\s+REFERENCES\b[\s\S]*$/i, "").trim();
   out = out.replace(/\s+PRIMARY KEY\b/i, "").trim();
   out = out.replace(/\s+UNIQUE\b(?!\()/i, "").trim();
+  // ALTER TABLE ADD COLUMN rejects non-constant defaults
+  // (CURRENT_TIMESTAMP, parenthesized expressions) outright.
+  out = out
+    .replace(/\s+DEFAULT\s+CURRENT_(TIMESTAMP|TIME|DATE)\b/i, (m) =>
+      / TEXT /i.test(` ${out} `) || !/\bINT/i.test(out)
+        ? " DEFAULT ''"
+        : " DEFAULT 0"
+    )
+    .replace(/\s+DEFAULT\s+\((?:[^()]|\([^()]*\))*\)/i, (m) =>
+      /\bINT/i.test(out) || /\b(REAL|FLOA|DOUB)/i.test(out)
+        ? " DEFAULT 0"
+        : " DEFAULT ''"
+    )
+    .trim();
+  // ALTER TABLE ADD COLUMN also rejects NOT NULL without a default value.
+  if (/\bNOT NULL\b/i.test(out) && !/\bDEFAULT\b/i.test(out)) {
+    out = `${out} DEFAULT ${defaultLiteralForType(out)}`;
+  }
   return out;
 }
 

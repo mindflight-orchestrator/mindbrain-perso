@@ -88,7 +88,16 @@ pub fn upsertWorkspace(
     workspace_id: []const u8,
     domain_profile_json: []const u8,
 ) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO workspaces(id, workspace_id, domain_profile, domain_profile_json) VALUES (?1, ?2, ?3, ?4)");
+    // INSERT OR REPLACE would delete and re-insert the row, resetting the
+    // columns not listed here (label, description) on every server start.
+    const stmt = try prepare(db,
+        \\INSERT INTO workspaces(id, workspace_id, domain_profile, domain_profile_json)
+        \\VALUES (?1, ?2, ?3, ?4)
+        \\ON CONFLICT(workspace_id) DO UPDATE SET
+        \\    domain_profile = excluded.domain_profile,
+        \\    domain_profile_json = excluded.domain_profile_json,
+        \\    updated_at = CURRENT_TIMESTAMP
+    );
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     try bindText(stmt, 2, workspace_id);

@@ -187,12 +187,6 @@ CREATE TABLE IF NOT EXISTS graph_entity (
 CREATE INDEX IF NOT EXISTS graph_entity_name_idx
     ON graph_entity(name);
 
-CREATE INDEX IF NOT EXISTS graph_entity_workspace_type_name_idx
-    ON graph_entity(workspace_id, entity_type, name);
-
-CREATE INDEX IF NOT EXISTS graph_entity_workspace_id_idx
-    ON graph_entity(workspace_id);
-
 -- Type B projection lookups (ghostcrab_projection_get) filter graph_entity by
 -- workspace_id + entity_type + a literal metadata JSON key. These expression
 -- indexes let those point lookups avoid scanning every workspace entity.
@@ -211,6 +205,9 @@ CREATE TABLE IF NOT EXISTS graph_entity_alias (
     PRIMARY KEY(term, entity_id),
     FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
 );
+
+CREATE INDEX IF NOT EXISTS graph_entity_alias_entity_idx
+    ON graph_entity_alias(entity_id);
 
 CREATE TABLE IF NOT EXISTS graph_relation (
     relation_id INTEGER PRIMARY KEY,
@@ -292,9 +289,6 @@ CREATE TABLE IF NOT EXISTS graph_entity_chunk (
     PRIMARY KEY(entity_id, workspace_id, collection_id, doc_id, chunk_index),
     FOREIGN KEY(entity_id) REFERENCES graph_entity(entity_id)
 );
-
-CREATE INDEX IF NOT EXISTS graph_entity_chunk_entity_idx
-    ON graph_entity_chunk(entity_id);
 
 CREATE INDEX IF NOT EXISTS graph_entity_chunk_source_idx
     ON graph_entity_chunk(workspace_id, collection_id, doc_id, chunk_index);
@@ -495,20 +489,19 @@ CREATE TABLE IF NOT EXISTS agent_facts (
     doc_id INTEGER UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS agent_facts_workspace_id_idx
-    ON agent_facts(workspace_id);
-
-CREATE INDEX IF NOT EXISTS agent_facts_source_ref_idx
-    ON agent_facts(source_ref)
-    WHERE source_ref IS NOT NULL;
-
 CREATE UNIQUE INDEX IF NOT EXISTS agent_facts_source_ref_workspace_uniq
     ON agent_facts(source_ref, workspace_id)
     WHERE source_ref IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_agent_facts_source_ref_workspace
-    ON agent_facts(source_ref, workspace_id)
-    WHERE source_ref IS NOT NULL;
+-- Registry/taxonomy lookups filter on (workspace_id, schema_id); the
+-- composite index also covers workspace-only scans as a prefix.
+CREATE INDEX IF NOT EXISTS agent_facts_workspace_schema_idx
+    ON agent_facts(workspace_id, schema_id);
+
+-- Entity inspect resolves facts by the entity id stored in facets_json.
+CREATE INDEX IF NOT EXISTS agent_facts_entity_ref_idx
+    ON agent_facts(workspace_id, json_extract(facets_json, '$.entity_id'))
+    WHERE json_extract(facets_json, '$.entity_id') IS NOT NULL;
 
 CREATE TRIGGER IF NOT EXISTS trg_sync_workspace_compat_after_insert
 AFTER INSERT ON workspaces
@@ -534,12 +527,13 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sync_agent_facts_compat_after_insert
 AFTER INSERT ON agent_facts
+WHEN NEW.doc_id IS NULL OR NEW.facets IS NOT NEW.facets_json
 BEGIN
     UPDATE agent_facts
     SET facets = COALESCE(NULLIF(NEW.facets, '{}'), NEW.facets_json, '{}'),
         facets_json = COALESCE(NULLIF(NEW.facets_json, '{}'), NEW.facets, '{}'),
         embedding = COALESCE(NEW.embedding, embedding),
-        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts WHERE rowid <> NEW.rowid)),
+        doc_id = COALESCE(NEW.doc_id, (SELECT COALESCE(MAX(doc_id), 0) + 1 FROM agent_facts)),
         updated_at = CURRENT_TIMESTAMP
     WHERE rowid = NEW.rowid;
 END;
@@ -601,7 +595,7 @@ CREATE INDEX IF NOT EXISTS idx_proj_expires
 CREATE TABLE IF NOT EXISTS mindbrain_answer_artifacts (
     artifact_id TEXT PRIMARY KEY,
     slug TEXT NOT NULL,
-    workspace_id TEXT,
+    workspace_id TEXT NOT NULL,
     agent_id TEXT,
     scope TEXT,
     artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),
@@ -737,6 +731,12 @@ CREATE TABLE IF NOT EXISTS memory_edges (
     weight REAL NOT NULL DEFAULT 1.0,
     created_at_unix INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS memory_projections_user_idx
+    ON memory_projections(user_id);
+
+CREATE INDEX IF NOT EXISTS memory_edges_user_idx
+    ON memory_edges(user_id);
 
 CREATE TABLE IF NOT EXISTS search_documents (
     table_id INTEGER NOT NULL,
@@ -978,9 +978,6 @@ CREATE TABLE IF NOT EXISTS ontology_values (
     UNIQUE(ontology_id, namespace, dimension, value),
     FOREIGN KEY(ontology_id, namespace, dimension) REFERENCES ontology_dimensions(ontology_id, namespace, dimension)
 );
-
-CREATE INDEX IF NOT EXISTS ontology_values_value_idx
-    ON ontology_values(ontology_id, namespace, dimension, value);
 
 CREATE TABLE IF NOT EXISTS ontology_entity_types (
     ontology_id TEXT NOT NULL,

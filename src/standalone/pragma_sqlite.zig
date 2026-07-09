@@ -421,20 +421,48 @@ fn packPriorityFor(index: *const ProjectionTypeIndex, projection_type: []const u
 
 fn matchesText(content: []const u8, query: []const u8) bool {
     if (query.len == 0) return true;
-    const hay = lowerOwned(std.heap.page_allocator, content) catch return false;
-    defer std.heap.page_allocator.free(hay);
-    const needle = lowerOwned(std.heap.page_allocator, query) catch return false;
-    defer std.heap.page_allocator.free(needle);
-    return std.mem.indexOf(u8, hay, needle) != null;
+    return std.ascii.indexOfIgnoreCase(content, query) != null;
+}
+
+fn jsonValueMatchesScope(value: std.json.Value, scope: []const u8, normalized: []const u8) bool {
+    switch (value) {
+        .string => |text| return std.mem.eql(u8, text, scope) or std.mem.eql(u8, text, normalized),
+        .integer => |n| {
+            var buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return false;
+            return std.mem.eql(u8, text, normalized);
+        },
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (jsonValueMatchesScope(entry.value_ptr.*, scope, normalized)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (jsonValueMatchesScope(item, scope, normalized)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn jsonMatchesScope(json_text: []const u8, scope: []const u8, normalized: []const u8) bool {
+    if (json_text.len == 0) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_text, .{}) catch return false;
+    defer parsed.deinit();
+    return jsonValueMatchesScope(parsed.value, scope, normalized);
 }
 
 fn matchesScope(scope: ?[]const u8, metadata_json: []const u8, facets_json: []const u8) bool {
     if (scope == null or scope.?.len == 0) return true;
+    // Compare whole JSON values, never substrings: scope "player:7"
+    // (normalized "7") must not match "player_id":"17" or a stray 0.7.
     const normalized = if (std.mem.startsWith(u8, scope.?, "player:")) scope.?[7..] else scope.?;
-    return std.mem.indexOf(u8, metadata_json, scope.?) != null or
-        std.mem.indexOf(u8, metadata_json, normalized) != null or
-        std.mem.indexOf(u8, facets_json, scope.?) != null or
-        std.mem.indexOf(u8, facets_json, normalized) != null;
+    return jsonMatchesScope(metadata_json, scope.?, normalized) or
+        jsonMatchesScope(facets_json, scope.?, normalized);
 }
 
 fn containsString(values: []const []const u8, target: []const u8) bool {
@@ -619,6 +647,9 @@ test "pragma sqlite has a TOON pack variant" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
+    // memory_projections references memory_items; this fixture only exercises
+    // pack formatting, so run it like a legacy FK-off database.
+    try db.exec("PRAGMA foreign_keys = OFF");
 
     try insertMemoryProjection(db, .{
         .id = "p1",

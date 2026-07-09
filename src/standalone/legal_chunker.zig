@@ -120,10 +120,24 @@ fn collectArticleSpans(allocator: std.mem.Allocator, text: []const u8) ![]Span {
 
     if (starts.items.len == 0) return allocator.alloc(Span, 0);
 
-    var spans = try allocator.alloc(Span, starts.items.len);
+    // Title/preamble text before the first heading is document content too;
+    // dropping it made it unsearchable at chunk level.
+    const has_preamble = blk: {
+        const leading = std.mem.trim(u8, text[0..starts.items[0]], " \t\r\n");
+        break :blk leading.len > 0;
+    };
+
+    const span_count = starts.items.len + @intFromBool(has_preamble);
+    var spans = try allocator.alloc(Span, span_count);
+    var span_index: usize = 0;
+    if (has_preamble) {
+        spans[span_index] = .{ .start = 0, .end = starts.items[0] };
+        span_index += 1;
+    }
     for (starts.items, 0..) |start, i| {
         const end = if (i + 1 < starts.items.len) starts.items[i + 1] else text.len;
-        spans[i] = .{ .start = start, .end = end };
+        spans[span_index] = .{ .start = start, .end = end };
+        span_index += 1;
     }
     return spans;
 }
@@ -184,10 +198,11 @@ test "chunkLegal splits article-shaped legal text" {
     const chunks = try chunkLegal(std.testing.allocator, text, .{ .profile = .legal_article });
     defer chunker.freeChunks(std.testing.allocator, chunks);
 
-    try std.testing.expectEqual(@as(usize, 3), chunks.len);
-    try std.testing.expect(std.mem.startsWith(u8, chunks[0].content, "Article 1."));
-    try std.testing.expect(std.mem.startsWith(u8, chunks[1].content, "Article 2."));
-    try std.testing.expect(std.mem.startsWith(u8, chunks[2].content, "Article 3."));
+    try std.testing.expectEqual(@as(usize, 4), chunks.len);
+    try std.testing.expect(std.mem.startsWith(u8, chunks[0].content, "Title I"));
+    try std.testing.expect(std.mem.startsWith(u8, chunks[1].content, "Article 1."));
+    try std.testing.expect(std.mem.startsWith(u8, chunks[2].content, "Article 2."));
+    try std.testing.expect(std.mem.startsWith(u8, chunks[3].content, "Article 3."));
     for (chunks) |ch| try std.testing.expectEqualStrings("legal_article", ch.strategy);
 }
 

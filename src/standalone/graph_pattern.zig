@@ -1044,8 +1044,8 @@ fn writeJsonExtract(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, metadata_col:
     const text = ptr[0..@intCast(c.sqlite3_column_bytes(stmt, metadata_col))];
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, text, .{}) catch return writer.writeAll("null");
     defer parsed.deinit();
-    const object = parsed.value.object;
-    const value = object.get(key) orelse return writer.writeAll("null");
+    if (parsed.value != .object) return writer.writeAll("null");
+    const value = parsed.value.object.get(key) orelse return writer.writeAll("null");
     return writer.print("{f}", .{std.json.fmt(value, .{})});
 }
 

@@ -76,6 +76,10 @@ pub const Pipeline = struct {
     /// When set together with `workspace_id`, ingestDocument also persists
     /// the document into `documents_raw` for this collection.
     collection_id: ?[]const u8 = null,
+    /// Bulk mode: queue facet deltas without merging per document; the
+    /// caller merges once at the end (see reindexFacets). A per-document
+    /// merge rewrites each posting blob once per document touching it.
+    defer_facet_merges: bool = false,
 
     // ---- Legacy registration / ingest (unchanged signatures) -------------
 
@@ -408,10 +412,26 @@ pub const Pipeline = struct {
         var generated_nanoid: ?[]u8 = null;
         errdefer if (generated_nanoid) |b| self.allocator.free(b);
 
+        // One transaction per document: the per-chunk/per-facet autocommit
+        // pattern cost thousands of fsyncs per document and left partial
+        // documents behind on failure.
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
+
         const nanoid_value: []const u8 = if (opts.doc_nanoid.len == 0) blk: {
             generated_nanoid = try nanoid.generateDefault(self.allocator);
             break :blk generated_nanoid.?;
         } else opts.doc_nanoid;
+
+        // documents_raw references workspaces and collections; materialize
+        // the parents so a first ingest into a fresh database succeeds.
+        try collections_sqlite.ensureWorkspace(self.db.*, .{ .workspace_id = opts.workspace_id });
+        try collections_sqlite.ensureCollection(self.db.*, .{
+            .workspace_id = opts.workspace_id,
+            .collection_id = opts.collection_id,
+            .name = opts.collection_id,
+            .default_language = opts.language,
+        });
 
         try collections_sqlite.upsertDocumentRaw(self.db.*, .{
             .workspace_id = opts.workspace_id,
@@ -467,7 +487,7 @@ pub const Pipeline = struct {
             }
 
             if (opts.chunk_bm25_table_id) |chunk_tid| {
-                const synthetic_id = chunkSyntheticId(opts.doc_id, ch.index, opts.chunk_bits);
+                const synthetic_id = try chunkSyntheticId(opts.doc_id, ch.index, opts.chunk_bits);
                 try self.search.upsertDocument(.{
                     .table_id = chunk_tid,
                     .doc_id = synthetic_id,
@@ -501,6 +521,8 @@ pub const Pipeline = struct {
                 opts.language,
             );
         }
+
+        try tx.commit();
 
         const owned_nanoid: []u8 = if (generated_nanoid) |b| blk: {
             generated_nanoid = null;
@@ -601,7 +623,7 @@ pub const Pipeline = struct {
                 const language = try facet_sqlite.dupeColumnText(self.allocator, stmt, 3);
                 defer self.allocator.free(language);
 
-                const synthetic_id = chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
+                const synthetic_id = try chunkSyntheticId(doc_id, chunk_index, options.chunk_bits);
                 try self.search.upsertDocument(.{
                     .table_id = chunk_tid,
                     .doc_id = synthetic_id,
@@ -636,6 +658,12 @@ pub const Pipeline = struct {
         defer facet_sqlite.finalize(stmt);
         try facet_sqlite.bindText(stmt, 1, workspace_id);
         try facet_sqlite.bindText(stmt, 2, collection_id);
+
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
+        const previous_defer = self.defer_facet_merges;
+        self.defer_facet_merges = true;
+        defer self.defer_facet_merges = previous_defer;
 
         var current_doc: ?u64 = null;
         var pending = std.ArrayList(FacetAssignment).empty;
@@ -677,6 +705,8 @@ pub const Pipeline = struct {
             total += 1;
         }
         if (current_doc) |cd| try flushFacetGroup(self, table_id, cd, &pending);
+        _ = try facet_sqlite.mergeDeltasSafe(self.db.*, table_id, null);
+        try tx.commit();
         return total;
     }
 
@@ -694,24 +724,51 @@ pub const Pipeline = struct {
     /// (graph_lj_out/in) is dropped here for this workspace's entities and then
     /// fully rebuilt from graph_relation at the end of the reindex.
     fn purgeWorkspaceGraph(self: *Pipeline, workspace_id: []const u8) !void {
-        const statements = [_][]const u8{
+        const PurgeStatement = struct {
+            sql: []const u8,
+            // Rule/link tables are created by migrations and are absent from
+            // import-mode schemas; skip them when the table does not exist.
+            optional: bool = false,
+        };
+        const statements = [_]PurgeStatement{
+            .{ .sql =
             \\DELETE FROM graph_lj_out
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
             \\DELETE FROM graph_lj_in
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
             \\DELETE FROM graph_entity_alias
             \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
-            ,
+            },
+            .{ .sql =
+            \\DELETE FROM graph_entity_degree
+            \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+            },
+            .{ .sql = "DELETE FROM graph_entity_chunk WHERE workspace_id = ?1", .optional = true },
+            .{
+                .sql =
+                \\DELETE FROM graph_entity_document
+                \\WHERE entity_id IN (SELECT entity_id FROM graph_entity WHERE workspace_id = ?1)
+                ,
+                .optional = true,
+            },
+            .{ .sql = "DELETE FROM graph_rule_evaluations WHERE workspace_id = ?1", .optional = true },
+            .{ .sql = "DELETE FROM graph_rule_events WHERE workspace_id = ?1", .optional = true },
+            .{ .sql =
             \\DELETE FROM graph_relation_property
             \\WHERE relation_id IN (SELECT relation_id FROM graph_relation WHERE workspace_id = ?1)
-            ,
-            "DELETE FROM graph_relation WHERE workspace_id = ?1",
-            "DELETE FROM graph_entity WHERE workspace_id = ?1",
+            },
+            .{ .sql = "DELETE FROM graph_relation WHERE workspace_id = ?1" },
+            .{ .sql = "DELETE FROM graph_entity WHERE workspace_id = ?1" },
         };
-        for (statements) |sql| {
-            const stmt = try facet_sqlite.prepare(self.db.*, sql);
+        for (statements) |entry| {
+            const stmt = facet_sqlite.prepare(self.db.*, entry.sql) catch |err| {
+                if (entry.optional and err == error.PrepareFailed) continue;
+                return err;
+            };
             defer facet_sqlite.finalize(stmt);
             try facet_sqlite.bindText(stmt, 1, workspace_id);
             try facet_sqlite.stepDone(stmt);
@@ -726,6 +783,12 @@ pub const Pipeline = struct {
         var projected_count: u64 = 0;
         var workspace_entity_ids = std.ArrayList(u32).empty;
         defer workspace_entity_ids.deinit(self.allocator);
+
+        // Purge + replay must be atomic: a crash between the two used to
+        // leave the derived graph permanently empty while raw data was
+        // intact, and per-row autocommit made the replay fsync-bound.
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
 
         // Strict rebuild: clear the workspace's derived graph rows before
         // replaying *_raw so removed entities/relations do not linger.
@@ -923,6 +986,7 @@ pub const Pipeline = struct {
         // paying for a whole-graph wipe/rebuild on every tenant reindex.
         try graph_sqlite.rebuildAdjacencyForWorkspace(self.db.*, self.allocator, workspace_id, workspace_entity_ids.items);
 
+        try tx.commit();
         return projected_count;
     }
 
@@ -938,7 +1002,11 @@ pub const Pipeline = struct {
     }
 };
 
-fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) u64 {
+fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) !u64 {
+    // Unchecked composition would silently collide: chunk 2^bits of doc N
+    // becomes chunk 0 of doc N+1 in the search index.
+    if (chunk_index >= (@as(u64, 1) << chunk_bits)) return error.ChunkIndexExceedsChunkBits;
+    if (doc_id > (@as(u64, std.math.maxInt(u64)) >> chunk_bits)) return error.DocIdExceedsChunkBits;
     return (doc_id << chunk_bits) | @as(u64, chunk_index);
 }
 
@@ -990,7 +1058,11 @@ fn syncFacetAssignments(self: *Pipeline, table_id: u64, doc_id: u64, facets: []c
         };
     }
 
-    _ = try facet_sqlite.syncFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    if (self.defer_facet_merges) {
+        try facet_sqlite.queueFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    } else {
+        _ = try facet_sqlite.syncFacetAssignments(self.db.*, table_id, doc_id, assignments);
+    }
 
     for (facets) |facet| {
         try self.facets.addPosting(table_id, facet.facet_id, facet.facet_value, chunk_id, &.{in_chunk_id});
