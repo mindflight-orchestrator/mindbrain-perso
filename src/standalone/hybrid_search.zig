@@ -7,7 +7,8 @@ pub const Error = error{
 
 /// Sentinel for "candidate has no score in this channel". Both channels use
 /// the same sentinel so BM25-only and vector-only candidates are treated
-/// symmetrically by the normalization below.
+/// symmetrically: a candidate is "present" in a channel iff its score is
+/// finite, and only present candidates receive a rank in that channel.
 const score_missing = -std.math.inf(f64);
 
 const CandidateScore = struct {
@@ -15,37 +16,114 @@ const CandidateScore = struct {
     vector_score: f64 = score_missing,
 };
 
-/// Min-max normalization contract: each channel (BM25, vector similarity) is
-/// rescaled to [0, 1] over the candidate set before the weighted blend, so an
-/// unbounded BM25 score cannot drown out cosine similarity (or vice versa).
-/// A candidate missing from a channel contributes 0 to the blend; when all
-/// present scores in a channel are equal they all map to 1.0.
-const ChannelRange = struct {
-    min: f64 = std.math.inf(f64),
-    max: f64 = -std.math.inf(f64),
+/// Reciprocal Rank Fusion (RRF) damping constant.
+///
+/// rrf(rank) = 1 / (RRF_K + rank). A larger K flattens the head of each
+/// channel's ranking (the gap between rank 1 and rank 2 shrinks), so no single
+/// channel's top hit can dominate the fused order on its own. K = 60 is the
+/// widely-used default from the original RRF work (Cormack, Clarke & Buettcher,
+/// SIGIR 2009) and TREC practice, and is what we adopt here.
+const RRF_K: f64 = 60.0;
 
-    fn observe(self: *ChannelRange, score: f64) void {
-        if (!std.math.isFinite(score)) return;
-        if (score < self.min) self.min = score;
-        if (score > self.max) self.max = score;
-    }
-
-    fn normalize(self: ChannelRange, score: f64) f64 {
-        if (!std.math.isFinite(score)) return 0.0;
-        if (!(self.max > self.min)) return 1.0;
-        return (score - self.min) / (self.max - self.min);
-    }
+/// One candidate's score within a single channel, used only to compute ranks.
+const RankEntry = struct {
+    doc_id: interfaces.DocId,
+    score: f64,
 };
 
-fn observeChannelRanges(
+/// Rank ordering within a channel: higher score first; ties break on doc_id
+/// ascending so rank assignment is fully deterministic across runs.
+fn rankEntryBefore(_: void, a: RankEntry, b: RankEntry) bool {
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc_id < b.doc_id;
+}
+
+const Channel = enum { bm25, vector };
+
+/// Builds a doc_id -> 1-based rank map for one channel. Only candidates whose
+/// score in that channel is finite (i.e. present) are ranked; absent
+/// candidates are omitted from the map entirely and contribute 0 via
+/// `rrfContribution` (no worst-rank penalty).
+fn buildChannelRanks(
+    allocator: std.mem.Allocator,
     candidate_scores: *const std.AutoHashMap(interfaces.DocId, CandidateScore),
-    bm25_range: *ChannelRange,
-    vector_range: *ChannelRange,
-) void {
+    channel: Channel,
+) !std.AutoHashMap(interfaces.DocId, usize) {
+    var entries = std.ArrayList(RankEntry).empty;
+    defer entries.deinit(allocator);
+
     var it = candidate_scores.iterator();
     while (it.next()) |entry| {
-        bm25_range.observe(entry.value_ptr.bm25_score);
-        vector_range.observe(entry.value_ptr.vector_score);
+        const score = switch (channel) {
+            .bm25 => entry.value_ptr.bm25_score,
+            .vector => entry.value_ptr.vector_score,
+        };
+        if (!std.math.isFinite(score)) continue;
+        try entries.append(allocator, .{ .doc_id = entry.key_ptr.*, .score = score });
+    }
+
+    std.mem.sort(RankEntry, entries.items, {}, rankEntryBefore);
+
+    var ranks = std.AutoHashMap(interfaces.DocId, usize).init(allocator);
+    errdefer ranks.deinit();
+    for (entries.items, 0..) |entry, index| {
+        try ranks.put(entry.doc_id, index + 1);
+    }
+    return ranks;
+}
+
+/// RRF contribution of one channel for a doc: 1/(RRF_K + rank) when the doc is
+/// present in that channel (has a rank), otherwise 0.
+fn rrfContribution(ranks: *const std.AutoHashMap(interfaces.DocId, usize), doc_id: interfaces.DocId) f64 {
+    const rank = ranks.get(doc_id) orelse return 0.0;
+    return 1.0 / (RRF_K + @as(f64, @floatFromInt(rank)));
+}
+
+/// Reciprocal Rank Fusion of the two channels, shared by both fusion sites so
+/// their ranking contract cannot drift.
+///
+///     combined = (1 - w) * rrf(rank_bm25) + w * rrf(rank_vector)
+///     rrf(rank) = 1 / (RRF_K + rank),  and 0 for a channel the doc is absent from
+///
+/// We fuse ranks rather than raw scores because RRF is magnitude-agnostic: it
+/// is robust to the BM25-vs-cosine scale mismatch that raw score blending
+/// suffered from, where an unbounded BM25 score could drown out bounded cosine
+/// similarity (or vice versa). At w = 0 the order is pure BM25 rank; at w = 1
+/// it is pure vector rank. The per-channel raw scores are still reported on
+/// each result unchanged; only the combined score and ordering derive from
+/// ranks. Results are pushed into `results` via the bounded top-k heap.
+fn fuseCandidatesRrf(
+    allocator: std.mem.Allocator,
+    candidate_scores: *const std.AutoHashMap(interfaces.DocId, CandidateScore),
+    vector_weight: f64,
+    limit: usize,
+    results: *std.ArrayList(interfaces.HybridSearchMatch),
+) !void {
+    var bm25_ranks = try buildChannelRanks(allocator, candidate_scores, .bm25);
+    defer bm25_ranks.deinit();
+    var vector_ranks = try buildChannelRanks(allocator, candidate_scores, .vector);
+    defer vector_ranks.deinit();
+
+    var iter = candidate_scores.iterator();
+    while (iter.next()) |entry| {
+        const doc_id = entry.key_ptr.*;
+        var bm25_score = entry.value_ptr.bm25_score;
+        var vector_score = entry.value_ptr.vector_score;
+
+        var combined_score = (1.0 - vector_weight) * rrfContribution(&bm25_ranks, doc_id) +
+            vector_weight * rrfContribution(&vector_ranks, doc_id);
+        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
+        // Reported per-channel scores stay raw; map the -inf "missing" sentinel
+        // to 0.0 for reporting only (ranking already handled absence above).
+        if (!std.math.isFinite(bm25_score)) bm25_score = 0.0;
+        if (!std.math.isFinite(vector_score)) vector_score = 0.0;
+
+        try insertTopHybridMatch(allocator, results, .{
+            .doc_id = doc_id,
+            .bm25_score = bm25_score,
+            .vector_score = vector_score,
+            .combined_score = combined_score,
+        }, limit);
     }
 }
 
@@ -174,36 +252,8 @@ pub fn search(
     var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
     defer results.deinit(allocator);
 
-    // First pass: channel ranges over the candidate set (see ChannelRange for
-    // the normalization contract). Reported per-channel scores stay raw; only
-    // the combined blend uses the normalized values.
-    var bm25_range: ChannelRange = .{};
-    var vector_range: ChannelRange = .{};
-    observeChannelRanges(&candidate_scores, &bm25_range, &vector_range);
-
-    var iter = candidate_scores.iterator();
-    while (iter.next()) |entry| {
-        var bm25_score = entry.value_ptr.bm25_score;
-        var vector_score = entry.value_ptr.vector_score;
-        var combined_score = bm25_range.normalize(bm25_score) * (1.0 - request.vector_weight) +
-            vector_range.normalize(vector_score) * request.vector_weight;
-        if (!std.math.isFinite(combined_score)) {
-            combined_score = 0.0;
-        }
-        if (!std.math.isFinite(bm25_score)) {
-            bm25_score = 0.0;
-        }
-        if (!std.math.isFinite(vector_score)) {
-            vector_score = 0.0;
-        }
-
-        try insertTopHybridMatch(allocator, &results, .{
-            .doc_id = entry.key_ptr.*,
-            .bm25_score = bm25_score,
-            .vector_score = vector_score,
-            .combined_score = combined_score,
-        }, request.limit);
-    }
+    // Fuse the two channels with Reciprocal Rank Fusion (see fuseCandidatesRrf).
+    try fuseCandidatesRrf(allocator, &candidate_scores, request.vector_weight, request.limit, &results);
 
     sortHybridMatches(results.items);
 
@@ -240,27 +290,8 @@ pub fn fusePreScored(
     var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
     defer results.deinit(allocator);
 
-    var bm25_range: ChannelRange = .{};
-    var vector_range: ChannelRange = .{};
-    observeChannelRanges(&candidate_scores, &bm25_range, &vector_range);
-
-    var iter = candidate_scores.iterator();
-    while (iter.next()) |entry| {
-        var bm25_score = entry.value_ptr.bm25_score;
-        var vector_score = entry.value_ptr.vector_score;
-        var combined_score = bm25_range.normalize(bm25_score) * (1.0 - vector_weight) +
-            vector_range.normalize(vector_score) * vector_weight;
-        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
-        if (!std.math.isFinite(bm25_score)) bm25_score = 0.0;
-        if (!std.math.isFinite(vector_score)) vector_score = 0.0;
-
-        try insertTopHybridMatch(allocator, &results, .{
-            .doc_id = entry.key_ptr.*,
-            .bm25_score = bm25_score,
-            .vector_score = vector_score,
-            .combined_score = combined_score,
-        }, limit);
-    }
+    // Same Reciprocal Rank Fusion as `search` (see fuseCandidatesRrf).
+    try fuseCandidatesRrf(allocator, &candidate_scores, vector_weight, limit, &results);
 
     sortHybridMatches(results.items);
     return results.toOwnedSlice(allocator);
@@ -486,16 +517,19 @@ test "hybrid search blends vector and BM25 scores" {
         .vector_weight = 0.85,
     });
 
-    // Normalization contract: each channel is min-max normalized over the
-    // candidate set before the blend. Doc 4 holds the channel minimum in both
-    // channels (BM25 0.0, vector 0.60), so it normalizes to 0 and ranks last;
-    // doc 3 keeps a small BM25 contribution and ranks above it.
+    // RRF contract: each channel is ranked independently (rank 1 = best) and
+    // fused as (1-w)*1/(K+rank_bm25) + w*1/(K+rank_vector), K = 60. BM25 ranks
+    // over {1,2,3}: 1,3,2; vector ranks over {2,1,4}: 2,1,4; docs absent from a
+    // channel contribute 0. At w = 0.85 the vector channel dominates, so doc 4
+    // (vector rank 3, no BM25) outranks doc 3 (BM25 rank 2, no vector) — the
+    // reverse of the old min-max order, because RRF is magnitude-agnostic.
     try std.testing.expectEqual(@as(usize, 4), results.len);
     try std.testing.expectEqual(@as(interfaces.DocId, 2), results[0].doc_id);
     try std.testing.expectEqual(@as(interfaces.DocId, 1), results[1].doc_id);
-    try std.testing.expectEqual(@as(interfaces.DocId, 3), results[2].doc_id);
-    try std.testing.expectEqual(@as(interfaces.DocId, 4), results[3].doc_id);
+    try std.testing.expectEqual(@as(interfaces.DocId, 4), results[2].doc_id);
+    try std.testing.expectEqual(@as(interfaces.DocId, 3), results[3].doc_id);
     try std.testing.expect(results[0].vector_score > results[1].vector_score);
+    // doc 1 carries a BM25 score; doc 4 has none (reported as 0.0).
     try std.testing.expect(results[1].bm25_score > results[2].bm25_score);
 }
 
@@ -539,15 +573,15 @@ test "fuse pre-scored matches is bounded and deterministic" {
     );
     defer std.testing.allocator.free(results);
 
-    // Normalization contract: docs 10 and 20 hold the maximum of both
-    // channels, so their normalized channel scores are 1.0 and the blend at
-    // weight 0.5 is exactly 1.0 for each; the doc_id tie-break keeps the
-    // order deterministic.
+    // RRF contract: within each channel the (0.5, 0.5) tie between docs 10 and
+    // 20 breaks on doc_id ascending, so doc 10 takes rank 1 and doc 20 rank 2
+    // in both channels. combined = 0.5/(K+r_bm25) + 0.5/(K+r_vec) with K = 60:
+    // doc 10 = 1/61, doc 20 = 1/62. Order is deterministic and 10 leads.
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqual(@as(interfaces.DocId, 10), results[0].doc_id);
     try std.testing.expectEqual(@as(interfaces.DocId, 20), results[1].doc_id);
-    try std.testing.expectEqual(@as(f64, 1.0), results[0].combined_score);
-    try std.testing.expectEqual(@as(f64, 1.0), results[1].combined_score);
+    try std.testing.expectApproxEqAbs(1.0 / 61.0, results[0].combined_score, 1e-9);
+    try std.testing.expectApproxEqAbs(1.0 / 62.0, results[1].combined_score, 1e-9);
 }
 
 test "calculateBm25Score normalizes non-finite avg_document_length" {

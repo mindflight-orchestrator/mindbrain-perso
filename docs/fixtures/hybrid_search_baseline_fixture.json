@@ -90,9 +90,9 @@
       "top_k": 3,
       "total_found": 3,
       "scores": {
-        "2": 1.0,
-        "1": 0.90948,
-        "3": 0.0
+        "2": 0.0163934,
+        "1": 0.0161290,
+        "3": 0.0158730
       }
     }
   },
@@ -101,6 +101,6 @@
     "allow_extra_fields": true,
     "order_required": true,
     "compare_total_found": true,
-    "notes": "Golden scores re-captured after hybrid fusion switched to min-max normalization per channel over the candidate set (combined = norm_bm25*(1-w) + norm_vector*w). Raw per-channel scores are unchanged."
+    "notes": "Golden scores are RRF-based: hybrid fusion uses Reciprocal Rank Fusion with K=60 (combined = (1-w)*1/(K+rank_bm25) + w*1/(K+rank_vector); a doc absent from a channel contributes 0). Ranks are per-channel over the candidate set, ties broken on doc_id ascending. Raw per-channel scores are unchanged; only the combined score/ordering derive from ranks. The ordered_doc_ids [2,1,3] are unchanged from the prior min-max baseline."
   }
 }
