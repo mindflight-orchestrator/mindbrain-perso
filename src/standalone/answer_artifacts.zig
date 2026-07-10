@@ -261,26 +261,25 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
 }
 
 pub fn workspaceForScope(db: Database, allocator: std.mem.Allocator, scope: []const u8) ![]const u8 {
+    // Nested workspaces are legal: a scope like 'a:b:c' can match both
+    // workspaces 'a' and 'a:b'. Every match is a prefix of the scope, so
+    // distinct matches always have distinct lengths and the longest prefix is
+    // the unambiguous owner — take it instead of erroring on multiplicity.
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT workspace_id
         \\FROM workspaces
         \\WHERE ?1 = workspace_id
         \\   OR ?1 LIKE workspace_id || ':%'
         \\ORDER BY length(workspace_id) DESC, workspace_id ASC
+        \\LIMIT 1
     );
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, scope);
 
-    const first_rc = c.sqlite3_step(stmt);
-    if (first_rc == c.SQLITE_DONE) return error.MissingWorkspace;
-    if (first_rc != c.SQLITE_ROW) return error.StepFailed;
-    const workspace_id = try facet_sqlite.dupeColumnText(allocator, stmt, 0);
-    errdefer allocator.free(workspace_id);
-
-    const second_rc = c.sqlite3_step(stmt);
-    if (second_rc == c.SQLITE_ROW) return error.AmbiguousWorkspace;
-    if (second_rc != c.SQLITE_DONE) return error.StepFailed;
-    return workspace_id;
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return error.MissingWorkspace;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return try facet_sqlite.dupeColumnText(allocator, stmt, 0);
 }
 
 fn countRows(db: Database, sql: []const u8) !usize {
@@ -780,4 +779,29 @@ test "workspace writes can mark live answer views stale" {
     defer row.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("stale", row.lifecycle);
     try std.testing.expectEqualStrings("dirty", row.state);
+}
+
+test "workspaceForScope resolves nested workspaces by longest prefix" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES
+        \\  ('a', 'a', 'Outer'),
+        \\  ('a:b', 'a:b', 'Nested');
+    );
+
+    const nested = try workspaceForScope(db, std.testing.allocator, "a:b:production");
+    defer std.testing.allocator.free(nested);
+    try std.testing.expectEqualStrings("a:b", nested);
+
+    const outer = try workspaceForScope(db, std.testing.allocator, "a:other");
+    defer std.testing.allocator.free(outer);
+    try std.testing.expectEqualStrings("a", outer);
+
+    const exact = try workspaceForScope(db, std.testing.allocator, "a:b");
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqualStrings("a:b", exact);
+
+    try std.testing.expectError(error.MissingWorkspace, workspaceForScope(db, std.testing.allocator, "unknown"));
 }

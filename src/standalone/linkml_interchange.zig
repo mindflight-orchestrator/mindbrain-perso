@@ -991,7 +991,10 @@ fn writeClassesYaml(allocator: Allocator, db: Database, ontology_id: []const u8,
     const stmt = try prepare(db, "SELECT entity_type, label, metadata_json FROM ontology_entity_types WHERE ontology_id = ?1 ORDER BY entity_type");
     defer finalize(stmt);
     try bindText(stmt, 1, ontology_id);
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
         const entity_type = try dupeColumnText(allocator, stmt, 0);
         defer allocator.free(entity_type);
         const label = try dupeColumnText(allocator, stmt, 1);
@@ -1010,7 +1013,10 @@ fn writeSlotsYaml(allocator: Allocator, db: Database, ontology_id: []const u8, w
     const stmt = try prepare(db, "SELECT edge_type, source_entity_type, target_entity_type, metadata_json FROM ontology_edge_types WHERE ontology_id = ?1 ORDER BY edge_type");
     defer finalize(stmt);
     try bindText(stmt, 1, ontology_id);
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
         const edge_type = try dupeColumnText(allocator, stmt, 0);
         defer allocator.free(edge_type);
         const source = try optionalColumnText(allocator, stmt, 1);
@@ -1048,7 +1054,10 @@ fn writeEnumsYaml(allocator: Allocator, db: Database, ontology_id: []const u8, w
     var current_dimension: ?[]const u8 = null;
     defer if (current_dimension) |value| allocator.free(value);
 
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
         const namespace = try dupeColumnText(allocator, stmt, 0);
         defer allocator.free(namespace);
         const dimension = try dupeColumnText(allocator, stmt, 1);

@@ -73,7 +73,23 @@ pub const TaxonomyNodeImport = struct {
 };
 
 pub fn upsertFacet(db: Database, record: FacetRecord) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id, source_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+    // agent_facts carries three unique constraints (PK id, UNIQUE doc_id, and
+    // the partial UNIQUE(source_ref, workspace_id)). INSERT OR REPLACE would
+    // silently delete any unrelated fact that happens to collide on doc_id or
+    // source_ref; upsert on the id only and surface the other collisions as
+    // typed errors instead.
+    const stmt = try prepare(db,
+        \\INSERT INTO agent_facts(id, schema_id, content, facets_json, workspace_id, doc_id, source_ref)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        \\ON CONFLICT(id) DO UPDATE SET
+        \\    schema_id = excluded.schema_id,
+        \\    content = excluded.content,
+        \\    facets = excluded.facets_json,
+        \\    facets_json = excluded.facets_json,
+        \\    workspace_id = excluded.workspace_id,
+        \\    doc_id = excluded.doc_id,
+        \\    source_ref = excluded.source_ref
+    );
     defer finalize(stmt);
     try bindText(stmt, 1, record.id);
     try bindText(stmt, 2, record.schema_id);
@@ -82,7 +98,15 @@ pub fn upsertFacet(db: Database, record: FacetRecord) !void {
     try bindText(stmt, 5, record.workspace_id);
     try bindInt64(stmt, 6, record.doc_id);
     if (record.source_ref) |source_ref| try bindText(stmt, 7, source_ref) else try bindNull(stmt, 7);
-    try stepDone(stmt);
+
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return;
+    if ((rc & 0xff) == c.SQLITE_CONSTRAINT) {
+        const msg = std.mem.span(c.sqlite3_errmsg(db.handle));
+        if (std.mem.indexOf(u8, msg, "agent_facts.doc_id") != null) return error.FactDocIdConflict;
+        if (std.mem.indexOf(u8, msg, "agent_facts.source_ref") != null) return error.FactSourceRefConflict;
+    }
+    return error.StepFailed;
 }
 
 pub fn importTaxonomyIntoFacets(
@@ -100,6 +124,17 @@ pub fn importTaxonomyIntoFacets(
     defer tx.deinit();
 
     try facet_sqlite.upsertFacetTable(db, table_id, schema_name, table_name, chunk_bits);
+
+    // (facet_id, value) -> value_id cache plus per-parent children
+    // accumulation: without them the import re-queried facet_value_nodes per
+    // level (O(n^2) without the natural-key index) and rewrote each hub
+    // parent's children bitmap once per child (O(k^2) blob churn).
+    var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+
+    var value_cache = FacetValueNodeCache{};
+    var children = std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)){};
 
     for (nodes) |node| {
         const facets_json = try renderTaxonomyFacetsJson(allocator, node);
@@ -125,10 +160,19 @@ pub fn importTaxonomyIntoFacets(
             const parent = node.levels[level_index];
             const child = node.levels[level_index + 1];
 
-            const parent_value_id = try ensureFacetValueNodeId(db, allocator, table_id, parent.facet_id, parent.facet_value);
-            const child_value_id = try ensureFacetValueNodeId(db, allocator, table_id, child.facet_id, child.facet_value);
-            try appendFacetChildLink(db, allocator, table_id, parent_value_id, child_value_id);
+            const parent_value_id = try ensureFacetValueNodeId(db, allocator, scratch, &value_cache, table_id, parent.facet_id, parent.facet_value);
+            const child_value_id = try ensureFacetValueNodeId(db, allocator, scratch, &value_cache, table_id, child.facet_id, child.facet_value);
+            const gop = try children.getOrPut(scratch, parent_value_id);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(scratch, child_value_id);
         }
+    }
+
+    // Flush each parent's accumulated children with a single bitmap
+    // read-modify-write instead of one per edge.
+    var it = children.iterator();
+    while (it.next()) |entry| {
+        try appendFacetChildLinks(db, allocator, table_id, entry.key_ptr.*, entry.value_ptr.items);
     }
 
     try tx.commit();
@@ -619,9 +663,12 @@ pub fn marketplaceSearchByDomain(
     const resolved = try resolveWorkspace(db, allocator, domain_or_workspace);
     defer if (resolved) |value| allocator.free(value);
     const domain_filter: ?[]const u8 = if (resolved) |value| value else null;
-    return try graph_sqlite.marketplaceSearch(
+    // Scope the traversal to the resolved workspace as well as filtering on it:
+    // the unscoped entry point walks every workspace's entities.
+    return try graph_sqlite.marketplaceSearchWorkspace(
         db,
         allocator,
+        resolved,
         query,
         domain_filter,
         min_confidence,
@@ -806,7 +853,26 @@ fn findGraphEntityId(
 }
 
 fn loadWorkspaceProjectionCount(db: Database, workspace_id: []const u8) !usize {
-    const stmt = try prepare(db, "SELECT COUNT(*) FROM projections WHERE scope = ?1 OR scope LIKE ?1 || ':%' OR scope IS NULL");
+    // The single `scope = ?1 OR scope LIKE ?1 || ':%' OR scope IS NULL`
+    // predicate was unindexable (expression LIKE plus a NULL arm the partial
+    // idx_proj_scope cannot serve) and scanned all projections per coverage
+    // report. Split into three disjoint, indexable counts: exact scope and
+    // the half-open [scope ++ ':', scope ++ ';') range use idx_proj_scope
+    // (';' is the code point after ':'), the NULL arm uses
+    // idx_proj_scope_null.
+    var total: usize = 0;
+    total += try countProjectionsBound(db, "SELECT COUNT(*) FROM projections WHERE scope = ?1", workspace_id);
+    total += try countProjectionsBound(db, "SELECT COUNT(*) FROM projections WHERE scope >= ?1 || ':' AND scope < ?1 || ';'", workspace_id);
+
+    const null_stmt = try prepare(db, "SELECT COUNT(*) FROM projections WHERE scope IS NULL");
+    defer finalize(null_stmt);
+    if (c.sqlite3_step(null_stmt) != c.SQLITE_ROW) return total;
+    total += @as(usize, @intCast(c.sqlite3_column_int64(null_stmt, 0)));
+    return total;
+}
+
+fn countProjectionsBound(db: Database, sql: []const u8, workspace_id: []const u8) !usize {
+    const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
@@ -867,27 +933,40 @@ fn countOntologyRows(facets: []const FacetRecord) usize {
     return count;
 }
 
+// Real JSON parsing: the previous substring scanning truncated values at
+// escaped quotes, matched keys inside nested objects, and missed non-string
+// values entirely.
 fn extractFacetJsonValue(allocator: std.mem.Allocator, facets_json: []const u8, key_name: []const u8) !?[]const u8 {
-    const pattern = try std.fmt.allocPrint(allocator, "\"{s}\":\"", .{key_name});
-    defer allocator.free(pattern);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, facets_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get(key_name) orelse return null;
+    return try jsonScalarToOwnedString(allocator, value);
+}
 
-    if (std.mem.indexOf(u8, facets_json, pattern)) |start| {
-        const value_start = start + pattern.len;
-        const rest = facets_json[value_start..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-        return try allocator.dupe(u8, rest[0..end]);
-    }
-    return null;
+fn jsonScalarToOwnedString(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .string => |text| try allocator.dupe(u8, text),
+        .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
+        .number_string => |text| try allocator.dupe(u8, text),
+        .bool => |flag| try allocator.dupe(u8, if (flag) "true" else "false"),
+        else => null,
+    };
 }
 
 fn extractFacetIdentity(allocator: std.mem.Allocator, facet: FacetRecord) ![]const u8 {
-    const keys = [_][]const u8{ "\"node_id\":\"", "\"entity_id\":\"", "\"name\":\"", "\"label\":\"" };
-    for (keys) |key| {
-        if (std.mem.indexOf(u8, facet.facets_json, key)) |start| {
-            const value_start = start + key.len;
-            const rest = facet.facets_json[value_start..];
-            const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
-            return try allocator.dupe(u8, rest[0..end]);
+    const keys = [_][]const u8{ "node_id", "entity_id", "name", "label" };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, facet.facets_json, .{}) catch
+        return try allocator.dupe(u8, facet.content);
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        for (keys) |key| {
+            const value = parsed.value.object.get(key) orelse continue;
+            if (try jsonScalarToOwnedString(allocator, value)) |text| {
+                if (text.len > 0) return text;
+                allocator.free(text);
+            }
         }
     }
     return try allocator.dupe(u8, facet.content);
@@ -926,8 +1005,12 @@ fn appendPostingDoc(
     level: TaxonomyFacetLevel,
     doc_id: u64,
 ) !void {
+    // Guard the casts: chunk ids and in-chunk ids are u32 roaring values, so
+    // chunk_bits above 32 or a doc_id at/above 2^(32 + chunk_bits) cannot be
+    // represented and previously tripped @intCast safety panics.
+    if (chunk_bits > 32) return error.ValueOutOfRange;
     const shift_bits: u6 = @intCast(chunk_bits);
-    const chunk_id: u32 = @intCast(doc_id >> shift_bits);
+    const chunk_id = std.math.cast(u32, doc_id >> shift_bits) orelse return error.ValueOutOfRange;
     const chunk_mask: u64 = (@as(u64, 1) << shift_bits) - 1;
     const in_chunk_id: u32 = @intCast(doc_id & chunk_mask);
 
@@ -941,38 +1024,59 @@ fn appendPostingDoc(
     try facet_sqlite.upsertPostingBitmap(db, allocator, table_id, level.facet_id, level.facet_value, chunk_id, merged);
 }
 
+const FacetValueNodeCache = struct {
+    // Keys are "{facet_id}\x00{facet_value}", allocated in the caller's
+    // scratch arena alongside the map storage.
+    map: std.StringHashMapUnmanaged(u32) = .{},
+    next_value_id: ?u32 = null,
+};
+
 fn ensureFacetValueNodeId(
     db: Database,
     allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    cache: *FacetValueNodeCache,
     table_id: u64,
     facet_id: u32,
     facet_value: []const u8,
 ) !u32 {
+    const key = try std.fmt.allocPrint(scratch, "{d}\x00{s}", .{ facet_id, facet_value });
+    if (cache.map.get(key)) |value_id| return value_id;
+
     const existing_stmt = try prepare(db, "SELECT value_id FROM facet_value_nodes WHERE table_id = ?1 AND facet_id = ?2 AND facet_value = ?3");
     defer finalize(existing_stmt);
     try bindInt64(existing_stmt, 1, table_id);
     try bindInt64(existing_stmt, 2, facet_id);
     try bindText(existing_stmt, 3, facet_value);
     if (c.sqlite3_step(existing_stmt) == c.SQLITE_ROW) {
-        return try columnU32(existing_stmt, 0);
+        const value_id = try columnU32(existing_stmt, 0);
+        try cache.map.put(scratch, key, value_id);
+        return value_id;
     }
 
-    const next_stmt = try prepare(db, "SELECT COALESCE(MAX(value_id), 0) + 1 FROM facet_value_nodes WHERE table_id = ?1");
-    defer finalize(next_stmt);
-    try bindInt64(next_stmt, 1, table_id);
-    if (c.sqlite3_step(next_stmt) != c.SQLITE_ROW) return error.MissingRow;
-    const value_id = try columnU32(next_stmt, 0);
+    if (cache.next_value_id == null) {
+        const next_stmt = try prepare(db, "SELECT COALESCE(MAX(value_id), 0) + 1 FROM facet_value_nodes WHERE table_id = ?1");
+        defer finalize(next_stmt);
+        try bindInt64(next_stmt, 1, table_id);
+        if (c.sqlite3_step(next_stmt) != c.SQLITE_ROW) return error.MissingRow;
+        cache.next_value_id = try columnU32(next_stmt, 0);
+    }
+    const value_id = cache.next_value_id.?;
+    cache.next_value_id = value_id + 1;
     try facet_sqlite.upsertFacetValueNode(db, allocator, table_id, value_id, facet_id, facet_value, null);
+    try cache.map.put(scratch, key, value_id);
     return value_id;
 }
 
-fn appendFacetChildLink(
+fn appendFacetChildLinks(
     db: Database,
     allocator: std.mem.Allocator,
     table_id: u64,
     parent_value_id: u32,
-    child_value_id: u32,
+    child_value_ids: []const u32,
 ) !void {
+    if (child_value_ids.len == 0) return;
+
     const stmt = try prepare(db, "SELECT facet_id, facet_value, children_blob FROM facet_value_nodes WHERE table_id = ?1 AND value_id = ?2");
     defer finalize(stmt);
     try bindInt64(stmt, 1, table_id);
@@ -993,7 +1097,7 @@ fn appendFacetChildLink(
     };
     defer child_bitmap.deinit();
 
-    child_bitmap.add(child_value_id);
+    for (child_value_ids) |child_value_id| child_bitmap.add(child_value_id);
     const child_ids = try child_bitmap.toArray(allocator);
     defer allocator.free(child_ids);
 
@@ -1484,4 +1588,147 @@ test "materializeRelevanceProjections ranks entity matches above query-only matc
 
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("proj-entity", rows[0].id);
+}
+
+test "upsertFacet updates by id and surfaces doc_id/source_ref conflicts as typed errors" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertFacet(db, .{
+        .id = "fact-a",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Original",
+        .facets_json = "{}",
+        .workspace_id = "default",
+        .doc_id = 1,
+        .source_ref = "ref:a",
+    });
+    // Same id: plain update, no constraint noise.
+    try upsertFacet(db, .{
+        .id = "fact-a",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Updated",
+        .facets_json = "{}",
+        .workspace_id = "default",
+        .doc_id = 1,
+        .source_ref = "ref:a",
+    });
+
+    // Different id colliding on doc_id: typed error, existing fact untouched.
+    try std.testing.expectError(error.FactDocIdConflict, upsertFacet(db, .{
+        .id = "fact-b",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Intruder",
+        .facets_json = "{}",
+        .workspace_id = "default",
+        .doc_id = 1,
+        .source_ref = "ref:b",
+    }));
+
+    // Different id colliding on (source_ref, workspace): typed error.
+    try std.testing.expectError(error.FactSourceRefConflict, upsertFacet(db, .{
+        .id = "fact-c",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Intruder",
+        .facets_json = "{}",
+        .workspace_id = "default",
+        .doc_id = 2,
+        .source_ref = "ref:a",
+    }));
+
+    const rows = try loadTaxonomyFacetRows(db, std.testing.allocator, "default");
+    defer {
+        for (rows) |row| deinitFacetRecord(std.testing.allocator, row);
+        std.testing.allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("fact-a", rows[0].id);
+    try std.testing.expectEqualStrings("Updated", rows[0].content);
+}
+
+test "facet json extraction survives escaped quotes, nested objects, and non-strings" {
+    const allocator = std.testing.allocator;
+
+    // Escaped quote inside the label must not truncate the value.
+    const escaped = "{\"node_id\":\"n1\",\"label\":\"say \\\"hi\\\" now\"}";
+    const label = (try extractFacetJsonValue(allocator, escaped, "label")).?;
+    defer allocator.free(label);
+    try std.testing.expectEqualStrings("say \"hi\" now", label);
+
+    // A key inside a nested object must not match at the top level.
+    const nested = "{\"meta\":{\"label\":\"inner\"},\"node_id\":\"n2\"}";
+    try std.testing.expect(try extractFacetJsonValue(allocator, nested, "label") == null);
+
+    // Non-string scalar values are stringified instead of missed.
+    const numeric = "{\"entity_id\":42}";
+    const entity_id = (try extractFacetJsonValue(allocator, numeric, "entity_id")).?;
+    defer allocator.free(entity_id);
+    try std.testing.expectEqualStrings("42", entity_id);
+
+    // Identity falls back through node_id/entity_id/name/label and handles
+    // escaped quotes; invalid JSON falls back to the content column.
+    const identity = try extractFacetIdentity(allocator, .{
+        .id = "f",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Fallback",
+        .facets_json = "{\"name\":\"Ada \\\"the first\\\"\"}",
+        .workspace_id = "default",
+        .doc_id = 1,
+    });
+    defer allocator.free(identity);
+    try std.testing.expectEqualStrings("Ada \"the first\"", identity);
+
+    const fallback = try extractFacetIdentity(allocator, .{
+        .id = "f2",
+        .schema_id = "ghostcrab:taxonomy",
+        .content = "Fallback",
+        .facets_json = "not json",
+        .workspace_id = "default",
+        .doc_id = 2,
+    });
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings("Fallback", fallback);
+}
+
+test "taxonomy import rejects chunk_bits and doc_id outside posting range" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const levels = [_]TaxonomyFacetLevel{
+        .{ .facet_id = 1, .facet_name = "domain", .facet_value = "science" },
+    };
+    const node = TaxonomyNodeImport{
+        .id = "tax-guard",
+        .workspace_id = "default",
+        .doc_id = 1,
+        .node_id = "physics",
+        .label = "Physics",
+        .levels = &levels,
+    };
+
+    // chunk_bits beyond the 32-bit in-chunk id space.
+    try std.testing.expectError(error.ValueOutOfRange, importTaxonomyIntoFacets(
+        db,
+        std.testing.allocator,
+        600,
+        "public",
+        "taxonomy_guard",
+        40,
+        &.{node},
+    ));
+
+    // doc_id beyond 2^(32 + chunk_bits) overflows the u32 chunk id.
+    var big_node = node;
+    big_node.doc_id = @as(u64, 1) << 40;
+    try std.testing.expectError(error.ValueOutOfRange, importTaxonomyIntoFacets(
+        db,
+        std.testing.allocator,
+        601,
+        "public",
+        "taxonomy_guard2",
+        4,
+        &.{big_node},
+    ));
 }

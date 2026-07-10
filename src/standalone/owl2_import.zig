@@ -68,7 +68,9 @@ const ImportSession = struct {
     workspace_id: []const u8,
     ontology_id: []const u8,
     materialize_graph: bool,
-    scratch: Allocator,
+    // Session-lifetime arena. Dedup-set and name-claim keys are duped into it;
+    // per-line parse data lives in the caller's line arena instead.
+    persistent: Allocator,
 
     stmt_triple: *c.sqlite3_stmt,
     stmt_entity_type: *c.sqlite3_stmt,
@@ -79,13 +81,23 @@ const ImportSession = struct {
     stmt_relation_raw: ?*c.sqlite3_stmt,
 
     // Dedup sets: skip re-sending identical ensure calls for the same
-    // entity_type/edge_type within one import.  Keys live in the scratch arena.
+    // entity_type/edge_type within one import. Keys live in the persistent arena.
     seen_entity_types: std.StringHashMapUnmanaged(void),
     seen_edge_types: std.StringHashMapUnmanaged(void),
 
+    // (entity_type, local name) -> stable entity id claims. Entities are keyed
+    // by stableId(IRI) but named by the IRI's local name, and the target
+    // tables enforce UNIQUE(..., entity_type, name): two IRIs from different
+    // namespaces sharing a local name (a#Person and b#Person) used to abort
+    // the whole import. First claim keeps the plain local name; later
+    // claimants get a deterministic disambiguated name. The full IRI stays in
+    // metadata_json either way.
+    ontology_names: std.StringHashMapUnmanaged(u64),
+    graph_names: std.StringHashMapUnmanaged(u64),
+
     fn init(
         db: Database,
-        scratch: Allocator,
+        persistent: Allocator,
         workspace_id: []const u8,
         ontology_id: []const u8,
         materialize_graph: bool,
@@ -181,16 +193,38 @@ const ImportSession = struct {
 
         // Pre-seed entity types written by seedOwlNamespaces so we skip them.
         var seen_entity_types = std.StringHashMapUnmanaged(void){};
-        try seen_entity_types.put(scratch, "owl_class", {});
-        try seen_entity_types.put(scratch, "owl_resource", {});
-        try seen_entity_types.put(scratch, "owl_blank_node", {});
+        try seen_entity_types.put(persistent, "owl_class", {});
+        try seen_entity_types.put(persistent, "owl_resource", {});
+        try seen_entity_types.put(persistent, "owl_blank_node", {});
+
+        // entities_raw names are unique per workspace across all ontologies,
+        // so pre-claim the names other ontologies already own; this import's
+        // own previous rows were deleted before the session started.
+        var graph_names = std.StringHashMapUnmanaged(u64){};
+        if (materialize_graph) {
+            const preload = try facet_sqlite.prepare(db,
+                \\SELECT entity_id, entity_type, name FROM entities_raw WHERE workspace_id = ?1
+            );
+            defer facet_sqlite.finalize(preload);
+            try facet_sqlite.bindText(preload, 1, workspace_id);
+            while (true) {
+                const rc = c.sqlite3_step(preload);
+                if (rc == c.SQLITE_DONE) break;
+                if (rc != c.SQLITE_ROW) return error.StepFailed;
+                const entity_id: u64 = @bitCast(c.sqlite3_column_int64(preload, 0));
+                const entity_type = columnText(preload, 1);
+                const name = columnText(preload, 2);
+                const key = try std.fmt.allocPrint(persistent, "{s}\x00{s}", .{ entity_type, name });
+                try graph_names.put(persistent, key, entity_id);
+            }
+        }
 
         return .{
             .db = db,
             .workspace_id = workspace_id,
             .ontology_id = ontology_id,
             .materialize_graph = materialize_graph,
-            .scratch = scratch,
+            .persistent = persistent,
             .stmt_triple = stmt_triple,
             .stmt_entity_type = stmt_entity_type,
             .stmt_edge_type = stmt_edge_type,
@@ -200,6 +234,8 @@ const ImportSession = struct {
             .stmt_relation_raw = stmt_relation_raw,
             .seen_entity_types = seen_entity_types,
             .seen_edge_types = .{},
+            .ontology_names = .{},
+            .graph_names = graph_names,
         };
     }
 
@@ -242,8 +278,10 @@ const ImportSession = struct {
     }
 
     fn ensureEntityType(s: *ImportSession, entity_type: []const u8, label: ?[]const u8, metadata_json: []const u8) !void {
-        const gop = try s.seen_entity_types.getOrPut(s.scratch, entity_type);
-        if (gop.found_existing) return;
+        // The caller's slice lives in the per-line arena; dupe the key into
+        // the session arena before storing it in the dedup set.
+        if (s.seen_entity_types.contains(entity_type)) return;
+        try s.seen_entity_types.put(s.persistent, try s.persistent.dupe(u8, entity_type), {});
         try facet_sqlite.resetStatement(s.stmt_entity_type);
         try facet_sqlite.bindText(s.stmt_entity_type, 1, s.ontology_id);
         try facet_sqlite.bindText(s.stmt_entity_type, 2, entity_type);
@@ -253,8 +291,8 @@ const ImportSession = struct {
     }
 
     fn ensureEdgeType(s: *ImportSession, edge_type: []const u8, metadata_json: []const u8) !void {
-        const gop = try s.seen_edge_types.getOrPut(s.scratch, edge_type);
-        if (gop.found_existing) return;
+        if (s.seen_edge_types.contains(edge_type)) return;
+        try s.seen_edge_types.put(s.persistent, try s.persistent.dupe(u8, edge_type), {});
         try facet_sqlite.resetStatement(s.stmt_edge_type);
         try facet_sqlite.bindText(s.stmt_edge_type, 1, s.ontology_id);
         try facet_sqlite.bindText(s.stmt_edge_type, 2, edge_type);
@@ -263,6 +301,45 @@ const ImportSession = struct {
         try facet_sqlite.bindNull(s.stmt_edge_type, 5);
         try facet_sqlite.bindText(s.stmt_edge_type, 6, metadata_json);
         try facet_sqlite.stepDone(s.stmt_edge_type);
+    }
+
+    /// Resolves the display name for an entity so that (entity_type, name)
+    /// stays unique in the target table. The first IRI to use a local name
+    /// keeps it; a different IRI colliding on the same (type, local name)
+    /// falls back to "<local>__<stable-id-hex>" (and, should even that be
+    /// taken, the full IRI). line_alloc only needs to outlive the caller's
+    /// statement bind; claim keys are duped into the session arena.
+    fn claimName(
+        s: *ImportSession,
+        map: *std.StringHashMapUnmanaged(u64),
+        line_alloc: Allocator,
+        entity_type: []const u8,
+        iri: []const u8,
+        entity_id: u64,
+    ) ![]const u8 {
+        const local = try localNameAlloc(line_alloc, iri);
+        const key = try std.fmt.allocPrint(line_alloc, "{s}\x00{s}", .{ entity_type, local });
+        if (map.get(key)) |owner| {
+            if (owner == entity_id) return local;
+        } else {
+            try map.put(s.persistent, try s.persistent.dupe(u8, key), entity_id);
+            return local;
+        }
+
+        const disamb = try std.fmt.allocPrint(line_alloc, "{s}__{x}", .{ local, entity_id });
+        const disamb_key = try std.fmt.allocPrint(line_alloc, "{s}\x00{s}", .{ entity_type, disamb });
+        if (map.get(disamb_key)) |owner| {
+            if (owner == entity_id) return disamb;
+        } else {
+            try map.put(s.persistent, try s.persistent.dupe(u8, disamb_key), entity_id);
+            return disamb;
+        }
+
+        // Pathological: even the hash-suffixed name is taken. The full IRI is
+        // unique per entity by construction.
+        const iri_key = try std.fmt.allocPrint(line_alloc, "{s}\x00{s}", .{ entity_type, iri });
+        try map.put(s.persistent, try s.persistent.dupe(u8, iri_key), entity_id);
+        return iri;
     }
 
     fn upsertOntologyEntity(s: *ImportSession, entity_id: u64, entity_type: []const u8, name: []const u8, metadata_json: []const u8) !void {
@@ -321,6 +398,12 @@ const ImportSession = struct {
 // importNTriplesReader is the streaming implementation.  It reads N-Triples
 // line-by-line from reader without buffering the entire file.  The reader's
 // buffer must be large enough to hold the longest individual line.
+//
+// Re-importing an ontology_id REPLACES its previous content instead of
+// merging with it: all triples and projected ontology/graph rows belonging to
+// the ontology are deleted inside the import transaction before the new file
+// is written, so a shorter re-import cannot leave stale trailing triples or
+// orphaned projections behind.
 pub fn importNTriplesReader(
     db: Database,
     allocator: Allocator,
@@ -329,12 +412,19 @@ pub fn importNTriplesReader(
     reader: *std.Io.Reader,
     options: ImportOptions,
 ) !ImportSummary {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const scratch = arena.allocator();
+    // Two arenas (the "streaming" import used to retain every line's parse
+    // allocations for the whole file): per-line data is reset after each
+    // triple, while dedup/name-claim keys live in the persistent arena.
+    var persistent_arena = std.heap.ArenaAllocator.init(allocator);
+    defer persistent_arena.deinit();
+    var line_arena = std.heap.ArenaAllocator.init(allocator);
+    defer line_arena.deinit();
 
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
+    // The replace-delete below removes entity rows that are re-inserted with
+    // the same stable ids later in the transaction; check FKs at COMMIT.
+    try db.exec("PRAGMA defer_foreign_keys = ON");
 
     try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = workspace_id, .label = workspace_id });
     try collections_sqlite.ensureOntology(db, .{
@@ -344,9 +434,10 @@ pub fn importNTriplesReader(
         .source_kind = "owl2",
         .metadata_json = "{\"format\":\"ntriples\"}",
     });
+    try deleteOntologyRows(db, workspace_id, ontology_id);
     try seedOwlNamespaces(db, ontology_id);
 
-    var session = try ImportSession.init(db, scratch, workspace_id, ontology_id, options.materialize_graph);
+    var session = try ImportSession.init(db, persistent_arena.allocator(), workspace_id, ontology_id, options.materialize_graph);
     defer session.deinit();
 
     var summary = ImportSummary{ .ontology_id = ontology_id };
@@ -358,6 +449,9 @@ pub fn importNTriplesReader(
         line_no += 1;
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
+
+        _ = line_arena.reset(.retain_capacity);
+        const scratch = line_arena.allocator();
 
         const triple = try parseNTripleLine(scratch, line);
         summary.triples += 1;
@@ -379,6 +473,39 @@ pub fn importNTriplesReader(
 
     try db.exec("COMMIT");
     return summary;
+}
+
+// Replace semantics for re-imports: drop the ontology's raw triples and its
+// projected ontology/graph rows. Type registries (ontology_entity_types,
+// ontology_edge_types, ontology_dimensions) are additive vocabulary that
+// other objects (e.g. gap rules) may reference, so they are kept.
+fn deleteOntologyRows(db: Database, workspace_id: []const u8, ontology_id: []const u8) !void {
+    const by_ontology = [_][]const u8{
+        "DELETE FROM ontology_triples_raw WHERE ontology_id = ?1",
+        "DELETE FROM ontology_relations_raw WHERE ontology_id = ?1",
+        "DELETE FROM ontology_entities_raw WHERE ontology_id = ?1",
+    };
+    for (by_ontology) |sql| {
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, ontology_id);
+        try facet_sqlite.stepDone(stmt);
+    }
+
+    // Materialized graph rows are deleted regardless of the current import's
+    // materialize_graph flag so a non-materializing re-import cannot leave
+    // stale graph projections from an earlier materializing run.
+    const by_workspace = [_][]const u8{
+        "DELETE FROM relations_raw WHERE workspace_id = ?1 AND ontology_id = ?2",
+        "DELETE FROM entities_raw WHERE workspace_id = ?1 AND ontology_id = ?2",
+    };
+    for (by_workspace) |sql| {
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, workspace_id);
+        try facet_sqlite.bindText(stmt, 2, ontology_id);
+        try facet_sqlite.stepDone(stmt);
+    }
 }
 
 pub fn importNTriples(
@@ -526,19 +653,23 @@ fn termNodeType(term: Term) []const u8 {
 
 fn upsertOntologyNode(session: *ImportSession, allocator: Allocator, iri: []const u8, entity_type: []const u8) !void {
     try session.ensureEntityType(entity_type, entity_type, "{}");
+    const entity_id = stableId(&.{ "ontology-entity", iri });
+    const name = try session.claimName(&session.ontology_names, allocator, entity_type, iri, entity_id);
     try session.upsertOntologyEntity(
-        stableId(&.{ "ontology-entity", iri }),
+        entity_id,
         entity_type,
-        try localNameAlloc(allocator, iri),
+        name,
         try iriMetadata(allocator, iri),
     );
 }
 
 fn upsertGraphNode(session: *ImportSession, allocator: Allocator, iri: []const u8, entity_type: []const u8) !void {
+    const entity_id = stableId(&.{ "graph-entity", iri });
+    const name = try session.claimName(&session.graph_names, allocator, entity_type, iri, entity_id);
     try session.upsertEntityRaw(
-        stableId(&.{ "graph-entity", iri }),
+        entity_id,
         entity_type,
-        try localNameAlloc(allocator, iri),
+        name,
         try iriMetadata(allocator, iri),
     );
 }
@@ -1009,4 +1140,125 @@ test "importNTriplesReader produces identical results to importNTriples" {
         try std.testing.expectEqual(ref_summary.ontology_relations, rdr_summary.ontology_relations);
         try std.testing.expectEqualStrings(ref_export, rdr_export);
     }
+}
+
+test "local-name collisions across namespaces import with disambiguated names" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // a#Person / b#Person collide on (owl_class, "Person"); a#alice / b#alice
+    // collide on (owl_resource, "alice") in both projected tables. This used
+    // to abort the whole import with a UNIQUE constraint failure.
+    const fixture =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://b.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://b.example/ns#alice> .
+        \\
+    ;
+    const summary = try importNTriples(db, allocator, "ws-collide", "onto-collide", fixture, .{
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(@as(usize, 3), summary.triples);
+    try std.testing.expectEqual(@as(usize, 2), summary.classes);
+
+    // Both classes survive as distinct rows; exactly one keeps the plain
+    // local name, the other is deterministically disambiguated.
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = 'onto-collide' AND entity_type = 'owl_class'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = 'onto-collide' AND entity_type = 'owl_class' AND name = 'Person'"),
+    );
+    // The full IRIs stay recoverable from metadata for both rows.
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = 'onto-collide' AND json_extract(metadata_json, '$.iri') = 'http://a.example/ns#Person'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = 'onto-collide' AND json_extract(metadata_json, '$.iri') = 'http://b.example/ns#Person'"),
+    );
+
+    // Same for the materialized graph rows in entities_raw.
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-collide' AND entity_type = 'owl_resource'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-collide' AND entity_type = 'owl_resource' AND name = 'alice'"),
+    );
+
+    // A second ontology in the same workspace re-using the local name must
+    // respect names already claimed by existing entities_raw rows.
+    const fixture_second =
+        \\<http://c.example/ns#alice> <http://x.example/ns#knows> <http://c.example/ns#bob> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-collide", "onto-collide-2", fixture_second, .{
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-collide' AND name = 'alice'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-collide' AND entity_type = 'owl_resource'"),
+    );
+}
+
+test "re-importing an ontology replaces its previous content" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const first =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-replace", "onto-replace", first, .{
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-replace"),
+    );
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-replace'") > 0);
+
+    // Shorter re-import: no stale trailing triples, no stale graph rows.
+    const second =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\
+    ;
+    const summary = try importNTriples(db, allocator, "ws-replace", "onto-replace", second, .{
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), summary.triples);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-replace"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-replace'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countRows(db, "SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws-replace'"),
+    );
+
+    const exported = try exportNTriples(db, allocator, "onto-replace");
+    defer allocator.free(exported);
+    try std.testing.expectEqualStrings(
+        "<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .\n",
+        exported,
+    );
 }

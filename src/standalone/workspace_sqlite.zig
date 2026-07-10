@@ -118,18 +118,23 @@ pub fn upsertTableSemantic(
     vector_column: ?[]const u8,
     language: []const u8,
 ) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO table_semantics(table_id, workspace_id, table_schema, table_name, business_role, generation_strategy, emit_facets, emit_graph_entity, emit_graph_relation, notes, schema_name, key_column, content_column, metadata_column, vector_column, language) VALUES (?1, ?2, ?3, ?4, NULL, 'unknown', 1, 0, 0, NULL, ?3, ?5, ?6, ?7, ?8, ?9)");
-    defer finalize(stmt);
-    try bindInt64(stmt, 1, table_id);
-    try bindText(stmt, 2, workspace_id);
-    try bindText(stmt, 3, schema_name);
-    try bindText(stmt, 4, table_name);
-    try bindText(stmt, 5, key_column);
-    try bindText(stmt, 6, content_column);
-    try bindText(stmt, 7, metadata_column);
-    if (vector_column) |value| try bindText(stmt, 8, value) else try bindNull(stmt, 8);
-    try bindText(stmt, 9, language);
-    try stepDone(stmt);
+    try upsertTableSemanticFull(db, .{
+        .table_id = table_id,
+        .workspace_id = workspace_id,
+        .schema_name = schema_name,
+        .table_name = table_name,
+        .key_column = key_column,
+        .content_column = content_column,
+        .metadata_column = metadata_column,
+        .vector_column = vector_column,
+        .language = language,
+        .business_role = null,
+        .generation_strategy = "unknown",
+        .emit_facets = true,
+        .emit_graph_entity = false,
+        .emit_graph_relation = false,
+        .notes = null,
+    });
 }
 
 pub const ColumnSemanticUpsert = struct {
@@ -1012,8 +1017,87 @@ pub const TableSemanticUpsert = struct {
     notes: ?[]const u8 = null,
 };
 
+/// Does a row with this table_id already describe the same physical table?
+/// `null` when no row holds the id; `false` when the id belongs to another table.
+fn tableIdDescribesSameTable(
+    db: Database,
+    table_id: u64,
+    schema_name: []const u8,
+    table_name: []const u8,
+) !?bool {
+    const stmt = try prepare(db, "SELECT (table_schema = ?2 AND table_name = ?3) FROM table_semantics WHERE table_id = ?1");
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, table_id);
+    try bindText(stmt, 2, schema_name);
+    try bindText(stmt, 3, table_name);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return c.sqlite3_column_int(stmt, 0) != 0;
+}
+
+fn updateTableSemanticRow(db: Database, row_id: u64, spec: TableSemanticUpsert) !void {
+    const stmt = try prepare(db,
+        \\UPDATE table_semantics SET
+        \\    workspace_id = ?2,
+        \\    table_schema = ?3,
+        \\    table_name = ?4,
+        \\    business_role = ?5,
+        \\    generation_strategy = ?6,
+        \\    emit_facets = ?7,
+        \\    emit_graph_entity = ?8,
+        \\    emit_graph_relation = ?9,
+        \\    notes = ?10,
+        \\    schema_name = ?3,
+        \\    key_column = ?11,
+        \\    content_column = ?12,
+        \\    metadata_column = ?13,
+        \\    vector_column = ?14,
+        \\    language = ?15,
+        \\    updated_at = CURRENT_TIMESTAMP
+        \\WHERE table_id = ?1
+    );
+    defer finalize(stmt);
+    try bindInt64(stmt, 1, row_id);
+    try bindText(stmt, 2, spec.workspace_id);
+    try bindText(stmt, 3, spec.schema_name);
+    try bindText(stmt, 4, spec.table_name);
+    if (spec.business_role) |value| try bindText(stmt, 5, value) else try bindNull(stmt, 5);
+    try bindText(stmt, 6, spec.generation_strategy);
+    try bindInt64(stmt, 7, @intFromBool(spec.emit_facets));
+    try bindInt64(stmt, 8, @intFromBool(spec.emit_graph_entity));
+    try bindInt64(stmt, 9, @intFromBool(spec.emit_graph_relation));
+    if (spec.notes) |value| try bindText(stmt, 10, value) else try bindNull(stmt, 10);
+    try bindText(stmt, 11, spec.key_column);
+    try bindText(stmt, 12, spec.content_column);
+    try bindText(stmt, 13, spec.metadata_column);
+    if (spec.vector_column) |value| try bindText(stmt, 14, value) else try bindNull(stmt, 14);
+    try bindText(stmt, 15, spec.language);
+    try stepDone(stmt);
+}
+
 pub fn upsertTableSemanticFull(db: Database, spec: TableSemanticUpsert) !void {
-    const stmt = try prepare(db, "INSERT OR REPLACE INTO table_semantics(table_id, workspace_id, table_schema, table_name, business_role, generation_strategy, emit_facets, emit_graph_entity, emit_graph_relation, notes, schema_name, key_column, content_column, metadata_column, vector_column, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?3, ?11, ?12, ?13, ?14, ?15)");
+    // Never INSERT OR REPLACE here: table_semantics has PK table_id plus
+    // UNIQUE(workspace_id, table_schema, table_name), and callers allocate
+    // fresh table_ids. OR REPLACE deleted the existing natural-key row and
+    // re-inserted it under the new id, aborting or orphaning FK children
+    // (column_semantics, relation_semantics, source_mappings, facet_tables,
+    // provenance). Re-registering a table must keep its table_id.
+    if (try lookupTableId(db, spec.workspace_id, spec.schema_name, spec.table_name)) |existing_id| {
+        try updateTableSemanticRow(db, existing_id, spec);
+        return;
+    }
+
+    // No row owns the natural key, but one may still own the primary key:
+    // `facet_sqlite.ensureFacetTableParents` inserts a placeholder under the
+    // 'default' workspace before the table is registered under its real one.
+    // Upgrade that row in place so FK children keep pointing at the same
+    // table_id. A different table holding the id is a genuine collision.
+    if (try tableIdDescribesSameTable(db, spec.table_id, spec.schema_name, spec.table_name)) |same_table| {
+        if (!same_table) return error.TableIdConflict;
+        try updateTableSemanticRow(db, spec.table_id, spec);
+        return;
+    }
+
+    const stmt = try prepare(db, "INSERT INTO table_semantics(table_id, workspace_id, table_schema, table_name, business_role, generation_strategy, emit_facets, emit_graph_entity, emit_graph_relation, notes, schema_name, key_column, content_column, metadata_column, vector_column, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?3, ?11, ?12, ?13, ?14, ?15)");
     defer finalize(stmt);
     try bindInt64(stmt, 1, spec.table_id);
     try bindText(stmt, 2, spec.workspace_id);
@@ -1173,4 +1257,105 @@ test "workspace export resolves by domain" {
     try std.testing.expect(toon != null);
     defer std.testing.allocator.free(toon.?);
     try std.testing.expect(std.mem.indexOf(u8, toon.?, "kind: workspace_export") != null);
+}
+
+test "re-registering a table keeps its table_id and FK children" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertWorkspace(db, "default", "{\"domain\":\"ghostcrab\"}");
+    try upsertTableSemanticFull(db, .{
+        .table_id = 1,
+        .workspace_id = "default",
+        .schema_name = "public",
+        .table_name = "documents",
+        .business_role = "catalog",
+    });
+    try upsertColumnSemantic(db, 1, 1, "id", "id", "uuid", false);
+
+    // Re-register under a freshly allocated id: the row must keep table_id 1
+    // (OR REPLACE used to delete it and strand/abort the FK children).
+    const fresh_id = try nextTableId(db);
+    try std.testing.expect(fresh_id != 1);
+    try upsertTableSemanticFull(db, .{
+        .table_id = fresh_id,
+        .workspace_id = "default",
+        .schema_name = "public",
+        .table_name = "documents",
+        .business_role = "updated-role",
+    });
+
+    try std.testing.expectEqual(@as(?u64, 1), try lookupTableId(db, "default", "public", "documents"));
+
+    const count_stmt = try prepare(db, "SELECT COUNT(*) FROM table_semantics WHERE workspace_id = 'default'");
+    defer finalize(count_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(count_stmt, 0));
+
+    const role_stmt = try prepare(db, "SELECT business_role FROM table_semantics WHERE table_id = 1");
+    defer finalize(role_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(role_stmt));
+    try std.testing.expectEqualStrings("updated-role", std.mem.span(c.sqlite3_column_text(role_stmt, 0)));
+
+    const child_stmt = try prepare(db, "SELECT COUNT(*) FROM column_semantics WHERE table_id = 1");
+    defer finalize(child_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(child_stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(child_stmt, 0));
+}
+
+test "registering a table upgrades the default placeholder row in place" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertWorkspace(db, "ws1", "{}");
+
+    // `facet_sqlite.ensureFacetTableParents` seeds this placeholder before the
+    // table is known to belong to a real workspace.
+    try db.exec("INSERT INTO workspaces(id, workspace_id) VALUES('default', 'default')");
+    try db.exec("INSERT INTO table_semantics(table_id, workspace_id, table_schema, table_name) VALUES (7, 'default', 'public', 'ws1::main')");
+    try upsertColumnSemantic(db, 1, 7, "doc_id", "doc_id", "integer", false);
+
+    try upsertTableSemanticFull(db, .{
+        .table_id = 7,
+        .workspace_id = "ws1",
+        .schema_name = "public",
+        .table_name = "ws1::main",
+    });
+
+    // Same row, same id: FK children survive and no duplicate is created.
+    try std.testing.expectEqual(@as(?u64, 7), try lookupTableId(db, "ws1", "public", "ws1::main"));
+    try std.testing.expectEqual(@as(?u64, null), try lookupTableId(db, "default", "public", "ws1::main"));
+
+    const count_stmt = try prepare(db, "SELECT COUNT(*) FROM table_semantics");
+    defer finalize(count_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(count_stmt, 0));
+
+    const child_stmt = try prepare(db, "SELECT COUNT(*) FROM column_semantics WHERE table_id = 7");
+    defer finalize(child_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(child_stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(child_stmt, 0));
+}
+
+test "a different table may not steal an existing table_id" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try upsertWorkspace(db, "ws1", "{}");
+    try upsertTableSemanticFull(db, .{
+        .table_id = 3,
+        .workspace_id = "ws1",
+        .schema_name = "public",
+        .table_name = "invoices",
+    });
+
+    try std.testing.expectError(error.TableIdConflict, upsertTableSemanticFull(db, .{
+        .table_id = 3,
+        .workspace_id = "ws1",
+        .schema_name = "public",
+        .table_name = "payments",
+    }));
 }
