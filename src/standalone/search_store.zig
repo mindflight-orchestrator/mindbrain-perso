@@ -19,22 +19,6 @@ const EmbeddingEntry = struct {
     values: []const f32,
 };
 
-const DocumentStatEntry = struct {
-    table_id: u64,
-    stats: interfaces.DocumentStats,
-};
-
-const TermStatEntry = struct {
-    table_id: u64,
-    stat: interfaces.TermStat,
-};
-
-const TermFrequencyEntry = struct {
-    table_id: u64,
-    doc_id: interfaces.DocId,
-    frequency: interfaces.TermFrequency,
-};
-
 const PostingEntry = struct {
     table_id: u64,
     term_hash: u64,
@@ -56,10 +40,10 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     documents: std.ArrayList(DocumentRecord),
     embeddings: std.ArrayList(EmbeddingEntry),
-    collection_stats: std.ArrayList(interfaces.CollectionStatsEntry),
-    document_stats: std.ArrayList(DocumentStatEntry),
-    term_stats: std.ArrayList(TermStatEntry),
-    term_frequencies: std.ArrayList(TermFrequencyEntry),
+    // Postings keep an ArrayList as backing storage for the bitmap values;
+    // posting_index_by_term points into it. The former ArrayList mirrors of
+    // the stats/frequency maps were write-only (and stale under the delta
+    // path), so BM25 state lives exclusively in the keyed maps below.
     postings: std.ArrayList(PostingEntry),
     // Keyed maps for O(1) BM25 reads.
     collection_stats_by_table: std.AutoHashMap(u64, interfaces.CollectionStats),
@@ -83,10 +67,6 @@ pub const Store = struct {
             .allocator = allocator,
             .documents = .empty,
             .embeddings = .empty,
-            .collection_stats = .empty,
-            .document_stats = .empty,
-            .term_stats = .empty,
-            .term_frequencies = .empty,
             .postings = .empty,
             .collection_stats_by_table = std.AutoHashMap(u64, interfaces.CollectionStats).init(allocator),
             .document_stats_by_doc = std.AutoHashMap(TableDocKey, interfaces.DocumentStats).init(allocator),
@@ -104,10 +84,6 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.clearBm25Index();
-        self.collection_stats.deinit(self.allocator);
-        self.document_stats.deinit(self.allocator);
-        self.term_stats.deinit(self.allocator);
-        self.term_frequencies.deinit(self.allocator);
         self.postings.deinit(self.allocator);
         self.collection_stats_by_table.deinit();
         self.document_stats_by_doc.deinit();
@@ -129,10 +105,6 @@ pub const Store = struct {
     }
 
     fn clearBm25Index(self: *Store) void {
-        self.collection_stats.clearRetainingCapacity();
-        self.document_stats.clearRetainingCapacity();
-        self.term_stats.clearRetainingCapacity();
-        self.term_frequencies.clearRetainingCapacity();
         for (self.postings.items) |*entry| entry.bitmap.deinit();
         self.postings.clearRetainingCapacity();
         self.collection_stats_by_table.clearRetainingCapacity();
@@ -466,10 +438,6 @@ pub const Store = struct {
                 .document_length = @intCast(tokens.len),
                 .unique_terms = @intCast(local_counts.count()),
             };
-            try self.document_stats.append(self.allocator, .{
-                .table_id = doc.table_id,
-                .stats = doc_stats,
-            });
             try self.document_stats_by_doc.put(.{
                 .table_id = doc.table_id,
                 .doc_id = doc.doc_id,
@@ -483,15 +451,6 @@ pub const Store = struct {
             var local_it = local_counts.iterator();
             while (local_it.next()) |entry| {
                 const term_hash = entry.key_ptr.*;
-                const frequency: interfaces.TermFrequency = .{
-                    .term_hash = term_hash,
-                    .frequency = entry.value_ptr.*,
-                };
-                try self.term_frequencies.append(self.allocator, .{
-                    .table_id = doc.table_id,
-                    .doc_id = doc.doc_id,
-                    .frequency = frequency,
-                });
                 try self.term_frequencies_by_doc_term.put(.{
                     .table_id = doc.table_id,
                     .doc_id = doc.doc_id,
@@ -518,10 +477,6 @@ pub const Store = struct {
                 .total_documents = total_docs,
                 .avg_document_length = avg,
             };
-            try self.collection_stats.append(self.allocator, .{
-                .table_id = entry.key_ptr.*,
-                .stats = stats,
-            });
             try self.collection_stats_by_table.put(entry.key_ptr.*, stats);
             try self.collection_total_length_by_table.put(entry.key_ptr.*, total_length);
         }
@@ -529,15 +484,10 @@ pub const Store = struct {
         var df_it = term_doc_freq.iterator();
         while (df_it.next()) |entry| {
             const unpacked = unpackTableTermKey(entry.key_ptr.*);
-            const stat: interfaces.TermStat = .{
+            try self.term_stats_by_term.put(entry.key_ptr.*, .{
                 .term_hash = unpacked.term_hash,
                 .document_frequency = entry.value_ptr.*,
-            };
-            try self.term_stats.append(self.allocator, .{
-                .table_id = unpacked.table_id,
-                .stat = stat,
             });
-            try self.term_stats_by_term.put(entry.key_ptr.*, stat);
         }
 
         var posting_it = posting_docs.iterator();

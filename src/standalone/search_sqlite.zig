@@ -143,8 +143,19 @@ pub fn syncSearchDocument(
     content: []const u8,
     language: []const u8,
 ) !void {
-    try upsertSearchDocument(db, table_id, doc_id, content, language);
-    _ = allocator;
+    // Incremental ingest must keep the compact BM25 artifacts (document/term
+    // stats, term frequencies, postings) in step with search_documents + FTS:
+    // the delete path (syncDeleteSearchDocument) reconciles artifacts, and an
+    // FTS-only upsert left post-rebuild documents invisible to compact-store
+    // consumers. The reconcile is a read-modify-write across several tables,
+    // so run the whole sync in one transaction (atomic, and it avoids one
+    // autocommit journal flush per statement).
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+    try upsertSearchDocumentRow(db, table_id, doc_id, content, language);
+    // Also refreshes the FTS row for the document.
+    try upsertSearchArtifactsForDocument(db, allocator, table_id, doc_id);
+    try tx.commit();
 }
 
 pub fn syncSearchDocumentIfTriggered(
@@ -165,8 +176,12 @@ pub fn syncDeleteSearchDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
+    // Same transactional envelope as syncSearchDocument.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
     try deleteSearchArtifactsForDocument(db, allocator, table_id, doc_id);
     try deleteSearchDocument(db, table_id, doc_id);
+    try tx.commit();
 }
 
 pub fn syncDeleteSearchDocumentIfTriggered(
@@ -186,6 +201,19 @@ pub fn upsertSearchDocument(
     content: []const u8,
     language: []const u8,
 ) !void {
+    try upsertSearchDocumentRow(db, table_id, doc_id, content, language);
+    try upsertSearchFtsDocument(db, table_id, doc_id, content);
+}
+
+/// Writes only the search_documents row; syncSearchDocument uses this so the
+/// FTS row is written exactly once (by upsertSearchArtifactsForDocument).
+fn upsertSearchDocumentRow(
+    db: Database,
+    table_id: u64,
+    doc_id: u64,
+    content: []const u8,
+    language: []const u8,
+) !void {
     const sql =
         "INSERT OR REPLACE INTO search_documents(table_id, doc_id, content, language) VALUES (?1, ?2, ?3, ?4)";
     const stmt = try prepare(db, sql);
@@ -196,8 +224,6 @@ pub fn upsertSearchDocument(
     try bindText(stmt, 3, content);
     try bindText(stmt, 4, language);
     try stepDone(stmt);
-
-    try upsertSearchFtsDocument(db, table_id, doc_id, content);
 }
 
 pub fn upsertSearchEmbedding(
@@ -323,15 +349,18 @@ pub fn searchEmbeddingExactTopK(
     var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
     defer matches.deinit(allocator);
 
+    // The scan is dimension-filtered, so every row decodes into the same
+    // buffer instead of one allocation per candidate row.
+    const values = try allocator.alloc(f32, query_vector.len);
+    defer allocator.free(values);
+
     while (true) {
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
         const doc_id = try columnDocId(stmt, 0);
-        const dimensions = try columnUsize(stmt, 1);
-        const values = try decodeEmbedding(allocator, stmt, 2, dimensions);
-        defer allocator.free(values);
+        try decodeEmbeddingInto(stmt, 2, values);
 
         const score = vector_distance.score(metric, query_vector, values);
         try vector_distance.insertTopMatch(allocator, &matches, .{
@@ -428,15 +457,17 @@ pub fn searchEmbeddingExactTopKWorkspace(
     var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
     defer matches.deinit(allocator);
 
+    // Dimension-filtered scan: reuse one decode buffer across rows.
+    const values = try allocator.alloc(f32, query_vector.len);
+    defer allocator.free(values);
+
     while (true) {
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
         const doc_id = try columnDocId(stmt, 0);
-        const dimensions = try columnUsize(stmt, 1);
-        const values = try decodeEmbedding(allocator, stmt, 2, dimensions);
-        defer allocator.free(values);
+        try decodeEmbeddingInto(stmt, 2, values);
 
         const score = vector_distance.score(metric, query_vector, values);
         try vector_distance.insertTopMatch(allocator, &matches, .{
@@ -779,6 +810,11 @@ pub fn upsertSearchArtifactsForDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
+    // Multi-table read-modify-write; Transaction is nesting-aware, so this is
+    // a no-op when the caller (e.g. syncSearchDocument) already owns one.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     const row = try loadSearchDocumentContentAndLanguage(db, allocator, table_id, doc_id);
     defer allocator.free(row.content);
     defer allocator.free(row.language);
@@ -813,6 +849,7 @@ pub fn upsertSearchArtifactsForDocument(
         tokens.len,
     );
     try reconcileDocumentTermArtifacts(db, allocator, table_id, doc_id, &old_counts, &new_counts);
+    try tx.commit();
 }
 
 pub fn deleteSearchArtifactsForDocument(
@@ -821,6 +858,10 @@ pub fn deleteSearchArtifactsForDocument(
     table_id: u64,
     doc_id: u64,
 ) !void {
+    // See upsertSearchArtifactsForDocument: nesting-aware transaction.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     try deleteSearchFtsDocument(db, table_id, doc_id);
     const old_doc_stats = try loadDocumentStat(db, table_id, doc_id);
     var old_counts = try loadTermFrequencyMapForDoc(db, allocator, table_id, doc_id);
@@ -834,6 +875,7 @@ pub fn deleteSearchArtifactsForDocument(
     if (old_doc_stats) |stats| {
         try reconcileCollectionArtifact(db, table_id, @as(u64, stats.document_length), null);
     }
+    try tx.commit();
 }
 
 pub fn loadCompactSearchStore(db: Database, allocator: std.mem.Allocator) !search_compact_store.Store {
@@ -1180,7 +1222,9 @@ fn reconcileTermArtifact(
     const old_df = if (maybe_old_df) |term_stat| term_stat.document_frequency else 0;
     var new_df = old_df;
     if (old_frequency == 0 and new_frequency > 0) new_df += 1;
-    if (old_frequency > 0 and new_frequency == 0) new_df -= 1;
+    // Saturating: a stale or drifted stats row (old_df == 0 while the doc
+    // still has a recorded frequency) must not underflow u64 and poison IDF.
+    if (old_frequency > 0 and new_frequency == 0) new_df -|= 1;
 
     if (new_df == 0) {
         try deleteTermStat(db, table_id, term_hash);
@@ -1385,6 +1429,22 @@ fn unpackArtifactKey(key: u128) struct { table_id: u64, term_hash: u64 } {
 
 fn encodeEmbedding(allocator: std.mem.Allocator, values: []const f32) ![]u8 {
     return vector_blob.encodeF32Le(allocator, values);
+}
+
+/// Decodes an embedding blob column into a caller-owned buffer; the blob must
+/// hold exactly `out.len` little-endian f32 values. Used by the exact top-k
+/// scans to avoid one allocation per candidate row.
+fn decodeEmbeddingInto(stmt: *c.sqlite3_stmt, index: c_int, out: []f32) !void {
+    const blob_ptr = c.sqlite3_column_blob(stmt, index) orelse return error.ValueOutOfRange;
+    const blob_size = c.sqlite3_column_bytes(stmt, index);
+    if (blob_size < 0) return error.ValueOutOfRange;
+
+    const bytes: []const u8 = @as([*]const u8, @ptrCast(blob_ptr))[0..@intCast(blob_size)];
+    if (bytes.len != out.len * @sizeOf(f32)) return error.ValueOutOfRange;
+    for (out, 0..) |*value, i| {
+        const chunk: *const [4]u8 = @ptrCast(bytes[i * @sizeOf(f32) ..][0..4]);
+        value.* = @bitCast(std.mem.readInt(u32, chunk, .little));
+    }
 }
 
 fn decodeEmbedding(
@@ -1767,6 +1827,27 @@ test "search sqlite delete removes fts bm25 rows" {
 
     const collection_stats = try bm25_repo.getCollectionStatsFn(bm25_repo.ctx, std.testing.allocator, 1);
     try std.testing.expectEqual(@as(u64, 1), collection_stats.total_documents);
+}
+
+test "search sqlite artifact delete survives drifted zero document frequency" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try syncSearchDocument(db, std.testing.allocator, 1, 7, "zig sqlite roaring", "english");
+
+    // Simulate drift: the term stats vanish while per-document frequencies
+    // remain. The df decrement must saturate at zero instead of underflowing
+    // u64 (panic / IDF poisoning).
+    try db.exec("DELETE FROM search_term_stats WHERE table_id = 1");
+
+    try syncDeleteSearchDocument(db, std.testing.allocator, 1, 7);
+
+    const snapshot = try compactSearchSnapshot(db, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.document_stats);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.term_stats);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.term_frequencies);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.postings);
 }
 
 test "search sqlite bm25 rebuild applies bm25_stopwords for document language" {

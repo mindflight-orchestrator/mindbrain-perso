@@ -90,9 +90,9 @@
       "top_k": 3,
       "total_found": 3,
       "scores": {
-        "2": 1.108682519125,
-        "1": 1.033073065799,
-        "3": 0.503586534554
+        "2": 1.0,
+        "1": 0.90948,
+        "3": 0.0
       }
     }
   },
@@ -101,6 +101,6 @@
     "allow_extra_fields": true,
     "order_required": true,
     "compare_total_found": true,
-    "notes": "Score values are intentionally null until the first standalone golden capture is recorded. Order and total_found are the first frozen assertions."
+    "notes": "Golden scores re-captured after hybrid fusion switched to min-max normalization per channel over the candidate set (combined = norm_bm25*(1-w) + norm_vector*w). Raw per-channel scores are unchanged."
   }
 }

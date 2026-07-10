@@ -886,6 +886,12 @@ pub fn chunkLate(
     text: []const u8,
     options: LateOptions,
 ) anyerror!LateResult {
+    // Same validation as chunk(): chunkLate feeds chunkFixedToken directly,
+    // and overlap >= target would make the stride 0 (infinite loop) or
+    // underflow the u32 subtraction.
+    if (options.target_tokens == 0) return error.InvalidOptions;
+    if (options.overlap_tokens >= options.target_tokens) return error.InvalidOptions;
+
     if (text.len == 0) {
         return .{
             .chunks = try allocator.alloc(Chunk, 0),
@@ -1311,4 +1317,28 @@ test "late chunker emits doc-level parent followed by token slices" {
         try std.testing.expectEqual(@as(?u32, 0), child.parent_chunk_index);
         try std.testing.expectEqualStrings("late", child.strategy);
     }
+}
+
+test "late chunker rejects nonsense overlap configurations like chunk()" {
+    const state = StubLateState{ .dim = 4 };
+    // overlap == target would make the fixed-token stride 0 (infinite loop).
+    try std.testing.expectError(error.InvalidOptions, chunkLate(std.testing.allocator, "alpha beta", .{
+        .embed = stubEmbedFullDoc,
+        .user_data = @ptrCast(@constCast(&state)),
+        .target_tokens = 2,
+        .overlap_tokens = 2,
+    }));
+    // overlap > target would underflow the u32 stride subtraction.
+    try std.testing.expectError(error.InvalidOptions, chunkLate(std.testing.allocator, "alpha beta", .{
+        .embed = stubEmbedFullDoc,
+        .user_data = @ptrCast(@constCast(&state)),
+        .target_tokens = 2,
+        .overlap_tokens = 3,
+    }));
+    try std.testing.expectError(error.InvalidOptions, chunkLate(std.testing.allocator, "alpha beta", .{
+        .embed = stubEmbedFullDoc,
+        .user_data = @ptrCast(@constCast(&state)),
+        .target_tokens = 0,
+        .overlap_tokens = 0,
+    }));
 }

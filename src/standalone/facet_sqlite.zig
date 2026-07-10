@@ -350,21 +350,25 @@ pub const Database = struct {
             \\    must_be_zero INTEGER NOT NULL CHECK (must_be_zero = 0)
             \\);
             \\
+            \\-- The backfill below COALESCEs every NULL-workspace row, not just
+            \\-- analysis plans, and `answer_artifacts.workspaceForScope` resolves
+            \\-- nested workspaces by longest prefix. So the guard must cover all
+            \\-- artifact kinds and only reject rows that resolve to *no*
+            \\-- workspace; several matches are legal.
             \\INSERT INTO answer_artifact_workspace_guard(must_be_zero)
             \\SELECT 1
             \\WHERE EXISTS (
             \\    SELECT 1
             \\    FROM mindbrain_answer_artifacts a
-            \\    WHERE a.artifact_kind = 'analysis_plan'
-            \\      AND a.workspace_id IS NULL
+            \\    WHERE a.workspace_id IS NULL
             \\      AND (
             \\          a.scope IS NULL
-            \\          OR (
-            \\              SELECT COUNT(*)
+            \\          OR NOT EXISTS (
+            \\              SELECT 1
             \\              FROM workspaces w
             \\              WHERE a.scope = w.workspace_id
             \\                 OR a.scope LIKE w.workspace_id || ':%'
-            \\          ) != 1
+            \\          )
             \\      )
             \\);
             \\
@@ -1336,10 +1340,10 @@ pub fn syncFacetAssignments(
 ) !u64 {
     if (assignments.len == 0) return 0;
 
-    const table = try loadFacetTableConfigById(db, std.heap.page_allocator, table_id);
+    const table = try loadFacetTableConfigById(db, std.heap.c_allocator, table_id);
     defer {
-        std.heap.page_allocator.free(table.schema_name);
-        std.heap.page_allocator.free(table.table_name);
+        std.heap.c_allocator.free(table.schema_name);
+        std.heap.c_allocator.free(table.table_name);
     }
 
     for (assignments) |assignment| {
@@ -1373,11 +1377,15 @@ pub fn applyDeltas(
     table_id: u64,
     facet_id: ?u32,
 ) !u64 {
-    const table = try loadFacetTableConfigById(db, std.heap.page_allocator, table_id);
-    defer {
-        std.heap.page_allocator.free(table.schema_name);
-        std.heap.page_allocator.free(table.table_name);
-    }
+    // One arena per merge: the previous std.heap.page_allocator usage paid a
+    // mmap syscall (and a 4KB page) for every duped row string, which is
+    // O(deltas) syscalls on bulk merges. Bitmaps inside the delta map are
+    // croaring-owned and still released via freeDeltaMap.
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const table = try loadFacetTableConfigById(db, scratch, table_id);
 
     const delta_sql = if (facet_id != null)
         "SELECT facet_id, facet_value, posting, delta FROM facet_deltas WHERE table_id = ?1 AND facet_id = ?2 AND delta <> 0"
@@ -1390,8 +1398,8 @@ pub fn applyDeltas(
     try bindInt64(stmt, 1, table_id);
     if (facet_id) |value| try bindInt64(stmt, 2, value);
 
-    var grouped = DeltaMap.init(std.heap.page_allocator);
-    errdefer freeDeltaMap(std.heap.page_allocator, &grouped);
+    var grouped = DeltaMap.init(scratch);
+    errdefer freeDeltaMap(scratch, &grouped);
 
     while (true) {
         const rc = c.sqlite3_step(stmt);
@@ -1399,9 +1407,9 @@ pub fn applyDeltas(
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
         const row_facet_id = try columnU32(stmt, 0);
-        const facet_value = try dupeColumnText(std.heap.page_allocator, stmt, 1);
+        const facet_value = try dupeColumnText(scratch, stmt, 1);
         var released = false;
-        defer if (!released) std.heap.page_allocator.free(facet_value);
+        defer if (!released) scratch.free(facet_value);
 
         const posting_i64 = try columnI64(stmt, 2);
         const posting_u64 = std.math.cast(u64, posting_i64) orelse return error.ValueOutOfRange;
@@ -1420,7 +1428,7 @@ pub fn applyDeltas(
         const gop = try grouped.getOrPut(owned_key);
         if (gop.found_existing) {
             released = true;
-            std.heap.page_allocator.free(facet_value);
+            scratch.free(facet_value);
         } else {
             gop.key_ptr.* = owned_key;
             gop.value_ptr.* = .{};
@@ -1497,8 +1505,10 @@ pub fn applyDeltas(
             continue;
         }
 
-        const bytes = try current.serializePortableStable(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(bytes);
+        // c_allocator (not the arena): blobs are freed per iteration, and an
+        // arena would retain every serialized posting until the merge ends.
+        const bytes = try current.serializePortableStable(std.heap.c_allocator);
+        defer std.heap.c_allocator.free(bytes);
 
         try resetStatement(upsert_stmt);
         try bindInt64(upsert_stmt, 1, table_id);
@@ -1511,7 +1521,7 @@ pub fn applyDeltas(
     }
 
     try clearFacetDeltas(db, table_id, facet_id);
-    freeDeltaMap(std.heap.page_allocator, &grouped);
+    freeDeltaMap(scratch, &grouped);
     return affected;
 }
 
@@ -2009,15 +2019,24 @@ pub fn dropFaceting(db: Database, table_id: u64) !void {
 }
 
 /// Document count for every value of a facet, parity for
-/// `facets.get_facet_counts`. Counts are summed across chunks.
+/// `facets.get_facet_counts`. Counts are summed across chunks in a single
+/// ordered scan of facet_postings. When `filter_bitmap` is set (global doc-id
+/// space), each value's postings are reconstructed to global ids with the
+/// table's chunk_bits and intersected with the filter before counting; values
+/// whose filtered count is zero are omitted.
 pub fn getFacetCounts(
     db: Database,
     allocator: std.mem.Allocator,
     table_id: u64,
     facet_id: u32,
+    filter_bitmap: ?roaring.Bitmap,
 ) ![]FacetValueCount {
+    // Postings are chunked with the table's configured chunk_bits; a filter
+    // bitmap lives in the reconstructed global doc-id space.
+    const chunk_bits: u8 = if (filter_bitmap != null) try loadChunkBitsForTableId(db, table_id) else 0;
+
     const sql =
-        "SELECT facet_value, posting_blob FROM facet_postings WHERE table_id = ?1 AND facet_id = ?2 ORDER BY facet_value, chunk_id";
+        "SELECT facet_value, chunk_id, posting_blob FROM facet_postings WHERE table_id = ?1 AND facet_id = ?2 ORDER BY facet_value, chunk_id";
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindInt64(stmt, 1, table_id);
@@ -2032,6 +2051,9 @@ pub fn getFacetCounts(
     var current_value: ?[]u8 = null;
     var current_count: u64 = 0;
     errdefer if (current_value) |value| allocator.free(value);
+    // Accumulates the current value's global doc-id bitmap (filtered mode).
+    var current_bitmap: ?roaring.Bitmap = null;
+    defer if (current_bitmap) |*bm| bm.deinit();
 
     while (true) {
         const rc = c.sqlite3_step(stmt);
@@ -2040,36 +2062,68 @@ pub fn getFacetCounts(
 
         const value_bytes = try dupeColumnText(allocator, stmt, 0);
         defer allocator.free(value_bytes);
-        const blob_len = c.sqlite3_column_bytes(stmt, 1);
-        const blob_ptr = c.sqlite3_column_blob(stmt, 1) orelse return error.MissingRow;
+        const chunk_id = try columnU32(stmt, 1);
+        const blob_len = c.sqlite3_column_bytes(stmt, 2);
+        const blob_ptr = c.sqlite3_column_blob(stmt, 2) orelse return error.MissingRow;
         const blob: []const u8 = @as([*]const u8, @ptrCast(blob_ptr))[0..@intCast(blob_len)];
         var bitmap = try roaring.Bitmap.deserializePortable(blob);
         defer bitmap.deinit();
-        const chunk_count = bitmap.cardinality();
 
         const same_value = current_value != null and std.mem.eql(u8, current_value.?, value_bytes);
         if (!same_value) {
-            if (current_value) |existing| {
-                try results.append(allocator, .{
-                    .facet_value = existing,
-                    .doc_count = current_count,
-                });
-            }
+            try flushFacetCount(allocator, &results, &current_value, &current_count, &current_bitmap, filter_bitmap);
             current_value = try allocator.dupe(u8, value_bytes);
-            current_count = chunk_count;
+        }
+
+        if (filter_bitmap == null) {
+            current_count += bitmap.cardinality();
         } else {
-            current_count += chunk_count;
+            if (current_bitmap == null) current_bitmap = try roaring.Bitmap.empty();
+            current_bitmap.?.orShiftedChunkInPlace(bitmap, chunk_id, chunk_bits);
         }
     }
-    if (current_value) |existing| {
-        try results.append(allocator, .{
-            .facet_value = existing,
-            .doc_count = current_count,
-        });
-        current_value = null;
-    }
+    try flushFacetCount(allocator, &results, &current_value, &current_count, &current_bitmap, filter_bitmap);
 
     return results.toOwnedSlice(allocator);
+}
+
+fn flushFacetCount(
+    allocator: std.mem.Allocator,
+    results: *std.ArrayList(FacetValueCount),
+    current_value: *?[]u8,
+    current_count: *u64,
+    current_bitmap: *?roaring.Bitmap,
+    filter_bitmap: ?roaring.Bitmap,
+) !void {
+    defer {
+        current_count.* = 0;
+        if (current_bitmap.*) |*bm| {
+            bm.deinit();
+            current_bitmap.* = null;
+        }
+    }
+    const value = current_value.* orelse return;
+
+    var count = current_count.*;
+    if (filter_bitmap) |filter| {
+        count = 0;
+        if (current_bitmap.*) |value_bitmap| {
+            var intersection = try value_bitmap.andNew(filter);
+            defer intersection.deinit();
+            count = intersection.cardinality();
+        }
+        if (count == 0) {
+            allocator.free(value);
+            current_value.* = null;
+            return;
+        }
+    }
+
+    try results.append(allocator, .{
+        .facet_value = value,
+        .doc_count = count,
+    });
+    current_value.* = null;
 }
 
 /// Top-N facet values by document count, parity for
@@ -2082,7 +2136,7 @@ pub fn topValues(
     facet_id: u32,
     limit: usize,
 ) ![]FacetValueCount {
-    const all = try getFacetCounts(db, allocator, table_id, facet_id);
+    const all = try getFacetCounts(db, allocator, table_id, facet_id, null);
     errdefer {
         for (all) |entry| allocator.free(entry.facet_value);
         allocator.free(all);
@@ -2098,6 +2152,79 @@ pub fn topValues(
     if (all.len <= limit) return all;
     for (all[limit..]) |entry| allocator.free(entry.facet_value);
     return try allocator.realloc(all, limit);
+}
+
+/// True when a `FacetRepository` handle was produced by
+/// `Repository.asFacetRepository`, i.e. it is backed by this SQLite engine.
+/// facet_store.countFacetValues uses this to route counting through the
+/// single-scan path instead of one getPostings query per facet value.
+pub fn facetRepositoryIsSqliteBacked(repository: interfaces.FacetRepository) bool {
+    return repository.getPostingsFn == &Repository.getPostings;
+}
+
+/// Database behind a SQLite-backed `FacetRepository`. Only valid when
+/// `facetRepositoryIsSqliteBacked` returned true.
+pub fn facetRepositoryDatabase(repository: interfaces.FacetRepository) Database {
+    const repo: *const Repository = @ptrCast(@alignCast(repository.ctx));
+    return repo.db.*;
+}
+
+/// Single-scan equivalent of facet_store.countFacetValues for the SQLite
+/// engine: table config + facet id lookups plus one ordered facet_postings
+/// scan, instead of listFacetValues followed by one getPostings query (and a
+/// full blob decode) per value. Semantics match the generic path: counts are
+/// intersected with `filter_bitmap` when present, zero-count values are
+/// omitted, and the result is sorted by cardinality descending then value
+/// ascending. `facet_name` is borrowed by the returned rows (callers free
+/// only `facet_value` and the slice).
+pub fn countFacetValuesSingleScan(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    facet_name: []const u8,
+    filter_bitmap: ?roaring.Bitmap,
+) ![]interfaces.FacetCount {
+    const table = try loadFacetTableRuntime(db, table_name);
+    const facet_id = loadFacetId(db, table.table_id, facet_name) catch |err| switch (err) {
+        error.MissingRow => return &.{},
+        else => return err,
+    };
+
+    const raw_counts = try getFacetCounts(db, allocator, table.table_id, facet_id, filter_bitmap);
+    var remaining = raw_counts.len;
+    defer {
+        for (raw_counts[raw_counts.len - remaining ..]) |entry| allocator.free(entry.facet_value);
+        allocator.free(raw_counts);
+    }
+
+    var counts = try std.ArrayList(interfaces.FacetCount).initCapacity(allocator, raw_counts.len);
+    defer {
+        for (counts.items) |count| allocator.free(count.facet_value);
+        counts.deinit(allocator);
+    }
+
+    for (raw_counts) |entry| {
+        remaining -= 1;
+        if (entry.doc_count == 0) {
+            allocator.free(entry.facet_value);
+            continue;
+        }
+        counts.appendAssumeCapacity(.{
+            .facet_name = facet_name,
+            .facet_value = entry.facet_value,
+            .cardinality = entry.doc_count,
+            .facet_id = facet_id,
+        });
+    }
+
+    std.sort.block(interfaces.FacetCount, counts.items, {}, struct {
+        fn lessThan(_: void, lhs: interfaces.FacetCount, rhs: interfaces.FacetCount) bool {
+            if (lhs.cardinality != rhs.cardinality) return lhs.cardinality > rhs.cardinality;
+            return std.mem.order(u8, lhs.facet_value, rhs.facet_value) == .lt;
+        }
+    }.lessThan);
+
+    return counts.toOwnedSlice(allocator);
 }
 
 /// Intersect the document postings of every supplied filter, parity for
@@ -2645,6 +2772,55 @@ test "sqlite-backed facet repository counts facet values" {
     try std.testing.expectEqual(@as(u64, 1), counts[1].cardinality);
 }
 
+test "single-scan facet counting reconstructs chunked postings against a filter" {
+    const facet_store = @import("facet_store.zig");
+
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertFacetTable(db, 1, "public", "docs_fixture", 4);
+    try insertFacetDefinition(db, 1, 1, "category");
+
+    // "search" spans two chunks: docs {1, 2} and {3 -> global 19}.
+    var search_chunk0 = try roaring.Bitmap.fromSlice(&.{ 1, 2 });
+    defer search_chunk0.deinit();
+    try insertPostingBitmap(db, std.testing.allocator, 1, 1, "search", 0, search_chunk0);
+    var search_chunk1 = try roaring.Bitmap.fromSlice(&.{3});
+    defer search_chunk1.deinit();
+    try insertPostingBitmap(db, std.testing.allocator, 1, 1, "search", 1, search_chunk1);
+
+    var filtering_chunk0 = try roaring.Bitmap.fromSlice(&.{2});
+    defer filtering_chunk0.deinit();
+    try insertPostingBitmap(db, std.testing.allocator, 1, 1, "filtering", 0, filtering_chunk0);
+    var filtering_chunk1 = try roaring.Bitmap.fromSlice(&.{1});
+    defer filtering_chunk1.deinit();
+    try insertPostingBitmap(db, std.testing.allocator, 1, 1, "filtering", 1, filtering_chunk1);
+
+    // Global doc ids: chunk 1 with chunk_bits=4 starts at 16.
+    var filter_bitmap = try roaring.Bitmap.fromSlice(&.{ 2, 19 });
+    defer filter_bitmap.deinit();
+
+    const repository = Repository{ .db = &db };
+    const counts = try facet_store.countFacetValues(
+        std.testing.allocator,
+        repository.asFacetRepository(),
+        "docs_fixture",
+        "category",
+        filter_bitmap,
+    );
+    defer {
+        for (counts) |count| std.testing.allocator.free(count.facet_value);
+        std.testing.allocator.free(counts);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), counts.len);
+    try std.testing.expectEqualStrings("search", counts[0].facet_value);
+    try std.testing.expectEqual(@as(u64, 2), counts[0].cardinality);
+    try std.testing.expectEqualStrings("filtering", counts[1].facet_value);
+    try std.testing.expectEqual(@as(u64, 1), counts[1].cardinality);
+}
+
 test "facet parity helpers expose counts, top values, and drop helpers" {
     var db = try Database.openInMemory();
     defer db.close();
@@ -2669,7 +2845,7 @@ test "facet parity helpers expose counts, top values, and drop helpers" {
     defer eu_chunk0.deinit();
     try insertPostingBitmap(db, std.testing.allocator, 7, 2, "eu", 0, eu_chunk0);
 
-    const counts = try getFacetCounts(db, std.testing.allocator, 7, 1);
+    const counts = try getFacetCounts(db, std.testing.allocator, 7, 1, null);
     defer {
         for (counts) |row| std.testing.allocator.free(row.facet_value);
         std.testing.allocator.free(counts);

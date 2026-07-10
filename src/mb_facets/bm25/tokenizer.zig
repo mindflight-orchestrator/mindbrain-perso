@@ -39,15 +39,17 @@ pub fn tokenizeWithExistingConnection(
     config_name: []const u8,
     allocator: std.mem.Allocator
 ) !std.ArrayList([]const u8) {
-    // We need to copy the lexemes string before SPI_finish releases the memory
-    // Use a fixed-size buffer for the lexemes string (should be enough for most cases)
-    const MAX_LEXEMES_LEN = 65536;
-    var lexemes_buf: [MAX_LEXEMES_LEN]u8 = undefined;
-    var lexemes_len: usize = 0;
-    
-    // Phase 1: Execute SPI and copy result to local buffer
+    // We need to copy the lexemes string before SPI_finish releases the memory.
+    // Heap-allocated: the previous 64KB stack buffer hard-aborted indexing of
+    // ~10-15k-word documents. Keep a generous sanity ceiling to still catch
+    // corrupted (unterminated) text values.
+    const MAX_LEXEMES_LEN = 64 * 1024 * 1024;
+    var lexemes_owned: ?[]u8 = null;
+    defer if (lexemes_owned) |owned| allocator.free(owned);
+
+    // Phase 1: Execute SPI and copy result to a caller-allocated buffer
     {
-        
+
         // Tokenize using to_tsvector(regconfig, text). We pass the config as a parameter and
         // cast it to regconfig in SQL to avoid quoting/escaping issues.
         const query = "SELECT array_to_string(tsvector_to_array(to_tsvector($1::regconfig, $2)), ' ') AS lexemes";
@@ -108,23 +110,20 @@ pub fn tokenizeWithExistingConnection(
             utils.elog(c.ERROR, "Lexemes string too long or not null-terminated");
             return error.BufferOverflow;
         }
-        
+
         if (result_len > 0) {
-            @memcpy(lexemes_buf[0..result_len], lexemes_cstr[0..result_len]);
-            lexemes_len = result_len;
+            const owned = try allocator.alloc(u8, result_len);
+            @memcpy(owned, lexemes_cstr[0..result_len]);
+            lexemes_owned = owned;
         }
         // SPI_finish called here via defer
     }
-    
-    // Phase 2: Parse lexemes from local buffer (outside SPI context)
+
+    // Phase 2: Parse lexemes from the owned buffer (outside SPI context)
     var tokens = std.ArrayList([]const u8).empty;
-    
-    if (lexemes_len == 0) {
-        return tokens;
-    }
-    
-    const lexemes_str = lexemes_buf[0..lexemes_len];
-    
+
+    const lexemes_str = lexemes_owned orelse return tokens;
+
     // Split by space
     var it = std.mem.splitScalar(u8, lexemes_str, ' ');
     while (it.next()) |lexeme| {

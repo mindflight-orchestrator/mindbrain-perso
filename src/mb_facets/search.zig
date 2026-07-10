@@ -126,8 +126,18 @@ pub fn search_documents_native(fcinfo: c.FunctionCallInfo) callconv(.c) c.Datum 
                     c.roaring_iterator_init(bm, &pl_iter);
                     while (pl_iter.has_value) {
                         const in_chunk_id = pl_iter.current_value;
-                        // Reconstruct: original_id = (chunk_id << chunk_bits) | in_chunk_id
-                        const original_id: u32 = (chunk_id << chunk_bits) | in_chunk_id;
+                        // Reconstruct: original_id = (chunk_id << chunk_bits) | in_chunk_id.
+                        // Widen to u64 first: the u32 shift wrapped for
+                        // chunk_id >= 2^(32 - chunk_bits) and silently mapped
+                        // documents onto the wrong ids. Roaring bitmaps here
+                        // are 32-bit, so ids beyond u32 are a hard error
+                        // instead of wraparound corruption.
+                        const original_id_wide: u64 = (@as(u64, chunk_id) << @intCast(chunk_bits)) | @as(u64, in_chunk_id);
+                        if (original_id_wide > std.math.maxInt(u32)) {
+                            utils.elog(c.ERROR, "search_documents_native: reconstructed document id exceeds 32-bit bitmap space");
+                            return c.PointerGetDatum(null);
+                        }
+                        const original_id: u32 = @intCast(original_id_wide);
 
                         if (facet_bitmap == null) {
                             facet_bitmap = c.roaring_bitmap_create();

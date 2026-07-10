@@ -108,7 +108,18 @@ pub fn loadStatisticsForTerms(
     allocator: std.mem.Allocator,
 ) !CollectionStats {
     var stats = CollectionStats.init(allocator);
-    
+
+    // Pre-size the map BEFORE any SPI session: allocations made while SPI is
+    // connected can land in the SPI memory context and vanish at SPI_finish.
+    // With an explicit term list the df row count is bounded by the number of
+    // query terms, which removes the COUNT(*) pre-pass (and the SPI
+    // finish/reconnect dance) that previously ran on every score/search call.
+    if (term_hashes) |hashes| {
+        if (hashes.len > 0) {
+            try stats.doc_frequencies.ensureTotalCapacity(@intCast(hashes.len));
+        }
+    }
+
     // Try to connect - may already be connected from caller
     const conn_result = c.SPI_connect();
     const need_finish = (conn_result == c.SPI_OK_CONNECT);
@@ -150,7 +161,7 @@ pub fn loadStatisticsForTerms(
         }
     }
     
-    // Load document frequencies - count first, then allocate and fill
+    // Build the optional term filter for the df query.
     var term_filter_buf = std.ArrayList(u8).empty;
     defer term_filter_buf.deinit(allocator);
     if (term_hashes) |hashes| {
@@ -164,12 +175,35 @@ pub fn loadStatisticsForTerms(
         try term_filter_buf.append(allocator, ')');
     }
 
+    if (term_hashes) |hashes| {
+        // Term-scoped path: the map is already sized (see above), so the
+        // document frequencies load in the same SPI session.
+        if (hashes.len > 0) {
+            const freq_query = try std.fmt.allocPrintSentinel(
+                allocator,
+                "SELECT term_hash, rb_cardinality(doc_ids)::bigint AS doc_count FROM facets.bm25_index WHERE table_id = {d}{s}",
+                .{ table_id, term_filter_buf.items }, 0);
+            defer allocator.free(freq_query);
+
+            const freq_ret = c.SPI_execute(freq_query.ptr, true, 0);
+            if (freq_ret == c.SPI_OK_SELECT) {
+                fillDocFrequenciesFromSpi(&stats);
+            }
+        }
+        if (need_finish) {
+            _ = c.SPI_finish();
+        }
+        return stats;
+    }
+
+    // Full-vocabulary path (loadStatistics): count first so the map can be
+    // sized outside the SPI session, then reconnect and fill.
     const count_query = try std.fmt.allocPrintSentinel(
         allocator,
-        "SELECT COUNT(*) FROM facets.bm25_index WHERE table_id = {d}{s}",
-        .{ table_id, term_filter_buf.items }, 0);
+        "SELECT COUNT(*) FROM facets.bm25_index WHERE table_id = {d}",
+        .{table_id}, 0);
     defer allocator.free(count_query);
-    
+
     const count_ret = c.SPI_execute(count_query.ptr, true, 1);
     var num_terms: u64 = 0;
     if (count_ret == c.SPI_OK_SELECT and c.SPI_processed > 0) {
@@ -179,19 +213,19 @@ pub fn loadStatisticsForTerms(
             num_terms = @intCast(c.DatumGetInt64(count_datum));
         }
     }
-    
+
     // Finish first SPI session if we created it
     if (need_finish) {
         _ = c.SPI_finish();
     }
-    
+
     if (num_terms == 0) {
         return stats;
     }
-    
+
     // Pre-allocate the HashMap with expected capacity
     try stats.doc_frequencies.ensureTotalCapacity(@intCast(num_terms));
-    
+
     // Re-connect to SPI to fetch the actual data
     const conn_result2 = c.SPI_connect();
     const need_finish2 = (conn_result2 == c.SPI_OK_CONNECT);
@@ -202,34 +236,39 @@ pub fn loadStatisticsForTerms(
     defer if (need_finish2) {
         _ = c.SPI_finish();
     };
-    
+
     // Load document frequencies
     const freq_query = try std.fmt.allocPrintSentinel(
         allocator,
-        "SELECT term_hash, rb_cardinality(doc_ids)::bigint AS doc_count FROM facets.bm25_index WHERE table_id = {d}{s}",
-        .{ table_id, term_filter_buf.items }, 0);
+        "SELECT term_hash, rb_cardinality(doc_ids)::bigint AS doc_count FROM facets.bm25_index WHERE table_id = {d}",
+        .{table_id}, 0);
     defer allocator.free(freq_query);
-    
+
     const freq_ret = c.SPI_execute(freq_query.ptr, true, 0);
     if (freq_ret == c.SPI_OK_SELECT) {
-        var i: u64 = 0;
-        while (i < c.SPI_processed) : (i += 1) {
-            const tuple = c.SPI_tuptable.*.vals[@intCast(i)];
-            const tupdesc = c.SPI_tuptable.*.tupdesc;
-            
-            var isnull_hash: bool = false;
-            var isnull_count: bool = false;
-            const hash_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull_hash);
-            const count_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull_count);
-            
-            if (!isnull_hash and !isnull_count) {
-                const term_hash = c.DatumGetInt64(hash_datum);
-                const doc_count = c.DatumGetInt64(count_datum);
-                // putAssumeCapacity won't allocate since we pre-allocated
-                stats.doc_frequencies.putAssumeCapacity(term_hash, doc_count);
-            }
+        fillDocFrequenciesFromSpi(&stats);
+    }
+
+    return stats;
+}
+
+/// Copies (term_hash, doc_count) rows of the just-executed SPI SELECT into
+/// stats.doc_frequencies. The map must already have capacity for every row
+/// (putAssumeCapacity: no allocation may happen inside an SPI session).
+fn fillDocFrequenciesFromSpi(stats: *CollectionStats) void {
+    if (c.SPI_tuptable == null) return;
+    var i: u64 = 0;
+    while (i < c.SPI_processed) : (i += 1) {
+        const tuple = c.SPI_tuptable.*.vals[@intCast(i)];
+        const tupdesc = c.SPI_tuptable.*.tupdesc;
+
+        var isnull_hash: bool = false;
+        var isnull_count: bool = false;
+        const hash_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull_hash);
+        const count_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull_count);
+
+        if (!isnull_hash and !isnull_count) {
+            stats.doc_frequencies.putAssumeCapacity(c.DatumGetInt64(hash_datum), c.DatumGetInt64(count_datum));
         }
     }
-    
-    return stats;
 }

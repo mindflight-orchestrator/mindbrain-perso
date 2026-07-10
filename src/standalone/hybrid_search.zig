@@ -5,10 +5,49 @@ pub const Error = error{
     InvalidWeight,
 };
 
+/// Sentinel for "candidate has no score in this channel". Both channels use
+/// the same sentinel so BM25-only and vector-only candidates are treated
+/// symmetrically by the normalization below.
+const score_missing = -std.math.inf(f64);
+
 const CandidateScore = struct {
-    bm25_score: f64 = 0.0,
-    vector_score: f64 = -std.math.inf(f64),
+    bm25_score: f64 = score_missing,
+    vector_score: f64 = score_missing,
 };
+
+/// Min-max normalization contract: each channel (BM25, vector similarity) is
+/// rescaled to [0, 1] over the candidate set before the weighted blend, so an
+/// unbounded BM25 score cannot drown out cosine similarity (or vice versa).
+/// A candidate missing from a channel contributes 0 to the blend; when all
+/// present scores in a channel are equal they all map to 1.0.
+const ChannelRange = struct {
+    min: f64 = std.math.inf(f64),
+    max: f64 = -std.math.inf(f64),
+
+    fn observe(self: *ChannelRange, score: f64) void {
+        if (!std.math.isFinite(score)) return;
+        if (score < self.min) self.min = score;
+        if (score > self.max) self.max = score;
+    }
+
+    fn normalize(self: ChannelRange, score: f64) f64 {
+        if (!std.math.isFinite(score)) return 0.0;
+        if (!(self.max > self.min)) return 1.0;
+        return (score - self.min) / (self.max - self.min);
+    }
+};
+
+fn observeChannelRanges(
+    candidate_scores: *const std.AutoHashMap(interfaces.DocId, CandidateScore),
+    bm25_range: *ChannelRange,
+    vector_range: *ChannelRange,
+) void {
+    var it = candidate_scores.iterator();
+    while (it.next()) |entry| {
+        bm25_range.observe(entry.value_ptr.bm25_score);
+        vector_range.observe(entry.value_ptr.vector_score);
+    }
+}
 
 pub fn search(
     allocator: std.mem.Allocator,
@@ -78,9 +117,9 @@ pub fn search(
 
             for (vector_matches) |match| {
                 const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
-                // -inf sentinel: negative similarities (anti-correlated docs)
-                // must not be silently collapsed to the 0.0 default.
-                if (entry.vector_score == -std.math.inf(f64) or match.similarity > entry.vector_score) {
+                // score_missing sentinel: negative similarities (anti-correlated
+                // docs) must not be silently collapsed to a 0.0 default.
+                if (entry.vector_score == score_missing or match.similarity > entry.vector_score) {
                     entry.vector_score = match.similarity;
                 }
             }
@@ -135,20 +174,27 @@ pub fn search(
     var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
     defer results.deinit(allocator);
 
+    // First pass: channel ranges over the candidate set (see ChannelRange for
+    // the normalization contract). Reported per-channel scores stay raw; only
+    // the combined blend uses the normalized values.
+    var bm25_range: ChannelRange = .{};
+    var vector_range: ChannelRange = .{};
+    observeChannelRanges(&candidate_scores, &bm25_range, &vector_range);
+
     var iter = candidate_scores.iterator();
     while (iter.next()) |entry| {
         var bm25_score = entry.value_ptr.bm25_score;
         var vector_score = entry.value_ptr.vector_score;
+        var combined_score = bm25_range.normalize(bm25_score) * (1.0 - request.vector_weight) +
+            vector_range.normalize(vector_score) * request.vector_weight;
+        if (!std.math.isFinite(combined_score)) {
+            combined_score = 0.0;
+        }
         if (!std.math.isFinite(bm25_score)) {
             bm25_score = 0.0;
         }
         if (!std.math.isFinite(vector_score)) {
             vector_score = 0.0;
-        }
-        var combined_score = bm25_score * (1.0 - request.vector_weight) +
-            vector_score * request.vector_weight;
-        if (!std.math.isFinite(combined_score)) {
-            combined_score = 0.0;
         }
 
         try insertTopHybridMatch(allocator, &results, .{
@@ -177,29 +223,36 @@ pub fn fusePreScored(
     var candidate_scores = std.AutoHashMap(interfaces.DocId, CandidateScore).init(allocator);
     defer candidate_scores.deinit();
 
+    // Both channels use the score_missing sentinel: a candidate absent from
+    // the BM25 result set is "missing", not "score 0", exactly like the
+    // vector channel (previously negative BM25 scores were clamped to the
+    // 0.0 default while vector used a -inf sentinel).
     for (bm25_matches) |match| {
         const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
-        if (match.score > entry.bm25_score) entry.bm25_score = match.score;
+        if (entry.bm25_score == score_missing or match.score > entry.bm25_score) entry.bm25_score = match.score;
     }
 
     for (vector_matches) |match| {
         const entry = try getOrPutCandidate(&candidate_scores, match.doc_id);
-        if (entry.vector_score == -std.math.inf(f64) or match.similarity > entry.vector_score) entry.vector_score = match.similarity;
+        if (entry.vector_score == score_missing or match.similarity > entry.vector_score) entry.vector_score = match.similarity;
     }
 
     var results = std.ArrayList(interfaces.HybridSearchMatch).empty;
     defer results.deinit(allocator);
 
+    var bm25_range: ChannelRange = .{};
+    var vector_range: ChannelRange = .{};
+    observeChannelRanges(&candidate_scores, &bm25_range, &vector_range);
+
     var iter = candidate_scores.iterator();
     while (iter.next()) |entry| {
         var bm25_score = entry.value_ptr.bm25_score;
         var vector_score = entry.value_ptr.vector_score;
+        var combined_score = bm25_range.normalize(bm25_score) * (1.0 - vector_weight) +
+            vector_range.normalize(vector_score) * vector_weight;
+        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
         if (!std.math.isFinite(bm25_score)) bm25_score = 0.0;
         if (!std.math.isFinite(vector_score)) vector_score = 0.0;
-
-        var combined_score = bm25_score * (1.0 - vector_weight) +
-            vector_score * vector_weight;
-        if (!std.math.isFinite(combined_score)) combined_score = 0.0;
 
         try insertTopHybridMatch(allocator, &results, .{
             .doc_id = entry.key_ptr.*,
@@ -433,11 +486,15 @@ test "hybrid search blends vector and BM25 scores" {
         .vector_weight = 0.85,
     });
 
+    // Normalization contract: each channel is min-max normalized over the
+    // candidate set before the blend. Doc 4 holds the channel minimum in both
+    // channels (BM25 0.0, vector 0.60), so it normalizes to 0 and ranks last;
+    // doc 3 keeps a small BM25 contribution and ranks above it.
     try std.testing.expectEqual(@as(usize, 4), results.len);
     try std.testing.expectEqual(@as(interfaces.DocId, 2), results[0].doc_id);
     try std.testing.expectEqual(@as(interfaces.DocId, 1), results[1].doc_id);
-    try std.testing.expectEqual(@as(interfaces.DocId, 4), results[2].doc_id);
-    try std.testing.expectEqual(@as(interfaces.DocId, 3), results[3].doc_id);
+    try std.testing.expectEqual(@as(interfaces.DocId, 3), results[2].doc_id);
+    try std.testing.expectEqual(@as(interfaces.DocId, 4), results[3].doc_id);
     try std.testing.expect(results[0].vector_score > results[1].vector_score);
     try std.testing.expect(results[1].bm25_score > results[2].bm25_score);
 }
@@ -482,11 +539,15 @@ test "fuse pre-scored matches is bounded and deterministic" {
     );
     defer std.testing.allocator.free(results);
 
+    // Normalization contract: docs 10 and 20 hold the maximum of both
+    // channels, so their normalized channel scores are 1.0 and the blend at
+    // weight 0.5 is exactly 1.0 for each; the doc_id tie-break keeps the
+    // order deterministic.
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqual(@as(interfaces.DocId, 10), results[0].doc_id);
     try std.testing.expectEqual(@as(interfaces.DocId, 20), results[1].doc_id);
-    try std.testing.expectEqual(@as(f64, 0.5), results[0].combined_score);
-    try std.testing.expectEqual(@as(f64, 0.5), results[1].combined_score);
+    try std.testing.expectEqual(@as(f64, 1.0), results[0].combined_score);
+    try std.testing.expectEqual(@as(f64, 1.0), results[1].combined_score);
 }
 
 test "calculateBm25Score normalizes non-finite avg_document_length" {
