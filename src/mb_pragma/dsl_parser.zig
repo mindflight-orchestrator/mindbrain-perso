@@ -40,7 +40,7 @@ pub const PropositionRecord = struct {
 
     /// Node-like values for graph expansion: subject, object, from, to, id.
     pub fn getNodeIds(self: *const PropositionRecord, allocator: std.mem.Allocator) ![]const []const u8 {
-        var list: std.ArrayListUnmanaged([]const u8) = .{};
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
         const keys = [_][]const u8{ "subject", "object", "from", "to", "id" };
         for (keys) |key| {
             if (self.fields.get(key)) |v| {
@@ -52,7 +52,7 @@ pub const PropositionRecord = struct {
 
     /// Format as JSON object string (caller frees).
     pub fn toJson(self: *const PropositionRecord, allocator: std.mem.Allocator) ![]const u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         try buf.appendSlice(allocator, "{\"type\":\"");
         try escapeJsonString(allocator, &buf, self.record_type);
         try buf.appendSlice(allocator, "\"");
@@ -78,33 +78,51 @@ fn escapeJsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, c),
+            else => {
+                // Remaining control bytes must be \u-escaped, otherwise the
+                // produced JSON is invalid and the ::jsonb cast fails the
+                // whole ingest statement.
+                if (c < 0x20) {
+                    var esc: [6]u8 = undefined;
+                    const rendered = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try buf.appendSlice(allocator, rendered);
+                } else {
+                    try buf.append(allocator, c);
+                }
+            },
         }
     }
 }
 
 fn putField(allocator: std.mem.Allocator, fields: *std.StringHashMap([]const u8), key: []const u8, val: []const u8) !void {
-    const k = allocator.dupe(u8, key) catch return;
-    const v = allocator.dupe(u8, val) catch {
+    const k = try allocator.dupe(u8, key);
+    errdefer allocator.free(k);
+    const v = try allocator.dupe(u8, val);
+    errdefer allocator.free(v);
+    const gop = try fields.getOrPut(k);
+    if (gop.found_existing) {
+        // Duplicate key: the map keeps its original key, so release the new
+        // copy and the value being replaced (last occurrence wins).
         allocator.free(k);
-        return;
-    };
-    fields.put(k, v) catch {
-        allocator.free(k);
-        allocator.free(v);
-    };
+        allocator.free(gop.value_ptr.*);
+    }
+    gop.value_ptr.* = v;
 }
 
-/// Parse a single DSL line. Returns null if line is empty or malformed.
-/// Caller owns the returned record; call deinit().
+/// Parse a single DSL line. Returns null if line is empty or malformed
+/// (or if allocation fails). Caller owns the returned record; call deinit().
 pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) ?PropositionRecord {
+    return parseLineChecked(allocator, line) catch null;
+}
+
+fn parseLineChecked(allocator: std.mem.Allocator, line: []const u8) !?PropositionRecord {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     if (trimmed.len == 0) return null;
 
     const first_bar = std.mem.indexOf(u8, trimmed, "|") orelse return null;
     const record_type_trimmed = std.mem.trim(u8, trimmed[0..first_bar], " \t");
     if (record_type_trimmed.len == 0) return null;
-    const record_type = allocator.dupe(u8, record_type_trimmed) catch return null;
+    const record_type = try allocator.dupe(u8, record_type_trimmed);
     errdefer allocator.free(record_type);
 
     var fields = std.StringHashMap([]const u8).init(allocator);
@@ -124,7 +142,9 @@ pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) ?PropositionRec
             if (std.mem.indexOf(u8, segment, "=")) |eq_idx| {
                 const key = std.mem.trim(u8, segment[0..eq_idx], " \t");
                 const val = std.mem.trim(u8, segment[eq_idx + 1 ..], " \t");
-                if (key.len > 0) putField(allocator, &fields, key, val) catch {};
+                // Propagate OOM: dropping the field silently produced
+                // field-less records that ranked/expanded incorrectly.
+                if (key.len > 0) try putField(allocator, &fields, key, val);
             }
         }
         rest = rest[bar_idx + 1 ..];
@@ -134,7 +154,7 @@ pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) ?PropositionRec
         if (std.mem.indexOf(u8, segment, "=")) |eq_idx| {
             const key = std.mem.trim(u8, segment[0..eq_idx], " \t");
             const val = std.mem.trim(u8, segment[eq_idx + 1 ..], " \t");
-            if (key.len > 0) putField(allocator, &fields, key, val) catch {};
+            if (key.len > 0) try putField(allocator, &fields, key, val);
         }
     }
 

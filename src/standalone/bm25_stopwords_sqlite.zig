@@ -49,7 +49,11 @@ pub const StopwordCache = struct {
         }
         defer _ = c.sqlite3_finalize(stmt.?);
 
-        _ = c.sqlite3_bind_text(stmt.?, 1, language.ptr, @intCast(language.len), facet_sqlite.sqliteTransient());
+        // A failed bind would leave ?1 NULL and permanently cache an empty
+        // stopword set for the language; surface it instead.
+        if (c.sqlite3_bind_text(stmt.?, 1, language.ptr, @intCast(language.len), facet_sqlite.sqliteTransient()) != c.SQLITE_OK) {
+            return error.BindFailed;
+        }
 
         while (true) {
             const rc = c.sqlite3_step(stmt.?);

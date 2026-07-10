@@ -122,7 +122,9 @@ fn documentOrChunkExists(
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, collection_id);
-    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(doc_id)));
+    // Bit-cast keeps doc ids >= 2^63 stable through SQLite's signed int64
+    // storage instead of panicking (matches the bigint convention elsewhere).
+    try facet_sqlite.bindInt64(stmt, 3, @as(i64, @bitCast(doc_id)));
     if (target_kind == .chunk) {
         const ci = chunk_index orelse return CliError.InvalidArguments;
         try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(ci)));

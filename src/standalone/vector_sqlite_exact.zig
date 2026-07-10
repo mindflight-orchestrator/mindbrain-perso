@@ -109,6 +109,11 @@ pub const Repository = struct {
         var matches = std.ArrayList(ChunkVectorSearchMatch).empty;
         defer matches.deinit(allocator);
 
+        // The WHERE clause pins dim to the query dimensionality, so one
+        // scratch buffer serves every row instead of an alloc per row.
+        const scratch = try allocator.alloc(f32, request.query_vector.len);
+        defer allocator.free(scratch);
+
         while (true) {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
@@ -117,10 +122,10 @@ pub const Repository = struct {
             const doc_id = try facet_sqlite.columnU64(stmt, 0);
             const chunk_index = try facet_sqlite.columnU32(stmt, 1);
             const dim: usize = @intCast(try facet_sqlite.columnU64(stmt, 2));
-            const values = try decodeColumnEmbedding(allocator, stmt, 3, dim);
-            defer allocator.free(values);
+            if (dim != scratch.len) return error.ValueOutOfRange;
+            try decodeColumnEmbeddingInto(scratch, stmt, 3);
 
-            const vector_score = vector_distance.score(request.metric, request.query_vector, values);
+            const vector_score = vector_distance.score(request.metric, request.query_vector, scratch);
             try insertTopChunkMatch(allocator, &matches, .{
                 .doc_id = doc_id,
                 .chunk_index = chunk_index,
@@ -149,6 +154,11 @@ pub const Repository = struct {
         var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
         defer matches.deinit(allocator);
 
+        // The WHERE clause pins dim to the query dimensionality, so one
+        // scratch buffer serves every row instead of an alloc per row.
+        const scratch = try allocator.alloc(f32, request.query_vector.len);
+        defer allocator.free(scratch);
+
         while (true) {
             const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_DONE) break;
@@ -156,10 +166,10 @@ pub const Repository = struct {
 
             const doc_id = try facet_sqlite.columnU64(stmt, 0);
             const dim: usize = @intCast(try facet_sqlite.columnU64(stmt, 1));
-            const values = try decodeColumnEmbedding(allocator, stmt, 2, dim);
-            defer allocator.free(values);
+            if (dim != scratch.len) return error.ValueOutOfRange;
+            try decodeColumnEmbeddingInto(scratch, stmt, 2);
 
-            const vector_score = vector_distance.score(request.metric, request.query_vector, values);
+            const vector_score = vector_distance.score(request.metric, request.query_vector, scratch);
             try insertTopDocumentMatch(allocator, &matches, .{
                 .doc_id = doc_id,
                 .distance = vector_score.distance,
@@ -235,15 +245,16 @@ fn deleteEmbeddingViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, ta
     return error.UnsupportedOperation;
 }
 
-fn decodeColumnEmbedding(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, index: c_int, dim: usize) ![]f32 {
+fn decodeColumnEmbeddingInto(out: []f32, stmt: *c.sqlite3_stmt, index: c_int) !void {
     const blob_ptr = c.sqlite3_column_blob(stmt, index) orelse return error.MissingRow;
     const blob_size = c.sqlite3_column_bytes(stmt, index);
     if (blob_size < 0) return error.ValueOutOfRange;
     const blob: []const u8 = @as([*]const u8, @ptrCast(blob_ptr))[0..@intCast(blob_size)];
-    return vector_blob.decodeF32Le(allocator, blob, dim) catch |err| switch (err) {
-        error.InvalidEmbeddingBlob => error.ValueOutOfRange,
-        else => err,
-    };
+    if (blob.len != out.len * @sizeOf(f32)) return error.ValueOutOfRange;
+    for (out, 0..) |*value, i| {
+        const chunk: *const [4]u8 = @ptrCast(blob[i * @sizeOf(f32) ..][0..4]);
+        value.* = @bitCast(std.mem.readInt(u32, chunk, .little));
+    }
 }
 
 fn insertTopDocumentMatch(

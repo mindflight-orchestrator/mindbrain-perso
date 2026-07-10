@@ -7,14 +7,12 @@ const c = utils.c;
 /// with c.roaring_bitmap_free(). Calls elog(ERROR) on failure (never returns).
 pub fn datumToRoaringBitmap(datum: c.Datum) *c.roaring_bitmap_t {
     const varlena = utils.detoast_datum(datum);
-    const varlena_ptr = @as(*align(1) c.struct_varlena, @ptrCast(varlena));
 
-    // Read 4-byte varlena header: size is stored as (total_bytes << 2)
-    const header_bytes = @as(*align(1) [4]u8, @ptrCast(varlena_ptr));
-    const header_u32 = std.mem.readInt(u32, header_bytes, .little);
-    const total_size = (header_u32 >> 2) & 0x3FFFFFFF;
-    const len = @as(usize, @intCast(total_size)) - utils.VARHDRSZ;
-    const data = @as([*]u8, @ptrCast(varlena_ptr)) + utils.VARHDRSZ;
+    // VARSIZE_ANY_EXHDR/VARDATA_ANY handle both 1-byte (short, <127B) and
+    // 4-byte varlena headers; decoding the header manually as 4-byte misread
+    // short-format values (garbage length, payload pointer off by 3).
+    const len = utils.varsize_any_exhdr(varlena);
+    const data = utils.vardata_any(varlena);
 
     const bitmap = c.roaring_bitmap_portable_deserialize_safe(data, @intCast(len));
     if (bitmap == null) {

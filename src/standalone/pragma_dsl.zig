@@ -124,7 +124,14 @@ fn putField(allocator: std.mem.Allocator, fields: *std.StringHashMap([]const u8)
     errdefer allocator.free(duped_key);
     const duped_value = try allocator.dupe(u8, value);
     errdefer allocator.free(duped_value);
-    try fields.put(duped_key, duped_value);
+    const gop = try fields.getOrPut(duped_key);
+    if (gop.found_existing) {
+        // Duplicate key: the map keeps its original key, so release the new
+        // copy and the value being replaced (last occurrence wins).
+        allocator.free(duped_key);
+        allocator.free(gop.value_ptr.*);
+    }
+    gop.value_ptr.* = duped_value;
 }
 
 fn escapeJsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -135,7 +142,17 @@ fn escapeJsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, char),
+            else => {
+                // Remaining control bytes must be \u-escaped or the whole
+                // output stops being valid JSON.
+                if (char < 0x20) {
+                    var esc: [6]u8 = undefined;
+                    const rendered = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{char}) catch unreachable;
+                    try buf.appendSlice(allocator, rendered);
+                } else {
+                    try buf.append(allocator, char);
+                }
+            },
         }
     }
 }
@@ -171,4 +188,24 @@ test "pragma dsl parser falls back on malformed confidence" {
     defer record.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(f64, 1.0), record.getConfidence());
+}
+
+test "pragma dsl parser handles duplicate keys without leaking" {
+    // Regression: put() used to keep the old key and leak the new key plus
+    // the replaced value (testing allocator flags the leak).
+    var record = parseLine(std.testing.allocator, "fact|subject=first|subject=second").?;
+    defer record.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("second", record.get("subject").?);
+}
+
+test "pragma dsl json export escapes control bytes" {
+    var record = parseLine(std.testing.allocator, "fact|subject=a\x01b").?;
+    defer record.deinit(std.testing.allocator);
+
+    const json = try record.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\u0001") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
 }

@@ -173,7 +173,7 @@ pub fn listRunsJson(db: Database, allocator: std.mem.Allocator, workspace_id: []
     );
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
-    try bindInt64(stmt, 2, @intCast(limit));
+    try bindInt64(stmt, 2, std.math.cast(i64, limit) orelse std.math.maxInt(i64));
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -197,7 +197,7 @@ pub fn listRunsJson(db: Database, allocator: std.mem.Allocator, workspace_id: []
         try out.writer.writeAll(",\"canonical_layer\":");
         try writeJsonString(&out.writer, columnText(stmt, 5));
         try out.writer.writeAll(",\"summary\":");
-        try writeRawJsonObject(&out.writer, columnText(stmt, 6));
+        try writeRawJsonObject(allocator, &out.writer, columnText(stmt, 6));
         try out.writer.print(",\"created_at_unix\":{},\"updated_at_unix\":{}", .{ c.sqlite3_column_int64(stmt, 7), c.sqlite3_column_int64(stmt, 8) });
         try out.writer.writeAll("}");
     }
@@ -233,7 +233,7 @@ pub fn actionsJson(db: Database, allocator: std.mem.Allocator, run_id: []const u
     while (try stepRow(stmt)) {
         if (!first) try out.writer.writeAll(",");
         first = false;
-        try writeActionRowJson(&out.writer, stmt);
+        try writeActionRowJson(allocator, &out.writer, stmt);
     }
     try out.writer.writeAll("]}");
     return try out.toOwnedSlice();
@@ -422,7 +422,7 @@ fn renderReportJson(allocator: std.mem.Allocator, input: struct {
     try out.writer.writeAll(",\"remediation\":{\"actions_total\":");
     try out.writer.print("{}", .{input.actions.len});
     try out.writer.writeAll(",\"actions\":");
-    try writeActionsArray(&out.writer, input.actions);
+    try writeActionsArray(allocator, &out.writer, input.actions);
     try out.writer.writeAll("}}");
     return try out.toOwnedSlice();
 }
@@ -431,7 +431,7 @@ fn renderActionsJson(allocator: std.mem.Allocator, actions: []const Action) ![]c
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"kind\":\"quality_remediation_actions\",\"actions\":");
-    try writeActionsArray(&out.writer, actions);
+    try writeActionsArray(allocator, &out.writer, actions);
     try out.writer.writeAll("}");
     return try out.toOwnedSlice();
 }
@@ -443,7 +443,7 @@ fn renderLayerCounts(writer: *std.Io.Writer, counts: Counts) !void {
     );
 }
 
-fn writeActionsArray(writer: *std.Io.Writer, actions: []const Action) !void {
+fn writeActionsArray(allocator: std.mem.Allocator, writer: *std.Io.Writer, actions: []const Action) !void {
     try writer.writeAll("[");
     for (actions, 0..) |action, index| {
         if (index > 0) try writer.writeAll(",");
@@ -463,11 +463,11 @@ fn writeActionsArray(writer: *std.Io.Writer, actions: []const Action) !void {
         try writer.writeAll(",\"projection_id\":");
         try writeOptionalJsonString(writer, action.projection_id);
         try writer.writeAll(",\"evidence\":");
-        try writeRawJsonObject(writer, action.evidence_json);
+        try writeRawJsonObject(allocator, writer, action.evidence_json);
         try writer.writeAll(",\"mcp_tool\":");
         try writeOptionalJsonString(writer, action.mcp_tool);
         try writer.writeAll(",\"tool_args\":");
-        try writeRawJsonObject(writer, action.tool_args_json);
+        try writeRawJsonObject(allocator, writer, action.tool_args_json);
         try writer.writeAll(",\"execution_mode\":");
         try writeJsonString(writer, action.execution_mode);
         try writer.writeAll(",\"idempotency_key\":");
@@ -519,7 +519,7 @@ fn persistAction(db: Database, run_id: []const u8, workspace_id: []const u8, ont
     try stepDone(stmt);
 }
 
-fn writeActionRowJson(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt) !void {
+fn writeActionRowJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, stmt: *c.sqlite3_stmt) !void {
     try writer.writeAll("{\"action_id\":");
     try writeJsonString(writer, columnText(stmt, 0));
     try writer.writeAll(",\"issue_type\":");
@@ -536,11 +536,11 @@ fn writeActionRowJson(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt) !void {
     try writer.writeAll(",\"projection_id\":");
     try writeOptionalColumnString(writer, stmt, 7);
     try writer.writeAll(",\"evidence\":");
-    try writeRawJsonObject(writer, columnText(stmt, 8));
+    try writeRawJsonObject(allocator, writer, columnText(stmt, 8));
     try writer.writeAll(",\"mcp_tool\":");
     try writeOptionalColumnString(writer, stmt, 9);
     try writer.writeAll(",\"tool_args\":");
-    try writeRawJsonObject(writer, columnText(stmt, 10));
+    try writeRawJsonObject(allocator, writer, columnText(stmt, 10));
     try writer.writeAll(",\"execution_mode\":");
     try writeJsonString(writer, columnText(stmt, 11));
     try writer.writeAll(",\"idempotency_key\":");
@@ -552,7 +552,7 @@ fn writeActionRowJson(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt) !void {
     try writer.writeAll(",\"decision_note\":");
     try writeOptionalColumnString(writer, stmt, 15);
     try writer.writeAll(",\"result\":");
-    try writeRawJsonObject(writer, columnText(stmt, 16));
+    try writeRawJsonObject(allocator, writer, columnText(stmt, 16));
     try writer.print(",\"created_at_unix\":{},\"updated_at_unix\":{}", .{ c.sqlite3_column_int64(stmt, 17), c.sqlite3_column_int64(stmt, 18) });
     try writer.writeAll("}");
 }
@@ -562,7 +562,7 @@ fn count(db: Database, sql: []const u8, workspace_id: []const u8) !u64 {
     defer finalize(stmt);
     try bindText(stmt, 1, workspace_id);
     if (!try stepRow(stmt)) return 0;
-    return @intCast(c.sqlite3_column_int64(stmt, 0));
+    return @intCast(@max(0, c.sqlite3_column_int64(stmt, 0)));
 }
 
 fn countForOntology(db: Database, sql: []const u8, ontology_id: []const u8) !u64 {
@@ -570,7 +570,7 @@ fn countForOntology(db: Database, sql: []const u8, ontology_id: []const u8) !u64
     defer finalize(stmt);
     try bindText(stmt, 1, ontology_id);
     if (!try stepRow(stmt)) return 0;
-    return @intCast(c.sqlite3_column_int64(stmt, 0));
+    return @intCast(@max(0, c.sqlite3_column_int64(stmt, 0)));
 }
 
 fn makeRunId(allocator: std.mem.Allocator, workspace_id: []const u8) ![]const u8 {
@@ -637,16 +637,19 @@ fn writeOptionalColumnString(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, colu
     if (c.sqlite3_column_type(stmt, column) == c.SQLITE_NULL) try writer.writeAll("null") else try writeJsonString(writer, columnText(stmt, column));
 }
 
-fn writeRawJsonObject(writer: *std.Io.Writer, value: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch {
-        try writer.writeAll("{}");
+fn writeRawJsonObject(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
+    // Validate with a token scan on the caller allocator instead of
+    // materializing a full Value tree on page_allocator for every column.
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const is_container = trimmed.len > 0 and (trimmed[0] == '{' or trimmed[0] == '[');
+    if (is_container and try std.json.validate(allocator, trimmed)) {
+        try writer.writeAll(trimmed);
         return;
-    };
-    defer parsed.deinit();
-    switch (parsed.value) {
-        .object, .array => try writer.writeAll(value),
-        else => try writer.writeAll("{}"),
     }
+    if (value.len > 0) {
+        std.log.warn("quality_convergence: stored JSON column is invalid ({d} bytes), emitting {{}}", .{value.len});
+    }
+    try writer.writeAll("{}");
 }
 
 fn prepare(db: Database, sql: []const u8) !*c.sqlite3_stmt {

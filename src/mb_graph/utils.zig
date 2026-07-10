@@ -22,6 +22,8 @@ extern fn fcinfo_set_isnull_helper(fcinfo: c.FunctionCallInfo, isnull: bool) voi
 extern fn elog_helper(level: c_int, msg: [*c]const u8) void;
 extern fn detoast_datum_helper(d: c.Datum) [*c]c.struct_varlena;
 extern fn varhdrsz_helper() c_int;
+extern fn varsize_any_exhdr_helper(ptr: [*c]c.struct_varlena) usize;
+extern fn vardata_any_helper(ptr: [*c]c.struct_varlena) ?*anyopaque;
 extern fn set_varsize_helper(ptr: [*c]c.struct_varlena, size: c_int) void;
 extern fn pointer_get_datum_helper(ptr: ?*const anyopaque) c.Datum;
 extern fn datum_get_pointer_helper(d: c.Datum) ?*const anyopaque;
@@ -50,7 +52,10 @@ pub const PgAllocator = struct {
         .remap = remap,
     };
 
-    fn alloc(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        // palloc guarantees only MAXALIGN (8 bytes); refuse stricter requests
+        // instead of handing back misaligned memory.
+        if (alignment.toByteUnits() > 8) return null;
         const ptr = c.palloc(len);
         if (ptr == null) return null;
         return @ptrCast(ptr);
@@ -89,6 +94,23 @@ pub fn detoast_datum(d: c.Datum) [*c]c.struct_varlena {
     return detoast_datum_helper(d);
 }
 
+/// VARSIZE_ANY_EXHDR: payload length regardless of 1-byte or 4-byte header.
+pub fn varsize_any_exhdr(ptr: [*c]c.struct_varlena) usize {
+    return varsize_any_exhdr_helper(ptr);
+}
+
+/// VARDATA_ANY: payload pointer regardless of 1-byte or 4-byte header.
+pub fn vardata_any(ptr: [*c]c.struct_varlena) [*]u8 {
+    return @ptrCast(vardata_any_helper(ptr).?);
+}
+
+/// DatumGetInt32 semantics: truncate the Datum to its low 32 bits and
+/// reinterpret as signed. A plain @intCast aborts the backend whenever the
+/// int4 argument is negative (sign-extended through the Datum).
+pub fn datum_get_int32(d: c.Datum) i32 {
+    return @bitCast(@as(u32, @truncate(d)));
+}
+
 pub fn pointer_get_datum(ptr: anytype) c.Datum {
     return pointer_get_datum_helper(@ptrCast(@alignCast(ptr)));
 }
@@ -110,6 +132,8 @@ pub fn set_return_null(fcinfo: c.FunctionCallInfo) void {
 }
 
 // Look up the OID of the roaringbitmap type. Assumes SPI is connected.
+// Raises an error when the type is missing: silently falling back to bytea
+// made every downstream query fail or return wrong "no edges" answers.
 pub fn getRoaringBitmapOid() c.Oid {
     const ret = c.SPI_execute("SELECT oid FROM pg_type WHERE typname = 'roaringbitmap'", true, 1);
     if (ret == c.SPI_OK_SELECT and c.SPI_processed > 0) {
@@ -122,5 +146,6 @@ pub fn getRoaringBitmapOid() c.Oid {
         );
         if (!isnull) return @as(c.Oid, @truncate(datum));
     }
-    return c.BYTEAOID;
+    elog(c.ERROR, "pg_dgraph: type 'roaringbitmap' not found; install the roaringbitmap extension");
+    unreachable; // elog(ERROR) longjmps and never returns
 }

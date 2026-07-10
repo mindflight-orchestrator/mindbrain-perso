@@ -4,16 +4,11 @@ const c = utils.c;
 const roaring_utils = @import("roaring_utils.zig");
 
 // ============================================================================
-// Session-scoped plan cache
+// Session-scoped caches
 // ============================================================================
-// SPI_keepplan() makes the plan survive across SPI connect/finish cycles
-// within the same backend session. We use null-initialised pointers and
-// populate them on first use.
-//
-// Plans are invalidated automatically when the backend exits.
-// Thread-safety is not a concern: the legacy backend executes one function at a time per session.
+// Invalidated automatically when the backend exits. Thread-safety is not a
+// concern: the backend executes one function at a time per session.
 
-var g_bfs_hop_plan:       ?*c.SPIPlanPtr = null; // graph.bfs_hop(int4[],rb,text[],r,r,d,d)
 var g_roaring_oid_cache:  c.Oid          = 0;    // cached roaringbitmap OID
 
 // ============================================================================
@@ -35,7 +30,11 @@ pub fn k_hops_filtered_wrapper(fcinfo: c.FunctionCallInfo) c.Datum {
     }
 
     const seed_nodes_datum = utils.get_arg_datum(fcinfo, 0);
-    const max_hops         = @as(i32, @intCast(utils.get_arg_datum(fcinfo, 1)));
+    const max_hops         = utils.datum_get_int32(utils.get_arg_datum(fcinfo, 1));
+    if (max_hops < 0) {
+        utils.elog(c.ERROR, "k_hops_filtered: max_hops must be non-negative");
+        unreachable;
+    }
 
     const edge_types_datum: ?c.Datum = if (nargs > 2 and !utils.is_arg_null(fcinfo, 2)) utils.get_arg_datum(fcinfo, 2) else null;
     const doc_types_datum:  ?c.Datum = if (nargs > 3 and !utils.is_arg_null(fcinfo, 3)) utils.get_arg_datum(fcinfo, 3) else null;
@@ -236,6 +235,12 @@ fn bfsHopSQL(
         @ptrCast(&nulls), true, 1,
     );
 
+    // Negative SPI codes are execution errors, not "no rows"; mapping them to
+    // null silently turned failures into wrong "no edges" answers.
+    if (ret < 0) {
+        utils.elogFmt(c.ERROR, "pg_dgraph: graph.bfs_hop failed (SPI code {d})", .{ret});
+        unreachable;
+    }
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) return null;
 
     var isnull: bool = false;
@@ -282,6 +287,10 @@ pub fn getAllowedEdges(
         @ptrCast(&argtypes), @ptrCast(&argvalues),
         @ptrCast(&nulls), true, 1,
     );
+    if (ret < 0) {
+        utils.elogFmt(c.ERROR, "pg_dgraph: allowed_edges failed (SPI code {d})", .{ret});
+        unreachable;
+    }
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) return null;
 
     var isnull: bool = false;
@@ -342,6 +351,10 @@ pub fn getEdgesFromNodes(nodes: *c.roaring_bitmap_t, outgoing: bool) ?*c.roaring
         @ptrCast(&argtypes), @ptrCast(&argvalues),
         null, true, 1,
     );
+    if (ret < 0) {
+        utils.elogFmt(c.ERROR, "pg_dgraph: edge lookup failed (SPI code {d})", .{ret});
+        unreachable;
+    }
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) return roaring_utils.createEmptyBitmap();
 
     var isnull: bool = false;
@@ -427,6 +440,10 @@ pub fn filterEdgesMeta(
         @ptrCast(&argtypes), @ptrCast(&argvalues),
         @ptrCast(&nulls), true, 1,
     );
+    if (ret < 0) {
+        utils.elogFmt(c.ERROR, "pg_dgraph: filter_edges_meta failed (SPI code {d})", .{ret});
+        unreachable;
+    }
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) return null;
 
     var isnull: bool = false;
@@ -490,6 +507,10 @@ pub fn getNextNodesFromEdges(
         @ptrCast(&argtypes), @ptrCast(&argvalues),
         null, true, 1,
     );
+    if (ret < 0) {
+        utils.elogFmt(c.ERROR, "pg_dgraph: next-node lookup failed (SPI code {d})", .{ret});
+        unreachable;
+    }
     if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) return null;
 
     var isnull: bool = false;

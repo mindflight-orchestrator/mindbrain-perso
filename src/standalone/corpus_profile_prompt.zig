@@ -79,12 +79,15 @@ pub fn sampleText(
     if (max_chars == 0 or text.len <= max_chars) return try allocator.dupe(u8, text);
 
     const section = max_chars / 3;
-    if (section == 0) return try allocator.dupe(u8, text[0..@min(text.len, max_chars)]);
+    if (section == 0) return try allocator.dupe(u8, text[0..snapToCodepointStart(text, @min(text.len, max_chars))]);
 
-    const head = text[0..@min(section, text.len)];
-    const mid_start = if (text.len > section) (text.len / 2) - @min(section / 2, text.len / 2) else 0;
-    const mid_end = @min(text.len, mid_start + section);
-    const tail_start = if (text.len > section) text.len - section else 0;
+    // Every cut point is snapped to a UTF-8 codepoint boundary so accented
+    // FR/NL corpora never produce invalid byte sequences in the LLM prompt.
+    const head = text[0..snapToCodepointStart(text, @min(section, text.len))];
+    const mid_start_raw = if (text.len > section) (text.len / 2) - @min(section / 2, text.len / 2) else 0;
+    const mid_start = snapToCodepointStart(text, mid_start_raw);
+    const mid_end = @max(mid_start, snapToCodepointStart(text, @min(text.len, mid_start_raw + section)));
+    const tail_start = snapToCodepointStart(text, if (text.len > section) text.len - section else 0);
     const tail = text[tail_start..];
 
     return try std.fmt.allocPrint(allocator,
@@ -99,6 +102,14 @@ pub fn sampleText(
     , .{ head, text[mid_start..mid_end], tail });
 }
 
+/// Moves `index` back to the start of the UTF-8 codepoint it points into
+/// (identity for indexes already on a boundary or at text.len).
+fn snapToCodepointStart(text: []const u8, index: usize) usize {
+    var i = @min(index, text.len);
+    while (i > 0 and i < text.len and (text[i] & 0xC0) == 0x80) i -= 1;
+    return i;
+}
+
 test "sampleText includes beginning middle and end for long input" {
     const text = "aaaabbbbccccddddeeeeffffgggghhhhiiii";
     const sample = try sampleText(std.testing.allocator, text, 12);
@@ -107,6 +118,17 @@ test "sampleText includes beginning middle and end for long input" {
     try std.testing.expect(std.mem.indexOf(u8, sample, "[BEGINNING]") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample, "[MIDDLE]") != null);
     try std.testing.expect(std.mem.indexOf(u8, sample, "[END]") != null);
+}
+
+test "sampleText never splits UTF-8 codepoints" {
+    // 'é' is 2 bytes; sizes chosen so naive byte cuts land mid-codepoint.
+    const text = "ééééééééééééééééééééééééé";
+    var max: usize = 7;
+    while (max <= 20) : (max += 1) {
+        const sample = try sampleText(std.testing.allocator, text, max);
+        defer std.testing.allocator.free(sample);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(sample));
+    }
 }
 
 test "build emits strict schema prompt" {

@@ -189,6 +189,9 @@ pub fn countFacetValuesWithVectorToon(
     var vector_bitmap = try roaring.Bitmap.empty();
     defer vector_bitmap.deinit();
     for (nearest) |match| {
+        // Roaring doc bitmaps are 32-bit; an out-of-range doc id means the
+        // stores disagree — fail instead of panicking (or silently dropping).
+        if (match.doc_id > std.math.maxInt(u32)) return error.ValueOutOfRange;
         vector_bitmap.add(@intCast(match.doc_id));
     }
 

@@ -11,8 +11,12 @@ pub fn shortest_path_filtered_wrapper(fcinfo: c.FunctionCallInfo) c.Datum {
         unreachable;
     }
 
-    const src = @as(i32, @intCast(utils.get_arg_datum(fcinfo, 0)));
-    const dest = @as(i32, @intCast(utils.get_arg_datum(fcinfo, 1)));
+    const src = utils.datum_get_int32(utils.get_arg_datum(fcinfo, 0));
+    const dest = utils.datum_get_int32(utils.get_arg_datum(fcinfo, 1));
+    if (src < 0 or dest < 0) {
+        utils.elog(c.ERROR, "shortest_path_filtered: node ids must be non-negative");
+        unreachable;
+    }
 
     const edge_types_datum: ?c.Datum = if (nargs > 2 and !utils.is_arg_null(fcinfo, 2)) utils.get_arg_datum(fcinfo, 2) else null;
     const doc_types_datum: ?c.Datum = if (nargs > 3 and !utils.is_arg_null(fcinfo, 3)) utils.get_arg_datum(fcinfo, 3) else null;
@@ -21,7 +25,11 @@ pub fn shortest_path_filtered_wrapper(fcinfo: c.FunctionCallInfo) c.Datum {
     const before_date_datum: ?c.Datum = if (nargs > 6 and !utils.is_arg_null(fcinfo, 6)) utils.get_arg_datum(fcinfo, 6) else null;
     const conf_min: ?f32 = if (nargs > 7 and !utils.is_arg_null(fcinfo, 7)) @as(f32, @bitCast(@as(u32, @truncate(utils.get_arg_datum(fcinfo, 7))))) else null;
     const conf_max: ?f32 = if (nargs > 8 and !utils.is_arg_null(fcinfo, 8)) @as(f32, @bitCast(@as(u32, @truncate(utils.get_arg_datum(fcinfo, 8))))) else null;
-    const max_depth: i32 = if (nargs > 9 and !utils.is_arg_null(fcinfo, 9)) @as(i32, @intCast(utils.get_arg_datum(fcinfo, 9))) else 20;
+    const max_depth: i32 = if (nargs > 9 and !utils.is_arg_null(fcinfo, 9)) utils.datum_get_int32(utils.get_arg_datum(fcinfo, 9)) else 20;
+    if (max_depth < 0) {
+        utils.elog(c.ERROR, "shortest_path_filtered: max_depth must be non-negative");
+        unreachable;
+    }
 
     const result = shortest_path_filtered(
         src, dest,
@@ -95,9 +103,12 @@ fn expandSide(
         if (e_front) |bm| c.roaring_bitmap_free(bm);
         return false;
     }
+    // e_front is always freed here; when allowed == null, e_filt merely
+    // aliases it (the alias-gated free leaked one bitmap per BFS level for
+    // the lifetime of the backend on unfiltered calls).
+    defer c.roaring_bitmap_free(e_front.?);
 
     const e_filt = if (allowed) |a| roaring_utils.bitmapAnd(e_front.?, a) else e_front.?;
-    if (allowed != null) c.roaring_bitmap_free(e_front.?);
     defer if (allowed != null) c.roaring_bitmap_free(e_filt);
 
     // filterEdgesMeta returns null both for "no result" and "no filters";

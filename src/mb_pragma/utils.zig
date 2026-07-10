@@ -68,7 +68,10 @@ pub const PgAllocator = struct {
         .free = free,
         .remap = remap,
     };
-    fn alloc(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        // palloc guarantees only MAXALIGN (8 bytes); refuse stricter requests
+        // instead of handing back misaligned memory.
+        if (alignment.toByteUnits() > 8) return null;
         const ptr = c.palloc(len);
         if (ptr == null) return null;
         return @ptrCast(ptr);

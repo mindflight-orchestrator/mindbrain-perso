@@ -66,7 +66,7 @@ pub const Adapter = struct {
         const avg_len_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull2);
 
         if (!isnull1) {
-            stats.total_documents = @intCast(c.DatumGetInt64(total_docs_datum));
+            stats.total_documents = @intCast(@max(0, c.DatumGetInt64(total_docs_datum)));
         }
         if (!isnull2) {
             stats.avg_document_length = c.DatumGetFloat8(avg_len_datum);
@@ -88,7 +88,7 @@ pub const Adapter = struct {
         const query = try std.fmt.allocPrintSentinel(
             allocator,
             "SELECT doc_ids FROM facets.bm25_index WHERE table_id = {d} AND term_hash = {d}",
-            .{ table_id, term_hash },
+            .{ table_id, @as(i64, @bitCast(term_hash)) },
             0,
         );
         defer allocator.free(query);
@@ -141,7 +141,7 @@ pub const Adapter = struct {
             \\FROM facets.bm25_documents d
             \\WHERE d.table_id = {d} AND d.doc_id = {d}
         ,
-            .{ table_id, doc_id },
+            .{ table_id, @as(i64, @bitCast(doc_id)) },
             0,
         );
         defer allocator.free(query);
@@ -159,9 +159,9 @@ pub const Adapter = struct {
         const unique_terms_datum = c.SPI_getbinval(tuple, tupdesc, 3, &isnull3);
 
         return .{
-            .doc_id = if (isnull1) doc_id else @intCast(c.DatumGetInt64(doc_id_datum)),
-            .document_length = if (isnull2) 0 else @intCast(c.DatumGetInt32(doc_len_datum)),
-            .unique_terms = if (isnull3) 0 else @intCast(c.DatumGetInt32(unique_terms_datum)),
+            .doc_id = if (isnull1) doc_id else @bitCast(c.DatumGetInt64(doc_id_datum)),
+            .document_length = if (isnull2) 0 else @intCast(@max(0, c.DatumGetInt32(doc_len_datum))),
+            .unique_terms = if (isnull3) 0 else @intCast(@max(0, c.DatumGetInt32(unique_terms_datum))),
         };
     }
 
@@ -207,8 +207,8 @@ pub const Adapter = struct {
             const df_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull2);
 
             stats[i] = .{
-                .term_hash = if (isnull1) 0 else @intCast(c.DatumGetInt64(hash_datum)),
-                .document_frequency = if (isnull2) 0 else @intCast(c.DatumGetInt64(df_datum)),
+                .term_hash = if (isnull1) 0 else @bitCast(c.DatumGetInt64(hash_datum)),
+                .document_frequency = if (isnull2) 0 else @intCast(@max(0, c.DatumGetInt64(df_datum))),
             };
         }
 
@@ -239,7 +239,7 @@ pub const Adapter = struct {
             \\  AND term_hash = ANY({s})
             \\  AND doc_id = {d}
         ,
-            .{ table_id, hash_arr, doc_id },
+            .{ table_id, hash_arr, @as(i64, @bitCast(doc_id)) },
             0,
         );
         defer allocator.free(query);
@@ -262,8 +262,8 @@ pub const Adapter = struct {
             const freq_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull2);
 
             freqs[i] = .{
-                .term_hash = if (isnull1) 0 else @intCast(c.DatumGetInt64(hash_datum)),
-                .frequency = if (isnull2) 0 else @intCast(c.DatumGetInt32(freq_datum)),
+                .term_hash = if (isnull1) 0 else @bitCast(c.DatumGetInt64(hash_datum)),
+                .frequency = if (isnull2) 0 else @intCast(@max(0, c.DatumGetInt32(freq_datum))),
             };
         }
 
@@ -271,31 +271,125 @@ pub const Adapter = struct {
     }
 
     fn getDocumentStatsBatchViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId) anyerror![]interfaces.DocumentStats {
-        var rows = std.ArrayList(interfaces.DocumentStats).empty;
-        defer rows.deinit(allocator);
-        for (doc_ids) |doc_id| {
-            if (try getDocumentStatsViaInterface(ctx, allocator, table_id, doc_id)) |stats| {
-                try rows.append(allocator, stats);
-            }
+        _ = ctx;
+        if (doc_ids.len == 0) return allocator.alloc(interfaces.DocumentStats, 0);
+
+        const conn_result = c.SPI_connect();
+        const need_finish = (conn_result == c.SPI_OK_CONNECT);
+        if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
+            return error.QueryFailed;
         }
-        return rows.toOwnedSlice(allocator);
+        defer if (need_finish) {
+            _ = c.SPI_finish();
+        };
+
+        const id_arr = try formatHashArray(doc_ids, allocator);
+        defer allocator.free(id_arr);
+
+        const query = try std.fmt.allocPrintSentinel(
+            allocator,
+            \\SELECT
+            \\    d.doc_id,
+            \\    d.doc_length,
+            \\    (SELECT COUNT(DISTINCT term_hash) FROM facets.bm25_term_frequencies tf
+            \\      WHERE tf.table_id = d.table_id AND tf.doc_id = d.doc_id)::int AS unique_terms
+            \\FROM facets.bm25_documents d
+            \\WHERE d.table_id = {d} AND d.doc_id = ANY({s})
+        ,
+            .{ table_id, id_arr },
+            0,
+        );
+        defer allocator.free(query);
+
+        const ret = c.SPI_execute(query.ptr, true, 0);
+        if (ret != c.SPI_OK_SELECT) return error.QueryFailed;
+
+        const row_count: usize = @intCast(c.SPI_processed);
+        if (row_count > 0 and c.SPI_tuptable == null) return error.QueryFailed;
+
+        const rows = try allocator.alloc(interfaces.DocumentStats, row_count);
+        errdefer allocator.free(rows);
+
+        var i: usize = 0;
+        while (i < row_count) : (i += 1) {
+            const tuple = c.SPI_tuptable.*.vals[@intCast(i)];
+            const tupdesc = c.SPI_tuptable.*.tupdesc;
+            var isnull1: bool = false;
+            var isnull2: bool = false;
+            var isnull3: bool = false;
+            const doc_id_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull1);
+            const doc_len_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull2);
+            const unique_terms_datum = c.SPI_getbinval(tuple, tupdesc, 3, &isnull3);
+
+            rows[i] = .{
+                .doc_id = if (isnull1) 0 else @bitCast(c.DatumGetInt64(doc_id_datum)),
+                .document_length = if (isnull2) 0 else @intCast(@max(0, c.DatumGetInt32(doc_len_datum))),
+                .unique_terms = if (isnull3) 0 else @intCast(@max(0, c.DatumGetInt32(unique_terms_datum))),
+            };
+        }
+
+        return rows;
     }
 
     fn getTermFrequenciesBatchViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, doc_ids: []const interfaces.DocId, term_hashes: []const u64) anyerror![]interfaces.DocumentTermFrequency {
-        var rows = std.ArrayList(interfaces.DocumentTermFrequency).empty;
-        defer rows.deinit(allocator);
-        for (doc_ids) |doc_id| {
-            const freqs = try getTermFrequenciesViaInterface(ctx, allocator, table_id, doc_id, term_hashes);
-            defer allocator.free(freqs);
-            for (freqs) |freq| {
-                try rows.append(allocator, .{
-                    .doc_id = doc_id,
-                    .term_hash = freq.term_hash,
-                    .frequency = freq.frequency,
-                });
-            }
+        _ = ctx;
+        if (doc_ids.len == 0 or term_hashes.len == 0) return allocator.alloc(interfaces.DocumentTermFrequency, 0);
+
+        const conn_result = c.SPI_connect();
+        const need_finish = (conn_result == c.SPI_OK_CONNECT);
+        if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
+            return error.QueryFailed;
         }
-        return rows.toOwnedSlice(allocator);
+        defer if (need_finish) {
+            _ = c.SPI_finish();
+        };
+
+        const id_arr = try formatHashArray(doc_ids, allocator);
+        defer allocator.free(id_arr);
+        const hash_arr = try formatHashArray(term_hashes, allocator);
+        defer allocator.free(hash_arr);
+
+        const query = try std.fmt.allocPrintSentinel(
+            allocator,
+            \\SELECT doc_id, term_hash, frequency AS freq
+            \\FROM facets.bm25_term_frequencies
+            \\WHERE table_id = {d}
+            \\  AND doc_id = ANY({s})
+            \\  AND term_hash = ANY({s})
+        ,
+            .{ table_id, id_arr, hash_arr },
+            0,
+        );
+        defer allocator.free(query);
+
+        const ret = c.SPI_execute(query.ptr, true, 0);
+        if (ret != c.SPI_OK_SELECT) return error.QueryFailed;
+
+        const row_count: usize = @intCast(c.SPI_processed);
+        if (row_count > 0 and c.SPI_tuptable == null) return error.QueryFailed;
+
+        const rows = try allocator.alloc(interfaces.DocumentTermFrequency, row_count);
+        errdefer allocator.free(rows);
+
+        var i: usize = 0;
+        while (i < row_count) : (i += 1) {
+            const tuple = c.SPI_tuptable.*.vals[@intCast(i)];
+            const tupdesc = c.SPI_tuptable.*.tupdesc;
+            var isnull1: bool = false;
+            var isnull2: bool = false;
+            var isnull3: bool = false;
+            const doc_id_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull1);
+            const hash_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull2);
+            const freq_datum = c.SPI_getbinval(tuple, tupdesc, 3, &isnull3);
+
+            rows[i] = .{
+                .doc_id = if (isnull1) 0 else @bitCast(c.DatumGetInt64(doc_id_datum)),
+                .term_hash = if (isnull2) 0 else @bitCast(c.DatumGetInt64(hash_datum)),
+                .frequency = if (isnull3) 0 else @intCast(@max(0, c.DatumGetInt32(freq_datum))),
+            };
+        }
+
+        return rows;
     }
 
     fn getPostingBitmapViaInterface(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64, term_hash: u64) anyerror!?roaring.Bitmap {
@@ -318,6 +412,9 @@ pub const Adapter = struct {
         return error.NotImplemented;
     }
 
+    /// Formats u64 values as a Postgres bigint[] literal. Values are bit-cast
+    /// to i64 so hashes/ids >= 2^63 round-trip through bigint (see
+    /// mb_facets/bm25/copy_binary.zig for the matching write path).
     fn formatHashArray(term_hashes: []const u64, allocator: std.mem.Allocator) ![]u8 {
         var hash_arr = std.ArrayList(u8).empty;
         defer hash_arr.deinit(allocator);
@@ -325,7 +422,7 @@ pub const Adapter = struct {
         try hash_arr.appendSlice(allocator, "ARRAY[");
         for (term_hashes, 0..) |hash, i| {
             if (i > 0) try hash_arr.appendSlice(allocator, ",");
-            const part = try std.fmt.allocPrint(allocator, "{d}", .{hash});
+            const part = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @bitCast(hash))});
             defer allocator.free(part);
             try hash_arr.appendSlice(allocator, part);
         }

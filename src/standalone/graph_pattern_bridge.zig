@@ -48,22 +48,39 @@ pub fn executePostgresAst(
     ast_json: []const u8,
     options_json: []const u8,
 ) ![]u8 {
-    var options_buf: std.Io.Writer.Allocating = .init(allocator);
-    defer options_buf.deinit();
-    if (options_json.len == 0) {
-        try options_buf.writer.writeAll("{}");
-    } else {
-        try options_buf.writer.writeAll(options_json);
-    }
-    const options = try options_buf.toOwnedSlice();
+    const options = if (options_json.len == 0) "{}" else options_json;
+
+    // Randomize the dollar-quote tag per call and require it absent from
+    // both payloads: with a fixed tag, a crafted AST/options string could
+    // close the quote and inject arbitrary SQL into the psql invocation.
+    var tag_buf: [2 + 3 + 16]u8 = undefined;
+    const tag: []const u8 = blk: {
+        var attempt: usize = 0;
+        while (attempt < 8) : (attempt += 1) {
+            var raw: [8]u8 = undefined;
+            std.crypto.random.bytes(&raw);
+            const hex = std.fmt.bytesToHex(raw, .lower);
+            const candidate = std.fmt.bufPrint(&tag_buf, "$gpq{s}$", .{hex}) catch unreachable;
+            if (std.mem.indexOf(u8, ast_json, candidate) == null and
+                std.mem.indexOf(u8, options, candidate) == null)
+            {
+                break :blk candidate;
+            }
+        }
+        return error.InvalidRequest;
+    };
 
     var sql: std.Io.Writer.Allocating = .init(allocator);
     defer sql.deinit();
-    try sql.writer.writeAll("SELECT graph.pattern_query_ast($gpq_ast$");
+    try sql.writer.writeAll("SELECT graph.pattern_query_ast(");
+    try sql.writer.writeAll(tag);
     try sql.writer.writeAll(ast_json);
-    try sql.writer.writeAll("$gpq_ast$::jsonb, $gpq_opt$");
+    try sql.writer.writeAll(tag);
+    try sql.writer.writeAll("::jsonb, ");
+    try sql.writer.writeAll(tag);
     try sql.writer.writeAll(options);
-    try sql.writer.writeAll("$gpq_opt$::jsonb);");
+    try sql.writer.writeAll(tag);
+    try sql.writer.writeAll("::jsonb);");
 
     const sql_cmd = try sql.toOwnedSlice();
     defer allocator.free(sql_cmd);
@@ -114,11 +131,14 @@ fn runPsqlScalarJson(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     defer allocator.free(psql);
 
     const io = zig16_compat.io();
+    // stderr is discarded (never read before) rather than piped: draining
+    // stdout to EOF while a stderr pipe fills past the kernel buffer used to
+    // deadlock both processes.
     var child = try std.process.spawn(io, .{
         .argv = &.{ psql, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql },
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .pipe,
+        .stderr = .ignore,
     });
     errdefer child.kill(io);
 
@@ -127,12 +147,6 @@ fn runPsqlScalarJson(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     var stdout_reader = stdout_file.reader(io, &stdout_buffer);
     const stdout = try stdout_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
     errdefer allocator.free(stdout);
-
-    const stderr_file = child.stderr orelse return error.PostgresExecutionFailed;
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr_reader = stderr_file.reader(io, &stderr_buffer);
-    const stderr_bytes = try stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    defer allocator.free(stderr_bytes);
 
     const term = try child.wait(io);
     switch (term) {

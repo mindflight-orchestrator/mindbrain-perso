@@ -107,15 +107,38 @@ pub fn rankNative(
     requested_types: ?[]const []const u8,
     limit_n: usize,
 ) ![]RankedProjection {
-    const all = try loadProjections(db, allocator, user_id);
-    defer {
-        for (all) |row| deinitProjectionRow(allocator, row);
-        allocator.free(all);
-    }
+    // Row snapshots and scoring scratch live in an arena: one bulk free at
+    // the end, and only the top-k winners are duped onto the caller allocator.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const all = try loadProjections(db, arena, user_id);
 
     var index = try projection_types.loadIndex(db, allocator);
     defer index.deinit();
 
+    const Candidate = struct {
+        row: *const ProjectionRow,
+        score: f64,
+    };
+
+    var candidates = std.ArrayList(Candidate).empty;
+    for (all) |*row| {
+        if (!index.matches(requested_types, row.projection_type)) continue;
+        const score = scoreProjection(row.*, query, &index);
+        if (score <= 0) continue;
+        try candidates.append(arena, .{ .row = row, .score = score });
+    }
+
+    std.mem.sort(Candidate, candidates.items, {}, struct {
+        fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+            if (lhs.score != rhs.score) return lhs.score > rhs.score;
+            return std.mem.order(u8, lhs.row.id, rhs.row.id) == .lt;
+        }
+    }.lessThan);
+
+    const out_len = @min(candidates.items.len, limit_n);
     var ranked = std.ArrayList(RankedProjection).empty;
     defer {
         for (ranked.items) |row| {
@@ -125,26 +148,14 @@ pub fn rankNative(
         }
         ranked.deinit(allocator);
     }
-
-    for (all) |row| {
-        if (!index.matches(requested_types, row.projection_type)) continue;
-        const score = scoreProjection(row, query, &index);
-        if (score <= 0) continue;
+    for (candidates.items[0..out_len]) |candidate| {
         try ranked.append(allocator, .{
-            .id = try allocator.dupe(u8, row.id),
-            .item_id = try allocator.dupe(u8, row.item_id),
-            .score = score,
-            .projection_type = try allocator.dupe(u8, row.projection_type),
+            .id = try allocator.dupe(u8, candidate.row.id),
+            .item_id = try allocator.dupe(u8, candidate.row.item_id),
+            .score = candidate.score,
+            .projection_type = try allocator.dupe(u8, candidate.row.projection_type),
         });
     }
-
-    std.mem.sort(RankedProjection, ranked.items, {}, struct {
-        fn lessThan(_: void, lhs: RankedProjection, rhs: RankedProjection) bool {
-            if (lhs.score != rhs.score) return lhs.score > rhs.score;
-            return std.mem.order(u8, lhs.id, rhs.id) == .lt;
-        }
-    }.lessThan);
-    if (ranked.items.len > limit_n) ranked.shrinkRetainingCapacity(limit_n);
     return ranked.toOwnedSlice(allocator);
 }
 
@@ -166,40 +177,30 @@ pub fn packContextScoped(
     scope: ?[]const u8,
     limit_n: usize,
 ) ![]PackedContextRow {
-    const all = try loadProjections(db, allocator, user_id);
-    defer {
-        for (all) |row| deinitProjectionRow(allocator, row);
-        allocator.free(all);
-    }
+    // Same arena strategy as rankNative: snapshot + scratch in the arena,
+    // dupe only the final top-k rows for the caller.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const all = try loadProjections(db, arena, user_id);
 
     var index = try projection_types.loadIndex(db, allocator);
     defer index.deinit();
 
     const PackEntry = struct {
-        row: PackedContextRow,
+        row: *const ProjectionRow,
         priority: i32,
     };
 
     var pack_entries = std.ArrayList(PackEntry).empty;
-    defer {
-        for (pack_entries.items) |entry| deinitPackedRow(allocator, entry.row);
-        pack_entries.deinit(allocator);
-    }
-
-    for (all) |row| {
+    for (all) |*row| {
         if (!isPackable(&index, row.projection_type)) continue;
-        if (!matchesScope(scope, row.metadata_json, row.facets_json)) continue;
+        if (!matchesScope(arena, scope, row.metadata_json, row.facets_json)) continue;
         if (!matchesText(row.content, query)) continue;
 
-        try pack_entries.append(allocator, .{
-            .row = .{
-                .id = try allocator.dupe(u8, row.id),
-                .item_id = try allocator.dupe(u8, row.item_id),
-                .projection_type = try allocator.dupe(u8, row.projection_type),
-                .content = try allocator.dupe(u8, row.content),
-                .rank_hint = row.rank_hint,
-                .confidence = row.confidence,
-            },
+        try pack_entries.append(arena, .{
+            .row = row,
             .priority = packPriorityFor(&index, row.projection_type),
         });
     }
@@ -213,15 +214,24 @@ pub fn packContextScoped(
             return std.mem.order(u8, lhs.row.id, rhs.row.id) == .lt;
         }
     }.lessThan);
-    if (pack_entries.items.len > limit_n) {
-        for (pack_entries.items[limit_n..]) |entry| deinitPackedRow(allocator, entry.row);
-        pack_entries.shrinkRetainingCapacity(limit_n);
-    }
 
-    var packed_rows = try allocator.alloc(PackedContextRow, pack_entries.items.len);
-    for (pack_entries.items, 0..) |entry, i| packed_rows[i] = entry.row;
-    pack_entries.clearRetainingCapacity();
-    return packed_rows;
+    const out_len = @min(pack_entries.items.len, limit_n);
+    var packed_rows = std.ArrayList(PackedContextRow).empty;
+    defer {
+        for (packed_rows.items) |row| deinitPackedRow(allocator, row);
+        packed_rows.deinit(allocator);
+    }
+    for (pack_entries.items[0..out_len]) |entry| {
+        try packed_rows.append(allocator, .{
+            .id = try allocator.dupe(u8, entry.row.id),
+            .item_id = try allocator.dupe(u8, entry.row.item_id),
+            .projection_type = try allocator.dupe(u8, entry.row.projection_type),
+            .content = try allocator.dupe(u8, entry.row.content),
+            .rank_hint = entry.row.rank_hint,
+            .confidence = entry.row.confidence,
+        });
+    }
+    return packed_rows.toOwnedSlice(allocator);
 }
 
 pub fn nextHops(
@@ -231,48 +241,38 @@ pub fn nextHops(
     seed_nodes: []const []const u8,
     limit_n: usize,
 ) ![]NextHop {
-    const edges = try loadEdges(db, allocator, user_id);
-    defer {
-        for (edges) |edge| deinitEdgeRow(allocator, edge);
-        allocator.free(edges);
-    }
+    // Edge/projection snapshots, DSL records, and score-map keys are all
+    // scratch data: keep them in an arena and dupe only the returned hops.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    var scores = std.StringHashMap(f64).init(allocator);
-    defer {
-        var it = scores.iterator();
-        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-        scores.deinit();
-    }
+    const edges = try loadEdges(db, arena, user_id);
+
+    var scores = std.StringHashMap(f64).init(arena);
+    defer scores.deinit();
 
     for (edges) |edge| {
         for (seed_nodes) |seed| {
             if (std.mem.eql(u8, edge.node_from, seed)) {
-                try accumulateScore(allocator, &scores, edge.node_to, edge.weight);
+                try accumulateScore(arena, &scores, edge.node_to, edge.weight);
             }
             if (std.mem.eql(u8, edge.node_to, seed)) {
-                try accumulateScore(allocator, &scores, edge.node_from, edge.weight * 0.8);
+                try accumulateScore(arena, &scores, edge.node_from, edge.weight * 0.8);
             }
         }
     }
 
-    const projections = try loadProjections(db, allocator, user_id);
-    defer {
-        for (projections) |row| deinitProjectionRow(allocator, row);
-        allocator.free(projections);
-    }
+    const projections = try loadProjections(db, arena, user_id);
 
     var index = try projection_types.loadIndex(db, allocator);
     defer index.deinit();
 
     for (projections) |projection| {
-        var rec = pragma_dsl.parseFirstRecord(allocator, projection.content);
-        defer if (rec) |*record| record.deinit(allocator);
+        var rec = pragma_dsl.parseFirstRecord(arena, projection.content);
+        defer if (rec) |*record| record.deinit(arena);
         if (rec == null) continue;
-        const nodes = try collectSuggestionNodes(allocator, rec.?);
-        defer {
-            for (nodes) |node| allocator.free(node);
-            allocator.free(nodes);
-        }
+        const nodes = try collectSuggestionNodes(arena, rec.?);
         // Per the PG contract, structured projections expand seeds via the
         // type-specific next_hop_multiplier; non-structured rows fall back
         // to the DSL record-type prior so we don't regress legacy data.
@@ -284,32 +284,39 @@ pub fn nextHops(
             if (!containsString(nodes, seed)) continue;
             for (nodes) |node| {
                 if (std.mem.eql(u8, node, seed)) continue;
-                try accumulateScore(allocator, &scores, node, projection.confidence * multiplier);
+                try accumulateScore(arena, &scores, node, projection.confidence * multiplier);
             }
         }
     }
 
-    var hops = std.ArrayList(NextHop).empty;
-    defer {
-        for (hops.items) |hop| allocator.free(hop.node_id);
-        hops.deinit(allocator);
-    }
-
+    var candidates = std.ArrayList(NextHop).empty;
     var it = scores.iterator();
     while (it.next()) |entry| {
-        try hops.append(allocator, .{
-            .node_id = try allocator.dupe(u8, entry.key_ptr.*),
+        try candidates.append(arena, .{
+            .node_id = entry.key_ptr.*,
             .score = entry.value_ptr.*,
         });
     }
 
-    std.mem.sort(NextHop, hops.items, {}, struct {
+    std.mem.sort(NextHop, candidates.items, {}, struct {
         fn lessThan(_: void, lhs: NextHop, rhs: NextHop) bool {
             if (lhs.score != rhs.score) return lhs.score > rhs.score;
             return std.mem.order(u8, lhs.node_id, rhs.node_id) == .lt;
         }
     }.lessThan);
-    if (hops.items.len > limit_n) hops.shrinkRetainingCapacity(limit_n);
+
+    const out_len = @min(candidates.items.len, limit_n);
+    var hops = std.ArrayList(NextHop).empty;
+    defer {
+        for (hops.items) |hop| allocator.free(hop.node_id);
+        hops.deinit(allocator);
+    }
+    for (candidates.items[0..out_len]) |candidate| {
+        try hops.append(allocator, .{
+            .node_id = try allocator.dupe(u8, candidate.node_id),
+            .score = candidate.score,
+        });
+    }
     return hops.toOwnedSlice(allocator);
 }
 
@@ -449,20 +456,20 @@ fn jsonValueMatchesScope(value: std.json.Value, scope: []const u8, normalized: [
     }
 }
 
-fn jsonMatchesScope(json_text: []const u8, scope: []const u8, normalized: []const u8) bool {
+fn jsonMatchesScope(allocator: std.mem.Allocator, json_text: []const u8, scope: []const u8, normalized: []const u8) bool {
     if (json_text.len == 0) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_text, .{}) catch return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return false;
     defer parsed.deinit();
     return jsonValueMatchesScope(parsed.value, scope, normalized);
 }
 
-fn matchesScope(scope: ?[]const u8, metadata_json: []const u8, facets_json: []const u8) bool {
+fn matchesScope(allocator: std.mem.Allocator, scope: ?[]const u8, metadata_json: []const u8, facets_json: []const u8) bool {
     if (scope == null or scope.?.len == 0) return true;
     // Compare whole JSON values, never substrings: scope "player:7"
     // (normalized "7") must not match "player_id":"17" or a stray 0.7.
     const normalized = if (std.mem.startsWith(u8, scope.?, "player:")) scope.?[7..] else scope.?;
-    return jsonMatchesScope(metadata_json, scope.?, normalized) or
-        jsonMatchesScope(facets_json, scope.?, normalized);
+    return jsonMatchesScope(allocator, metadata_json, scope.?, normalized) or
+        jsonMatchesScope(allocator, facets_json, scope.?, normalized);
 }
 
 fn containsString(values: []const []const u8, target: []const u8) bool {
