@@ -44,6 +44,16 @@ const ModelEntry = struct {
 const BudgetFile = struct {
     default: BudgetSpec,
     models: []const ModelEntry,
+
+    /// Frees a file produced by `loadBudgetFromJson`. Must not be called on
+    /// `builtin_budget_file`, whose entries are static.
+    pub fn deinit(self: BudgetFile, allocator: std.mem.Allocator) void {
+        for (self.models) |entry| {
+            if (entry.provider) |provider| allocator.free(provider);
+            if (entry.model) |model| allocator.free(model);
+        }
+        allocator.free(self.models);
+    }
 };
 
 pub fn estimateTokensFromChars(chars: usize, chars_per_token: u32) usize {
@@ -78,15 +88,28 @@ pub fn loadBudgetFromJson(allocator: std.mem.Allocator, json: []const u8) !Budge
     defer parsed.deinit();
 
     var models = try allocator.alloc(ModelEntry, parsed.value.models.len);
-    errdefer allocator.free(models);
-    for (parsed.value.models, 0..) |row, i| {
+    var filled: usize = 0;
+    errdefer {
+        for (models[0..filled]) |entry| {
+            if (entry.provider) |provider| allocator.free(provider);
+            if (entry.model) |model| allocator.free(model);
+        }
+        allocator.free(models);
+    }
+    for (parsed.value.models) |row| {
         const match: MatchKind = if (row.match) |m| blk: {
             if (std.mem.eql(u8, m, "prefix")) break :blk .prefix;
             break :blk .exact;
         } else .exact;
-        models[i] = .{
-            .provider = row.provider,
-            .model = row.model,
+        // Dupe out of the parser arena: `parsed` is freed before the entries
+        // are used, so borrowed slices (notably escaped strings, which always
+        // live in the arena) would dangle.
+        const provider = if (row.provider) |p| try allocator.dupe(u8, p) else null;
+        errdefer if (provider) |p| allocator.free(p);
+        const model = if (row.model) |m| try allocator.dupe(u8, m) else null;
+        models[filled] = .{
+            .provider = provider,
+            .model = model,
             .match = match,
             .spec = .{
                 .context_tokens = row.context_tokens,
@@ -95,6 +118,7 @@ pub fn loadBudgetFromJson(allocator: std.mem.Allocator, json: []const u8) !Budge
                 .chars_per_token = row.chars_per_token,
             },
         };
+        filled += 1;
     }
     return .{ .default = parsed.value.default, .models = models };
 }
@@ -180,7 +204,7 @@ pub fn loadBudget(
         const json = try std.Io.Dir.cwd().readFileAlloc(zig16_compat.io(), path, allocator, .limited(1024 * 1024));
         defer allocator.free(json);
         const file = try loadBudgetFromJson(allocator, json);
-        defer allocator.free(file.models);
+        defer file.deinit(allocator);
         return resolveBudgetSpec(file, provider, model);
     }
 
@@ -191,7 +215,7 @@ pub fn loadBudget(
     const file = loadBudgetFromJson(allocator, json) catch {
         return resolveBudgetSpec(builtin_budget_file, provider, model);
     };
-    defer allocator.free(file.models);
+    defer file.deinit(allocator);
     return resolveBudgetSpec(file, provider, model);
 }
 
@@ -299,22 +323,25 @@ pub fn planBudgetBatches(
         batches.deinit(allocator);
     }
 
+    // Greedy packing on a running character sum. A batch needs no truncation
+    // exactly when its total length fits the remaining budget (see
+    // computeDocumentCharLimits), so this is equivalent to probing each
+    // prefix with computeDocumentCharLimits while staying O(n).
+    const budget_chars = inputBudgetChars(spec);
+    const overhead = system_chars + fixed_user_chars;
+    const remaining = if (budget_chars > overhead) budget_chars - overhead else 0;
+
     var start: usize = 0;
     while (start < doc_ids.len) {
-        var best_end = start + 1;
+        // A batch always contains at least one document, even one that must
+        // be truncated on its own.
         var end = start + 1;
-        while (end <= doc_ids.len) : (end += 1) {
-            var report = try computeDocumentCharLimits(allocator, spec, doc_ids[start..end], doc_lengths[start..end], system_chars, fixed_user_chars);
-            if (report.truncated_doc_ids.len == 0) {
-                best_end = end;
-                report.deinit(allocator);
-                continue;
-            }
-            report.deinit(allocator);
-            break;
+        var running = doc_lengths[start];
+        while (end < doc_ids.len and running + doc_lengths[end] <= remaining) : (end += 1) {
+            running += doc_lengths[end];
         }
-        try batches.append(allocator, try allocator.dupe(u64, doc_ids[start..best_end]));
-        start = best_end;
+        try batches.append(allocator, try allocator.dupe(u64, doc_ids[start..end]));
+        start = end;
     }
 
     return try batches.toOwnedSlice(allocator);
@@ -362,10 +389,51 @@ test "resolveBudgetSpec exact and prefix wildcard" {
         \\{"default":{"context_tokens":1000,"output_tokens":100,"prompt_reserve_tokens":50,"chars_per_token":4},"models":[{"provider":"openai","model":"gpt-5-mini","context_tokens":400000,"output_tokens":128000,"prompt_reserve_tokens":32000,"chars_per_token":4},{"provider":"openai","model":"gpt-5*","match":"prefix","context_tokens":200000,"output_tokens":64000,"prompt_reserve_tokens":16000,"chars_per_token":4}]}
     ;
     const file = try loadBudgetFromJson(std.testing.allocator, json);
-    defer std.testing.allocator.free(file.models);
+    defer file.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 400000), resolveBudgetSpec(file, "openai", "gpt-5-mini").context_tokens);
     try std.testing.expectEqual(@as(u64, 200000), resolveBudgetSpec(file, "openai", "gpt-5-nano").context_tokens);
     try std.testing.expectEqual(@as(u64, 1000), resolveBudgetSpec(file, "anthropic", "claude").context_tokens);
+}
+
+test "loadBudgetFromJson copies strings out of the parser arena" {
+    // "open\u0061i" decodes to "openai" inside the parser arena (escaped
+    // strings never alias the input), covering the dangling-slice case;
+    // freeing the input before resolving covers the aliasing case.
+    const json =
+        \\{"default":{"context_tokens":1000,"output_tokens":100,"prompt_reserve_tokens":50,"chars_per_token":4},"models":[{"provider":"open\u0061i","model":"gpt-5-mini","context_tokens":400000,"output_tokens":128000,"prompt_reserve_tokens":32000,"chars_per_token":4}]}
+    ;
+    const json_copy = try std.testing.allocator.dupe(u8, json);
+    const file = try loadBudgetFromJson(std.testing.allocator, json_copy);
+    defer file.deinit(std.testing.allocator);
+    std.testing.allocator.free(json_copy);
+
+    try std.testing.expectEqualStrings("openai", file.models[0].provider.?);
+    try std.testing.expectEqualStrings("gpt-5-mini", file.models[0].model.?);
+    try std.testing.expectEqual(@as(u64, 400000), resolveBudgetSpec(file, "openai", "gpt-5-mini").context_tokens);
+}
+
+test "planBudgetBatches groups documents by remaining character budget" {
+    // remaining chars = (2000 - 400 - 400) * 4 - (1000 + 500) = 3300
+    const spec: BudgetSpec = .{
+        .context_tokens = 2000,
+        .output_tokens = 400,
+        .prompt_reserve_tokens = 400,
+        .chars_per_token = 4,
+    };
+    const doc_ids = [_]u64{ 1, 2, 3, 4 };
+    const doc_lengths = [_]usize{ 2000, 1000, 9000, 3000 };
+    const batches = try planBudgetBatches(std.testing.allocator, spec, &doc_ids, &doc_lengths, 1000, 500);
+    defer {
+        for (batches) |batch| std.testing.allocator.free(batch);
+        std.testing.allocator.free(batches);
+    }
+
+    // [1,2] fit together; 3 exceeds the budget alone but still forms a batch;
+    // 4 starts a new batch.
+    try std.testing.expectEqual(@as(usize, 3), batches.len);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, batches[0]);
+    try std.testing.expectEqualSlices(u64, &.{3}, batches[1]);
+    try std.testing.expectEqualSlices(u64, &.{4}, batches[2]);
 }
 
 test "computeDocumentCharLimits leaves small corpus intact" {

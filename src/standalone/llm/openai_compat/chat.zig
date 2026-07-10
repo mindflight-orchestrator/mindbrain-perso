@@ -8,6 +8,7 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     model: []const u8,
     max_response_bytes: usize = 4 * 1024 * 1024,
+    retry: http_client.RetryPolicy = .{},
 };
 
 pub fn chat(
@@ -22,8 +23,11 @@ pub fn chat(
     const body = try renderRequest(allocator, config.model, request);
     defer allocator.free(body);
 
-    const response = try http_client.postJson(allocator, io, url, config.api_key, body);
-    errdefer response.deinit(allocator);
+    const response = try http_client.postJson(allocator, io, url, config.api_key, body, .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
+    // parseResponse owns response.body from here on (success and failure).
     return parseResponse(allocator, response.body);
 }
 
@@ -170,15 +174,22 @@ fn renderToolChoice(writer: *std.Io.Writer, choice: types.ToolChoice) !void {
     }
 }
 
+/// Takes ownership of `raw_json`: on success it is stored in the returned
+/// response (freed by its `deinit`); on failure it is freed here. Callers
+/// must not free it themselves.
 pub fn parseResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.ChatResponse {
     errdefer allocator.free(raw_json);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const choices = parsed.value.object.get("choices") orelse return error.InvalidResponse;
+    if (choices != .array) return error.InvalidResponse;
     if (choices.array.items.len == 0) return error.InvalidResponse;
     const first = choices.array.items[0];
+    if (first != .object) return error.InvalidResponse;
     const message = first.object.get("message") orelse return error.InvalidResponse;
+    if (message != .object) return error.InvalidResponse;
     const content_value = message.object.get("content");
     const content = if (content_value) |value| switch (value) {
         .string => |text| try allocator.dupe(u8, text),
@@ -199,21 +210,32 @@ fn parseToolCalls(allocator: std.mem.Allocator, message: std.json.Value) ![]type
     const calls_value = message.object.get("tool_calls") orelse return &.{};
     if (calls_value != .array) return error.InvalidResponse;
     const calls = try allocator.alloc(types.ToolCall, calls_value.array.items.len);
-    errdefer allocator.free(calls);
+    var filled: usize = 0;
+    errdefer {
+        for (calls[0..filled]) |call| call.deinit(allocator);
+        allocator.free(calls);
+    }
 
-    for (calls_value.array.items, 0..) |call_value, i| {
+    for (calls_value.array.items) |call_value| {
+        if (call_value != .object) return error.InvalidResponse;
         const id_value = call_value.object.get("id") orelse return error.InvalidResponse;
+        if (id_value != .string) return error.InvalidResponse;
         const function_value = call_value.object.get("function") orelse return error.InvalidResponse;
+        if (function_value != .object) return error.InvalidResponse;
         const name_value = function_value.object.get("name") orelse return error.InvalidResponse;
+        if (name_value != .string) return error.InvalidResponse;
         const arguments_value = function_value.object.get("arguments") orelse return error.InvalidResponse;
-        calls[i] = .{
-            .id = try allocator.dupe(u8, id_value.string),
-            .name = try allocator.dupe(u8, name_value.string),
-            .arguments_json = if (arguments_value == .string)
-                try allocator.dupe(u8, arguments_value.string)
-            else
-                try std.json.Stringify.valueAlloc(allocator, arguments_value, .{}),
-        };
+
+        const id = try allocator.dupe(u8, id_value.string);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, name_value.string);
+        errdefer allocator.free(name);
+        const arguments_json = if (arguments_value == .string)
+            try allocator.dupe(u8, arguments_value.string)
+        else
+            try std.json.Stringify.valueAlloc(allocator, arguments_value, .{});
+        calls[filled] = .{ .id = id, .name = name, .arguments_json = arguments_json };
+        filled += 1;
     }
     return calls;
 }
@@ -318,6 +340,27 @@ test "parseResponse extracts content and tool calls" {
     try std.testing.expectEqualStrings("using a tool", response.content);
     try std.testing.expectEqual(@as(usize, 1), response.tool_calls.len);
     try std.testing.expectEqualStrings("lookup", response.tool_calls[0].name);
+}
+
+fn expectInvalidResponse(raw: []const u8) !void {
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    try std.testing.expectError(error.InvalidResponse, parseResponse(std.testing.allocator, owned));
+}
+
+test "parseResponse rejects malformed payloads without crashing or leaking" {
+    try expectInvalidResponse("[]");
+    try expectInvalidResponse("{\"choices\":42}");
+    try expectInvalidResponse("{\"choices\":[\"nope\"]}");
+    try expectInvalidResponse("{\"choices\":[{\"message\":\"nope\"}]}");
+    try expectInvalidResponse("{\"choices\":[{\"message\":{\"tool_calls\":\"nope\"}}]}");
+    try expectInvalidResponse("{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":5}]}}]}");
+    // Later malformed element must free the tool calls parsed before it.
+    try expectInvalidResponse(
+        \\{"choices":[{"message":{"tool_calls":[
+        \\  {"id":"call_1","function":{"name":"lookup","arguments":"{}"}},
+        \\  {"id":"call_2","function":{"name":7,"arguments":"{}"}}
+        \\]}}]}
+    );
 }
 
 test "parseResponse preserves raw JSON when assistant content is empty" {

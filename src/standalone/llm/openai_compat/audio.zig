@@ -7,6 +7,8 @@ pub const Config = struct {
     base_url: []const u8,
     api_key: ?[]const u8 = null,
     model: []const u8,
+    max_response_bytes: usize = 4 * 1024 * 1024,
+    retry: http_client.RetryPolicy = .{},
 };
 
 pub fn transcribe(
@@ -37,8 +39,11 @@ pub fn transcribe(
         header_count += 1;
     }
 
-    const response = try http_client.postWithHeaders(allocator, io, url, body, headers_buf[0..header_count]);
-    errdefer response.deinit(allocator);
+    const response = try http_client.postWithHeaders(allocator, io, url, body, headers_buf[0..header_count], .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
+    // parseResponse owns response.body from here on (success and failure).
     return parseResponse(allocator, response.body);
 }
 
@@ -47,40 +52,42 @@ pub fn renderMultipartRequest(
     boundary: []const u8,
     request: types.AudioTranscriptionRequest,
 ) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
 
-    try appendField(allocator, &out, boundary, "model", request.model);
-    if (request.language) |language| try appendField(allocator, &out, boundary, "language", language);
-    if (request.prompt) |prompt| try appendField(allocator, &out, boundary, "prompt", prompt);
-    if (request.response_format) |format| try appendField(allocator, &out, boundary, "response_format", format);
+    try appendField(&out.writer, boundary, "model", request.model);
+    if (request.language) |language| try appendField(&out.writer, boundary, "language", language);
+    if (request.prompt) |prompt| try appendField(&out.writer, boundary, "prompt", prompt);
+    if (request.response_format) |format| try appendField(&out.writer, boundary, "response_format", format);
 
-    try out.writer(allocator).print("--{s}\r\n", .{boundary});
-    try out.writer(allocator).print(
+    try out.writer.print("--{s}\r\n", .{boundary});
+    try out.writer.print(
         "Content-Disposition: form-data; name=\"file\"; filename=\"{s}\"\r\n",
         .{request.filename},
     );
-    try out.writer(allocator).print("Content-Type: {s}\r\n\r\n", .{request.mime_type});
-    try out.appendSlice(allocator, request.audio_bytes);
-    try out.appendSlice(allocator, "\r\n");
-    try out.writer(allocator).print("--{s}--\r\n", .{boundary});
+    try out.writer.print("Content-Type: {s}\r\n\r\n", .{request.mime_type});
+    try out.writer.writeAll(request.audio_bytes);
+    try out.writer.writeAll("\r\n");
+    try out.writer.print("--{s}--\r\n", .{boundary});
 
-    return try out.toOwnedSlice(allocator);
+    return try out.toOwnedSlice();
 }
 
 fn appendField(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    writer: *std.Io.Writer,
     boundary: []const u8,
     name: []const u8,
     value: []const u8,
 ) !void {
-    try out.writer(allocator).print("--{s}\r\n", .{boundary});
-    try out.writer(allocator).print("Content-Disposition: form-data; name=\"{s}\"\r\n\r\n", .{name});
-    try out.appendSlice(allocator, value);
-    try out.appendSlice(allocator, "\r\n");
+    try writer.print("--{s}\r\n", .{boundary});
+    try writer.print("Content-Disposition: form-data; name=\"{s}\"\r\n\r\n", .{name});
+    try writer.writeAll(value);
+    try writer.writeAll("\r\n");
 }
 
+/// Takes ownership of `raw_json`: on success it is stored in the returned
+/// response (freed by its `deinit`); on failure it is freed here. Callers
+/// must not free it themselves.
 pub fn parseResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.AudioTranscriptionResponse {
     errdefer allocator.free(raw_json);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch {
@@ -88,7 +95,9 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.AudioT
     };
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const text_value = parsed.value.object.get("text") orelse return error.InvalidResponse;
+    if (text_value != .string) return error.InvalidResponse;
     return .{ .text = try allocator.dupe(u8, text_value.string), .raw_json = raw_json };
 }
 
