@@ -2416,6 +2416,19 @@ pub fn stepDone(stmt: *c.sqlite3_stmt) Error!void {
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
 }
 
+pub fn stepDoneContext(stmt: *c.sqlite3_stmt, context: []const u8) Error!void {
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+        const handle = c.sqlite3_db_handle(stmt);
+        const message = c.sqlite3_errmsg(handle);
+        std.log.warn("sqlite step failed ({s}): {s} (extended code {d})", .{
+            context,
+            if (message != null) std.mem.span(message) else "unknown error",
+            c.sqlite3_extended_errcode(handle),
+        });
+        return error.StepFailed;
+    }
+}
+
 pub fn bindInt64(stmt: *c.sqlite3_stmt, index: c_int, value: anytype) Error!void {
     if (c.sqlite3_bind_int64(stmt, index, @intCast(value)) != c.SQLITE_OK) return error.BindFailed;
 }

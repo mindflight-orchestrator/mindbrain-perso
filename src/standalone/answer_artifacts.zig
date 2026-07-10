@@ -260,7 +260,7 @@ fn backfillProjections(db: Database, allocator: std.mem.Allocator, stats: *Repai
     return count;
 }
 
-fn workspaceForScope(db: Database, allocator: std.mem.Allocator, scope: []const u8) ![]const u8 {
+pub fn workspaceForScope(db: Database, allocator: std.mem.Allocator, scope: []const u8) ![]const u8 {
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT workspace_id
         \\FROM workspaces

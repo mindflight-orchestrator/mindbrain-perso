@@ -8,6 +8,7 @@ const facet_sqlite = @import("facet_sqlite.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
 const search_sqlite = @import("search_sqlite.zig");
 const schema_column_migrations = @import("schema_column_migrations.zig");
+const answer_artifacts = @import("answer_artifacts.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = facet_sqlite.Database;
@@ -1077,7 +1078,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     }
 
     for (bundle.mindbrain_answer_artifacts) |row| {
-        try upsertAnswerArtifact(db, row);
+        try upsertAnswerArtifact(db, allocator, row);
     }
 
     for (bundle.mindbrain_answer_events) |row| {
@@ -1337,7 +1338,35 @@ fn upsertQualityRemediationAction(db: Database, row: QualityRemediationActionRow
     try execPreparedDone(stmt);
 }
 
-fn upsertAnswerArtifact(db: Database, row: AnswerArtifactRow) !void {
+fn upsertAnswerArtifact(db: Database, allocator: Allocator, row: AnswerArtifactRow) !void {
+    // Legacy bundles (pre workspace-strict schema, 2026-06-16) may carry
+    // answer artifacts with a null workspace_id and only a scope. The table
+    // now requires workspace_id NOT NULL, so derive it from scope the same
+    // way the migration backfill does, and refuse the row otherwise.
+    var resolved = row;
+    var derived_workspace: ?[]const u8 = null;
+    defer if (derived_workspace) |v| allocator.free(v);
+    if (row.workspace_id == null) {
+        const scope = row.scope orelse {
+            std.log.warn(
+                "answer artifact '{s}' has null workspace_id and no scope; cannot satisfy workspace-strict schema",
+                .{row.artifact_id},
+            );
+            return error.MissingWorkspace;
+        };
+        derived_workspace = answer_artifacts.workspaceForScope(db, allocator, scope) catch |err| {
+            std.log.warn(
+                "answer artifact '{s}' has null workspace_id and scope '{s}' does not resolve to exactly one workspace ({s})",
+                .{ row.artifact_id, scope, @errorName(err) },
+            );
+            return err;
+        };
+        std.log.warn(
+            "answer artifact '{s}': backfilled null workspace_id from scope '{s}' -> '{s}'",
+            .{ row.artifact_id, scope, derived_workspace.? },
+        );
+        resolved.workspace_id = derived_workspace;
+    }
     const stmt = try facet_sqlite.prepare(db,
         \\INSERT INTO mindbrain_answer_artifacts(
         \\  artifact_id, slug, workspace_id, agent_id, scope, artifact_kind,
@@ -1361,22 +1390,33 @@ fn upsertAnswerArtifact(db: Database, row: AnswerArtifactRow) !void {
         \\  updated_at_unix = excluded.updated_at_unix
     );
     defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, row.artifact_id);
-    try facet_sqlite.bindText(stmt, 2, row.slug);
-    try bindMaybeText(stmt, 3, row.workspace_id);
-    try bindMaybeText(stmt, 4, row.agent_id);
-    try bindMaybeText(stmt, 5, row.scope);
-    try facet_sqlite.bindText(stmt, 6, row.artifact_kind);
-    try bindMaybeText(stmt, 7, row.public_label_key);
-    try facet_sqlite.bindText(stmt, 8, row.public_label);
-    try facet_sqlite.bindText(stmt, 9, row.lifecycle);
-    try facet_sqlite.bindText(stmt, 10, row.state);
-    try facet_sqlite.bindInt64(stmt, 11, row.current_version);
-    try facet_sqlite.bindText(stmt, 12, row.payload_json);
-    try bindMaybeText(stmt, 13, row.legacy_ref);
-    try facet_sqlite.bindInt64(stmt, 14, row.created_at_unix);
-    try facet_sqlite.bindInt64(stmt, 15, row.updated_at_unix);
-    try facet_sqlite.stepDone(stmt);
+    try facet_sqlite.bindText(stmt, 1, resolved.artifact_id);
+    try facet_sqlite.bindText(stmt, 2, resolved.slug);
+    try bindMaybeText(stmt, 3, resolved.workspace_id);
+    try bindMaybeText(stmt, 4, resolved.agent_id);
+    try bindMaybeText(stmt, 5, resolved.scope);
+    try facet_sqlite.bindText(stmt, 6, resolved.artifact_kind);
+    try bindMaybeText(stmt, 7, resolved.public_label_key);
+    try facet_sqlite.bindText(stmt, 8, resolved.public_label);
+    try facet_sqlite.bindText(stmt, 9, resolved.lifecycle);
+    try facet_sqlite.bindText(stmt, 10, resolved.state);
+    try facet_sqlite.bindInt64(stmt, 11, resolved.current_version);
+    try facet_sqlite.bindText(stmt, 12, resolved.payload_json);
+    try bindMaybeText(stmt, 13, resolved.legacy_ref);
+    try facet_sqlite.bindInt64(stmt, 14, resolved.created_at_unix);
+    try facet_sqlite.bindInt64(stmt, 15, resolved.updated_at_unix);
+    facet_sqlite.stepDoneContext(stmt, "mindbrain_answer_artifacts upsert") catch |err| {
+        std.log.warn(
+            "failed to import answer artifact '{s}' (workspace_id '{s}', scope '{s}', kind '{s}')",
+            .{
+                resolved.artifact_id,
+                resolved.workspace_id orelse "<null>",
+                resolved.scope orelse "<null>",
+                resolved.artifact_kind,
+            },
+        );
+        return err;
+    };
 }
 
 fn upsertAnswerEvent(db: Database, row: AnswerEventRow) !void {
@@ -3722,4 +3762,133 @@ test "export+import bundle round-trips chunks, cross-collection links and entity
     try std.testing.expect(std.mem.indexOf(u8, partial, "\"doc_id\": 100") != null);
     // Documents that belong only to the other collection must not leak.
     try std.testing.expect(std.mem.indexOf(u8, partial, "Storage retention spec") == null);
+}
+
+test "bundle import backfills null answer artifact workspace_id from scope" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Legacy bundle shape: analysis_plan rows exported before the 2026-06-16
+    // workspace-strict migration carry workspace_id null and only a scope.
+    const bundle_json =
+        \\{
+        \\  "kind": "ghostcrab_backup_bundle",
+        \\  "schema_version": "2",
+        \\  "scope": {"kind": "workspace", "workspace_id": "ws_fix", "collection_id": null},
+        \\  "workspaces": [{"workspace_id": "ws_fix", "label": "Fix", "description": null, "domain_profile": null}],
+        \\  "collections": [],
+        \\  "ontologies": [],
+        \\  "collection_ontologies": [],
+        \\  "workspace_settings": [],
+        \\  "documents_raw": [],
+        \\  "chunks_raw": [],
+        \\  "facet_assignments_raw": [],
+        \\  "entities_raw": [],
+        \\  "entity_aliases_raw": [],
+        \\  "relations_raw": [],
+        \\  "entity_documents_raw": [],
+        \\  "entity_chunks_raw": [],
+        \\  "document_links_raw": [],
+        \\  "mindbrain_answer_artifacts": [{
+        \\    "artifact_id": "analysis_plan__legacy_exact",
+        \\    "slug": "legacy_exact",
+        \\    "workspace_id": null,
+        \\    "agent_id": "agent:self",
+        \\    "scope": "ws_fix",
+        \\    "artifact_kind": "analysis_plan",
+        \\    "public_label_key": null,
+        \\    "public_label": "Legacy plan (exact scope)",
+        \\    "lifecycle": "active",
+        \\    "state": "open",
+        \\    "current_version": 1,
+        \\    "payload_json": "{}",
+        \\    "legacy_ref": null,
+        \\    "created_at_unix": 0,
+        \\    "updated_at_unix": 0
+        \\  }, {
+        \\    "artifact_id": "analysis_plan__legacy_prefixed",
+        \\    "slug": "legacy_prefixed",
+        \\    "workspace_id": null,
+        \\    "agent_id": "agent:self",
+        \\    "scope": "ws_fix:production:legacy",
+        \\    "artifact_kind": "analysis_plan",
+        \\    "public_label_key": null,
+        \\    "public_label": "Legacy plan (prefixed scope)",
+        \\    "lifecycle": "active",
+        \\    "state": "open",
+        \\    "current_version": 1,
+        \\    "payload_json": "{}",
+        \\    "legacy_ref": null,
+        \\    "created_at_unix": 0,
+        \\    "updated_at_unix": 0
+        \\  }]
+        \\}
+    ;
+    try importBundleJson(db, std.testing.allocator, bundle_json);
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const count_stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(count_stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+            return c.sqlite3_column_int64(count_stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 2), try Counts.one(db, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id = 'ws_fix'"));
+    try std.testing.expectEqual(@as(i64, 0), try Counts.one(db, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE workspace_id IS NULL"));
+}
+
+test "bundle import rejects null answer artifact workspace_id with unresolvable scope" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const bundle_json =
+        \\{
+        \\  "kind": "ghostcrab_backup_bundle",
+        \\  "schema_version": "2",
+        \\  "scope": {"kind": "workspace", "workspace_id": "ws_fix", "collection_id": null},
+        \\  "workspaces": [{"workspace_id": "ws_fix", "label": "Fix", "description": null, "domain_profile": null}],
+        \\  "collections": [],
+        \\  "ontologies": [],
+        \\  "collection_ontologies": [],
+        \\  "workspace_settings": [],
+        \\  "documents_raw": [],
+        \\  "chunks_raw": [],
+        \\  "facet_assignments_raw": [],
+        \\  "entities_raw": [],
+        \\  "entity_aliases_raw": [],
+        \\  "relations_raw": [],
+        \\  "entity_documents_raw": [],
+        \\  "entity_chunks_raw": [],
+        \\  "document_links_raw": [],
+        \\  "mindbrain_answer_artifacts": [{
+        \\    "artifact_id": "analysis_plan__orphan",
+        \\    "slug": "orphan",
+        \\    "workspace_id": null,
+        \\    "agent_id": "agent:self",
+        \\    "scope": "elsewhere:unknown",
+        \\    "artifact_kind": "analysis_plan",
+        \\    "public_label_key": null,
+        \\    "public_label": "Orphan plan",
+        \\    "lifecycle": "active",
+        \\    "state": "open",
+        \\    "current_version": 1,
+        \\    "payload_json": "{}",
+        \\    "legacy_ref": null,
+        \\    "created_at_unix": 0,
+        \\    "updated_at_unix": 0
+        \\  }]
+        \\}
+    ;
+    try std.testing.expectError(
+        error.MissingWorkspace,
+        importBundleJson(db, std.testing.allocator, bundle_json),
+    );
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM mindbrain_answer_artifacts");
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
 }
