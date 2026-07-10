@@ -646,7 +646,10 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     defer parsed.deinit();
     const bundle = parsed.value;
 
-    try db.exec("BEGIN");
+    // IMMEDIATE: a deferred BEGIN would take the write lock only after part
+    // of the import ran, failing with SQLITE_BUSY mid-bundle under
+    // concurrent writers instead of up front.
+    try db.exec("BEGIN IMMEDIATE");
     errdefer db.exec("ROLLBACK") catch |rollback_err| {
         std.log.warn("collections import rollback failed: {s}", .{@errorName(rollback_err)});
     };
@@ -758,7 +761,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.ontology_entities) |row| {
         try collections_sqlite.upsertOntologyEntity(db, .{
             .ontology_id = row.ontology_id,
-            .entity_id = @intCast(row.entity_id),
+            .entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange,
             .entity_type = row.entity_type,
             .name = row.label,
             .metadata_json = row.metadata_json,
@@ -768,10 +771,10 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.ontology_relations) |row| {
         try collections_sqlite.upsertOntologyRelation(db, .{
             .ontology_id = row.ontology_id,
-            .relation_id = @intCast(row.relation_id),
+            .relation_id = std.math.cast(u64, row.relation_id) orelse return error.ValueOutOfRange,
             .edge_type = row.edge_type,
-            .source_entity_id = @intCast(row.source_entity_id),
-            .target_entity_id = @intCast(row.target_entity_id),
+            .source_entity_id = std.math.cast(u64, row.source_entity_id) orelse return error.ValueOutOfRange,
+            .target_entity_id = std.math.cast(u64, row.target_entity_id) orelse return error.ValueOutOfRange,
             .metadata_json = row.metadata_json,
         });
     }
@@ -779,7 +782,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.ontology_triples) |row| {
         try collections_sqlite.upsertOntologyTriple(db, .{
             .ontology_id = row.ontology_id,
-            .triple_index = @intCast(row.triple_index),
+            .triple_index = std.math.cast(u64, row.triple_index) orelse return error.ValueOutOfRange,
             .subject_kind = row.subject_kind,
             .subject = row.subject,
             .predicate = row.predicate,
@@ -841,7 +844,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try collections_sqlite.upsertDocumentRaw(db, .{
             .workspace_id = row.workspace_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .doc_nanoid = row.doc_nanoid,
             .content = row.content,
             .language = row.language,
@@ -855,14 +858,14 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try collections_sqlite.upsertChunkRaw(db, .{
             .workspace_id = row.workspace_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .chunk_index = std.math.cast(u32, row.chunk_index) orelse return error.ValueOutOfRange,
             .content = row.content,
             .language = row.language,
-            .offset_start = if (row.offset_start) |o| @intCast(o) else null,
-            .offset_end = if (row.offset_end) |o| @intCast(o) else null,
+            .offset_start = if (row.offset_start) |o| (std.math.cast(u64, o) orelse return error.ValueOutOfRange) else null,
+            .offset_end = if (row.offset_end) |o| (std.math.cast(u64, o) orelse return error.ValueOutOfRange) else null,
             .strategy = row.strategy,
-            .token_count = if (row.token_count) |tc| @intCast(tc) else null,
+            .token_count = if (row.token_count) |tc| (std.math.cast(u64, tc) orelse return error.ValueOutOfRange) else null,
             .parent_chunk_index = if (row.parent_chunk_index) |pi| std.math.cast(u32, pi) orelse return error.ValueOutOfRange else null,
             .metadata_json = row.metadata_json,
         });
@@ -872,7 +875,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try collections_sqlite.upsertDocumentVector(db, .{
             .workspace_id = row.workspace_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .dim = std.math.cast(u32, row.dim) orelse return error.ValueOutOfRange,
             .embedding_blob = row.embedding_blob,
         });
@@ -882,7 +885,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try collections_sqlite.upsertChunkVector(db, .{
             .workspace_id = row.workspace_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .chunk_index = if (row.chunk_index) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else return error.ValueOutOfRange,
             .dim = std.math.cast(u32, row.dim) orelse return error.ValueOutOfRange,
             .embedding_blob = row.embedding_blob,
@@ -899,7 +902,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .workspace_id = row.workspace_id,
             .collection_id = row.collection_id,
             .target_kind = target_kind,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .chunk_index = chunk_index_opt,
             .ontology_id = row.ontology_id,
             .namespace = row.namespace,
@@ -924,7 +927,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         const old_entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange;
         const external_id = row.external_id orelse try bundleEntityExternalId(allocator, row.workspace_id, old_entity_id);
         defer if (row.external_id == null) allocator.free(external_id);
-        const new_entity_id = try collections_sqlite.upsertEntityRawAuto(db, .{
+        const spec = collections_sqlite.EntityRawAutoSpec{
             .workspace_id = row.workspace_id,
             .ontology_id = row.ontology_id,
             .external_id = external_id,
@@ -932,9 +935,15 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .name = row.name,
             .confidence = row.confidence,
             .metadata_json = row.metadata_json,
-        });
-        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_entity_id);
-        try entity_id_map.put(map_key, new_entity_id);
+        };
+        // Rows that carry an explicit external_id must resolve through it
+        // only: the natural-key fallback silently merged distinct entities
+        // (legal duplicates from pre-UNIQUE exports) and rewired relations.
+        const new_entity_id = if (row.external_id != null)
+            try collections_sqlite.upsertEntityRawByExternalIdStrict(db, spec)
+        else
+            try collections_sqlite.upsertEntityRawAuto(db, spec);
+        try putRawIdMapping(allocator, &entity_id_map, row.workspace_id, old_entity_id, new_entity_id);
     }
 
     for (bundle.entity_aliases_raw) |row| {
@@ -965,8 +974,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .confidence = row.confidence,
             .metadata_json = row.metadata_json,
         });
-        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_relation_id);
-        try relation_id_map.put(map_key, new_relation_id);
+        try putRawIdMapping(allocator, &relation_id_map, row.workspace_id, old_relation_id, new_relation_id);
     }
 
     for (bundle.relation_properties_raw) |row| {
@@ -979,7 +987,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .value_text = row.value_text,
             .value_number = row.value_number,
             .value_integer = row.value_integer,
-            .ref_doc_id = if (row.ref_doc_id) |v| @intCast(v) else null,
+            .ref_doc_id = if (row.ref_doc_id) |v| (std.math.cast(u64, v) orelse return error.ValueOutOfRange) else null,
             .currency = row.currency,
         });
     }
@@ -990,7 +998,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .workspace_id = row.workspace_id,
             .entity_id = entity_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .role = row.role,
             .confidence = row.confidence,
         });
@@ -1002,7 +1010,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
             .workspace_id = row.workspace_id,
             .entity_id = entity_id,
             .collection_id = row.collection_id,
-            .doc_id = @intCast(row.doc_id),
+            .doc_id = std.math.cast(u64, row.doc_id) orelse return error.ValueOutOfRange,
             .chunk_index = std.math.cast(u32, row.chunk_index) orelse return error.ValueOutOfRange,
             .role = row.role,
             .confidence = row.confidence,
@@ -1012,8 +1020,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.graph_entity) |row| {
         const old_entity_id = std.math.cast(u64, row.entity_id) orelse return error.ValueOutOfRange;
         const new_entity_id = try upsertGraphEntityBundleRow(db, row);
-        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_entity_id);
-        try graph_entity_id_map.put(map_key, new_entity_id);
+        try putRawIdMapping(allocator, &graph_entity_id_map, row.workspace_id, old_entity_id, new_entity_id);
     }
 
     for (bundle.graph_entity_alias) |row| {
@@ -1026,8 +1033,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         const source_id = try lookupRawId(&graph_entity_id_map, row.workspace_id, row.source_id);
         const target_id = try lookupRawId(&graph_entity_id_map, row.workspace_id, row.target_id);
         const new_relation_id = try upsertGraphRelationBundleRow(db, row, source_id, target_id);
-        const map_key = try rawIdMapKey(allocator, row.workspace_id, old_relation_id);
-        try graph_relation_id_map.put(map_key, new_relation_id);
+        try putRawIdMapping(allocator, &graph_relation_id_map, row.workspace_id, old_relation_id, new_relation_id);
     }
 
     for (bundle.graph_relation_property) |row| {
@@ -1048,14 +1054,14 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.document_links_raw) |row| {
         try collections_sqlite.upsertDocumentLinkRaw(db, .{
             .workspace_id = row.workspace_id,
-            .link_id = @intCast(row.link_id),
+            .link_id = std.math.cast(u64, row.link_id) orelse return error.ValueOutOfRange,
             .ontology_id = row.ontology_id,
             .edge_type = row.edge_type,
             .source_collection_id = row.source_collection_id,
-            .source_doc_id = @intCast(row.source_doc_id),
+            .source_doc_id = std.math.cast(u64, row.source_doc_id) orelse return error.ValueOutOfRange,
             .source_chunk_index = if (row.source_chunk_index) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else null,
             .target_collection_id = row.target_collection_id,
-            .target_doc_id = @intCast(row.target_doc_id),
+            .target_doc_id = std.math.cast(u64, row.target_doc_id) orelse return error.ValueOutOfRange,
             .target_chunk_index = if (row.target_chunk_index) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else null,
             .weight = row.weight,
             .source = row.source,
@@ -1066,9 +1072,9 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     for (bundle.external_links_raw) |row| {
         try collections_sqlite.upsertExternalLinkRaw(db, .{
             .workspace_id = row.workspace_id,
-            .link_id = @intCast(row.link_id),
+            .link_id = std.math.cast(u64, row.link_id) orelse return error.ValueOutOfRange,
             .source_collection_id = row.source_collection_id,
-            .source_doc_id = @intCast(row.source_doc_id),
+            .source_doc_id = std.math.cast(u64, row.source_doc_id) orelse return error.ValueOutOfRange,
             .source_chunk_index = if (row.source_chunk_index) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else null,
             .target_uri = row.target_uri,
             .edge_type = row.edge_type,
@@ -1447,6 +1453,18 @@ fn rawIdMapKey(allocator: Allocator, workspace_id: []const u8, id: u64) ![]const
     return try std.fmt.allocPrint(allocator, "{s}:{d}", .{ workspace_id, id });
 }
 
+/// `StringHashMap.put` keeps the pre-existing key when the entry already
+/// exists, so the freshly-duped key would leak on duplicate bundle ids.
+fn putRawIdMapping(allocator: Allocator, map: *std.StringHashMap(u64), workspace_id: []const u8, old_id: u64, new_id: u64) !void {
+    const key = try rawIdMapKey(allocator, workspace_id, old_id);
+    const entry = map.getOrPut(key) catch |err| {
+        allocator.free(key);
+        return err;
+    };
+    if (entry.found_existing) allocator.free(key);
+    entry.value_ptr.* = new_id;
+}
+
 fn lookupRawId(map: *std.StringHashMap(u64), workspace_id: []const u8, old_id: i64) !u64 {
     const id = std.math.cast(u64, old_id) orelse return error.ValueOutOfRange;
     var buf: [256]u8 = undefined;
@@ -1569,7 +1587,7 @@ fn upsertGraphEntityAliasBundleRow(db: Database, row: GraphEntityAliasRow, entit
 }
 
 fn upsertGraphRelationBundleRow(db: Database, row: GraphRelationRow, source_id: u64, target_id: u64) !u64 {
-    if (lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id)) |existing_id| {
+    if (lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id, row.valid_from_unix, row.valid_to_unix)) |existing_id| {
         const update_stmt = try facet_sqlite.prepare(db,
             \\UPDATE graph_relation SET
             \\  valid_from_unix = ?1,
@@ -1620,10 +1638,46 @@ fn upsertGraphRelationBundleRow(db: Database, row: GraphRelationRow, source_id: 
     try facet_sqlite.bindInt64(stmt, 12, row.created_at_unix);
     try facet_sqlite.stepDone(stmt);
 
-    return try lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id);
+    return try lookupGraphRelationId(db, row.workspace_id, row.relation_type, source_id, target_id, row.valid_from_unix, row.valid_to_unix);
 }
 
-fn lookupGraphRelationId(db: Database, workspace_id: []const u8, relation_type: []const u8, source_id: u64, target_id: u64) !u64 {
+/// Temporal multi-edges (same type/source/target with distinct validity
+/// windows) are legal, so the match key includes the validity window; the
+/// old (type, source, target) match collapsed them into one row on import.
+/// Bundles without a validity window (both fields null) fall back to the
+/// legacy any-window match for backward compatibility.
+fn lookupGraphRelationId(
+    db: Database,
+    workspace_id: []const u8,
+    relation_type: []const u8,
+    source_id: u64,
+    target_id: u64,
+    valid_from_unix: ?i64,
+    valid_to_unix: ?i64,
+) !u64 {
+    {
+        const stmt = try facet_sqlite.prepare(db,
+            \\SELECT relation_id FROM graph_relation
+            \\WHERE workspace_id = ?1 AND relation_type = ?2 AND source_id = ?3 AND target_id = ?4
+            \\  AND valid_from_unix IS ?5 AND valid_to_unix IS ?6
+            \\ORDER BY relation_id DESC LIMIT 1
+        );
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, workspace_id);
+        try facet_sqlite.bindText(stmt, 2, relation_type);
+        try facet_sqlite.bindInt64(stmt, 3, @as(i64, @intCast(source_id)));
+        try facet_sqlite.bindInt64(stmt, 4, @as(i64, @intCast(target_id)));
+        try bindMaybeInt(stmt, 5, valid_from_unix);
+        try bindMaybeInt(stmt, 6, valid_to_unix);
+        const status = c.sqlite3_step(stmt);
+        if (status == c.SQLITE_ROW) return std.math.cast(u64, c.sqlite3_column_int64(stmt, 0)) orelse error.ValueOutOfRange;
+        if (status != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    // Legacy fallback: rows without any validity window keep matching an
+    // existing edge regardless of its window (pre-window import behavior).
+    if (valid_from_unix != null or valid_to_unix != null) return error.MissingRow;
+
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT relation_id FROM graph_relation
         \\WHERE workspace_id = ?1 AND relation_type = ?2 AND source_id = ?3 AND target_id = ?4
@@ -3342,6 +3396,53 @@ test "export+import bundle round-trips workspace, collection, raw rows" {
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_artifacts WHERE artifact_kind = 'analysis_plan' AND workspace_id = 'ws_round' AND scope = 'ws_round:production:round_scoped'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'live_answer_view__round'"));
     try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM mindbrain_answer_events WHERE artifact_id = 'analysis_plan__round_scoped'"));
+}
+
+test "bundle import preserves temporal multi-edges on graph_relation" {
+    var source = try Database.openInMemory();
+    defer source.close();
+    try source.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(source, .{ .workspace_id = "ws_temporal" });
+
+    // Two POSSEDE edges between the same endpoints with distinct validity
+    // windows: legal ownership history that the import must not collapse.
+    try source.exec(
+        \\INSERT INTO graph_entity(workspace_id, entity_type, name, confidence, metadata_json, created_at_unix)
+        \\VALUES ('ws_temporal', 'contact', 'Alice', 1.0, '{}', 0),
+        \\       ('ws_temporal', 'bien', 'Maison', 1.0, '{}', 0);
+        \\INSERT INTO graph_relation(workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, metadata_json, created_at_unix)
+        \\SELECT 'ws_temporal', 'POSSEDE', a.entity_id, b.entity_id, 1577836800, 1717200000, 1.0, '{"phase":"past"}', 0
+        \\FROM graph_entity a, graph_entity b
+        \\WHERE a.name = 'Alice' AND b.name = 'Maison';
+        \\INSERT INTO graph_relation(workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, metadata_json, created_at_unix)
+        \\SELECT 'ws_temporal', 'POSSEDE', a.entity_id, b.entity_id, 1717200000, NULL, 1.0, '{"phase":"current"}', 0
+        \\FROM graph_entity a, graph_entity b
+        \\WHERE a.name = 'Alice' AND b.name = 'Maison';
+    );
+
+    const bundle = try exportToJson(std.testing.allocator, source, .{ .workspace = "ws_temporal" });
+    defer std.testing.allocator.free(bundle);
+
+    var dest = try Database.openInMemory();
+    defer dest.close();
+    try dest.applyStandaloneSchema();
+    try importBundleJson(dest, std.testing.allocator, bundle);
+
+    const Counts = struct {
+        fn one(d: Database, sql_count: []const u8) !i64 {
+            const count_stmt = try facet_sqlite.prepare(d, sql_count);
+            defer facet_sqlite.finalize(count_stmt);
+            try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
+            return c.sqlite3_column_int64(count_stmt, 0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 2), try Counts.one(dest, "SELECT COUNT(*) FROM graph_relation WHERE workspace_id = 'ws_temporal'"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM graph_relation WHERE workspace_id = 'ws_temporal' AND valid_to_unix IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try Counts.one(dest, "SELECT COUNT(*) FROM graph_relation WHERE workspace_id = 'ws_temporal' AND valid_to_unix = 1717200000"));
+
+    // Re-importing the same bundle must stay idempotent (exact window match).
+    try importBundleJson(dest, std.testing.allocator, bundle);
+    try std.testing.expectEqual(@as(i64, 2), try Counts.one(dest, "SELECT COUNT(*) FROM graph_relation WHERE workspace_id = 'ws_temporal'"));
 }
 
 test "backup import does not synthesize an auto default ontology" {

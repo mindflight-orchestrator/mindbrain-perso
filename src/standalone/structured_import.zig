@@ -221,16 +221,23 @@ pub fn readTableFile(allocator: std.mem.Allocator, path: []const u8) !CsvTable {
 }
 
 fn cloneCsvTable(allocator: std.mem.Allocator, source: CsvTable) !CsvTable {
+    // errdefers below only free the filled prefix: iterating the whole
+    // freshly-alloc'd (undefined) array on an early failure was UB.
     const headers = try allocator.alloc([]const u8, source.headers.len);
+    var headers_filled: usize = 0;
     errdefer {
-        for (headers) |h| allocator.free(h);
+        for (headers[0..headers_filled]) |h| allocator.free(h);
         allocator.free(headers);
     }
-    for (source.headers, 0..) |header, idx| headers[idx] = try allocator.dupe(u8, header);
+    for (source.headers, 0..) |header, idx| {
+        headers[idx] = try allocator.dupe(u8, header);
+        headers_filled = idx + 1;
+    }
 
     const rows = try allocator.alloc([]const []const u8, source.rows.len);
+    var rows_filled: usize = 0;
     errdefer {
-        for (rows) |row| {
+        for (rows[0..rows_filled]) |row| {
             for (row) |cell| allocator.free(cell);
             allocator.free(row);
         }
@@ -238,8 +245,17 @@ fn cloneCsvTable(allocator: std.mem.Allocator, source: CsvTable) !CsvTable {
     }
     for (source.rows, 0..) |source_row, row_idx| {
         const row = try allocator.alloc([]const u8, source_row.len);
-        for (source_row, 0..) |cell, col_idx| row[col_idx] = try allocator.dupe(u8, cell);
+        var cells_filled: usize = 0;
+        errdefer {
+            for (row[0..cells_filled]) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
+        for (source_row, 0..) |cell, col_idx| {
+            row[col_idx] = try allocator.dupe(u8, cell);
+            cells_filled = col_idx + 1;
+        }
         rows[row_idx] = row;
+        rows_filled = row_idx + 1;
     }
     return .{ .headers = headers, .rows = rows };
 }
@@ -348,19 +364,24 @@ fn csvTableFromHeadersRowsObject(allocator: std.mem.Allocator, value: std.json.V
     const rows_val = value.object.get("rows") orelse return error.InvalidJsonTable;
     if (headers_val != .array or rows_val != .array) return error.InvalidJsonTable;
 
+    // errdefers only free the filled prefix: on malformed input the fill
+    // loops bail early and the tail of these arrays is still undefined.
     const headers = try allocator.alloc([]const u8, headers_val.array.items.len);
+    var headers_filled: usize = 0;
     errdefer {
-        for (headers) |h| allocator.free(h);
+        for (headers[0..headers_filled]) |h| allocator.free(h);
         allocator.free(headers);
     }
     for (headers_val.array.items, 0..) |header, idx| {
         if (header != .string) return error.InvalidJsonTable;
         headers[idx] = try allocator.dupe(u8, header.string);
+        headers_filled = idx + 1;
     }
 
     const rows = try allocator.alloc([]const []const u8, rows_val.array.items.len);
+    var rows_filled: usize = 0;
     errdefer {
-        for (rows) |row| {
+        for (rows[0..rows_filled]) |row| {
             for (row) |cell| allocator.free(cell);
             allocator.free(row);
         }
@@ -369,12 +390,18 @@ fn csvTableFromHeadersRowsObject(allocator: std.mem.Allocator, value: std.json.V
     for (rows_val.array.items, 0..) |row_val, row_idx| {
         if (row_val != .array) return error.InvalidJsonTable;
         const row = try allocator.alloc([]const u8, headers.len);
-        errdefer allocator.free(row);
+        var cells_filled: usize = 0;
+        errdefer {
+            for (row[0..cells_filled]) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
         for (0..headers.len) |col_idx| {
             const cell_val = if (col_idx < row_val.array.items.len) row_val.array.items[col_idx] else std.json.Value{ .string = "" };
             row[col_idx] = try jsonScalarToString(allocator, cell_val);
+            cells_filled = col_idx + 1;
         }
         rows[row_idx] = row;
+        rows_filled = row_idx + 1;
     }
     return .{ .headers = headers, .rows = rows };
 }
@@ -385,16 +412,23 @@ fn csvTableFromJsonRows(allocator: std.mem.Allocator, rows_value: []const std.js
         else => return error.InvalidJsonTable,
     };
     const header_keys = first_obj.keys();
+    // errdefers only free the filled prefix: on malformed input the fill
+    // loops bail early and the tail of these arrays is still undefined.
     const headers = try allocator.alloc([]const u8, header_keys.len);
+    var headers_filled: usize = 0;
     errdefer {
-        for (headers) |h| allocator.free(h);
+        for (headers[0..headers_filled]) |h| allocator.free(h);
         allocator.free(headers);
     }
-    for (header_keys, 0..) |key, idx| headers[idx] = try allocator.dupe(u8, key);
+    for (header_keys, 0..) |key, idx| {
+        headers[idx] = try allocator.dupe(u8, key);
+        headers_filled = idx + 1;
+    }
 
     const rows = try allocator.alloc([]const []const u8, rows_value.len);
+    var rows_filled: usize = 0;
     errdefer {
-        for (rows) |row| {
+        for (rows[0..rows_filled]) |row| {
             for (row) |cell| allocator.free(cell);
             allocator.free(row);
         }
@@ -406,12 +440,18 @@ fn csvTableFromJsonRows(allocator: std.mem.Allocator, rows_value: []const std.js
             else => return error.InvalidJsonTable,
         };
         const row = try allocator.alloc([]const u8, headers.len);
-        errdefer allocator.free(row);
+        var cells_filled: usize = 0;
+        errdefer {
+            for (row[0..cells_filled]) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
         for (headers, 0..) |header, col_idx| {
             const cell_val = row_obj.get(header) orelse std.json.Value{ .string = "" };
             row[col_idx] = try jsonScalarToString(allocator, cell_val);
+            cells_filled = col_idx + 1;
         }
         rows[row_idx] = row;
+        rows_filled = row_idx + 1;
     }
     return .{ .headers = headers, .rows = rows };
 }
@@ -458,16 +498,23 @@ fn csvTableFromToonRows(allocator: std.mem.Allocator, rows_value: []const ztoon.
         .object => |items| items,
         else => return error.InvalidToonTable,
     };
+    // errdefers only free the filled prefix: on malformed input the fill
+    // loops bail early and the tail of these arrays is still undefined.
     const headers = try allocator.alloc([]const u8, first_row.len);
+    var headers_filled: usize = 0;
     errdefer {
-        for (headers) |header| allocator.free(header);
+        for (headers[0..headers_filled]) |header| allocator.free(header);
         allocator.free(headers);
     }
-    for (first_row, 0..) |field, idx| headers[idx] = try allocator.dupe(u8, field.key);
+    for (first_row, 0..) |field, idx| {
+        headers[idx] = try allocator.dupe(u8, field.key);
+        headers_filled = idx + 1;
+    }
 
     var rows = try allocator.alloc([]const []const u8, rows_value.len);
+    var rows_filled: usize = 0;
     errdefer {
-        for (rows) |row| {
+        for (rows[0..rows_filled]) |row| {
             for (row) |cell| allocator.free(cell);
             allocator.free(row);
         }
@@ -479,19 +526,25 @@ fn csvTableFromToonRows(allocator: std.mem.Allocator, rows_value: []const ztoon.
             else => return error.InvalidToonTable,
         };
         const row = try allocator.alloc([]const u8, headers.len);
-        errdefer allocator.free(row);
+        var cells_filled: usize = 0;
+        errdefer {
+            for (row[0..cells_filled]) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
         for (headers, 0..) |header, col_idx| {
-            var cell_text: []const u8 = try allocator.dupe(u8, "");
-            for (row_fields) |field| {
-                if (std.mem.eql(u8, field.key, header)) {
-                    allocator.free(cell_text);
-                    cell_text = try scalarToString(allocator, field.value);
-                    break;
+            const cell_text: []const u8 = blk: {
+                for (row_fields) |field| {
+                    if (std.mem.eql(u8, field.key, header)) {
+                        break :blk try scalarToString(allocator, field.value);
+                    }
                 }
-            }
+                break :blk try allocator.dupe(u8, "");
+            };
             row[col_idx] = cell_text;
+            cells_filled = col_idx + 1;
         }
         rows[row_idx] = row;
+        rows_filled = row_idx + 1;
     }
     return .{ .headers = headers, .rows = rows };
 }
@@ -809,7 +862,11 @@ pub fn validateBundleWithOptions(allocator: std.mem.Allocator, opts: ValidateBun
         defer facets.deinit(allocator);
 
         var seen = std.StringHashMap(void).init(allocator);
-        defer seen.deinit();
+        defer {
+            var seen_keys = seen.keyIterator();
+            while (seen_keys.next()) |key| allocator.free(key.*);
+            seen.deinit();
+        }
         for (facets.rows, 0..) |_, row_idx| {
             const source_ref = facets.cell(row_idx, "source_ref") orelse {
                 try errors.append(allocator, try std.fmt.allocPrint(allocator, "facets row {d}: missing source_ref", .{row_idx + 1}));
@@ -868,11 +925,18 @@ pub const ApplyOptions = struct {
 };
 
 const ApplyBatch = struct {
+    allocator: std.mem.Allocator,
     fact_exists_stmt: *facet_sqlite.c.sqlite3_stmt,
     provenance_stmt: *facet_sqlite.c.sqlite3_stmt,
     relation_exists_stmt: *facet_sqlite.c.sqlite3_stmt,
+    /// Prepared statements for the per-row entity/relation auto-upserts;
+    /// re-preparing them for every row dominated bulk import time.
+    graph_cache: collections_sqlite.RawGraphUpsertCache,
+    /// local_type -> table_semantics table_id (null when unregistered);
+    /// avoids one table_semantics probe per import_ready row.
+    table_id_cache: std.StringHashMap(?u64),
 
-    fn init(db: facet_sqlite.Database) !ApplyBatch {
+    fn init(allocator: std.mem.Allocator, db: facet_sqlite.Database) !ApplyBatch {
         const fact_exists_stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM agent_facts WHERE workspace_id = ?1 AND source_ref = ?2 LIMIT 1");
         errdefer facet_sqlite.finalize(fact_exists_stmt);
         const provenance_stmt = try facet_sqlite.prepare(db,
@@ -883,17 +947,38 @@ const ApplyBatch = struct {
         );
         errdefer facet_sqlite.finalize(provenance_stmt);
         const relation_exists_stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM relations_raw WHERE workspace_id = ?1 AND external_id = ?2 LIMIT 1");
+        errdefer facet_sqlite.finalize(relation_exists_stmt);
+        const graph_cache = try collections_sqlite.RawGraphUpsertCache.init(db);
         return .{
+            .allocator = allocator,
             .fact_exists_stmt = fact_exists_stmt,
             .provenance_stmt = provenance_stmt,
             .relation_exists_stmt = relation_exists_stmt,
+            .graph_cache = graph_cache,
+            .table_id_cache = std.StringHashMap(?u64).init(allocator),
         };
     }
 
-    fn deinit(self: ApplyBatch) void {
+    fn deinit(self: *ApplyBatch) void {
         facet_sqlite.finalize(self.fact_exists_stmt);
         facet_sqlite.finalize(self.provenance_stmt);
         facet_sqlite.finalize(self.relation_exists_stmt);
+        self.graph_cache.deinit();
+        var keys = self.table_id_cache.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.table_id_cache.deinit();
+    }
+
+    fn lookupTableIdCached(self: *ApplyBatch, db: facet_sqlite.Database, workspace_id: []const u8, source_ref: []const u8) !?u64 {
+        const local_type = entityLocalTypeFromSourceRef(source_ref) orelse return null;
+        if (self.table_id_cache.get(local_type)) |cached| return cached;
+        const resolved = workspace_sqlite.lookupTableId(db, workspace_id, "structured", local_type) catch null;
+        const key = try self.allocator.dupe(u8, local_type);
+        self.table_id_cache.put(key, resolved) catch |err| {
+            self.allocator.free(key);
+            return err;
+        };
+        return resolved;
     }
 
     fn factExistsBySourceRef(self: *ApplyBatch, workspace_id: []const u8, source_ref: []const u8) bool {
@@ -959,6 +1044,10 @@ fn applyFacetRecord(
 
     const facets_json = try normalizeFacetsJsonSource(allocator, record.facets_json_raw, effective.source_tag);
     defer allocator.free(facets_json);
+    // Parse the normalized facets once per row; edge derivation and the two
+    // metadata merges below re-parsed the same JSON up to three times.
+    var facets_parsed = try std.json.parseFromSlice(std.json.Value, allocator, facets_json, .{});
+    defer facets_parsed.deinit();
 
     const stable_id = try stableFactId(allocator, workspace_id, record.source_ref);
     defer allocator.free(stable_id);
@@ -979,9 +1068,9 @@ fn applyFacetRecord(
 
     const entity_type = try entityTypeFromSourceRef(allocator, workspace_id, record.source_ref);
     defer allocator.free(entity_type);
-    const entity_metadata = try mergeImportMetadata(allocator, facets_json, effective.source_tag, record.source_ref, null);
+    const entity_metadata = try mergeImportMetadataFromValue(allocator, facets_parsed.value, effective.source_tag, record.source_ref, null);
     defer allocator.free(entity_metadata);
-    _ = try collections_sqlite.upsertEntityRawAuto(db, .{
+    const entity_spec = collections_sqlite.EntityRawAutoSpec{
         .workspace_id = workspace_id,
         .ontology_id = effective.ontology_id,
         .external_id = record.source_ref,
@@ -989,7 +1078,11 @@ fn applyFacetRecord(
         .name = record.content,
         .confidence = 0.9,
         .metadata_json = entity_metadata,
-    });
+    };
+    _ = if (batch) |b|
+        try collections_sqlite.upsertEntityRawAutoCached(db, &b.graph_cache, entity_spec)
+    else
+        try collections_sqlite.upsertEntityRawAuto(db, entity_spec);
     report.entities_upserted += 1;
 
     if (effective.edges_mode != .provided) {
@@ -998,7 +1091,7 @@ fn applyFacetRecord(
             .ontology_id = effective.ontology_id,
             .source_tag = effective.source_tag,
             .source_ref = record.source_ref,
-            .facets_json = facets_json,
+            .facets_value = facets_parsed.value,
             .contract_relations = contract_relations,
             .mode = effective.mode,
             .batch = batch,
@@ -1009,7 +1102,10 @@ fn applyFacetRecord(
 
     const fingerprint = try rowFingerprint(allocator, record.source_ref, facets_json);
     defer allocator.free(fingerprint);
-    const table_id = record.table_id orelse lookupTableIdForSourceRef(db, workspace_id, record.source_ref);
+    const table_id = record.table_id orelse if (batch) |b|
+        try b.lookupTableIdCached(db, workspace_id, record.source_ref)
+    else
+        lookupTableIdForSourceRef(db, workspace_id, record.source_ref);
     if (effective.require_semantics and table_id == null) {
         const local_type = entityLocalTypeFromSourceRef(record.source_ref) orelse "unknown";
         std.log.err("missing table_semantics for entity '{s}' (source_ref={s}); run register-semantics before apply", .{ local_type, record.source_ref });
@@ -1036,7 +1132,18 @@ const TableSemanticsRow = struct {
 };
 
 fn wsTableName(allocator: std.mem.Allocator, entity_name: []const u8) ![]const u8 {
+    // The result is spliced into `SELECT * FROM {s}`; entity names come from
+    // mapping JSON keys, so refuse anything that is not a plain identifier.
+    if (!isPlainIdentifier(entity_name)) return error.InvalidTableName;
     return try std.fmt.allocPrint(allocator, "ws_{s}", .{entity_name});
+}
+
+fn isPlainIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
 }
 
 fn parseNotesJsonField(allocator: std.mem.Allocator, notes: []const u8, field: []const u8) !?[]const u8 {
@@ -1187,15 +1294,19 @@ fn forEachWsTableRow(
     const col_count: usize = @intCast(facet_sqlite.c.sqlite3_column_count(stmt));
     if (col_count == 0) return error.WsTableEmpty;
 
+    // A single defer over the filled prefix covers both the success and
+    // error paths; the previous errdefer+defer pair double-freed `columns`
+    // whenever a later row failed.
     const columns = try allocator.alloc([]const u8, col_count);
-    errdefer allocator.free(columns);
+    var columns_filled: usize = 0;
+    defer {
+        for (columns[0..columns_filled]) |col| allocator.free(col);
+        allocator.free(columns);
+    }
     for (0..col_count) |idx| {
         const name = facet_sqlite.c.sqlite3_column_name(stmt, @intCast(idx)) orelse return error.StepFailed;
         columns[idx] = try allocator.dupe(u8, std.mem.span(name));
-    }
-    defer {
-        for (columns) |col| allocator.free(col);
-        allocator.free(columns);
+        columns_filled = idx + 1;
     }
 
     var column_index = std.StringHashMap(usize).init(allocator);
@@ -1209,7 +1320,11 @@ fn forEachWsTableRow(
         if (rc == facet_sqlite.c.SQLITE_DONE) break;
         if (rc != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
         const row = try allocator.alloc([]const u8, col_count);
-        errdefer allocator.free(row);
+        var row_filled: usize = 0;
+        defer {
+            for (row[0..row_filled]) |cell| allocator.free(cell);
+            allocator.free(row);
+        }
         for (0..col_count) |idx| {
             const text = blk: {
                 const ptr = facet_sqlite.c.sqlite3_column_text(stmt, @intCast(idx));
@@ -1219,10 +1334,7 @@ fn forEachWsTableRow(
                 break :blk try allocator.dupe(u8, bytes);
             };
             row[idx] = text;
-        }
-        defer {
-            for (row) |cell| allocator.free(cell);
-            allocator.free(row);
+            row_filled = idx + 1;
         }
         try applyWsRow(allocator, ctx, columns, &column_index, row);
     }
@@ -1357,7 +1469,7 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
                 std.log.warn("structured import rollback failed: {s}", .{@errorName(rollback_err)});
             };
         };
-        var batch = try ApplyBatch.init(db);
+        var batch = try ApplyBatch.init(allocator, db);
         defer batch.deinit();
         if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
         const report = try applyFromWsTables(allocator, db, effective, contract_relations, map, &batch);
@@ -1387,7 +1499,7 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
             std.log.warn("structured import rollback failed: {s}", .{@errorName(rollback_err)});
         };
     };
-    var batch = try ApplyBatch.init(db);
+    var batch = try ApplyBatch.init(allocator, db);
     defer batch.deinit();
     if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
 
@@ -1430,7 +1542,8 @@ const DeriveEdgeContext = struct {
     ontology_id: []const u8,
     source_tag: []const u8,
     source_ref: []const u8,
-    facets_json: []const u8,
+    /// Already-parsed facets JSON for the row (owned by the caller).
+    facets_value: std.json.Value,
     contract_relations: []const ContractRelation,
     mode: ImportMode,
     batch: ?*ApplyBatch = null,
@@ -1461,7 +1574,7 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         if (exists) return false;
     }
 
-    const source_id = try collections_sqlite.ensureEntityRawAuto(db, .{
+    const source_spec = collections_sqlite.EntityRawAutoSpec{
         .workspace_id = workspace_id,
         .ontology_id = opts.ontology_id,
         .external_id = source,
@@ -1469,8 +1582,8 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         .name = source,
         .confidence = confidence,
         .metadata_json = metadata,
-    });
-    const target_id = try collections_sqlite.ensureEntityRawAuto(db, .{
+    };
+    const target_spec = collections_sqlite.EntityRawAutoSpec{
         .workspace_id = workspace_id,
         .ontology_id = opts.ontology_id,
         .external_id = target,
@@ -1478,11 +1591,19 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         .name = target,
         .confidence = confidence,
         .metadata_json = metadata,
-    });
+    };
+    const source_id = if (batch) |b|
+        try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, source_spec)
+    else
+        try collections_sqlite.ensureEntityRawAuto(db, source_spec);
+    const target_id = if (batch) |b|
+        try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, target_spec)
+    else
+        try collections_sqlite.ensureEntityRawAuto(db, target_spec);
 
     const edge_ext = try edgeExternalId(allocator, source, label, target);
     defer allocator.free(edge_ext);
-    _ = try collections_sqlite.upsertRelationRawAuto(db, .{
+    const relation_spec = collections_sqlite.RelationRawAutoSpec{
         .workspace_id = workspace_id,
         .ontology_id = opts.ontology_id,
         .external_id = edge_ext,
@@ -1491,23 +1612,25 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         .target_entity_id = target_id,
         .confidence = confidence,
         .metadata_json = metadata,
-    });
+    };
+    _ = if (batch) |b|
+        try collections_sqlite.upsertRelationRawAutoCached(db, &b.graph_cache, relation_spec)
+    else
+        try collections_sqlite.upsertRelationRawAuto(db, relation_spec);
     return true;
 }
 
 fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, ctx: DeriveEdgeContext) !ApplyEdgeOutcome {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, ctx.facets_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return .{};
+    if (ctx.facets_value != .object) return .{};
 
-    const entity_type_value = parsed.value.object.get("entity_type") orelse return .{};
+    const entity_type_value = ctx.facets_value.object.get("entity_type") orelse return .{};
     if (entity_type_value != .string) return .{};
     const current_entity_type = entity_type_value.string;
 
     var out = ApplyEdgeOutcome{};
     for (ctx.contract_relations) |rel| {
         if (!std.mem.eql(u8, rel.target_type, current_entity_type)) continue;
-        const ref_value = parsed.value.object.get(rel.source_ref_column) orelse continue;
+        const ref_value = ctx.facets_value.object.get(rel.source_ref_column) orelse continue;
         if (ref_value != .string or ref_value.string.len == 0) continue;
 
         const source_external = try expandEntityExternalId(allocator, rel.source_type, ref_value.string);
@@ -1515,7 +1638,7 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
         const target_external = try allocator.dupe(u8, ctx.source_ref);
         defer allocator.free(target_external);
 
-        const metadata = try mergeImportMetadata(allocator, ctx.facets_json, ctx.source_tag, source_external, target_external);
+        const metadata = try mergeImportMetadataFromValue(allocator, ctx.facets_value, ctx.source_tag, source_external, target_external);
         defer allocator.free(metadata);
 
         const edge_ext = try edgeExternalId(allocator, source_external, rel.edge_label, target_external);
@@ -1536,7 +1659,7 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
         const target_type = try entityTypeFromSourceRef(allocator, ctx.workspace_id, target_external);
         defer allocator.free(target_type);
 
-        const source_id = try collections_sqlite.ensureEntityRawAuto(db, .{
+        const source_spec = collections_sqlite.EntityRawAutoSpec{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
             .external_id = source_external,
@@ -1544,8 +1667,8 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
             .name = source_external,
             .confidence = 0.85,
             .metadata_json = metadata,
-        });
-        const target_id = try collections_sqlite.ensureEntityRawAuto(db, .{
+        };
+        const target_spec = collections_sqlite.EntityRawAutoSpec{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
             .external_id = target_external,
@@ -1553,8 +1676,16 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
             .name = target_external,
             .confidence = 0.85,
             .metadata_json = metadata,
-        });
-        _ = try collections_sqlite.upsertRelationRawAuto(db, .{
+        };
+        const source_id = if (ctx.batch) |b|
+            try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, source_spec)
+        else
+            try collections_sqlite.ensureEntityRawAuto(db, source_spec);
+        const target_id = if (ctx.batch) |b|
+            try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, target_spec)
+        else
+            try collections_sqlite.ensureEntityRawAuto(db, target_spec);
+        const relation_spec = collections_sqlite.RelationRawAutoSpec{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
             .external_id = edge_ext,
@@ -1563,7 +1694,11 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
             .target_entity_id = target_id,
             .confidence = 0.85,
             .metadata_json = metadata,
-        });
+        };
+        _ = if (ctx.batch) |b|
+            try collections_sqlite.upsertRelationRawAutoCached(db, &b.graph_cache, relation_spec)
+        else
+            try collections_sqlite.upsertRelationRawAuto(db, relation_spec);
         out.inserted += 1;
     }
     return out;
@@ -1634,18 +1769,35 @@ fn mergeImportMetadata(
     target_endpoint: ?[]const u8,
 ) ![]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .ignore_unknown_fields = true }) catch {
-        if (target_endpoint) |target| {
-            return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f},\"target_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}), std.json.fmt(target, .{}) });
-        }
-        return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}) });
+        return fallbackImportMetadata(allocator, tag, source_endpoint, target_endpoint);
     };
     defer parsed.deinit();
+    return mergeImportMetadataFromValue(allocator, parsed.value, tag, source_endpoint, target_endpoint);
+}
 
-    if (parsed.value != .object) {
-        if (target_endpoint) |target| {
-            return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f},\"target_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}), std.json.fmt(target, .{}) });
-        }
-        return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}) });
+fn fallbackImportMetadata(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    source_endpoint: []const u8,
+    target_endpoint: ?[]const u8,
+) ![]const u8 {
+    if (target_endpoint) |target| {
+        return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f},\"target_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}), std.json.fmt(target, .{}) });
+    }
+    return try std.fmt.allocPrint(allocator, "{{\"source\":{f},\"source_endpoint\":{f}}}", .{ std.json.fmt(tag, .{}), std.json.fmt(source_endpoint, .{}) });
+}
+
+/// Same as `mergeImportMetadata` but reuses an already-parsed JSON value so
+/// hot import paths only parse each row's facets once.
+fn mergeImportMetadataFromValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    tag: []const u8,
+    source_endpoint: []const u8,
+    target_endpoint: ?[]const u8,
+) ![]const u8 {
+    if (value != .object) {
+        return fallbackImportMetadata(allocator, tag, source_endpoint, target_endpoint);
     }
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
@@ -1659,14 +1811,14 @@ fn mergeImportMetadata(
         try buf.writer.writeAll(",\"target_endpoint\":");
         try buf.writer.print("{f}", .{std.json.fmt(target, .{})});
     }
-    for (parsed.value.object.keys()) |key| {
+    for (value.object.keys()) |key| {
         if (std.mem.eql(u8, key, "source")) continue;
         if (std.mem.eql(u8, key, "source_endpoint")) continue;
         if (std.mem.eql(u8, key, "target_endpoint")) continue;
-        const value = parsed.value.object.get(key) orelse continue;
+        const entry = value.object.get(key) orelse continue;
         try buf.writer.writeAll(",");
         try buf.writer.print("\"{s}\":", .{key});
-        try buf.writer.print("{f}", .{std.json.fmt(value, .{})});
+        try buf.writer.print("{f}", .{std.json.fmt(entry, .{})});
     }
     try buf.writer.writeAll("}");
     return buf.toOwnedSlice();
@@ -2185,6 +2337,42 @@ test "csvTableFromToonRoot reads tabular toon" {
     try std.testing.expectEqualStrings("Ari", table.cell(0, "name").?);
     try std.testing.expectEqualStrings("true", table.cell(0, "active").?);
     try std.testing.expectEqualStrings("false", table.cell(1, "active").?);
+}
+
+test "malformed json table inputs fail cleanly without corrupting memory" {
+    // Header list containing a non-string entry: the fill loop bails early
+    // and the errdefer must only free the filled prefix.
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+            \\{"tables":{"t":{"headers":["a",1,"b"],"rows":[["x","y","z"]]}}}
+        , .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidJsonTable, tabularBundleFromJsonRoot(std.testing.allocator, parsed.value));
+    }
+    // Row cell of an unsupported type: bails mid-row.
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+            \\[{"a":"1","b":{"nested":true}},{"a":"2","b":"ok"}]
+        , .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.UnsupportedJsonCell, tabularBundleFromJsonRoot(std.testing.allocator, parsed.value));
+    }
+    // Non-array row after a valid one: bails after some rows are filled.
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+            \\{"tables":{"t":{"headers":["a","b"],"rows":[["x","y"],"not-a-row"]}}}
+        , .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidJsonTable, tabularBundleFromJsonRoot(std.testing.allocator, parsed.value));
+    }
+}
+
+test "wsTableName rejects non-identifier entity names" {
+    try std.testing.expectError(error.InvalidTableName, wsTableName(std.testing.allocator, "lot; DROP TABLE x"));
+    try std.testing.expectError(error.InvalidTableName, wsTableName(std.testing.allocator, ""));
+    const ok = try wsTableName(std.testing.allocator, "lot_2");
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("ws_lot_2", ok);
 }
 
 fn countRows(db: facet_sqlite.Database, sql: []const u8) !u64 {

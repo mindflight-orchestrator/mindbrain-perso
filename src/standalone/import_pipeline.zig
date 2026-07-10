@@ -81,6 +81,53 @@ pub const Pipeline = struct {
     /// merge rewrites each posting blob once per document touching it.
     defer_facet_merges: bool = false,
 
+    // ---- Memoized scaffolding state ---------------------------------------
+    // ingestDocumentChunked used to re-ensure workspace/collection/ontology
+    // rows on every call (~30 no-op statements per document). Remember what
+    // was last ensured; setActiveCollection invalidates the memo. Fixed
+    // buffers keep Pipeline free of owned allocations (it has no deinit);
+    // ids longer than the buffers simply skip memoization.
+    ensured_workspace_buf: [128]u8 = undefined,
+    ensured_workspace_len: usize = 0,
+    ensured_collection_buf: [192]u8 = undefined,
+    ensured_collection_len: usize = 0,
+    ensured_ontology_buf: [256]u8 = undefined,
+    ensured_ontology_len: usize = 0,
+
+    fn scaffoldEnsured(self: *const Pipeline, workspace_id: []const u8, collection_id: []const u8) bool {
+        return self.ensured_workspace_len > 0 and
+            std.mem.eql(u8, self.ensured_workspace_buf[0..self.ensured_workspace_len], workspace_id) and
+            self.ensured_collection_len > 0 and
+            std.mem.eql(u8, self.ensured_collection_buf[0..self.ensured_collection_len], collection_id);
+    }
+
+    fn rememberScaffold(self: *Pipeline, workspace_id: []const u8, collection_id: []const u8) void {
+        // A new scaffold invalidates the ontology memo (it belongs to the
+        // previously ensured workspace).
+        self.ensured_ontology_len = 0;
+        if (workspace_id.len > self.ensured_workspace_buf.len) return;
+        if (collection_id.len > self.ensured_collection_buf.len) return;
+        @memcpy(self.ensured_workspace_buf[0..workspace_id.len], workspace_id);
+        self.ensured_workspace_len = workspace_id.len;
+        @memcpy(self.ensured_collection_buf[0..collection_id.len], collection_id);
+        self.ensured_collection_len = collection_id.len;
+    }
+
+    fn rememberOntology(self: *Pipeline, ontology_id: []const u8) void {
+        if (ontology_id.len > self.ensured_ontology_buf.len) {
+            self.ensured_ontology_len = 0;
+            return;
+        }
+        @memcpy(self.ensured_ontology_buf[0..ontology_id.len], ontology_id);
+        self.ensured_ontology_len = ontology_id.len;
+    }
+
+    fn invalidateScaffoldMemo(self: *Pipeline) void {
+        self.ensured_workspace_len = 0;
+        self.ensured_collection_len = 0;
+        self.ensured_ontology_len = 0;
+    }
+
     // ---- Legacy registration / ingest (unchanged signatures) -------------
 
     pub fn registerFacetTable(self: *Pipeline, registration: FacetRegistration) !void {
@@ -99,6 +146,18 @@ pub const Pipeline = struct {
     }
 
     pub fn ingestDocument(self: *Pipeline, document: DocumentImport) !void {
+        // Search, facet, and raw-mirror writes are dependent; a savepoint
+        // keeps them atomic (and avoids one autocommit fsync per statement)
+        // whether or not the caller already opened a transaction.
+        try self.db.exec("SAVEPOINT pipeline_ingest_document");
+        errdefer {
+            self.db.exec("ROLLBACK TO SAVEPOINT pipeline_ingest_document") catch |rollback_err| {
+                std.log.warn("ingestDocument savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+            self.db.exec("RELEASE SAVEPOINT pipeline_ingest_document") catch |release_err| {
+                std.log.warn("ingestDocument savepoint release failed: {s}", .{@errorName(release_err)});
+            };
+        }
         try self.search.upsertDocument(.{
             .table_id = document.table_id,
             .doc_id = document.doc_id,
@@ -139,6 +198,7 @@ pub const Pipeline = struct {
                 });
             }
         };
+        try self.db.exec("RELEASE SAVEPOINT pipeline_ingest_document");
     }
 
     pub fn upsertEntity(self: *Pipeline, entity: EntityImport) !void {
@@ -207,6 +267,7 @@ pub const Pipeline = struct {
     pub fn setActiveCollection(self: *Pipeline, workspace_id: []const u8, collection_id: []const u8) void {
         self.workspace_id = workspace_id;
         self.collection_id = collection_id;
+        self.invalidateScaffoldMemo();
     }
 
     // ---- Raw-first ingest ------------------------------------------------
@@ -262,9 +323,22 @@ pub const Pipeline = struct {
     }
 
     pub fn upsertEntityFull(self: *Pipeline, spec: collections_sqlite.EntityRawSpec) !void {
+        // Raw + derived writes must land together (same pattern as
+        // addRelationProperty); a crash in between left the graph runtime
+        // out of sync with entities_raw.
+        try self.db.exec("SAVEPOINT pipeline_upsert_entity");
+        errdefer {
+            self.db.exec("ROLLBACK TO SAVEPOINT pipeline_upsert_entity") catch |rollback_err| {
+                std.log.warn("upsertEntityFull savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+            self.db.exec("RELEASE SAVEPOINT pipeline_upsert_entity") catch |release_err| {
+                std.log.warn("upsertEntityFull savepoint release failed: {s}", .{@errorName(release_err)});
+            };
+        }
         try collections_sqlite.upsertEntityRaw(self.db.*, spec);
         const eid32: u32 = std.math.cast(u32, spec.entity_id) orelse return error.ValueOutOfRange;
         try graph_sqlite.upsertEntityFull(self.db.*, eid32, spec.workspace_id, spec.entity_type, spec.name, @floatCast(spec.confidence), spec.metadata_json);
+        try self.db.exec("RELEASE SAVEPOINT pipeline_upsert_entity");
     }
 
     pub fn upsertEntityAlias(self: *Pipeline, spec: collections_sqlite.EntityAliasRawSpec) !void {
@@ -272,6 +346,17 @@ pub const Pipeline = struct {
     }
 
     pub fn addRelationFull(self: *Pipeline, spec: collections_sqlite.RelationRawSpec) !void {
+        // Raw row, derived relation, and both adjacency blobs must land
+        // together (same pattern as addRelationProperty).
+        try self.db.exec("SAVEPOINT pipeline_add_relation");
+        errdefer {
+            self.db.exec("ROLLBACK TO SAVEPOINT pipeline_add_relation") catch |rollback_err| {
+                std.log.warn("addRelationFull savepoint rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+            self.db.exec("RELEASE SAVEPOINT pipeline_add_relation") catch |release_err| {
+                std.log.warn("addRelationFull savepoint release failed: {s}", .{@errorName(release_err)});
+            };
+        }
         try collections_sqlite.upsertRelationRaw(self.db.*, spec);
         const rid: u32 = std.math.cast(u32, spec.relation_id) orelse return error.ValueOutOfRange;
         const src: u32 = std.math.cast(u32, spec.source_entity_id) orelse return error.ValueOutOfRange;
@@ -292,6 +377,7 @@ pub const Pipeline = struct {
         try self.graph.appendIncoming(tgt, rid);
         try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_out", src, rid, self.allocator);
         try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_in", tgt, rid, self.allocator);
+        try self.db.exec("RELEASE SAVEPOINT pipeline_add_relation");
     }
 
     /// Persists a single typed edge property into the raw staging table and
@@ -425,13 +511,17 @@ pub const Pipeline = struct {
 
         // documents_raw references workspaces and collections; materialize
         // the parents so a first ingest into a fresh database succeeds.
-        try collections_sqlite.ensureWorkspace(self.db.*, .{ .workspace_id = opts.workspace_id });
-        try collections_sqlite.ensureCollection(self.db.*, .{
-            .workspace_id = opts.workspace_id,
-            .collection_id = opts.collection_id,
-            .name = opts.collection_id,
-            .default_language = opts.language,
-        });
+        // Skipped when the previous ingest already ensured the same pair.
+        const scaffold_cached = self.scaffoldEnsured(opts.workspace_id, opts.collection_id);
+        if (!scaffold_cached) {
+            try collections_sqlite.ensureWorkspace(self.db.*, .{ .workspace_id = opts.workspace_id });
+            try collections_sqlite.ensureCollection(self.db.*, .{
+                .workspace_id = opts.workspace_id,
+                .collection_id = opts.collection_id,
+                .name = opts.collection_id,
+                .default_language = opts.language,
+            });
+        }
 
         try collections_sqlite.upsertDocumentRaw(self.db.*, .{
             .workspace_id = opts.workspace_id,
@@ -445,7 +535,14 @@ pub const Pipeline = struct {
 
         var owned_ontology: ?[]const u8 = null;
         defer if (owned_ontology) |o| self.allocator.free(o);
-        const ontology_id: []const u8 = if (opts.ontology_id) |o| o else blk: {
+        const ontology_id: []const u8 = if (opts.ontology_id) |o|
+            o
+        else if (scaffold_cached and self.ensured_ontology_len > 0)
+            // Same workspace as the previous ingest: reuse the resolved
+            // default ontology instead of replaying ensureDefaultOntology's
+            // ~20 idempotent statements per document.
+            self.ensured_ontology_buf[0..self.ensured_ontology_len]
+        else blk: {
             owned_ontology = try collections_sqlite.ensureDefaultOntology(
                 self.db.*,
                 self.allocator,
@@ -524,6 +621,11 @@ pub const Pipeline = struct {
 
         try tx.commit();
 
+        // Memoize only after a successful commit: a rolled-back ensure must
+        // not satisfy the next call's scaffold check.
+        if (!scaffold_cached) self.rememberScaffold(opts.workspace_id, opts.collection_id);
+        if (owned_ontology) |resolved| self.rememberOntology(resolved);
+
         const owned_nanoid: []u8 = if (generated_nanoid) |b| blk: {
             generated_nanoid = null;
             break :blk b;
@@ -563,6 +665,12 @@ pub const Pipeline = struct {
         options: ReindexBm25Options,
     ) !ReindexBm25Counts {
         var counts: ReindexBm25Counts = .{ .documents = 0, .chunks = 0 };
+
+        // One transaction for the whole replay, like reindexFacets and
+        // reindexGraph: per-row autocommit meant ~5 fsyncs per document and
+        // left a half-rebuilt index behind if interrupted.
+        var tx = try facet_sqlite.Transaction.begin(self.db.*);
+        defer tx.deinit();
 
         {
             const sql =
@@ -635,6 +743,7 @@ pub const Pipeline = struct {
             }
         }
 
+        try tx.commit();
         return counts;
     }
 
@@ -891,8 +1000,10 @@ pub const Pipeline = struct {
             try graph_sqlite.upsertRelationFull(self.db.*, rid, workspace_id, edge, src, tgt, valid_from_unix, valid_to_unix, confidence, metadata_json);
             try self.graph.appendOutgoing(src, rid);
             try self.graph.appendIncoming(tgt, rid);
-            try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_out", src, rid, self.allocator);
-            try graph_sqlite.appendAdjacencyRelation(self.db.*, "graph_lj_in", tgt, rid, self.allocator);
+            // No per-relation graph_lj_out/in append here: the purge above
+            // cleared them and rebuildAdjacencyForWorkspace below rebuilds
+            // them wholesale, so per-row blob read-modify-writes were pure
+            // O(sum k^2) waste that got discarded anyway.
             projected_count += 1;
         }
 

@@ -45,6 +45,9 @@ pub fn ddlPropose(allocator: std.mem.Allocator, db: facet_sqlite.Database, works
         defer allocator.free(table_name);
         const key_column = try facet_sqlite.dupeColumnText(allocator, stmt, 2);
         defer allocator.free(key_column);
+        // Identifiers reach the emitted DDL verbatim, and the semantics rows
+        // they come from are populated from user-supplied proposal JSON.
+        if (!isPlainIdentifier(key_column)) return error.InvalidColumnName;
 
         const ws_name = try wsTableName(allocator, table_name);
         defer allocator.free(ws_name);
@@ -58,10 +61,14 @@ pub fn ddlPropose(allocator: std.mem.Allocator, db: facet_sqlite.Database, works
 
         const columns = try loadColumnSemantics(allocator, db, workspace_id, table_name);
         defer {
-            for (columns) |col| allocator.free(col.name);
+            for (columns) |col| {
+                allocator.free(col.name);
+                allocator.free(col.role);
+            }
             allocator.free(columns);
         }
         for (columns) |col| {
+            if (!isPlainIdentifier(col.name)) return error.InvalidColumnName;
             if (std.mem.eql(u8, col.name, key_column)) continue;
             try out.appendSlice(allocator, ",\n  ");
             try out.appendSlice(allocator, col.name);
@@ -69,7 +76,10 @@ pub fn ddlPropose(allocator: std.mem.Allocator, db: facet_sqlite.Database, works
         }
         try out.appendSlice(allocator, "\n);\n");
         try out.appendSlice(allocator, "CREATE INDEX IF NOT EXISTS idx_");
-        try out.appendSlice(allocator, ws_name[4..]);
+        // "ws_" prefix is 3 chars; [4..] dropped the table name's first
+        // letter, colliding index names across tables (and IF NOT EXISTS
+        // then silently skipped the later ones).
+        try out.appendSlice(allocator, ws_name[3..]);
         try out.appendSlice(allocator, "_pk ON ");
         try out.appendSlice(allocator, ws_name);
         try out.appendSlice(allocator, "(");
@@ -82,7 +92,7 @@ pub fn ddlPropose(allocator: std.mem.Allocator, db: facet_sqlite.Database, works
             if (!std.mem.eql(u8, col.role, "fk")) continue;
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, "CREATE INDEX IF NOT EXISTS idx_");
-            try out.appendSlice(allocator, ws_name[4..]);
+            try out.appendSlice(allocator, ws_name[3..]);
             try out.appendSlice(allocator, "_");
             try out.appendSlice(allocator, col.name);
             try out.appendSlice(allocator, " ON ");
@@ -120,17 +130,21 @@ fn loadColumnSemantics(allocator: std.mem.Allocator, db: facet_sqlite.Database, 
     try facet_sqlite.bindText(stmt, 2, table_name);
     var out = std.ArrayList(ColumnSpec).empty;
     errdefer {
-        for (out.items) |col| allocator.free(col.name);
+        for (out.items) |col| {
+            allocator.free(col.name);
+            allocator.free(col.role);
+        }
         out.deinit(allocator);
     }
     while (true) {
         const rc = facet_sqlite.c.sqlite3_step(stmt);
         if (rc == facet_sqlite.c.SQLITE_DONE) break;
         if (rc != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
-        try out.append(allocator, .{
-            .name = try facet_sqlite.dupeColumnText(allocator, stmt, 0),
-            .role = try facet_sqlite.dupeColumnText(allocator, stmt, 1),
-        });
+        const name = try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+        errdefer allocator.free(name);
+        const role = try facet_sqlite.dupeColumnText(allocator, stmt, 1);
+        errdefer allocator.free(role);
+        try out.append(allocator, .{ .name = name, .role = role });
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -289,56 +303,6 @@ fn lookupKeyColumn(allocator: std.mem.Allocator, db: facet_sqlite.Database, work
     return try facet_sqlite.dupeColumnText(allocator, stmt, 0);
 }
 
-fn upsertWsRow(
-    allocator: std.mem.Allocator,
-    db: facet_sqlite.Database,
-    ws_name: []const u8,
-    key_column: []const u8,
-    headers: []const []const u8,
-    row: []const []const u8,
-) !void {
-    const key_idx = blk: {
-        for (headers, 0..) |header, idx| {
-            if (std.mem.eql(u8, header, key_column)) break :blk idx;
-        }
-        return error.MissingPrimaryKey;
-    };
-    if (key_idx >= row.len or row[key_idx].len == 0) return error.MissingPrimaryKey;
-
-    var columns = std.ArrayList([]const u8).empty;
-    defer columns.deinit(allocator);
-    var values = std.ArrayList([]const u8).empty;
-    defer values.deinit(allocator);
-    for (headers, 0..) |header, idx| {
-        if (idx >= row.len) continue;
-        try columns.append(allocator, header);
-        try values.append(allocator, row[idx]);
-    }
-
-    var sql = std.ArrayList(u8).empty;
-    defer sql.deinit(allocator);
-    try sql.appendSlice(allocator, "INSERT OR REPLACE INTO ");
-    try sql.appendSlice(allocator, ws_name);
-    try sql.append(allocator, '(');
-    for (columns.items, 0..) |col, idx| {
-        if (idx > 0) try sql.append(allocator, ',');
-        try sql.appendSlice(allocator, col);
-    }
-    try sql.appendSlice(allocator, ") VALUES (");
-    for (0..columns.items.len) |idx| {
-        if (idx > 0) try sql.append(allocator, ',');
-        try sql.appendSlice(allocator, "?");
-    }
-    try sql.append(allocator, ')');
-
-    const stmt = try facet_sqlite.prepare(db, sql.items);
-    defer facet_sqlite.finalize(stmt);
-    for (values.items, 0..) |value, idx| {
-        try facet_sqlite.bindText(stmt, @intCast(idx + 1), value);
-    }
-    if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_DONE) return error.StepFailed;
-}
-
 const WsUpsertBatch = struct {
     stmt: *facet_sqlite.c.sqlite3_stmt,
     headers: []const []const u8,
@@ -420,4 +384,42 @@ fn isPlainIdentifier(name: []const u8) bool {
 
 pub fn readDataPlane(mapping_path: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     return structured_import.readDataPlane(mapping_path, allocator);
+}
+
+test "ddlPropose derives index names from the full table name" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try workspace_sqlite.upsertWorkspace(db, "ws-ddl", "{\"domain\":\"test\"}");
+    try workspace_sqlite.upsertTableSemanticFull(db, .{
+        .table_id = 1,
+        .workspace_id = "ws-ddl",
+        .schema_name = "structured",
+        .table_name = "lot",
+        .key_column = "record_id",
+        .content_column = "content",
+    });
+    try workspace_sqlite.upsertColumnSemanticFull(db, .{
+        .column_semantic_id = 1,
+        .table_id = 1,
+        .column_name = "record_id",
+        .column_role = "id",
+        .data_type = "text",
+    });
+    try workspace_sqlite.upsertColumnSemanticFull(db, .{
+        .column_semantic_id = 2,
+        .table_id = 1,
+        .column_name = "copro_id",
+        .column_role = "fk",
+        .data_type = "text",
+    });
+
+    const report = try ddlPropose(std.testing.allocator, db, "ws-ddl");
+    defer std.testing.allocator.free(report.sql);
+    // Regression: ws_name[4..] used to strip the table name's first letter
+    // ("idx_ot_pk"), colliding index names across tables.
+    try std.testing.expect(std.mem.indexOf(u8, report.sql, "CREATE INDEX IF NOT EXISTS idx_lot_pk ON ws_lot(record_id);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.sql, "CREATE INDEX IF NOT EXISTS idx_lot_copro_id ON ws_lot(copro_id);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.sql, "idx_ot_") == null);
 }
