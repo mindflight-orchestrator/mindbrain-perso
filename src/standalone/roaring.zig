@@ -34,6 +34,8 @@ extern fn roaring_bitmap_portable_size_in_bytes(bitmap: *const roaring_bitmap_t)
 extern fn roaring_bitmap_portable_serialize(bitmap: *const roaring_bitmap_t, buf: [*]u8) usize;
 extern fn roaring_bitmap_portable_deserialize_safe(buf: [*]const u8, maxbytes: usize) ?*roaring_bitmap_t;
 extern fn roaring_bitmap_to_uint32_array(bitmap: *const roaring_bitmap_t, ans: [*]u32) void;
+extern fn roaring_bitmap_add_many(bitmap: *roaring_bitmap_t, n_args: usize, vals: [*]const u32) void;
+extern fn roaring_bitmap_add_offset(bitmap: *const roaring_bitmap_t, offset: i64) ?*roaring_bitmap_t;
 extern fn roaring_iterator_init(r: *const roaring_bitmap_t, newit: *RoaringUint32Iterator) void;
 extern fn roaring_uint32_iterator_advance(it: *RoaringUint32Iterator) bool;
 
@@ -61,8 +63,8 @@ pub const Bitmap = struct {
         var bitmap = try empty();
         errdefer bitmap.deinit();
 
-        for (values) |value| {
-            roaring_bitmap_add(bitmap.handle, value);
+        if (values.len > 0) {
+            roaring_bitmap_add_many(bitmap.handle, values.len, values.ptr);
         }
 
         return bitmap;
@@ -173,12 +175,28 @@ pub const Bitmap = struct {
     }
 
     /// Merge a chunk-local posting bitmap into `self` using global doc ids.
+    ///
+    /// `chunk_bits` must stay below 32 and the shifted chunk base must fit in
+    /// u32 (the CRoaring id space); both are schema invariants.
     pub fn orShiftedChunkInPlace(self: *Bitmap, chunk_bitmap: Bitmap, chunk_id: u32, chunk_bits: u8) void {
+        std.debug.assert(chunk_bits < 32);
+        const offset: u64 = @as(u64, chunk_id) << @intCast(chunk_bits & 31);
+        std.debug.assert(offset <= std.math.maxInt(u32));
+
+        // Bulk path: shift the whole chunk once, then OR it in (containers
+        // are merged wholesale instead of one add per element).
+        if (roaring_bitmap_add_offset(chunk_bitmap.handle, @intCast(offset & std.math.maxInt(u32)))) |shifted| {
+            defer roaring_bitmap_free(shifted);
+            _ = roaring_bitmap_or_inplace(self.handle, shifted);
+            return;
+        }
+
+        // OOM fallback: per-element merge, matching the previous behavior.
         var iter: RoaringUint32Iterator = undefined;
         roaring_iterator_init(chunk_bitmap.handle, &iter);
-        const offset = chunk_id << @intCast(chunk_bits);
+        const base: u32 = @intCast(offset & std.math.maxInt(u32));
         while (iter.has_value) {
-            self.add(offset | iter.current_value);
+            self.add(base | iter.current_value);
             _ = roaring_uint32_iterator_advance(&iter);
         }
     }

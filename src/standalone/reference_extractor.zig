@@ -19,16 +19,26 @@ pub const Reference = struct {
     resolved: bool = false,
 };
 
+const RefKey = struct {
+    kind: ReferenceKind,
+    offset_start: usize,
+    offset_end: usize,
+};
+
+const SeenRefs = std.AutoHashMap(RefKey, void);
+
 pub fn extract(
     allocator: std.mem.Allocator,
     text: []const u8,
 ) ![]Reference {
     var refs = std.ArrayList(Reference).empty;
     errdefer refs.deinit(allocator);
+    var seen = SeenRefs.init(allocator);
+    defer seen.deinit();
 
-    try extractUrls(allocator, text, &refs);
-    try extractArticleRefs(allocator, text, &refs);
-    try extractInstrumentRefs(allocator, text, &refs);
+    try extractUrls(allocator, text, &refs, &seen);
+    try extractArticleRefs(allocator, text, &refs, &seen);
+    try extractInstrumentRefs(allocator, text, &refs, &seen);
 
     return refs.toOwnedSlice(allocator);
 }
@@ -41,6 +51,7 @@ fn extractUrls(
     allocator: std.mem.Allocator,
     text: []const u8,
     refs: *std.ArrayList(Reference),
+    seen: *SeenRefs,
 ) !void {
     var cursor: usize = 0;
     while (cursor < text.len) {
@@ -49,7 +60,7 @@ fn extractUrls(
         const pos = minOptional(http_pos, https_pos) orelse break;
         var end = pos;
         while (end < text.len and !isReferenceTerminator(text[end])) : (end += 1) {}
-        try appendUnique(allocator, refs, .{
+        try appendUnique(allocator, refs, seen, .{
             .kind = .url,
             .text = text[pos..end],
             .offset_start = pos,
@@ -63,6 +74,7 @@ fn extractArticleRefs(
     allocator: std.mem.Allocator,
     text: []const u8,
     refs: *std.ArrayList(Reference),
+    seen: *SeenRefs,
 ) !void {
     var cursor: usize = 0;
     while (cursor < text.len) {
@@ -70,7 +82,7 @@ fn extractArticleRefs(
         const end = referenceEnd(text, pos + "article".len);
         const ref_text = trimAscii(text[pos..end]);
         if (ref_text.len > "article".len) {
-            try appendUnique(allocator, refs, .{
+            try appendUnique(allocator, refs, seen, .{
                 .kind = .internal,
                 .text = ref_text,
                 .offset_start = pos,
@@ -85,6 +97,7 @@ fn extractInstrumentRefs(
     allocator: std.mem.Allocator,
     text: []const u8,
     refs: *std.ArrayList(Reference),
+    seen: *SeenRefs,
 ) !void {
     const prefixes = [_][]const u8{ "decree", "law", "ordinance", "regulation" };
     for (prefixes) |prefix| {
@@ -94,7 +107,7 @@ fn extractInstrumentRefs(
             const end = referenceEnd(text, pos + prefix.len);
             const ref_text = trimAscii(text[pos..end]);
             if (ref_text.len > prefix.len) {
-                try appendUnique(allocator, refs, .{
+                try appendUnique(allocator, refs, seen, .{
                     .kind = .external,
                     .text = ref_text,
                     .offset_start = pos,
@@ -109,16 +122,15 @@ fn extractInstrumentRefs(
 fn appendUnique(
     allocator: std.mem.Allocator,
     refs: *std.ArrayList(Reference),
+    seen: *SeenRefs,
     ref_value: Reference,
 ) !void {
-    for (refs.items) |existing| {
-        if (existing.kind == ref_value.kind and
-            existing.offset_start == ref_value.offset_start and
-            existing.offset_end == ref_value.offset_end)
-        {
-            return;
-        }
-    }
+    const gop = try seen.getOrPut(.{
+        .kind = ref_value.kind,
+        .offset_start = ref_value.offset_start,
+        .offset_end = ref_value.offset_end,
+    });
+    if (gop.found_existing) return;
     try refs.append(allocator, ref_value);
 }
 
@@ -155,6 +167,10 @@ fn referenceEnd(text: []const u8, after_prefix: usize) usize {
         end += " of ".len;
         while (end < text.len and isReferenceBodyByte(text[end])) {
             if (startsWithIgnoreCase(text[end..], " and ")) break;
+            // A '.' that closes a sentence (not part of a code such as
+            // "2024.06") terminates the tail scan instead of letting the
+            // reference swallow the next sentence.
+            if (text[end] == '.' and (end + 1 >= text.len or !std.ascii.isAlphanumeric(text[end + 1]))) break;
             end += 1;
         }
     }
@@ -205,6 +221,15 @@ test "extract finds internal and external legal references" {
 
     try std.testing.expectEqual(@as(usize, 2), countKind(refs, .internal));
     try std.testing.expectEqual(@as(usize, 1), countKind(refs, .external));
+}
+
+test "of-tail scan stops at sentence boundary" {
+    const text = "Article 2 of this ordinance. Unrelated next sentence follows here.";
+    const refs = try extract(std.testing.allocator, text);
+    defer freeReferences(std.testing.allocator, refs);
+
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("Article 2 of this ordinance", refs[0].text);
 }
 
 test "extract finds urls separately from legal instruments" {

@@ -485,8 +485,32 @@ fn stripHtml(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     while (pos < html.len) : (pos += 1) {
         const ch = html[pos];
         if (ch == '<') {
-            const tag_end = std.mem.indexOfScalarPos(u8, html, pos, '>') orelse html.len - 1;
-            if (htmlTagAddsBreak(html[pos + 1 .. tag_end])) {
+            // Drop comment bodies entirely.
+            if (std.mem.startsWith(u8, html[pos..], "<!--")) {
+                if (!last_space) {
+                    try out.append(allocator, ' ');
+                    last_space = true;
+                }
+                const comment_close = std.mem.indexOfPos(u8, html, pos + 4, "-->") orelse break;
+                pos = comment_close + 2;
+                continue;
+            }
+            // A trailing/unterminated '<' consumes the rest of the input;
+            // never index past html.len (a truncated document must not panic).
+            const tag_end = std.mem.indexOfScalarPos(u8, html, pos, '>') orelse html.len;
+            const raw_tag = html[@min(pos + 1, tag_end)..tag_end];
+            // Drop script/style element bodies entirely.
+            if (skippedContainerClose(raw_tag)) |close_needle| {
+                if (!last_space) {
+                    try out.append(allocator, ' ');
+                    last_space = true;
+                }
+                const search_from = @min(tag_end + 1, html.len);
+                const rel_close = std.ascii.indexOfIgnoreCase(html[search_from..], close_needle) orelse break;
+                pos = std.mem.indexOfScalarPos(u8, html, search_from + rel_close, '>') orelse html.len;
+                continue;
+            }
+            if (htmlTagAddsBreak(raw_tag)) {
                 if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
                     try out.append(allocator, '\n');
                 }
@@ -509,6 +533,16 @@ fn stripHtml(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Returns the closing-tag needle when `raw_tag` opens an element whose body
+/// must be dropped from text extraction (script/style), null otherwise.
+fn skippedContainerClose(raw_tag: []const u8) ?[]const u8 {
+    const tag = trimLeft(raw_tag, " ");
+    if (tag.len > 0 and tag[tag.len - 1] == '/') return null; // self-closing
+    if (startsWithTag(tag, "script")) return "</script";
+    if (startsWithTag(tag, "style")) return "</style";
+    return null;
 }
 
 fn htmlTagAddsBreak(raw_tag: []const u8) bool {
@@ -638,6 +672,34 @@ test "splitForLanguages separates simple French and Dutch lines" {
     try std.testing.expectEqualStrings("nl", pieces[1].language);
     try std.testing.expect(std.mem.indexOf(u8, pieces[0].text, "Article 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, pieces[1].text, "Artikel 1") != null);
+}
+
+test "stripHtml survives truncated input ending with '<'" {
+    // Regression: `orelse html.len - 1` used to slice [pos+1..pos] and panic.
+    const stripped = try stripHtml(std.testing.allocator, "Article 1 <");
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expectEqualStrings("Article 1 ", stripped);
+
+    const lone = try stripHtml(std.testing.allocator, "<");
+    defer std.testing.allocator.free(lone);
+    try std.testing.expectEqualStrings(" ", lone);
+
+    const unterminated = try stripHtml(std.testing.allocator, "hello <b");
+    defer std.testing.allocator.free(unterminated);
+    try std.testing.expectEqualStrings("hello ", unterminated);
+}
+
+test "stripHtml drops script, style, and comment bodies" {
+    const html =
+        "<p>Keep me</p><script type=\"text/javascript\">var x = 1 < 2;</script>" ++
+        "<style>body { color: red; }</style><!-- hidden note -->tail";
+    const stripped = try stripHtml(std.testing.allocator, html);
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "Keep me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "tail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "var x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "color") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "hidden") == null);
 }
 
 test "splitForLanguages falls back when split is ambiguous" {

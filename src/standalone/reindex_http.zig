@@ -154,7 +154,12 @@ fn tryResolveFacetTable(
     table_id_param: ?u64,
 ) !?interfaces.FacetTableConfig {
     if (table_id_param) |table_id| {
-        const config = facet_sqlite.loadFacetTableConfigByTableId(db, allocator, table_id) catch return null;
+        // Only a missing registration demotes to the raw fallback; real DB
+        // errors must surface instead of silently degrading the search path.
+        const config = facet_sqlite.loadFacetTableConfigByTableId(db, allocator, table_id) catch |err| switch (err) {
+            error.MissingRow => return null,
+            else => return err,
+        };
         if (!std.mem.eql(u8, config.table_name, collection_id)) {
             allocator.free(config.schema_name);
             allocator.free(config.table_name);
@@ -162,7 +167,10 @@ fn tryResolveFacetTable(
         }
         return config;
     }
-    return facet_sqlite.loadFacetTableConfig(db, allocator, collection_id) catch null;
+    return facet_sqlite.loadFacetTableConfig(db, allocator, collection_id) catch |err| switch (err) {
+        error.MissingRow => null,
+        else => err,
+    };
 }
 
 fn searchCollectionFacetsRaw(
@@ -225,13 +233,13 @@ fn searchCollectionFacetsRaw(
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
         const chunk_index_raw = c.sqlite3_column_int64(stmt, 1);
-        const chunk_index: ?u32 = if (chunk_index_raw < 0)
+        const chunk_index: ?u32 = if (chunk_index_raw < 0 or chunk_index_raw > std.math.maxInt(u32))
             null
         else
             @intCast(chunk_index_raw);
 
         try rows.append(allocator, .{
-            .doc_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .doc_id = @bitCast(c.sqlite3_column_int64(stmt, 0)),
             .chunk_index = chunk_index,
             .namespace = try facet_sqlite.dupeColumnText(allocator, stmt, 2),
             .dimension = try facet_sqlite.dupeColumnText(allocator, stmt, 3),
@@ -260,20 +268,6 @@ fn searchCollectionFacetsPostings(
         else => return err,
     };
 
-    var repository = facet_sqlite.Repository{ .db = &db };
-    const repo = repository.asFacetRepository();
-
-    const facet_values = try repo.listFacetValuesFn(
-        repo.ctx,
-        allocator,
-        table_config.table_id,
-        facet_id,
-    );
-    defer {
-        for (facet_values) |value| allocator.free(value);
-        allocator.free(facet_values);
-    }
-
     var rows = std.ArrayList(CollectionFacetMatch).empty;
     errdefer {
         for (rows.items) |row| row.deinit(allocator);
@@ -283,49 +277,106 @@ fn searchCollectionFacetsPostings(
     var seen_docs = try roaring.Bitmap.empty();
     defer seen_docs.deinit();
 
-    for (facet_values) |facet_value| {
-        if (rows.items.len >= limit) break;
-        if (!valueMatchesQuery(facet_value, value_query)) continue;
+    // Single scan over the facet's postings ordered by value: group the chunk
+    // blobs per facet_value in-stream instead of issuing one postings query
+    // per distinct value (which was O(values) statements per request).
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT facet_value, chunk_id, posting_blob FROM facet_postings WHERE table_id = {d} AND facet_id = {d} ORDER BY facet_value, chunk_id",
+        .{ table_config.table_id, facet_id },
+    );
+    defer allocator.free(sql);
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
 
-        const postings = try repo.getPostingsFn(
-            repo.ctx,
-            allocator,
-            table_config.table_id,
-            facet_id,
-            &.{facet_value},
-        );
-        defer {
-            for (postings) |posting| {
-                var bitmap = posting.bitmap;
-                bitmap.deinit();
+    const c = facet_sqlite.c;
+
+    var group_value: ?[]const u8 = null;
+    defer if (group_value) |value| allocator.free(value);
+    var group_postings = std.ArrayList(interfaces.FacetPosting).empty;
+    defer {
+        for (group_postings.items) |posting| {
+            var bitmap = posting.bitmap;
+            bitmap.deinit();
+        }
+        group_postings.deinit(allocator);
+    }
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_ROW and rc != c.SQLITE_DONE) return error.StepFailed;
+        const end_of_rows = rc == c.SQLITE_DONE;
+
+        var row_value: ?[]const u8 = null;
+        errdefer if (row_value) |value| allocator.free(value);
+        if (!end_of_rows) row_value = try facet_sqlite.dupeColumnText(allocator, stmt, 0);
+
+        const same_group = group_value != null and row_value != null and
+            std.mem.eql(u8, group_value.?, row_value.?);
+
+        var collect = same_group;
+        if (!same_group) {
+            // Flush the completed group before starting the next one.
+            if (group_value) |value| {
+                if (try facet_sqlite.reconstructFacetBitmapFromPostings(
+                    allocator,
+                    table_config.chunk_bits,
+                    group_postings.items,
+                )) |reconstructed| {
+                    var facet_bitmap = reconstructed;
+                    defer facet_bitmap.deinit();
+                    var iter = roaring.Bitmap.UInt32Iterator.init(facet_bitmap);
+                    while (iter.hasValue()) {
+                        if (rows.items.len >= limit) break;
+                        const doc_id = iter.currentValue();
+                        iter.advance();
+                        if (seen_docs.contains(doc_id)) continue;
+                        seen_docs.add(doc_id);
+
+                        try rows.append(allocator, .{
+                            .doc_id = doc_id,
+                            .chunk_index = null,
+                            .namespace = try allocator.dupe(u8, namespace),
+                            .dimension = try allocator.dupe(u8, dimension),
+                            .value = try allocator.dupe(u8, value),
+                            .weight = 1.0,
+                        });
+                    }
+                }
+                for (group_postings.items) |posting| {
+                    var bitmap = posting.bitmap;
+                    bitmap.deinit();
+                }
+                group_postings.clearRetainingCapacity();
+                allocator.free(value);
+                group_value = null;
             }
-            allocator.free(postings);
+
+            if (end_of_rows or rows.items.len >= limit) {
+                if (row_value) |value| allocator.free(value);
+                break;
+            }
+
+            if (valueMatchesQuery(row_value.?, value_query)) {
+                group_value = row_value;
+                row_value = null; // ownership moved to group_value
+                collect = true;
+            }
         }
 
-        var facet_bitmap = (try facet_sqlite.reconstructFacetBitmapFromPostings(
-            allocator,
-            table_config.chunk_bits,
-            postings,
-        )) orelse continue;
-        defer facet_bitmap.deinit();
-
-        var iter = roaring.Bitmap.UInt32Iterator.init(facet_bitmap);
-        while (iter.hasValue()) {
-            if (rows.items.len >= limit) break;
-            const doc_id = iter.currentValue();
-            iter.advance();
-            if (seen_docs.contains(doc_id)) continue;
-            seen_docs.add(doc_id);
-
-            try rows.append(allocator, .{
-                .doc_id = doc_id,
-                .chunk_index = null,
-                .namespace = try allocator.dupe(u8, namespace),
-                .dimension = try allocator.dupe(u8, dimension),
-                .value = try allocator.dupe(u8, facet_value),
-                .weight = 1.0,
+        if (collect) {
+            const chunk_id_raw = c.sqlite3_column_int64(stmt, 1);
+            if (chunk_id_raw < 0 or chunk_id_raw > std.math.maxInt(u32)) return error.StepFailed;
+            const blob_len = c.sqlite3_column_bytes(stmt, 2);
+            const blob_ptr = c.sqlite3_column_blob(stmt, 2) orelse return error.MissingRow;
+            const blob: []const u8 = @as([*]const u8, @ptrCast(blob_ptr))[0..@intCast(blob_len)];
+            try group_postings.append(allocator, .{
+                .chunk_id = @intCast(chunk_id_raw),
+                .bitmap = try roaring.Bitmap.deserializePortable(blob),
             });
         }
+
+        if (row_value) |value| allocator.free(value);
     }
 
     return rows.toOwnedSlice(allocator);

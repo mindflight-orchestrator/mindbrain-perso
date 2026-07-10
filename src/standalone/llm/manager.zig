@@ -45,17 +45,20 @@ pub const Manager = struct {
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
+                .max_response_bytes = provider.max_response_bytes,
             }, request),
             .anthropic => anthropic.chat(allocator, io, .{
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
                 .version = provider.anthropic_version orelse "2023-06-01",
+                .max_response_bytes = provider.max_response_bytes,
             }, request),
             else => openai_chat.chat(allocator, io, .{
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
+                .max_response_bytes = provider.max_response_bytes,
             }, request),
         };
     }
@@ -69,11 +72,14 @@ pub const Manager = struct {
     ) !openai_stream.EventList {
         const provider = self.getProvider(options.provider) orelse return error.ProviderNotFound;
         if (!supports(provider, .streaming)) return error.UnsupportedCapability;
-        if (provider.kind == .gemini) return error.UnsupportedProvider;
+        // Gemini and Anthropic speak different wire protocols; refuse rather
+        // than silently sending them OpenAI-compatible streaming requests.
+        if (provider.kind == .gemini or provider.kind == .anthropic) return error.UnsupportedProvider;
         return openai_stream.streamChat(allocator, io, .{
             .base_url = provider.base_url,
             .api_key = provider.api_key,
             .model = provider.model,
+            .max_response_bytes = provider.max_response_bytes,
         }, .{
             .messages = messages,
             .temperature = options.temperature,
@@ -98,11 +104,13 @@ pub const Manager = struct {
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
+                .max_response_bytes = provider.max_response_bytes,
             }, request),
             else => openai_responses.respond(allocator, io, .{
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = provider.model,
+                .max_response_bytes = provider.max_response_bytes,
             }, request),
         };
     }
@@ -116,11 +124,14 @@ pub const Manager = struct {
     ) !openai_responses.EventList {
         const provider = self.getProvider(options.provider) orelse return error.ProviderNotFound;
         if (!supports(provider, .responses) or !supports(provider, .streaming)) return error.UnsupportedCapability;
-        if (provider.kind == .gemini) return error.UnsupportedProvider;
+        // Gemini and Anthropic speak different wire protocols; refuse rather
+        // than silently sending them OpenAI-compatible streaming requests.
+        if (provider.kind == .gemini or provider.kind == .anthropic) return error.UnsupportedProvider;
         return openai_responses.streamRespond(allocator, io, .{
             .base_url = provider.base_url,
             .api_key = provider.api_key,
             .model = provider.model,
+            .max_response_bytes = provider.max_response_bytes,
         }, request);
     }
 
@@ -139,11 +150,13 @@ pub const Manager = struct {
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = model,
+                .max_response_bytes = provider.max_response_bytes,
             }, inputs),
             else => openai_embeddings.embedTexts(allocator, io, .{
                 .base_url = provider.base_url,
                 .api_key = provider.api_key,
                 .model = model,
+                .max_response_bytes = provider.max_response_bytes,
             }, inputs),
         };
     }
@@ -171,6 +184,7 @@ pub const Manager = struct {
             .base_url = provider.base_url,
             .api_key = provider.api_key,
             .model = effective.model,
+            .max_response_bytes = provider.max_response_bytes,
         }, effective);
     }
 };
@@ -274,6 +288,28 @@ test "manager resolves default and named providers" {
     try std.testing.expectEqualStrings("local", manager.getProvider(null).?.name);
     try std.testing.expectEqualStrings("remote", manager.getProvider("remote").?.name);
     try std.testing.expect(manager.getProvider("missing") == null);
+}
+
+test "streaming rejects providers that do not speak the OpenAI wire protocol" {
+    const providers = [_]types.ProviderConfig{
+        .{
+            .name = "claude",
+            .kind = .anthropic,
+            .base_url = "https://api.anthropic.com",
+            .model = "claude",
+            .capabilities = &.{ .chat, .streaming, .responses },
+        },
+    };
+    const manager = Manager.init(.{ .providers = &providers, .default_provider = "claude" });
+
+    try std.testing.expectError(
+        error.UnsupportedProvider,
+        manager.streamChat(std.testing.allocator, std.testing.io, &.{}, .{}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedProvider,
+        manager.streamRespond(std.testing.allocator, std.testing.io, .{ .input = .{ .text = "" } }, .{}),
+    );
 }
 
 test "tool name sanitize and restore mirrors Go reference behavior" {

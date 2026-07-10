@@ -248,11 +248,19 @@ fn getPostingBitmap(ctx: *anyopaque, allocator: std.mem.Allocator, table_id: u64
 
 fn getEmbeddingDimensions(ctx: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, column_name: []const u8) anyerror!?usize {
     _ = allocator;
+    // The compact store keys embeddings by numeric table_id and has no
+    // table_name/column_name mapping, so the identifiers cannot be resolved
+    // here. Only answer when every loaded embedding agrees on a dimension;
+    // otherwise report unknown rather than another table's dimensionality.
     _ = table_name;
     _ = column_name;
     const self: *Store = @ptrCast(@alignCast(ctx));
     if (self.embeddings.items.len == 0) return null;
-    return self.embeddings.items[0].values.len;
+    const dims = self.embeddings.items[0].values.len;
+    for (self.embeddings.items[1..]) |entry| {
+        if (entry.values.len != dims) return null;
+    }
+    return dims;
 }
 
 /// Bounded heap top-k: O(N * D + N log K) instead of O(N * D + N log N).
@@ -267,6 +275,9 @@ fn searchNearest(ctx: *anyopaque, allocator: std.mem.Allocator, request: interfa
         if (request.table_id) |tid| {
             if (entry.table_id != tid) continue;
         }
+        // An entry with another dimensionality belongs to a different
+        // embedding space; skip it rather than score a truncated prefix.
+        if (entry.values.len != request.query_vector.len) continue;
         const vector_score = vector_distance.score(request.metric, request.query_vector, entry.values);
         try vector_distance.insertTopMatch(allocator, &matches, .{
             .doc_id = entry.doc_id,

@@ -1043,17 +1043,31 @@ pub fn deprecateEntity(db: Database, entity_id: u32) !void {
     try stepDone(stmt);
 }
 
+/// Cross-workspace lookup mirroring the PG `graph.find_entities_by_type`
+/// surface; use `findEntitiesByTypeWorkspace` when the caller has a
+/// workspace to scope by.
 pub fn findEntitiesByType(
     db: Database,
     allocator: std.mem.Allocator,
     entity_type: []const u8,
 ) ![]EntityRecordFull {
-    const stmt = try prepare(
-        db,
-        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE entity_type = ?1 AND deprecated_at IS NULL ORDER BY confidence DESC, name ASC",
-    );
+    return findEntitiesByTypeWorkspace(db, allocator, null, entity_type);
+}
+
+pub fn findEntitiesByTypeWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    entity_type: []const u8,
+) ![]EntityRecordFull {
+    const sql = if (workspace_id != null)
+        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE entity_type = ?1 AND workspace_id = ?2 AND deprecated_at IS NULL ORDER BY confidence DESC, name ASC"
+    else
+        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE entity_type = ?1 AND deprecated_at IS NULL ORDER BY confidence DESC, name ASC";
+    const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindText(stmt, 1, entity_type);
+    if (workspace_id) |ws| try bindText(stmt, 2, ws);
 
     var rows = std.ArrayList(EntityRecordFull).empty;
     defer {
@@ -1084,12 +1098,15 @@ pub fn findEntitiesByType(
 }
 
 pub fn registerAliases(db: Database, entity_id: u32, terms: []const []const u8, confidence: f32) !void {
+    if (terms.len == 0) return;
+    // One prepared statement reset per term instead of a prepare per term.
+    const stmt = try prepare(
+        db,
+        "INSERT INTO graph_entity_alias(term, entity_id, confidence) VALUES (?1, ?2, ?3) " ++ "ON CONFLICT(term, entity_id) DO UPDATE SET confidence = MAX(graph_entity_alias.confidence, excluded.confidence)",
+    );
+    defer finalize(stmt);
     for (terms) |term| {
-        const stmt = try prepare(
-            db,
-            "INSERT INTO graph_entity_alias(term, entity_id, confidence) VALUES (?1, ?2, ?3) " ++ "ON CONFLICT(term, entity_id) DO UPDATE SET confidence = MAX(graph_entity_alias.confidence, excluded.confidence)",
-        );
-        defer finalize(stmt);
+        try resetStatement(stmt);
         try bindText(stmt, 1, term);
         try bindInt64(stmt, 2, entity_id);
         if (c.sqlite3_bind_double(stmt, 3, confidence) != c.SQLITE_OK) return error.BindFailed;
@@ -1225,17 +1242,32 @@ pub fn getEntity(
     return try loadEntityFull(db, allocator, entity_id);
 }
 
+/// Cross-workspace lookup mirroring the PG `graph.find_entity_by_name`
+/// surface (names are only unique per workspace + type, so this returns an
+/// arbitrary match when several workspaces share a name). Prefer
+/// `findEntityByNameWorkspace` when a workspace is known.
 pub fn findEntityByName(
     db: Database,
     allocator: std.mem.Allocator,
     name: []const u8,
 ) !?EntityRecordFull {
-    const stmt = try prepare(
-        db,
-        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE name = ?1 AND deprecated_at IS NULL LIMIT 1",
-    );
+    return findEntityByNameWorkspace(db, allocator, null, name);
+}
+
+pub fn findEntityByNameWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    name: []const u8,
+) !?EntityRecordFull {
+    const sql = if (workspace_id != null)
+        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE name = ?1 AND workspace_id = ?2 AND deprecated_at IS NULL LIMIT 1"
+    else
+        "SELECT entity_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix FROM graph_entity WHERE name = ?1 AND deprecated_at IS NULL LIMIT 1";
+    const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindText(stmt, 1, name);
+    if (workspace_id) |ws| try bindText(stmt, 2, ws);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
     return .{
         .entity_id = try columnU32(stmt, 0),
@@ -1395,9 +1427,24 @@ pub fn loadEntityIdByName(db: Database, workspace_id: []const u8, name: []const 
     return try columnU32(stmt, 0);
 }
 
+/// Cross-workspace text search (PG parity surface). Prefer
+/// `entityFtsSearchWorkspace` when the caller has a workspace to scope by.
 pub fn entityFtsSearch(
     db: Database,
     allocator: std.mem.Allocator,
+    query: []const u8,
+    type_filter: ?[]const []const u8,
+    domain_filter: ?[]const u8,
+    min_confidence: f32,
+    limit: usize,
+) ![]EntitySearchResult {
+    return entityFtsSearchWorkspace(db, allocator, null, query, type_filter, domain_filter, min_confidence, limit);
+}
+
+pub fn entityFtsSearchWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
     query: []const u8,
     type_filter: ?[]const []const u8,
     domain_filter: ?[]const u8,
@@ -1429,7 +1476,13 @@ pub fn entityFtsSearch(
         defer allocator.free(clause);
         try sql_buf.appendSlice(allocator, clause);
     }
-    try sql_buf.appendSlice(allocator, ") ORDER BY confidence DESC, name ASC LIMIT 5000");
+    try sql_buf.appendSlice(allocator, ")");
+    if (workspace_id != null) {
+        const clause = try std.fmt.allocPrint(allocator, " AND workspace_id = ?{d}", .{term_count + 2});
+        defer allocator.free(clause);
+        try sql_buf.appendSlice(allocator, clause);
+    }
+    try sql_buf.appendSlice(allocator, " ORDER BY confidence DESC, name ASC LIMIT 5000");
 
     const stmt = try prepare(db, sql_buf.items);
     defer finalize(stmt);
@@ -1439,6 +1492,7 @@ pub fn entityFtsSearch(
         defer allocator.free(pattern);
         try bindText(stmt, @intCast(term_index + 2), pattern);
     }
+    if (workspace_id) |ws| try bindText(stmt, @intCast(term_count + 2), ws);
 
     var results = std.ArrayList(EntitySearchResult).empty;
     defer {
@@ -1521,9 +1575,24 @@ pub fn entityFtsSearch(
     return results.toOwnedSlice(allocator);
 }
 
+/// Cross-workspace marketplace search (PG parity surface). Prefer
+/// `marketplaceSearchWorkspace` when the caller has a workspace to scope by.
 pub fn marketplaceSearch(
     db: Database,
     allocator: std.mem.Allocator,
+    query: []const u8,
+    domain_filter: ?[]const u8,
+    min_confidence: f32,
+    max_hops: usize,
+    limit: usize,
+) ![]MarketplaceResult {
+    return marketplaceSearchWorkspace(db, allocator, null, query, domain_filter, min_confidence, max_hops, limit);
+}
+
+pub fn marketplaceSearchWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
     query: []const u8,
     domain_filter: ?[]const u8,
     min_confidence: f32,
@@ -1534,7 +1603,7 @@ pub fn marketplaceSearch(
     // Single scan: the seeds are the confidence-filtered prefix of the same
     // ranked candidate list; a second entityFtsSearch pass re-scanned and
     // re-tokenized the whole store.
-    const candidate_hits = try entityFtsSearch(db, allocator, query, null, domain_filter, 0.0, 1000);
+    const candidate_hits = try entityFtsSearchWorkspace(db, allocator, workspace_id, query, null, domain_filter, 0.0, 1000);
     defer {
         for (candidate_hits) |hit| {
             allocator.free(hit.name);
@@ -1554,15 +1623,20 @@ pub fn marketplaceSearch(
     }
     if (seed_ids_list.items.len == 0) return allocator.alloc(MarketplaceResult, 0);
 
-    var runtime = try loadRuntime(db, allocator);
-    defer runtime.deinit();
-
     const seed_ids = seed_ids_list.items;
 
-    var reachable = try runtime.kHops(allocator, seed_ids, max_hops, .{ .edge_types = marketplace_edge_types[0..] });
-    defer reachable.deinit();
-
-    const reachable_ids = try reachable.toArray(allocator);
+    // SQL BFS (as in streamSubgraph / shortestPathSqlFallback): O(visited)
+    // batched frontier expansions instead of deserializing the whole
+    // graph — every workspace's relations and adjacency bitmaps — into
+    // memory per request via loadRuntime.
+    const reachable_ids = try marketplaceReachableIds(
+        db,
+        allocator,
+        workspace_id,
+        seed_ids,
+        max_hops,
+        marketplace_edge_types[0..],
+    );
     defer allocator.free(reachable_ids);
 
     var seed_set = std.AutoHashMap(u32, void).init(allocator);
@@ -1604,10 +1678,12 @@ pub fn marketplaceSearch(
             try sql_buf.appendSlice(allocator, id_text);
         }
         try sql_buf.appendSlice(allocator, ")");
+        if (workspace_id != null) try sql_buf.appendSlice(allocator, " AND e.workspace_id = ?2");
 
         const stmt = try prepare(db, sql_buf.items);
         defer finalize(stmt);
         if (c.sqlite3_bind_double(stmt, 1, min_confidence) != c.SQLITE_OK) return error.BindFailed;
+        if (workspace_id) |ws| try bindText(stmt, 2, ws);
 
         while (true) {
             const rc = c.sqlite3_step(stmt);
@@ -1665,6 +1741,125 @@ pub fn marketplaceSearch(
     return results.toOwnedSlice(allocator);
 }
 
+/// Undirected BFS over active (non-deprecated) relations of the given
+/// types, expanding whole frontier levels with batched IN(...) queries.
+/// Returns every visited entity id (seeds included). Caller frees.
+fn marketplaceReachableIds(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    seed_ids: []const u32,
+    max_hops: usize,
+    edge_types: []const []const u8,
+) ![]u32 {
+    var visited = std.AutoHashMap(u32, void).init(allocator);
+    defer visited.deinit();
+
+    var order = std.ArrayList(u32).empty;
+    defer order.deinit(allocator);
+
+    var frontier = std.ArrayList(u32).empty;
+    defer frontier.deinit(allocator);
+    var next_frontier = std.ArrayList(u32).empty;
+    defer next_frontier.deinit(allocator);
+
+    for (seed_ids) |seed_id| {
+        if ((try visited.getOrPut(seed_id)).found_existing) continue;
+        try frontier.append(allocator, seed_id);
+        try order.append(allocator, seed_id);
+    }
+
+    var depth: usize = 0;
+    while (depth < max_hops and frontier.items.len != 0) : (depth += 1) {
+        next_frontier.clearRetainingCapacity();
+
+        var chunk_start: usize = 0;
+        while (chunk_start < frontier.items.len) {
+            const chunk_end = @min(chunk_start + 500, frontier.items.len);
+            const chunk = frontier.items[chunk_start..chunk_end];
+            chunk_start = chunk_end;
+            try expandMarketplaceFrontierChunk(db, allocator, workspace_id, chunk, edge_types, &visited, &next_frontier, &order);
+        }
+
+        std.mem.swap(std.ArrayList(u32), &frontier, &next_frontier);
+    }
+
+    return order.toOwnedSlice(allocator);
+}
+
+fn expandMarketplaceFrontierChunk(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    chunk: []const u32,
+    edge_types: []const []const u8,
+    visited: *std.AutoHashMap(u32, void),
+    next_frontier: *std.ArrayList(u32),
+    order: *std.ArrayList(u32),
+) !void {
+    if (chunk.len == 0 or edge_types.len == 0) return;
+
+    var sql_buf = std.Io.Writer.Allocating.init(allocator);
+    defer sql_buf.deinit();
+
+    var ids_buf = std.Io.Writer.Allocating.init(allocator);
+    defer ids_buf.deinit();
+    for (chunk, 0..) |id, index| {
+        if (index != 0) try ids_buf.writer.writeByte(',');
+        try ids_buf.writer.print("{d}", .{id});
+    }
+    const ids_sql = try ids_buf.toOwnedSlice();
+    defer allocator.free(ids_sql);
+
+    var types_buf = std.Io.Writer.Allocating.init(allocator);
+    defer types_buf.deinit();
+    for (edge_types, 0..) |_, index| {
+        if (index != 0) try types_buf.writer.writeByte(',');
+        try types_buf.writer.print("?{d}", .{index + 1});
+    }
+    const types_sql = try types_buf.toOwnedSlice();
+    defer allocator.free(types_sql);
+
+    const workspace_index = edge_types.len + 1;
+    const workspace_sql: []const u8 = if (workspace_id != null)
+        try std.fmt.allocPrint(allocator, " AND r.workspace_id = ?{d}", .{workspace_index})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(workspace_sql);
+
+    // Both directions in one statement; numbered placeholders repeat so the
+    // edge types (and workspace) bind once.
+    try sql_buf.writer.print(
+        "SELECT r.target_id FROM graph_relation r WHERE r.deprecated_at IS NULL AND r.relation_type IN ({s}){s} AND r.source_id IN ({s}) " ++
+            "UNION " ++
+            "SELECT r.source_id FROM graph_relation r WHERE r.deprecated_at IS NULL AND r.relation_type IN ({s}){s} AND r.target_id IN ({s})",
+        .{ types_sql, workspace_sql, ids_sql, types_sql, workspace_sql, ids_sql },
+    );
+    const sql = try sql_buf.toOwnedSlice();
+    defer allocator.free(sql);
+
+    const stmt = try prepare(db, sql);
+    defer finalize(stmt);
+    for (edge_types, 0..) |edge_type, index| {
+        try bindText(stmt, @intCast(index + 1), edge_type);
+    }
+    if (workspace_id) |ws| try bindText(stmt, @intCast(workspace_index), ws);
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        const neighbor_id = try columnU32(stmt, 0);
+        if ((try visited.getOrPut(neighbor_id)).found_existing) continue;
+        try next_frontier.append(allocator, neighbor_id);
+        try order.append(allocator, neighbor_id);
+    }
+}
+
+/// Keyed by a globally-unique entity id; relations cannot cross workspaces
+/// (enforced by `assertRelationEndpointsInWorkspace` on write paths), so the
+/// recursive CTE stays inside the seed entity's workspace without an
+/// explicit r.workspace_id guard.
 pub fn skillDependencies(
     db: Database,
     allocator: std.mem.Allocator,
@@ -1723,12 +1918,18 @@ pub fn confidenceDecay(
     const last_seen = columnOptionalI64(stmt, 0);
     if (last_seen == null) return 0.1;
 
-    var entity = try loadEntityFull(db, std.heap.page_allocator, entity_id);
-    defer entity.deinit(std.heap.page_allocator);
+    // Only the confidence is needed; the previous version pulled the whole
+    // entity record through the page allocator for one f32.
+    const conf_stmt = try prepare(db, "SELECT confidence FROM graph_entity WHERE entity_id = ?1");
+    defer finalize(conf_stmt);
+    try bindInt64(conf_stmt, 1, entity_id);
+    if (c.sqlite3_step(conf_stmt) != c.SQLITE_ROW) return error.MissingRow;
+    const confidence: f32 = @floatCast(c.sqlite3_column_double(conf_stmt, 0));
+
     const now = unixTimestamp();
     const age_days = @as(f64, @floatFromInt(if (now > last_seen.?) now - last_seen.? else 0)) / 86400.0;
     const half_life = if (half_life_days == 0) 90.0 else @as(f64, @floatFromInt(half_life_days));
-    const decay = @as(f32, @floatCast(entity.confidence * @as(f32, @floatCast(std.math.pow(f64, 0.5, age_days / half_life)))));
+    const decay = @as(f32, @floatCast(confidence * @as(f32, @floatCast(std.math.pow(f64, 0.5, age_days / half_life)))));
     return decay;
 }
 
@@ -1752,6 +1953,9 @@ pub fn confidenceDecayByName(
     return try confidenceDecay(db, id, half_life_days);
 }
 
+/// Keyed by a globally-unique entity id; relations cannot cross workspaces,
+/// so the neighborhood stays inside the seed entity's workspace without an
+/// explicit workspace guard.
 pub fn entityNeighborhood(
     db: Database,
     allocator: std.mem.Allocator,
@@ -2190,14 +2394,6 @@ fn rebuildLjForEntitiesNoTransaction(
     const in_stmt = try prepare(db, "DELETE FROM graph_lj_in WHERE entity_id = ?1");
     defer finalize(in_stmt);
 
-    const rel_sql = if (workspace_id != null)
-        "SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL AND workspace_id = ?1 ORDER BY relation_id"
-    else
-        "SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL ORDER BY relation_id";
-    const rel_stmt = try prepare(db, rel_sql);
-    defer finalize(rel_stmt);
-    if (workspace_id) |ws| try bindText(rel_stmt, 1, ws);
-
     var outgoing = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator);
     defer {
         var it = outgoing.iterator();
@@ -2218,31 +2414,65 @@ fn rebuildLjForEntitiesNoTransaction(
         _ = try target_set.put(entity_id, {});
     }
 
-    while (true) {
-        const rc = c.sqlite3_step(rel_stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
+    // Fetch only relations incident to the touched entities in id batches;
+    // the previous version scanned every workspace relation for any touched
+    // set. A relation can match by source in one chunk and by target in
+    // another, so dedupe across chunks.
+    var seen_relations = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_relations.deinit();
 
-        const relation_id = try columnU32(rel_stmt, 0);
-        const source_id = try columnU32(rel_stmt, 1);
-        const target_id = try columnU32(rel_stmt, 2);
-        const source_in_set = target_set.contains(source_id);
-        const target_in_set = target_set.contains(target_id);
-        if (!source_in_set and !target_in_set) continue;
+    var chunk_start: usize = 0;
+    while (chunk_start < entity_ids.len) {
+        const chunk_end = @min(chunk_start + 500, entity_ids.len);
+        const chunk = entity_ids[chunk_start..chunk_end];
+        chunk_start = chunk_end;
 
-        // Only accumulate rows for entities being rebuilt: writing a
-        // neighbor's row here would replace its full adjacency with just
-        // the relations incident to this rebuild's entity set.
-        if (source_in_set) {
-            const outgoing_entry = try outgoing.getOrPut(source_id);
-            if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
-            try outgoing_entry.value_ptr.append(allocator, relation_id);
+        var sql_buf = std.Io.Writer.Allocating.init(allocator);
+        defer sql_buf.deinit();
+        try sql_buf.writer.writeAll("SELECT relation_id, source_id, target_id FROM graph_relation WHERE deprecated_at IS NULL");
+        if (workspace_id != null) try sql_buf.writer.writeAll(" AND workspace_id = ?1");
+        try sql_buf.writer.writeAll(" AND (source_id IN (");
+        for (chunk, 0..) |entity_id, index| {
+            if (index != 0) try sql_buf.writer.writeByte(',');
+            try sql_buf.writer.print("{d}", .{entity_id});
         }
+        try sql_buf.writer.writeAll(") OR target_id IN (");
+        for (chunk, 0..) |entity_id, index| {
+            if (index != 0) try sql_buf.writer.writeByte(',');
+            try sql_buf.writer.print("{d}", .{entity_id});
+        }
+        try sql_buf.writer.writeAll(")) ORDER BY relation_id");
+        const rel_sql = try sql_buf.toOwnedSlice();
+        defer allocator.free(rel_sql);
 
-        if (target_in_set) {
-            const incoming_entry = try incoming.getOrPut(target_id);
-            if (!incoming_entry.found_existing) incoming_entry.value_ptr.* = .empty;
-            try incoming_entry.value_ptr.append(allocator, relation_id);
+        const rel_stmt = try prepare(db, rel_sql);
+        defer finalize(rel_stmt);
+        if (workspace_id) |ws| try bindText(rel_stmt, 1, ws);
+
+        while (true) {
+            const rc = c.sqlite3_step(rel_stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            const relation_id = try columnU32(rel_stmt, 0);
+            if ((try seen_relations.getOrPut(relation_id)).found_existing) continue;
+            const source_id = try columnU32(rel_stmt, 1);
+            const target_id = try columnU32(rel_stmt, 2);
+
+            // Only accumulate rows for entities being rebuilt: writing a
+            // neighbor's row here would replace its full adjacency with just
+            // the relations incident to this rebuild's entity set.
+            if (target_set.contains(source_id)) {
+                const outgoing_entry = try outgoing.getOrPut(source_id);
+                if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+                try outgoing_entry.value_ptr.append(allocator, relation_id);
+            }
+
+            if (target_set.contains(target_id)) {
+                const incoming_entry = try incoming.getOrPut(target_id);
+                if (!incoming_entry.found_existing) incoming_entry.value_ptr.* = .empty;
+                try incoming_entry.value_ptr.append(allocator, relation_id);
+            }
         }
     }
 
@@ -2458,12 +2688,15 @@ pub fn traverseWorkspace(
     var found_target = false;
     var found_target_id: ?u32 = null;
 
+    var neighbor_stmts = try TraverseNeighborStmts.init(db, workspace_id);
+    defer neighbor_stmts.deinit();
+
     var current_depth: usize = 0;
     outer: while (current_depth < depth and frontier.items.len != 0) : (current_depth += 1) {
         next_frontier.clearRetainingCapacity();
 
         for (frontier.items) |node_id| {
-            const neighbors = try loadTraverseNeighbors(db, allocator, node_id, direction, filter, workspace_id);
+            const neighbors = try neighbor_stmts.load(allocator, node_id, direction, filter);
             defer {
                 for (neighbors) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
                 allocator.free(neighbors);
@@ -2606,19 +2839,20 @@ fn shortestPathSqlFallback(
     var predecessors = std.AutoHashMap(u32, graph_store.PathEdge).init(allocator);
     defer predecessors.deinit();
 
+    var neighbor_stmts = try TraverseNeighborStmts.init(db, workspace_id);
+    defer neighbor_stmts.deinit();
+
     var depth: usize = 0;
     while (depth < max_depth and frontier.items.len != 0) : (depth += 1) {
         var next_frontier = std.ArrayList(u32).empty;
         defer next_frontier.deinit(allocator);
 
         for (frontier.items) |node_id| {
-            const neighbors = try loadTraverseNeighbors(
-                db,
+            const neighbors = try neighbor_stmts.load(
                 allocator,
                 node_id,
                 .outbound,
                 .{ .edge_types = edge_types },
-                workspace_id,
             );
             defer {
                 for (neighbors) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3030,6 +3264,8 @@ pub fn findRelationByIds(
     return try loadRelationFullFromStmt(allocator, stmt);
 }
 
+/// Resolves names across all workspaces (PG parity surface); prefer
+/// `findRelationByEndpointsWorkspace` when a workspace is known.
 pub fn findRelationByEndpoints(
     db: Database,
     allocator: std.mem.Allocator,
@@ -3037,9 +3273,20 @@ pub fn findRelationByEndpoints(
     target_name: []const u8,
     relation_type: []const u8,
 ) !?RelationRecordFull {
-    var source = try findEntityByName(db, allocator, source_name) orelse return null;
+    return findRelationByEndpointsWorkspace(db, allocator, null, source_name, target_name, relation_type);
+}
+
+pub fn findRelationByEndpointsWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    source_name: []const u8,
+    target_name: []const u8,
+    relation_type: []const u8,
+) !?RelationRecordFull {
+    var source = try findEntityByNameWorkspace(db, allocator, workspace_id, source_name) orelse return null;
     defer source.deinit(allocator);
-    var target = try findEntityByName(db, allocator, target_name) orelse return null;
+    var target = try findEntityByNameWorkspace(db, allocator, workspace_id, target_name) orelse return null;
     defer target.deinit(allocator);
     return try findRelationByIds(db, allocator, source.entity_id, target.entity_id, relation_type);
 }
@@ -3090,13 +3337,25 @@ pub fn getRelationsTo(
     return try loadRelationsWithQuery(db, allocator, query, relation_type);
 }
 
+/// Resolves the name across all workspaces (PG parity surface); prefer
+/// `findRelationsFromSourceByTypeWorkspace` when a workspace is known.
 pub fn findRelationsFromSourceByType(
     db: Database,
     allocator: std.mem.Allocator,
     source_name: []const u8,
     relation_type: []const u8,
 ) ![]RelationRecordFull {
-    var source = try findEntityByName(db, allocator, source_name) orelse return allocator.alloc(RelationRecordFull, 0);
+    return findRelationsFromSourceByTypeWorkspace(db, allocator, null, source_name, relation_type);
+}
+
+pub fn findRelationsFromSourceByTypeWorkspace(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: ?[]const u8,
+    source_name: []const u8,
+    relation_type: []const u8,
+) ![]RelationRecordFull {
+    var source = try findEntityByNameWorkspace(db, allocator, workspace_id, source_name) orelse return allocator.alloc(RelationRecordFull, 0);
     defer source.deinit(allocator);
     return try getRelationsFrom(db, allocator, source.entity_id, relation_type);
 }
@@ -3105,6 +3364,13 @@ pub fn cleanupTestData(
     db: Database,
     prefix: []const u8,
 ) !void {
+    // The prefix is spliced into a multi-statement script (bind parameters
+    // are unavailable through exec), so restrict it to characters that can
+    // neither break out of the literal nor widen the LIKE patterns.
+    if (prefix.len == 0) return error.InvalidValue;
+    for (prefix) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return error.InvalidValue;
+    }
     var sql_buf: [1024]u8 = undefined;
     const query = std.fmt.bufPrintZ(
         &sql_buf,
@@ -3122,6 +3388,8 @@ pub fn cleanupTestData(
     try db.exec(query);
 }
 
+/// Keyed by a globally-unique entity id; the null-workspace neighbor loads
+/// are safe because relations cannot cross workspaces.
 pub fn streamEntityNeighborhood(
     db: Database,
     allocator: std.mem.Allocator,
@@ -3268,14 +3536,16 @@ pub fn streamSubgraph(
         });
     }
 
+    var neighbor_stmts = try TraverseNeighborStmts.init(db, workspace_id);
+    defer neighbor_stmts.deinit();
+
     var depth: usize = 0;
     while (depth < max_hops and frontier.items.len != 0) : (depth += 1) {
         var next_frontier = std.ArrayList(u32).empty;
         defer next_frontier.deinit(allocator);
 
         for (frontier.items) |node_id| {
-            const outbound = try loadTraverseNeighbors(
-                db,
+            const outbound = try neighbor_stmts.load(
                 allocator,
                 node_id,
                 .outbound,
@@ -3286,7 +3556,6 @@ pub fn streamSubgraph(
                     .after_unix_seconds = after_unix_seconds,
                     .before_unix_seconds = before_unix_seconds,
                 },
-                workspace_id,
             );
             defer {
                 for (outbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3314,8 +3583,7 @@ pub fn streamSubgraph(
                 });
             }
 
-            const inbound = try loadTraverseNeighbors(
-                db,
+            const inbound = try neighbor_stmts.load(
                 allocator,
                 node_id,
                 .inbound,
@@ -3326,7 +3594,6 @@ pub fn streamSubgraph(
                     .after_unix_seconds = after_unix_seconds,
                     .before_unix_seconds = before_unix_seconds,
                 },
-                workspace_id,
             );
             defer {
                 for (inbound) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
@@ -3408,27 +3675,6 @@ fn lowerDup(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     const copy = try allocator.dupe(u8, text);
     for (copy) |*ch| ch.* = std.ascii.toLower(ch.*);
     return copy;
-}
-
-fn fieldContainsAllTokens(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-    query_terms: []const []const u8,
-) !bool {
-    var tokens = try tokenization_sqlite.tokenizePure(text, allocator);
-    defer deinitTokenList(allocator, &tokens);
-
-    for (query_terms) |term| {
-        var found = false;
-        for (tokens.items) |token| {
-            if (std.mem.eql(u8, token, term)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
 }
 
 fn tokenFrequencyInField(
@@ -3514,7 +3760,21 @@ fn ftsScore(
     }
 
     const coverage = @as(f32, @floatFromInt(matched_terms)) / @as(f32, @floatFromInt(terms.len));
-    const phrase_boost: f32 = if (fieldContainsAllTokens(allocator, name, terms) catch false) 1.0 else 0.0;
+    // Reuse the already-computed name tokens instead of re-tokenizing the
+    // name a second time for the phrase boost.
+    const phrase_boost: f32 = blk: {
+        for (terms) |term| {
+            var found = false;
+            for (name_tokens.items) |token| {
+                if (std.mem.eql(u8, token, term)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break :blk 0.0;
+        }
+        break :blk 1.0;
+    };
     const exact_name_boost: f32 = if (name_hits == terms.len and name_tokens.items.len == terms.len) 0.5 else 0.0;
     const metadata_boost: f32 = if (meta_hits > 0) 0.25 else 0.0;
 
@@ -4019,23 +4279,6 @@ fn loadTraverseEntityByIdInWorkspace(db: Database, allocator: std.mem.Allocator,
     };
 }
 
-fn loadTraverseEntityById(db: Database, allocator: std.mem.Allocator, entity_id: u32) !TraverseEntitySummary {
-    const stmt = try prepare(
-        db,
-        "SELECT entity_id, name, COALESCE(json_extract(metadata_json, '$.label'), name), COALESCE(json_extract(metadata_json, '$.node_type'), 'entity'), metadata_json FROM graph_entity WHERE entity_id = ?1",
-    );
-    defer finalize(stmt);
-    try bindInt64(stmt, 1, entity_id);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
-    return .{
-        .entity_id = try columnU32(stmt, 0),
-        .name = try dupeColumnText(allocator, stmt, 1),
-        .node_label = try dupeColumnText(allocator, stmt, 2),
-        .node_type = try dupeColumnText(allocator, stmt, 3),
-        .metadata_json = try dupeColumnText(allocator, stmt, 4),
-    };
-}
-
 fn loadTraverseEntityIdByName(db: Database, workspace_id: []const u8, name: []const u8) !u32 {
     const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE workspace_id = ?1 AND name = ?2 AND deprecated_at IS NULL LIMIT 1");
     defer finalize(stmt);
@@ -4045,6 +4288,94 @@ fn loadTraverseEntityIdByName(db: Database, workspace_id: []const u8, name: []co
     return try columnU32(stmt, 0);
 }
 
+/// Prepared outbound/inbound neighbor statements, reusable across an entire
+/// BFS so frontier expansion resets and rebinds instead of re-preparing the
+/// SQL for every visited node.
+const TraverseNeighborStmts = struct {
+    outbound: *c.sqlite3_stmt,
+    inbound: *c.sqlite3_stmt,
+    workspace_id: ?[]const u8,
+
+    fn init(db: Database, workspace_id: ?[]const u8) !TraverseNeighborStmts {
+        const outbound_sql = if (workspace_id == null)
+            "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC"
+        else
+            "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC";
+        const inbound_sql = if (workspace_id == null)
+            "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC"
+        else
+            "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC";
+
+        const outbound = try prepare(db, outbound_sql);
+        errdefer finalize(outbound);
+        const inbound = try prepare(db, inbound_sql);
+        return .{
+            .outbound = outbound,
+            .inbound = inbound,
+            .workspace_id = workspace_id,
+        };
+    }
+
+    fn deinit(self: *TraverseNeighborStmts) void {
+        finalize(self.outbound);
+        finalize(self.inbound);
+        self.* = undefined;
+    }
+
+    fn load(
+        self: *TraverseNeighborStmts,
+        allocator: std.mem.Allocator,
+        entity_id: u32,
+        direction: TraverseDirection,
+        filter: interfaces.GraphEdgeFilter,
+    ) ![]TraverseNeighbor {
+        const stmt = switch (direction) {
+            .outbound => self.outbound,
+            .inbound => self.inbound,
+        };
+        try resetStatement(stmt);
+        try bindInt64(stmt, 1, entity_id);
+        if (self.workspace_id) |ws| try bindText(stmt, 2, ws);
+
+        var neighbors = std.ArrayList(TraverseNeighbor).empty;
+        errdefer {
+            for (neighbors.items) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
+            neighbors.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.StepFailed;
+
+            const relation = graph_store.RelationRecord{
+                .relation_id = try columnU32(stmt, 0),
+                .source_id = try columnU32(stmt, 2),
+                .target_id = try columnU32(stmt, 3),
+                .relation_type = try dupeColumnText(allocator, stmt, 1),
+                .valid_from_unix = columnOptionalI64(stmt, 4),
+                .valid_to_unix = columnOptionalI64(stmt, 5),
+                .confidence = @floatCast(c.sqlite3_column_double(stmt, 6)),
+            };
+            defer allocator.free(relation.relation_type);
+            if (!passesFilter(relation, filter)) continue;
+
+            try neighbors.append(allocator, .{
+                .relation_id = relation.relation_id,
+                .entity = .{
+                    .entity_id = try columnU32(stmt, 7),
+                    .name = try dupeColumnText(allocator, stmt, 8),
+                    .node_label = try dupeColumnText(allocator, stmt, 9),
+                    .node_type = try dupeColumnText(allocator, stmt, 10),
+                    .metadata_json = try dupeColumnText(allocator, stmt, 11),
+                },
+            });
+        }
+
+        return neighbors.toOwnedSlice(allocator);
+    }
+};
+
 fn loadTraverseNeighbors(
     db: Database,
     allocator: std.mem.Allocator,
@@ -4053,54 +4384,9 @@ fn loadTraverseNeighbors(
     filter: interfaces.GraphEdgeFilter,
     workspace_id: ?[]const u8,
 ) ![]TraverseNeighbor {
-    const sql = if (workspace_id == null) switch (direction) {
-        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
-        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
-    } else switch (direction) {
-        .outbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.target_id WHERE r.source_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
-        .inbound => "SELECT r.relation_id, r.relation_type, r.source_id, r.target_id, r.valid_from_unix, r.valid_to_unix, r.confidence, n.entity_id, n.name, COALESCE(json_extract(n.metadata_json, '$.label'), n.name), COALESCE(json_extract(n.metadata_json, '$.node_type'), 'entity'), n.metadata_json FROM graph_relation r JOIN graph_entity n ON n.entity_id = r.source_id WHERE r.target_id = ?1 AND r.workspace_id = ?2 AND n.workspace_id = ?2 AND r.deprecated_at IS NULL AND n.deprecated_at IS NULL ORDER BY r.relation_id ASC",
-    };
-    const stmt = try prepare(db, sql);
-    defer finalize(stmt);
-    try bindInt64(stmt, 1, entity_id);
-    if (workspace_id) |ws| try bindText(stmt, 2, ws);
-
-    var neighbors = std.ArrayList(TraverseNeighbor).empty;
-    errdefer {
-        for (neighbors.items) |neighbor| deinitTraverseNeighbor(allocator, neighbor);
-        neighbors.deinit(allocator);
-    }
-
-    while (true) {
-        const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_DONE) break;
-        if (rc != c.SQLITE_ROW) return error.StepFailed;
-
-        const relation = graph_store.RelationRecord{
-            .relation_id = try columnU32(stmt, 0),
-            .source_id = try columnU32(stmt, 2),
-            .target_id = try columnU32(stmt, 3),
-            .relation_type = try dupeColumnText(allocator, stmt, 1),
-            .valid_from_unix = columnOptionalI64(stmt, 4),
-            .valid_to_unix = columnOptionalI64(stmt, 5),
-            .confidence = @floatCast(c.sqlite3_column_double(stmt, 6)),
-        };
-        defer allocator.free(relation.relation_type);
-        if (!passesFilter(relation, filter)) continue;
-
-        try neighbors.append(allocator, .{
-            .relation_id = relation.relation_id,
-            .entity = .{
-                .entity_id = try columnU32(stmt, 7),
-                .name = try dupeColumnText(allocator, stmt, 8),
-                .node_label = try dupeColumnText(allocator, stmt, 9),
-                .node_type = try dupeColumnText(allocator, stmt, 10),
-                .metadata_json = try dupeColumnText(allocator, stmt, 11),
-            },
-        });
-    }
-
-    return neighbors.toOwnedSlice(allocator);
+    var stmts = try TraverseNeighborStmts.init(db, workspace_id);
+    defer stmts.deinit();
+    return stmts.load(allocator, entity_id, direction, filter);
 }
 
 fn deinitTraverseNeighbor(allocator: std.mem.Allocator, neighbor: TraverseNeighbor) void {
@@ -4140,40 +4426,56 @@ fn buildTraversePathIds(
     return path;
 }
 
-fn buildTraversePathNames(
-    db: Database,
-    allocator: std.mem.Allocator,
-    visits: std.AutoHashMap(u32, TraverseVisit),
-    node_id: u32,
-) ![][]const u8 {
-    const path_ids = try buildTraversePathIds(allocator, visits, node_id);
-    defer allocator.free(path_ids);
-
-    const path = try allocator.alloc([]const u8, path_ids.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (path[0..initialized]) |segment| allocator.free(segment);
-        allocator.free(path);
-    }
-
-    for (path_ids, 0..) |path_id, index| {
-        const entity = try loadTraverseEntityById(db, allocator, path_id);
-        path[index] = entity.name;
-        initialized += 1;
-        allocator.free(entity.node_label);
-        allocator.free(entity.node_type);
-        allocator.free(entity.metadata_json);
-    }
-
-    return path;
-}
-
 fn buildTraverseRows(
     db: Database,
     allocator: std.mem.Allocator,
     visits: std.AutoHashMap(u32, TraverseVisit),
     node_ids: []const u32,
 ) ![]TraverseRow {
+    // Load every referenced entity once up front (rows and their path
+    // ancestors); the previous version re-fetched each ancestor's row for
+    // every path it appeared on and re-prepared the SQL each time.
+    var summaries = std.AutoHashMap(u32, TraverseEntitySummary).init(allocator);
+    defer {
+        var it = summaries.valueIterator();
+        while (it.next()) |summary| deinitTraverseEntitySummary(allocator, summary.*);
+        summaries.deinit();
+    }
+
+    const entity_stmt = try prepare(
+        db,
+        "SELECT entity_id, name, COALESCE(json_extract(metadata_json, '$.label'), name), COALESCE(json_extract(metadata_json, '$.node_type'), 'entity'), metadata_json FROM graph_entity WHERE entity_id = ?1",
+    );
+    defer finalize(entity_stmt);
+    const relation_stmt = try prepare(db, "SELECT relation_type FROM graph_relation WHERE relation_id = ?1");
+    defer finalize(relation_stmt);
+
+    for (node_ids) |node_id| {
+        var current = node_id;
+        while (true) {
+            if (!summaries.contains(current)) {
+                try resetStatement(entity_stmt);
+                try bindInt64(entity_stmt, 1, current);
+                if (c.sqlite3_step(entity_stmt) != c.SQLITE_ROW) return error.MissingRow;
+                const summary = TraverseEntitySummary{
+                    .entity_id = try columnU32(entity_stmt, 0),
+                    .name = try dupeColumnText(allocator, entity_stmt, 1),
+                    .node_label = try dupeColumnText(allocator, entity_stmt, 2),
+                    .node_type = try dupeColumnText(allocator, entity_stmt, 3),
+                    .metadata_json = try dupeColumnText(allocator, entity_stmt, 4),
+                };
+                errdefer deinitTraverseEntitySummary(allocator, summary);
+                try summaries.put(current, summary);
+            }
+            const visit = visits.get(current) orelse return error.MissingRow;
+            if (visit.predecessor) |predecessor| {
+                current = predecessor.from_node;
+            } else {
+                break;
+            }
+        }
+    }
+
     const rows = try allocator.alloc(TraverseRow, node_ids.len);
     var initialized: usize = 0;
     errdefer {
@@ -4190,27 +4492,45 @@ fn buildTraverseRows(
     }
 
     for (node_ids, 0..) |node_id, index| {
-        const entity = try loadTraverseEntityById(db, allocator, node_id);
-        errdefer deinitTraverseEntitySummary(allocator, entity);
+        const summary = summaries.get(node_id) orelse return error.MissingRow;
         const visit = visits.get(node_id) orelse return error.MissingRow;
-        const path = try buildTraversePathNames(db, allocator, visits, node_id);
-        const path_initialized: usize = path.len;
+
+        const path_ids = try buildTraversePathIds(allocator, visits, node_id);
+        defer allocator.free(path_ids);
+        const path = try allocator.alloc([]const u8, path_ids.len);
+        var path_initialized: usize = 0;
         errdefer {
             for (path[0..path_initialized]) |segment| allocator.free(segment);
             allocator.free(path);
         }
-
-        var edge_label: ?[]const u8 = null;
-        if (visit.predecessor) |predecessor| {
-            const relation = (try loadRelation(db, allocator, predecessor.relation_id)) orelse return error.MissingRow;
-            edge_label = relation.relation_type;
+        for (path_ids, 0..) |path_id, path_index| {
+            const ancestor = summaries.get(path_id) orelse return error.MissingRow;
+            path[path_index] = try allocator.dupe(u8, ancestor.name);
+            path_initialized += 1;
         }
 
+        var edge_label: ?[]const u8 = null;
+        errdefer if (edge_label) |value| allocator.free(value);
+        if (visit.predecessor) |predecessor| {
+            try resetStatement(relation_stmt);
+            try bindInt64(relation_stmt, 1, predecessor.relation_id);
+            if (c.sqlite3_step(relation_stmt) != c.SQLITE_ROW) return error.MissingRow;
+            edge_label = try dupeColumnText(allocator, relation_stmt, 0);
+        }
+
+        const node_id_text = try allocator.dupe(u8, summary.name);
+        errdefer allocator.free(node_id_text);
+        const node_label = try allocator.dupe(u8, summary.node_label);
+        errdefer allocator.free(node_label);
+        const node_type = try allocator.dupe(u8, summary.node_type);
+        errdefer allocator.free(node_type);
+        const metadata_json = try allocator.dupe(u8, summary.metadata_json);
+
         rows[index] = .{
-            .node_id = entity.name,
-            .node_label = entity.node_label,
-            .node_type = entity.node_type,
-            .metadata_json = entity.metadata_json,
+            .node_id = node_id_text,
+            .node_label = node_label,
+            .node_type = node_type,
+            .metadata_json = metadata_json,
             .edge_label = edge_label,
             .depth = visit.depth,
             .path = path,
@@ -4959,6 +5279,70 @@ test "sqlite graph cleanup helper removes prefixed test data" {
     defer finalize(alias_stmt);
     try std.testing.expect(c.sqlite3_step(alias_stmt) == c.SQLITE_ROW);
     try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(alias_stmt, 0));
+}
+
+test "sqlite graph cleanup helper rejects prefixes that could escape the SQL literal" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try insertEntity(db, 1, "person", "keeper");
+
+    try std.testing.expectError(error.InvalidValue, cleanupTestData(db, ""));
+    try std.testing.expectError(error.InvalidValue, cleanupTestData(db, "x'; DELETE FROM graph_entity; --"));
+    try std.testing.expectError(error.InvalidValue, cleanupTestData(db, "%"));
+    try std.testing.expectEqual(@as(u64, 1), try countEntitiesByWorkspace(db, "default"));
+}
+
+test "workspace-scoped marketplace and fts search do not leak other workspaces" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // ws-a: a matching skill plus a neighbor reachable over 'related_to'.
+    try upsertEntityWithMetadataWorkspace(db, 1, "ws-a", "skill", "alpha exporter", "{}");
+    try upsertEntityWithMetadataWorkspace(db, 2, "ws-a", "skill", "csv helper", "{}");
+    try upsertRelationFull(db, 10, "ws-a", "related_to", 1, 2, null, null, 0.9, "{}");
+    // ws-b: same searchable name; must never surface in ws-a results.
+    try upsertEntityWithMetadataWorkspace(db, 3, "ws-b", "skill", "alpha exporter twin", "{}");
+    try upsertRelationFull(db, 11, "ws-b", "related_to", 3, 3, null, null, 0.9, "{}");
+
+    const scoped_hits = try entityFtsSearchWorkspace(db, std.testing.allocator, "ws-a", "alpha", null, null, 0.0, 10);
+    defer {
+        for (scoped_hits) |hit| {
+            std.testing.allocator.free(hit.name);
+            std.testing.allocator.free(hit.entity_type);
+            std.testing.allocator.free(hit.metadata_json);
+        }
+        std.testing.allocator.free(scoped_hits);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped_hits.len);
+    try std.testing.expectEqual(@as(u32, 1), scoped_hits[0].entity_id);
+
+    const results = try marketplaceSearchWorkspace(db, std.testing.allocator, "ws-a", "alpha", null, 0.0, 2, 10);
+    defer {
+        for (results) |row| {
+            std.testing.allocator.free(row.name);
+            std.testing.allocator.free(row.entity_type);
+            std.testing.allocator.free(row.metadata_json);
+        }
+        std.testing.allocator.free(results);
+    }
+
+    // The seed and its ws-a neighbor, and nothing from ws-b.
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    var found_seed = false;
+    var found_neighbor = false;
+    for (results) |row| {
+        try std.testing.expect(row.entity_id != 3);
+        if (row.entity_id == 1) {
+            found_seed = true;
+            try std.testing.expect(row.is_direct_match);
+        }
+        if (row.entity_id == 2) found_neighbor = true;
+    }
+    try std.testing.expect(found_seed);
+    try std.testing.expect(found_neighbor);
 }
 
 test "sqlite graph stream helpers emit json events" {

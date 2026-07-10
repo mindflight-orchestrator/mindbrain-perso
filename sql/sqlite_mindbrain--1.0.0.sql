@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS column_semantics (
     UNIQUE(workspace_id, table_schema, table_name, column_name)
 );
 
+-- Workspace export walks column semantics per table; without this index each
+-- table forces a full scan of column_semantics.
+CREATE INDEX IF NOT EXISTS column_semantics_table_id_idx
+    ON column_semantics(table_id);
+
 CREATE TABLE IF NOT EXISTS relation_semantics (
     relation_semantic_id INTEGER PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -94,6 +99,15 @@ CREATE TABLE IF NOT EXISTS relation_semantics (
     UNIQUE(workspace_id, from_schema, from_table, to_schema, to_table, fk_column)
 );
 
+-- Workspace export counts relations per table with `source_table_id = ?1 OR
+-- target_table_id = ?1`; these two indexes let SQLite's OR optimization avoid
+-- a full scan per table.
+CREATE INDEX IF NOT EXISTS relation_semantics_source_table_idx
+    ON relation_semantics(source_table_id);
+
+CREATE INDEX IF NOT EXISTS relation_semantics_target_table_idx
+    ON relation_semantics(target_table_id);
+
 CREATE TABLE IF NOT EXISTS source_mappings (
     source_mapping_id INTEGER PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -105,6 +119,10 @@ CREATE TABLE IF NOT EXISTS source_mappings (
     FOREIGN KEY(target_table_id) REFERENCES table_semantics(table_id),
     UNIQUE(workspace_id, source_key)
 );
+
+-- Workspace export scans source mappings per target table.
+CREATE INDEX IF NOT EXISTS source_mappings_target_table_idx
+    ON source_mappings(target_table_id);
 
 CREATE TABLE IF NOT EXISTS structured_import_provenance (
     workspace_id TEXT NOT NULL,
@@ -171,6 +189,20 @@ CREATE TABLE IF NOT EXISTS facet_value_nodes (
     PRIMARY KEY(table_id, value_id),
     FOREIGN KEY(table_id, facet_id) REFERENCES facet_definitions(table_id, facet_id)
 );
+
+-- All readers and writers treat (table_id, facet_id, facet_value) as a natural
+-- key (lookup-before-insert), so enforce it and make those lookups indexed.
+-- Guard: drop legacy duplicate rows (keeping the earliest) so creating the
+-- unique index cannot fail on databases written before the constraint existed.
+DELETE FROM facet_value_nodes
+WHERE rowid NOT IN (
+    SELECT MIN(rowid)
+    FROM facet_value_nodes
+    GROUP BY table_id, facet_id, facet_value
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS facet_value_nodes_value_uidx
+    ON facet_value_nodes(table_id, facet_id, facet_value);
 
 CREATE TABLE IF NOT EXISTS graph_entity (
     entity_id INTEGER PRIMARY KEY,
@@ -585,6 +617,11 @@ CREATE INDEX IF NOT EXISTS idx_proj_agent
 
 CREATE INDEX IF NOT EXISTS idx_proj_scope
     ON projections(scope) WHERE scope IS NOT NULL;
+
+-- Coverage counts the unscoped projections separately; idx_proj_scope is
+-- partial on scope IS NOT NULL, so the NULL arm needs its own partial index.
+CREATE INDEX IF NOT EXISTS idx_proj_scope_null
+    ON projections(scope) WHERE scope IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_proj_type_weight
     ON projections(proj_type, weight DESC);

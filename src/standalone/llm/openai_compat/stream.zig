@@ -33,7 +33,10 @@ pub fn streamChat(
     const body = try renderStreamingRequest(allocator, config.model, request);
     defer allocator.free(body);
 
-    const response = try http_client.postJson(allocator, io, url, config.api_key, body);
+    const response = try http_client.postJson(allocator, io, url, config.api_key, body, .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
     defer response.deinit(allocator);
     return parseSseEvents(allocator, response.body);
 }
@@ -77,10 +80,14 @@ fn appendEventForChunk(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const choices = parsed.value.object.get("choices") orelse return;
+    if (choices != .array) return error.InvalidResponse;
     if (choices.array.items.len == 0) return;
     const first = choices.array.items[0];
+    if (first != .object) return error.InvalidResponse;
     const delta = first.object.get("delta") orelse return;
+    if (delta != .object) return error.InvalidResponse;
 
     if (delta.object.get("content")) |content_value| {
         if (content_value == .string and content_value.string.len > 0) {
@@ -95,8 +102,10 @@ fn appendEventForChunk(
     if (delta.object.get("tool_calls")) |tool_calls| {
         if (tool_calls == .array) {
             for (tool_calls.array.items) |call| {
+                if (call != .object) return error.InvalidResponse;
                 const id = if (call.object.get("id")) |value| if (value == .string) value.string else "" else "";
                 const function = call.object.get("function");
+                if (function) |fn_value| if (fn_value != .object) return error.InvalidResponse;
                 const name = if (function) |fn_value| if (fn_value.object.get("name")) |value| if (value == .string) value.string else "" else "" else "";
                 const args = if (function) |fn_value| if (fn_value.object.get("arguments")) |value| if (value == .string) value.string else "" else "" else "";
                 try events.append(allocator, .{

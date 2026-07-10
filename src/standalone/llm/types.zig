@@ -35,6 +35,8 @@ pub const ProviderConfig = struct {
     audio_model: ?[]const u8 = null,
     anthropic_version: ?[]const u8 = null,
     capabilities: []const Capability = &.{ .chat, .json_output },
+    /// Cap on buffered response-body bytes for requests to this provider.
+    max_response_bytes: usize = 4 * 1024 * 1024,
 };
 
 pub const ManagerConfig = struct {

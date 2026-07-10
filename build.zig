@@ -66,6 +66,19 @@ pub fn build(b: *std.Build) void {
     });
     standalone_test_mod.linkSystemLibrary("sqlite3", .{});
 
+    // `tool.zig` consumes the engine through the `mindbrain` module, so it cannot
+    // join `standalone_test_mod` (a file may belong to only one module). Give it
+    // its own test root instead — it imports nothing else but `std`.
+    const tool_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/standalone/tool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tool_test_mod.addImport("mindbrain", standalone_http_lib_mod);
+    tool_test_mod.linkSystemLibrary("sqlite3", .{});
+    const tool_tests = b.addTest(.{ .root_module = tool_test_mod });
+
     const bm25_search_test_mod = b.createModule(.{
         .root_source_file = b.path("src/mb_facets/bm25/search_test.zig"),
         .target = target,
@@ -76,6 +89,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_standalone_tests = b.addRunArtifact(standalone_tests);
+    const run_tool_tests = b.addRunArtifact(tool_tests);
     const run_bm25_tests = b.addRunArtifact(bm25_tests);
 
     // Zig's default build summary only prints failed steps, so successful test runs are silent.
@@ -83,10 +97,11 @@ pub fn build(b: *std.Build) void {
     const print_tests_ok = b.addSystemCommand(&.{
         "sh", "-c",
         \\printf '\n%s\n%s\n\n' \
-        \\  'All unit tests passed (standalone + BM25).' \
+        \\  'All unit tests passed (standalone + tool + BM25).' \
         \\  'For per-step detail and timing:  zig build test --summary all'
     });
     print_tests_ok.step.dependOn(&run_standalone_tests.step);
+    print_tests_ok.step.dependOn(&run_tool_tests.step);
     print_tests_ok.step.dependOn(&run_bm25_tests.step);
 
     const test_standalone_step = b.step("test-standalone", "Run standalone engine tests");

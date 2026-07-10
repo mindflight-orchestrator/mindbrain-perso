@@ -7,6 +7,8 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     model: []const u8,
     version: []const u8 = "2023-06-01",
+    max_response_bytes: usize = 4 * 1024 * 1024,
+    retry: http_client.RetryPolicy = .{},
 };
 
 pub fn chat(
@@ -32,8 +34,11 @@ pub fn chat(
         header_count += 1;
     }
 
-    const response = try http_client.postWithHeaders(allocator, io, url, body, headers_buf[0..header_count]);
-    errdefer response.deinit(allocator);
+    const response = try http_client.postWithHeaders(allocator, io, url, body, headers_buf[0..header_count], .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
+    // parseMessagesResponse owns response.body from here on (success and failure).
     return parseMessagesResponse(allocator, response.body);
 }
 
@@ -145,16 +150,21 @@ fn renderContentPart(writer: *std.Io.Writer, part: types.ContentPart) !void {
     }
 }
 
+/// Takes ownership of `raw_json`: on success it is stored in the returned
+/// response (freed by its `deinit`); on failure it is freed here. Callers
+/// must not free it themselves.
 pub fn parseMessagesResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.ChatResponse {
     errdefer allocator.free(raw_json);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const content = parsed.value.object.get("content") orelse return error.InvalidResponse;
     if (content != .array) return error.InvalidResponse;
     var text = std.Io.Writer.Allocating.init(allocator);
     errdefer text.deinit();
     for (content.array.items) |part| {
+        if (part != .object) return error.InvalidResponse;
         const kind = part.object.get("type") orelse continue;
         if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
         const value = part.object.get("text") orelse continue;
@@ -188,4 +198,15 @@ test "parseMessagesResponse extracts text blocks" {
     var response = try parseMessagesResponse(std.testing.allocator, raw);
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hello world", response.content);
+}
+
+test "parseMessagesResponse rejects malformed payloads without crashing or leaking" {
+    inline for (.{
+        "[]",
+        "{\"content\":42}",
+        "{\"content\":[true]}",
+    }) |raw| {
+        const owned = try std.testing.allocator.dupe(u8, raw);
+        try std.testing.expectError(error.InvalidResponse, parseMessagesResponse(std.testing.allocator, owned));
+    }
 }

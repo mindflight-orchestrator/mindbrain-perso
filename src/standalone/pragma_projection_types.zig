@@ -60,7 +60,15 @@ pub const ProjectionTypeIndex = struct {
         return null;
     }
 
+    /// Keys are lowercased at load time, so the common path is a single
+    /// hash-map probe instead of a case-insensitive scan of every row.
     fn findExact(self: *const ProjectionTypeIndex, type_name: []const u8) ?Entry {
+        var buf: [128]u8 = undefined;
+        if (type_name.len <= buf.len) {
+            return self.rows.get(std.ascii.lowerString(buf[0..type_name.len], type_name));
+        }
+        // Names longer than the stack buffer are pathological; fall back to
+        // the old linear scan rather than allocating on a read path.
         var it = self.rows.iterator();
         while (it.next()) |kv| {
             if (std.ascii.eqlIgnoreCase(kv.key_ptr.*, type_name)) return kv.value_ptr.*;
@@ -134,7 +142,7 @@ pub fn loadIndex(db: Database, parent_allocator: std.mem.Allocator) !ProjectionT
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
-        const type_name = try dupeColumnText(allocator, stmt, 0);
+        const type_name = try dupeColumnTextLower(allocator, stmt, 0);
         const aliases_json = try dupeColumnText(allocator, stmt, 1);
         const rank_bias = c.sqlite3_column_double(stmt, 2);
         const pack_priority = c.sqlite3_column_int(stmt, 3);
@@ -187,6 +195,14 @@ fn dupeColumnText(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, index: c_
     const ptr = c.sqlite3_column_text(stmt, index) orelse return try allocator.dupe(u8, "");
     const bytes: []const u8 = @as([*]const u8, @ptrCast(ptr))[0..@intCast(len)];
     return try allocator.dupe(u8, bytes);
+}
+
+fn dupeColumnTextLower(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, index: c_int) ![]const u8 {
+    const len = c.sqlite3_column_bytes(stmt, index);
+    const ptr = c.sqlite3_column_text(stmt, index) orelse return try allocator.dupe(u8, "");
+    const bytes: []const u8 = @as([*]const u8, @ptrCast(ptr))[0..@intCast(len)];
+    const out = try allocator.alloc(u8, bytes.len);
+    return std.ascii.lowerString(out, bytes);
 }
 
 test "projection types index respects compatibility aliases and biases" {

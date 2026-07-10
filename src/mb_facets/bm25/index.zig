@@ -168,21 +168,24 @@ fn updateInvertedIndex(table_id: c.Oid, term_hash: i64, term_text: []const u8, d
 
     // Use atomic upserts. The posting bitmap is kept in bm25_index while
     // per-document frequencies are stored in a narrow normalized table.
+    // config_name is bound as $2, not spliced into the SQL literal: a quote
+    // in the language/config value broke the statement (SQL injection).
     const upsert_query = try std.fmt.allocPrintSentinel(allocator,
         \\INSERT INTO facets.bm25_index (table_id, term_hash, term_text, doc_ids, language)
-        \\VALUES ({d}, {d}, $1, rb_build(ARRAY[{d}::int]), '{s}')
+        \\VALUES ({d}, {d}, $1, rb_build(ARRAY[{d}::int]), $2)
         \\ON CONFLICT (table_id, term_hash) DO UPDATE SET
         \\    doc_ids = rb_or(facets.bm25_index.doc_ids, EXCLUDED.doc_ids),
         \\    term_text = EXCLUDED.term_text,
         \\    language = EXCLUDED.language
-    , .{ table_id, term_hash, doc_id, config_name }, 0);
+    , .{ table_id, term_hash, doc_id }, 0);
     defer allocator.free(upsert_query);
 
-    var argtypes = [_]c.Oid{c.TEXTOID};
-    var argvalues = [_]c.Datum{term_text_datum};
-    var argnulls = [_]u8{' '};
+    const config_datum = c.PointerGetDatum(c.cstring_to_text_with_len(config_name.ptr, @intCast(config_name.len)));
+    var argtypes = [_]c.Oid{ c.TEXTOID, c.TEXTOID };
+    var argvalues = [_]c.Datum{ term_text_datum, config_datum };
+    var argnulls = [_]u8{ ' ', ' ' };
 
-    const ret = c.SPI_execute_with_args(upsert_query.ptr, 1, &argtypes, &argvalues, &argnulls, false, // not read_only
+    const ret = c.SPI_execute_with_args(upsert_query.ptr, 2, &argtypes, &argvalues, &argnulls, false, // not read_only
         0);
 
     if (ret != c.SPI_OK_INSERT and ret != c.SPI_OK_UPDATE) {
@@ -253,10 +256,17 @@ fn updateDocumentMetadata(table_id: c.Oid, doc_id: i64, doc_length: i32, config_
     const check_ret = c.SPI_execute(check_query.ptr, true, 1);
     const is_new_doc = (check_ret == c.SPI_OK_SELECT and c.SPI_processed == 0);
 
-    const query = try std.fmt.allocPrintSentinel(allocator, "INSERT INTO facets.bm25_documents (table_id, doc_id, doc_length, language) VALUES ({d}, {d}, {d}, '{s}') ON CONFLICT (table_id, doc_id) DO UPDATE SET doc_length = EXCLUDED.doc_length, updated_at = now()", .{ table_id, doc_id, doc_length, config_name }, 0);
+    // config_name is bound as $1, not spliced into the SQL literal (a quote
+    // in the language/config value broke the statement).
+    const query = try std.fmt.allocPrintSentinel(allocator, "INSERT INTO facets.bm25_documents (table_id, doc_id, doc_length, language) VALUES ({d}, {d}, {d}, $1) ON CONFLICT (table_id, doc_id) DO UPDATE SET doc_length = EXCLUDED.doc_length, updated_at = now()", .{ table_id, doc_id, doc_length }, 0);
     defer allocator.free(query);
 
-    const ret = c.SPI_execute(query.ptr, false, 0);
+    const config_datum = c.PointerGetDatum(c.cstring_to_text_with_len(config_name.ptr, @intCast(config_name.len)));
+    var argtypes = [_]c.Oid{c.TEXTOID};
+    var argvalues = [_]c.Datum{config_datum};
+    var argnulls = [_]u8{' '};
+
+    const ret = c.SPI_execute_with_args(query.ptr, 1, &argtypes, &argvalues, &argnulls, false, 0);
     if (ret != c.SPI_OK_INSERT and ret != c.SPI_OK_UPDATE) {
         utils.elog(c.ERROR, "Failed to update document metadata");
         return error.UpdateFailed;

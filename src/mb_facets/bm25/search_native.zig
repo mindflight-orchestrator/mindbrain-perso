@@ -235,9 +235,13 @@ pub fn searchNative(
         });
     }
 
+    // doc_id tie-break (same contract as hybrid_search.hybridBetter): the
+    // results come out of a hashmap, so a score-only sort shuffles tied
+    // documents between otherwise identical queries and breaks pagination.
     std.mem.sort(SearchResult, results.items, {}, struct {
         fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-            return a.score > b.score;
+            if (a.score != b.score) return a.score > b.score;
+            return a.doc_id < b.doc_id;
         }
     }.lessThan);
 
@@ -332,15 +336,19 @@ pub fn bm25_search_native(fcinfo: c.FunctionCallInfo) callconv(.c) c.Datum {
     }
 
     // p_prefix_match boolean (default false) - arg 3
-    // Currently not used in searchNative, but we need to skip it
-    _ = utils.is_arg_null(fcinfo, 3); // prefix_match
+    // Not implemented by searchNative: warn instead of silently ignoring it.
+    if (!utils.is_arg_null(fcinfo, 3) and c.DatumGetBool(utils.get_arg_datum(fcinfo, 3))) {
+        utils.elogFmt(c.WARNING, "bm25_search_native: p_prefix_match is not supported by the native search path and is ignored", .{});
+    }
 
     // p_fuzzy_match boolean (default false) - arg 4
-    // Currently not used in searchNative, but we need to skip it
-    _ = utils.is_arg_null(fcinfo, 4); // fuzzy_match
+    // Not implemented by searchNative: warn instead of silently ignoring it.
+    if (!utils.is_arg_null(fcinfo, 4) and c.DatumGetBool(utils.get_arg_datum(fcinfo, 4))) {
+        utils.elogFmt(c.WARNING, "bm25_search_native: p_fuzzy_match is not supported by the native search path and is ignored", .{});
+    }
 
     // p_fuzzy_threshold float (default 0.3) - arg 5
-    // Currently not used in searchNative, but we need to skip it
+    // Only meaningful together with p_fuzzy_match, which is unsupported.
     _ = utils.is_arg_null(fcinfo, 5); // fuzzy_threshold
 
     // p_k1 float (default 1.2) - arg 6

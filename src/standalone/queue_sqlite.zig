@@ -69,20 +69,6 @@ pub const QueueStore = struct {
 
         const now = unixTimestamp();
         const lease_until = now + @max(visibility_timeout_seconds, 0);
-        const select_stmt = try prepare(
-            self.db,
-            "SELECT msg_id, read_ct, enqueued_at_unix, message FROM queue_messages WHERE queue_name = ?1 AND archived = 0 AND deleted = 0 AND (vt_until_unix IS NULL OR vt_until_unix <= ?2) ORDER BY msg_id ASC LIMIT ?3",
-        );
-        defer finalize(select_stmt);
-        try bindText(select_stmt, 1, queue_name);
-        try bindInt64(select_stmt, 2, now);
-        try bindInt64(select_stmt, 3, limit_n);
-
-        const update_stmt = try prepare(
-            self.db,
-            "UPDATE queue_messages SET read_ct = read_ct + 1, vt_until_unix = ?2 WHERE msg_id = ?1 AND queue_name = ?3 AND archived = 0 AND deleted = 0",
-        );
-        defer finalize(update_stmt);
 
         var out = std.ArrayList(Message).empty;
         errdefer {
@@ -90,32 +76,60 @@ pub const QueueStore = struct {
             out.deinit(self.allocator);
         }
 
-        while (true) {
-            const rc = c.sqlite3_step(select_stmt);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) return error.StepFailed;
+        // Drain the SELECT cursor completely before touching the table:
+        // updating vt_until_unix while the cursor still steps the same index
+        // on the same connection can skip or duplicate deliveries.
+        {
+            const select_stmt = try prepare(
+                self.db,
+                "SELECT msg_id, read_ct, enqueued_at_unix, message FROM queue_messages WHERE queue_name = ?1 AND archived = 0 AND deleted = 0 AND (vt_until_unix IS NULL OR vt_until_unix <= ?2) ORDER BY msg_id ASC LIMIT ?3",
+            );
+            defer finalize(select_stmt);
+            try bindText(select_stmt, 1, queue_name);
+            try bindInt64(select_stmt, 2, now);
+            try bindInt64(select_stmt, 3, limit_n);
 
-            const msg_id = try columnI64(select_stmt, 0);
-            const read_ct = try columnI64(select_stmt, 1);
-            const enqueued_at = try columnI64(select_stmt, 2);
-            const message = try dupeColumnText(self.allocator, select_stmt, 3);
+            while (true) {
+                const rc = c.sqlite3_step(select_stmt);
+                if (rc == c.SQLITE_DONE) break;
+                if (rc != c.SQLITE_ROW) return error.StepFailed;
 
-            try resetStatement(update_stmt);
-            try bindInt64(update_stmt, 1, msg_id);
-            try bindInt64(update_stmt, 2, lease_until);
-            try bindText(update_stmt, 3, queue_name);
-            try stepDone(update_stmt);
+                const msg_id = try columnI64(select_stmt, 0);
+                const read_ct = try columnI64(select_stmt, 1);
+                const enqueued_at = try columnI64(select_stmt, 2);
+                const message = try dupeColumnText(self.allocator, select_stmt, 3);
 
-            try out.append(self.allocator, .{
-                .msg_id = msg_id,
-                .read_ct = read_ct + 1,
-                .enqueued_at_unix = enqueued_at,
-                .vt_until_unix = lease_until,
-                .message = message,
-            });
+                try out.append(self.allocator, .{
+                    .msg_id = msg_id,
+                    .read_ct = read_ct + 1,
+                    .enqueued_at_unix = enqueued_at,
+                    .vt_until_unix = lease_until,
+                    .message = message,
+                });
+            }
         }
 
-        try resetStatement(select_stmt);
+        if (out.items.len > 0) {
+            // Single lease UPDATE for the whole batch, inside the same
+            // BEGIN IMMEDIATE transaction as the SELECT above.
+            var sql = std.ArrayList(u8).empty;
+            defer sql.deinit(self.allocator);
+            try sql.appendSlice(self.allocator, "UPDATE queue_messages SET read_ct = read_ct + 1, vt_until_unix = ?1 WHERE queue_name = ?2 AND archived = 0 AND deleted = 0 AND msg_id IN (");
+            for (out.items, 0..) |row, i| {
+                if (i > 0) try sql.append(self.allocator, ',');
+                var id_buf: [20]u8 = undefined;
+                const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{row.msg_id}) catch return error.StepFailed;
+                try sql.appendSlice(self.allocator, id_text);
+            }
+            try sql.append(self.allocator, ')');
+
+            const update_stmt = try prepare(self.db, sql.items);
+            defer finalize(update_stmt);
+            try bindInt64(update_stmt, 1, lease_until);
+            try bindText(update_stmt, 2, queue_name);
+            try stepDone(update_stmt);
+        }
+
         try commit(self.db);
         return out.toOwnedSlice(self.allocator);
     }
@@ -341,6 +355,34 @@ test "queue sqlite reclaims a message after immediate lease expiry" {
     try std.testing.expectEqual(@as(usize, 1), second.len);
     try std.testing.expectEqualStrings(first[0].message, second[0].message);
     try std.testing.expectEqual(@as(i64, 2), second[0].read_ct);
+}
+
+test "queue sqlite batch read delivers each message exactly once with zero visibility timeout" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var queue = QueueStore.init(db, std.testing.allocator);
+    var expected_ids: [3]i64 = undefined;
+    for (&expected_ids, 0..) |*slot, i| {
+        var payload_buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "{{\"n\":{d}}}", .{i});
+        slot.* = try queue.sendText("signal_raw", payload);
+    }
+
+    // Regression: with visibility_timeout 0 the lease UPDATE keeps rows
+    // eligible (vt_until_unix <= now); mutating rows while the SELECT cursor
+    // was still stepping used to duplicate or skip deliveries.
+    const msgs = try queue.read("signal_raw", 0, 10);
+    defer {
+        for (msgs) |msg| std.testing.allocator.free(msg.message);
+        std.testing.allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    for (msgs, expected_ids) |msg, expected_id| {
+        try std.testing.expectEqual(expected_id, msg.msg_id);
+        try std.testing.expectEqual(@as(i64, 1), msg.read_ct);
+    }
 }
 
 test "queue sqlite preserves leased messages across reopen" {

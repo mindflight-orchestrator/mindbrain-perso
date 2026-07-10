@@ -6,12 +6,22 @@ pub const Score = struct {
     similarity: f64,
 };
 
+/// Scores over the common prefix (`@min(a.len, b.len)`) for legacy callers
+/// that tolerate mixed-dimension stores. New code should prefer
+/// `scoreChecked`, which rejects mismatched dimensions instead of silently
+/// producing a truncated (and therefore meaningless) score.
 pub fn score(metric: interfaces.VectorDistanceMetric, query: []const f32, candidate: []const f32) Score {
     return switch (metric) {
         .cosine => cosineScore(query, candidate),
         .l2 => l2Score(query, candidate),
         .inner_product => innerProductScore(query, candidate),
     };
+}
+
+/// Like `score` but errors on mismatched embedding dimensions.
+pub fn scoreChecked(metric: interfaces.VectorDistanceMetric, query: []const f32, candidate: []const f32) error{DimensionMismatch}!Score {
+    if (query.len != candidate.len) return error.DimensionMismatch;
+    return score(metric, query, candidate);
 }
 
 pub fn lessThan(_: void, lhs: interfaces.VectorSearchMatch, rhs: interfaces.VectorSearchMatch) bool {
@@ -136,6 +146,16 @@ test "vector distance ranks cosine neighbors by similarity" {
 
     try std.testing.expect(close.similarity > far.similarity);
     try std.testing.expect(close.distance < far.distance);
+}
+
+test "scoreChecked rejects mismatched embedding dimensions" {
+    const query = [_]f32{ 1.0, 0.0 };
+    try std.testing.expectError(
+        error.DimensionMismatch,
+        scoreChecked(.cosine, &query, &.{ 1.0, 0.0, 0.5 }),
+    );
+    const ok = try scoreChecked(.cosine, &query, &.{ 1.0, 0.0 });
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), ok.similarity, 1e-9);
 }
 
 test "vector distance supports l2 and inner product metrics" {

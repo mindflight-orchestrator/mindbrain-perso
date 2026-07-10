@@ -8,6 +8,7 @@ pub const Config = struct {
     api_key: ?[]const u8 = null,
     model: []const u8,
     max_response_bytes: usize = 4 * 1024 * 1024,
+    retry: http_client.RetryPolicy = .{},
 };
 
 pub const EventList = struct {
@@ -37,8 +38,11 @@ pub fn respond(
     const body = try renderRequest(allocator, config.model, request);
     defer allocator.free(body);
 
-    const response = try http_client.postJson(allocator, io, url, config.api_key, body);
-    errdefer response.deinit(allocator);
+    const response = try http_client.postJson(allocator, io, url, config.api_key, body, .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
+    // parseResponse owns response.body from here on (success and failure).
     return parseResponse(allocator, response.body);
 }
 
@@ -56,7 +60,10 @@ pub fn streamRespond(
     const body = try renderRequest(allocator, config.model, stream_request);
     defer allocator.free(body);
 
-    const response = try http_client.postJson(allocator, io, url, config.api_key, body);
+    const response = try http_client.postJson(allocator, io, url, config.api_key, body, .{
+        .max_response_bytes = config.max_response_bytes,
+        .retry = config.retry,
+    });
     defer response.deinit(allocator);
     return parseSseEvents(allocator, response.body);
 }
@@ -221,11 +228,15 @@ fn renderToolChoice(writer: *std.Io.Writer, choice: types.ToolChoice) !void {
     }
 }
 
+/// Takes ownership of `raw_json`: on success it is stored in the returned
+/// result (freed by its `deinit`); on failure it is freed here. Callers must
+/// not free it themselves.
 pub fn parseResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.ResponseResult {
     errdefer allocator.free(raw_json);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidResponse;
     const id = try dupObjectString(allocator, parsed.value, "id", "");
     errdefer allocator.free(id);
     const status = try dupObjectString(allocator, parsed.value, "status", "");
@@ -257,7 +268,11 @@ fn parseOutputItem(
     item_value: std.json.Value,
     output_text: *std.Io.Writer.Allocating,
 ) !types.ResponseOutputItem {
-    const item_type = if (item_value.object.get("type")) |value| value.string else "unknown";
+    if (item_value != .object) return error.InvalidResponse;
+    const item_type = if (item_value.object.get("type")) |value|
+        (if (value == .string) value.string else return error.InvalidResponse)
+    else
+        "unknown";
     if (std.mem.eql(u8, item_type, "message")) return parseMessageOutput(allocator, item_value, output_text);
     if (std.mem.eql(u8, item_type, "function_call")) return .{ .function_call = .{
         .id = try dupObjectString(allocator, item_value, "id", ""),
@@ -290,9 +305,14 @@ fn parseMessageOutput(
     var text = std.Io.Writer.Allocating.init(allocator);
     errdefer text.deinit();
     for (content.array.items) |part| {
-        const part_type = if (part.object.get("type")) |value| value.string else "";
+        if (part != .object) return error.InvalidResponse;
+        const part_type = if (part.object.get("type")) |value|
+            (if (value == .string) value.string else return error.InvalidResponse)
+        else
+            "";
         if (std.mem.eql(u8, part_type, "output_text")) {
             if (part.object.get("text")) |value| {
+                if (value != .string) return error.InvalidResponse;
                 try text.writer.writeAll(value.string);
                 try output_text.writer.writeAll(value.string);
             }
@@ -306,6 +326,7 @@ fn parseMessageOutput(
 }
 
 fn dupSummary(allocator: std.mem.Allocator, item_value: std.json.Value) ![]u8 {
+    if (item_value != .object) return error.InvalidResponse;
     const summary = item_value.object.get("summary") orelse return try allocator.dupe(u8, "");
     if (summary == .string) return try allocator.dupe(u8, summary.string);
     return try std.json.Stringify.valueAlloc(allocator, summary, .{});
@@ -317,6 +338,7 @@ fn dupObjectString(
     key: []const u8,
     default: []const u8,
 ) ![]u8 {
+    if (object != .object) return error.InvalidResponse;
     const value = object.object.get(key) orelse return try allocator.dupe(u8, default);
     return switch (value) {
         .string => |text| try allocator.dupe(u8, text),
@@ -355,7 +377,11 @@ fn appendEventForChunk(
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
-    const event_type = if (parsed.value.object.get("type")) |value| value.string else "";
+    if (parsed.value != .object) return error.InvalidResponse;
+    const event_type = if (parsed.value.object.get("type")) |value|
+        (if (value == .string) value.string else return error.InvalidResponse)
+    else
+        "";
 
     if (std.mem.eql(u8, event_type, "response.created")) {
         try events.append(allocator, .{ .kind = .response_created, .raw_json = try allocator.dupe(u8, data) });
@@ -444,6 +470,20 @@ test "parseResponse extracts output text and function call" {
     try std.testing.expectEqualStrings("resp_1", result.id);
     try std.testing.expectEqualStrings("hello", result.output_text);
     try std.testing.expectEqual(@as(usize, 2), result.output_items.len);
+}
+
+fn expectInvalidResponse(raw: []const u8) !void {
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    try std.testing.expectError(error.InvalidResponse, parseResponse(std.testing.allocator, owned));
+}
+
+test "parseResponse rejects malformed payloads without crashing or leaking" {
+    try expectInvalidResponse("[]");
+    try expectInvalidResponse("{\"output\":42}");
+    try expectInvalidResponse("{\"output\":[true]}");
+    try expectInvalidResponse("{\"output\":[{\"type\":7}]}");
+    try expectInvalidResponse("{\"output\":[{\"type\":\"message\",\"content\":\"nope\"}]}");
+    try expectInvalidResponse("{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":5}]}]}");
 }
 
 test "parseSseEvents normalizes response stream events" {

@@ -31,6 +31,16 @@ int varhdrsz_helper(void) {
     return VARHDRSZ;
 }
 
+/* Format-agnostic varlena accessors: handle both 1-byte (short) and 4-byte
+ * headers, unlike manual header decoding which misreads short varlenas. */
+size_t varsize_any_exhdr_helper(struct varlena *ptr) {
+    return VARSIZE_ANY_EXHDR(ptr);
+}
+
+void *vardata_any_helper(struct varlena *ptr) {
+    return VARDATA_ANY(ptr);
+}
+
 void set_varsize_helper(struct varlena *ptr, int size) {
     SET_VARSIZE(ptr, size);
 }

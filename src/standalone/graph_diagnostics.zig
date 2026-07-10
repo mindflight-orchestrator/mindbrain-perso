@@ -277,6 +277,12 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
     else
         return error.InvalidArguments;
 
+    // One transaction for the whole import: a mid-loop validation or bind
+    // failure in replace mode used to lose the deleted rules while keeping
+    // only the rows inserted so far.
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+
     if (envelope.replace) {
         const workspace_id = envelope.workspace_id orelse return error.MissingWorkspace;
         const delete_sql = "DELETE FROM graph_gap_rules WHERE ontology_id = ?1 AND workspace_id = ?2";
@@ -337,6 +343,7 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
         try facet_sqlite.stepDone(stmt);
         imported += 1;
     }
+    try tx.commit();
     return imported;
 }
 
@@ -436,27 +443,50 @@ fn fieldFilterMatches(allocator: std.mem.Allocator, entity_value: ?[]const u8, f
     return true;
 }
 
-fn entityMatchesRuleFilter(allocator: std.mem.Allocator, entity_metadata_json: []const u8, rule_metadata_json: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rule_metadata_json, .{
-        .allocate = .alloc_if_needed,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    const root = parsed.value;
-    if (root != .object) return true;
-    const entity_filter = root.object.get("entity_filter") orelse return true;
-    if (entity_filter != .object) return true;
-    const metadata = entity_filter.object.get("metadata") orelse return true;
-    if (metadata != .object) return true;
+/// Pre-parsed `entity_filter.metadata` object from a rule's metadata JSON.
+/// Parsed once per rule; the previous code re-parsed the rule JSON for
+/// every evaluated entity.
+const RuleFilter = struct {
+    parsed: ?std.json.Parsed(std.json.Value) = null,
+    metadata: ?std.json.ObjectMap = null,
 
-    var iterator = metadata.object.iterator();
-    while (iterator.next()) |entry| {
-        const field_value = try metadataFieldString(allocator, entity_metadata_json, entry.key_ptr.*);
-        defer if (field_value) |value| allocator.free(value);
-        if (!try fieldFilterMatches(allocator, field_value, entry.value_ptr.*)) return false;
+    fn init(allocator: std.mem.Allocator, rule_metadata_json: []const u8) !RuleFilter {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rule_metadata_json, .{
+            .allocate = .alloc_if_needed,
+            .ignore_unknown_fields = true,
+        });
+        const metadata: ?std.json.ObjectMap = blk: {
+            const root = parsed.value;
+            if (root != .object) break :blk null;
+            const entity_filter = root.object.get("entity_filter") orelse break :blk null;
+            if (entity_filter != .object) break :blk null;
+            const metadata_value = entity_filter.object.get("metadata") orelse break :blk null;
+            if (metadata_value != .object) break :blk null;
+            break :blk metadata_value.object;
+        };
+        if (metadata == null) {
+            parsed.deinit();
+            return .{};
+        }
+        return .{ .parsed = parsed, .metadata = metadata };
     }
-    return true;
-}
+
+    fn deinit(self: *RuleFilter) void {
+        if (self.parsed) |*parsed| parsed.deinit();
+        self.* = .{};
+    }
+
+    fn matches(self: RuleFilter, allocator: std.mem.Allocator, entity_metadata_json: []const u8) !bool {
+        const metadata = self.metadata orelse return true;
+        var iterator = metadata.iterator();
+        while (iterator.next()) |entry| {
+            const field_value = try metadataFieldString(allocator, entity_metadata_json, entry.key_ptr.*);
+            defer if (field_value) |value| allocator.free(value);
+            if (!try fieldFilterMatches(allocator, field_value, entry.value_ptr.*)) return false;
+        }
+        return true;
+    }
+};
 
 pub fn rulesJson(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8, workspace_id: ?[]const u8) ![]u8 {
     const resolved_workspace_id = workspace_id orelse return error.MissingWorkspace;
@@ -605,31 +635,65 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
     var invalid_count: usize = 0;
     var remediation_actions_created: usize = 0;
 
+    // Statements are prepared once for the whole run and reset per row;
+    // the previous version re-prepared 3-5 statements per (rule, entity).
+    const entity_stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_id, metadata_json
+        \\FROM graph_entity
+        \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
+        \\ORDER BY entity_id
+    );
+    defer facet_sqlite.finalize(entity_stmt);
+
+    const state_stmt = try facet_sqlite.prepare(db,
+        \\SELECT state
+        \\FROM graph_rule_evaluations
+        \\WHERE workspace_id = ?1 AND ontology_id = ?2 AND rule_id = ?3 AND subject_entity_id = ?4
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(state_stmt);
+
+    const upsert_stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO graph_rule_evaluations(
+        \\  workspace_id, ontology_id, rule_id, subject_entity_id, state,
+        \\  observed_count, expected_min, expected_max, last_evaluated_at_unix, updated_at_unix
+        \\)
+        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), unixepoch())
+        \\ON CONFLICT(workspace_id, ontology_id, rule_id, subject_entity_id) DO UPDATE SET
+        \\  state = excluded.state,
+        \\  observed_count = excluded.observed_count,
+        \\  expected_min = excluded.expected_min,
+        \\  expected_max = excluded.expected_max,
+        \\  last_evaluated_at_unix = unixepoch(),
+        \\  updated_at_unix = unixepoch()
+    );
+    defer facet_sqlite.finalize(upsert_stmt);
+
+    var counter = try RuleRelationCounter.init(db);
+    defer counter.deinit();
+
     for (rules) |rule| {
-        const entity_stmt = try facet_sqlite.prepare(db,
-            \\SELECT entity_id, metadata_json
-            \\FROM graph_entity
-            \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
-            \\ORDER BY entity_id
-        );
-        defer facet_sqlite.finalize(entity_stmt);
+        var rule_filter = try RuleFilter.init(allocator, rule.metadata_json);
+        defer rule_filter.deinit();
+
+        try facet_sqlite.resetStatement(entity_stmt);
         try facet_sqlite.bindText(entity_stmt, 1, options.workspace_id);
         try facet_sqlite.bindText(entity_stmt, 2, rule.entity_type);
         while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW) {
             const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
             const entity_metadata = columnText(entity_stmt, 1);
-            if (!try entityMatchesRuleFilter(allocator, entity_metadata, rule.metadata_json)) continue;
+            if (!try rule_filter.matches(allocator, entity_metadata)) continue;
 
-            const observed = try countRuleRelations(db, options.workspace_id, entity_id, rule);
+            const observed = try counter.count(options.workspace_id, entity_id, rule);
             const state = ruleState(observed, rule);
             if (std.mem.eql(u8, state, "invalid")) invalid_count += 1;
             evaluated += 1;
 
-            const previous_state = try loadEvaluationState(db, allocator, options.workspace_id, ontology_id, rule.rule_id, entity_id);
+            const previous_state = try loadEvaluationState(state_stmt, allocator, options.workspace_id, ontology_id, rule.rule_id, entity_id);
             defer if (previous_state) |value| allocator.free(value);
             const from_state = previous_state orelse "unknown";
 
-            try upsertEvaluationState(db, options.workspace_id, ontology_id, rule, entity_id, state, observed);
+            try upsertEvaluationState(upsert_stmt, options.workspace_id, ontology_id, rule, entity_id, state, observed);
             if (previous_state == null or !std.mem.eql(u8, previous_state.?, state)) {
                 changed += 1;
                 const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, from_state, state, observed);
@@ -818,14 +882,8 @@ fn ruleState(observed: i64, rule: GapRule) []const u8 {
     return "valid";
 }
 
-fn loadEvaluationState(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rule_id: []const u8, subject_entity_id: u64) !?[]u8 {
-    const stmt = try facet_sqlite.prepare(db,
-        \\SELECT state
-        \\FROM graph_rule_evaluations
-        \\WHERE workspace_id = ?1 AND ontology_id = ?2 AND rule_id = ?3 AND subject_entity_id = ?4
-        \\LIMIT 1
-    );
-    defer facet_sqlite.finalize(stmt);
+fn loadEvaluationState(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rule_id: []const u8, subject_entity_id: u64) !?[]u8 {
+    try facet_sqlite.resetStatement(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, ontology_id);
     try facet_sqlite.bindText(stmt, 3, rule_id);
@@ -834,22 +892,8 @@ fn loadEvaluationState(db: Database, allocator: std.mem.Allocator, workspace_id:
     return try dupeColumnText(allocator, stmt, 0);
 }
 
-fn upsertEvaluationState(db: Database, workspace_id: []const u8, ontology_id: []const u8, rule: GapRule, subject_entity_id: u64, state: []const u8, observed: i64) !void {
-    const stmt = try facet_sqlite.prepare(db,
-        \\INSERT INTO graph_rule_evaluations(
-        \\  workspace_id, ontology_id, rule_id, subject_entity_id, state,
-        \\  observed_count, expected_min, expected_max, last_evaluated_at_unix, updated_at_unix
-        \\)
-        \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), unixepoch())
-        \\ON CONFLICT(workspace_id, ontology_id, rule_id, subject_entity_id) DO UPDATE SET
-        \\  state = excluded.state,
-        \\  observed_count = excluded.observed_count,
-        \\  expected_min = excluded.expected_min,
-        \\  expected_max = excluded.expected_max,
-        \\  last_evaluated_at_unix = unixepoch(),
-        \\  updated_at_unix = unixepoch()
-    );
-    defer facet_sqlite.finalize(stmt);
+fn upsertEvaluationState(stmt: *c.sqlite3_stmt, workspace_id: []const u8, ontology_id: []const u8, rule: GapRule, subject_entity_id: u64, state: []const u8, observed: i64) !void {
+    try facet_sqlite.resetStatement(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindText(stmt, 2, ontology_id);
     try facet_sqlite.bindText(stmt, 3, rule.rule_id);
@@ -1388,21 +1432,30 @@ fn loadRules(db: Database, allocator: std.mem.Allocator, ontology_id: []const u8
 }
 
 fn evaluateRules(db: Database, allocator: std.mem.Allocator, options: DiagnosticsOptions, rules: []const GapRule, issues: *std.ArrayList(Issue), summary: *Summary) !void {
+    // Prepared once per run and reset per row; see runRuleEvaluations.
+    const entity_stmt = try facet_sqlite.prepare(db,
+        \\SELECT entity_id, metadata_json
+        \\FROM graph_entity
+        \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
+        \\ORDER BY entity_id
+    );
+    defer facet_sqlite.finalize(entity_stmt);
+
+    var counter = try RuleRelationCounter.init(db);
+    defer counter.deinit();
+
     for (rules) |rule| {
-        const entity_stmt = try facet_sqlite.prepare(db,
-            \\SELECT entity_id, metadata_json
-            \\FROM graph_entity
-            \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
-            \\ORDER BY entity_id
-        );
-        defer facet_sqlite.finalize(entity_stmt);
+        var rule_filter = try RuleFilter.init(allocator, rule.metadata_json);
+        defer rule_filter.deinit();
+
+        try facet_sqlite.resetStatement(entity_stmt);
         try facet_sqlite.bindText(entity_stmt, 1, options.workspace_id);
         try facet_sqlite.bindText(entity_stmt, 2, rule.entity_type);
         while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW and issues.items.len < options.limit) {
             const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
             const entity_metadata = columnText(entity_stmt, 1);
-            if (!try entityMatchesRuleFilter(allocator, entity_metadata, rule.metadata_json)) continue;
-            const observed = try countRuleRelations(db, options.workspace_id, entity_id, rule);
+            if (!try rule_filter.matches(allocator, entity_metadata)) continue;
+            const observed = try counter.count(options.workspace_id, entity_id, rule);
             if (observed < rule.min_count) {
                 try appendIssue(allocator, issues, .{
                     .kind = "missing_required_relation",
@@ -1463,43 +1516,70 @@ fn appendIssue(allocator: std.mem.Allocator, issues: *std.ArrayList(Issue), seed
     });
 }
 
-fn countRuleRelations(db: Database, workspace_id: []const u8, entity_id: u64, rule: GapRule) !i64 {
-    const sql = switch (rule.direction) {
-        .out =>
-        \\SELECT COUNT(*)
-        \\FROM graph_relation r
-        \\JOIN graph_entity target ON target.entity_id = r.target_id
-        \\WHERE r.workspace_id = ?1 AND r.source_id = ?2 AND r.relation_type = ?3
-        \\  AND r.deprecated_at IS NULL
-        \\  AND (?4 IS NULL OR target.entity_type = ?4)
-        ,
-        .in =>
-        \\SELECT COUNT(*)
-        \\FROM graph_relation r
-        \\JOIN graph_entity source ON source.entity_id = r.source_id
-        \\WHERE r.workspace_id = ?1 AND r.target_id = ?2 AND r.relation_type = ?3
-        \\  AND r.deprecated_at IS NULL
-        \\  AND (?4 IS NULL OR source.entity_type = ?4)
-        ,
-        .either =>
-        \\SELECT COUNT(*)
-        \\FROM graph_relation r
-        \\JOIN graph_entity source ON source.entity_id = r.source_id
-        \\JOIN graph_entity target ON target.entity_id = r.target_id
-        \\WHERE r.workspace_id = ?1 AND (r.source_id = ?2 OR r.target_id = ?2) AND r.relation_type = ?3
-        \\  AND r.deprecated_at IS NULL
-        \\  AND (?4 IS NULL OR source.entity_type = ?4 OR target.entity_type = ?4)
-        ,
-    };
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindInt64(stmt, 2, entity_id);
-    try facet_sqlite.bindText(stmt, 3, rule.relation_type);
-    if (rule.target_entity_type) |value| try facet_sqlite.bindText(stmt, 4, value) else try facet_sqlite.bindNull(stmt, 4);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
-    return c.sqlite3_column_int64(stmt, 0);
-}
+/// One prepared COUNT statement per direction, reset and rebound per
+/// (rule, entity) pair instead of re-prepared each time.
+const RuleRelationCounter = struct {
+    out_stmt: *c.sqlite3_stmt,
+    in_stmt: *c.sqlite3_stmt,
+    either_stmt: *c.sqlite3_stmt,
+
+    fn init(db: Database) !RuleRelationCounter {
+        const out_stmt = try facet_sqlite.prepare(db,
+            \\SELECT COUNT(*)
+            \\FROM graph_relation r
+            \\JOIN graph_entity target ON target.entity_id = r.target_id
+            \\WHERE r.workspace_id = ?1 AND r.source_id = ?2 AND r.relation_type = ?3
+            \\  AND r.deprecated_at IS NULL
+            \\  AND (?4 IS NULL OR target.entity_type = ?4)
+        );
+        errdefer facet_sqlite.finalize(out_stmt);
+        const in_stmt = try facet_sqlite.prepare(db,
+            \\SELECT COUNT(*)
+            \\FROM graph_relation r
+            \\JOIN graph_entity source ON source.entity_id = r.source_id
+            \\WHERE r.workspace_id = ?1 AND r.target_id = ?2 AND r.relation_type = ?3
+            \\  AND r.deprecated_at IS NULL
+            \\  AND (?4 IS NULL OR source.entity_type = ?4)
+        );
+        errdefer facet_sqlite.finalize(in_stmt);
+        const either_stmt = try facet_sqlite.prepare(db,
+            \\SELECT COUNT(*)
+            \\FROM graph_relation r
+            \\JOIN graph_entity source ON source.entity_id = r.source_id
+            \\JOIN graph_entity target ON target.entity_id = r.target_id
+            \\WHERE r.workspace_id = ?1 AND (r.source_id = ?2 OR r.target_id = ?2) AND r.relation_type = ?3
+            \\  AND r.deprecated_at IS NULL
+            \\  AND (?4 IS NULL OR source.entity_type = ?4 OR target.entity_type = ?4)
+        );
+        return .{
+            .out_stmt = out_stmt,
+            .in_stmt = in_stmt,
+            .either_stmt = either_stmt,
+        };
+    }
+
+    fn deinit(self: *RuleRelationCounter) void {
+        facet_sqlite.finalize(self.out_stmt);
+        facet_sqlite.finalize(self.in_stmt);
+        facet_sqlite.finalize(self.either_stmt);
+        self.* = undefined;
+    }
+
+    fn count(self: *RuleRelationCounter, workspace_id: []const u8, entity_id: u64, rule: GapRule) !i64 {
+        const stmt = switch (rule.direction) {
+            .out => self.out_stmt,
+            .in => self.in_stmt,
+            .either => self.either_stmt,
+        };
+        try facet_sqlite.resetStatement(stmt);
+        try facet_sqlite.bindText(stmt, 1, workspace_id);
+        try facet_sqlite.bindInt64(stmt, 2, entity_id);
+        try facet_sqlite.bindText(stmt, 3, rule.relation_type);
+        if (rule.target_entity_type) |value| try facet_sqlite.bindText(stmt, 4, value) else try facet_sqlite.bindNull(stmt, 4);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+        return c.sqlite3_column_int64(stmt, 0);
+    }
+};
 
 fn evaluateRelationTypeMismatches(db: Database, allocator: std.mem.Allocator, options: DiagnosticsOptions, ontology_id: []const u8, issues: *std.ArrayList(Issue), summary: *Summary) !void {
     const stmt = try facet_sqlite.prepare(db,

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
+pub const workspace_slug = @import("workspace_slug.zig");
 
 pub const Database = facet_sqlite.Database;
 pub const Error = facet_sqlite.Error;
@@ -305,6 +306,12 @@ pub const DocumentLinkRawSpec = struct {
 // ---- Workspaces / collections / settings ----------------------------------
 
 pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
+    // The workspace_id is expected to already be canonical: external callers (CLI,
+    // HTTP) slug it at the boundary. This function does NOT canonicalize, so it
+    // cannot diverge from sibling inserts that reuse the same id under a deferred
+    // FK check (bundle import keys a workspace and all its children off one id).
+    const workspace_id = spec.workspace_id;
+
     const sql =
         \\INSERT INTO workspaces(id, workspace_id, label, description, domain_profile, status)
         \\VALUES(?1, ?1, COALESCE(?2, ?1), COALESCE(?3, ''), COALESCE(?4, 'generic'), 'active')
@@ -317,7 +324,7 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
 
-    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
     if (spec.label) |label| try facet_sqlite.bindText(stmt, 2, label) else try facet_sqlite.bindNull(stmt, 2);
     if (spec.description) |desc| try facet_sqlite.bindText(stmt, 3, desc) else try facet_sqlite.bindNull(stmt, 3);
     if (spec.domain_profile) |profile| try facet_sqlite.bindText(stmt, 4, profile) else try facet_sqlite.bindNull(stmt, 4);
@@ -329,7 +336,7 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
     ;
     const settings_stmt = try facet_sqlite.prepare(db, settings_sql);
     defer facet_sqlite.finalize(settings_stmt);
-    try facet_sqlite.bindText(settings_stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(settings_stmt, 1, workspace_id);
     try facet_sqlite.stepDone(settings_stmt);
 
     if (spec.bootstrap_default_ontology) {
@@ -337,18 +344,18 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
         // `source.*` namespace is always available, even before any explicit
         // ontology has been declared. Idempotent.
         var default_id_buf: [256]u8 = undefined;
-        const default_id_slice = try formatDefaultOntologyId(&default_id_buf, spec.workspace_id);
+        const default_id_slice = try formatDefaultOntologyId(&default_id_buf, workspace_id);
         try ensureOntology(db, .{
             .ontology_id = default_id_slice,
-            .workspace_id = spec.workspace_id,
+            .workspace_id = workspace_id,
             .name = "default",
             .source_kind = "auto",
         });
         // Only bootstrap default_ontology_id when none is set. Later
         // ensureWorkspace calls (e.g. document-ingest) must not clobber an explicit
         // default such as ws::core set by ontology-compile-linkml.
-        if (try defaultOntologyIsUnset(db, spec.workspace_id)) {
-            try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+        if (try defaultOntologyIsUnset(db, workspace_id)) {
+            try setDefaultOntology(db, workspace_id, default_id_slice);
         }
         try ensureSourceNamespace(db, default_id_slice);
     }
@@ -912,6 +919,7 @@ pub fn upsertEntityRaw(db: Database, spec: EntityRawSpec) !void {
         \\    name = excluded.name,
         \\    confidence = excluded.confidence,
         \\    metadata_json = excluded.metadata_json
+        \\WHERE entities_raw.workspace_id = excluded.workspace_id
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
@@ -924,6 +932,16 @@ pub fn upsertEntityRaw(db: Database, spec: EntityRawSpec) !void {
     if (c.sqlite3_bind_double(stmt, 7, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 8, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
+    // The workspace guard turns a cross-workspace explicit-id collision into
+    // a skipped update; surface that as a hard error instead of silently
+    // rewriting (pre-guard) or silently dropping (post-guard) the row.
+    if (c.sqlite3_changes(db.handle) == 0) {
+        std.log.warn(
+            "entities_raw upsert: entity_id {d} already belongs to another workspace (attempted workspace '{s}')",
+            .{ spec.entity_id, spec.workspace_id },
+        );
+        return error.WorkspaceMismatch;
+    }
 }
 
 pub const EntityRawAutoSpec = struct {
@@ -936,40 +954,176 @@ pub const EntityRawAutoSpec = struct {
     metadata_json: []const u8 = "{}",
 };
 
+const entity_select_by_external_sql = "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND external_id = ?2";
+const entity_select_by_natural_sql = "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND entity_type = ?2 AND name = ?3";
+const entity_update_by_id_sql =
+    \\UPDATE entities_raw
+    \\SET ontology_id = ?2,
+    \\    entity_type = ?3,
+    \\    name = ?4,
+    \\    confidence = ?5,
+    \\    metadata_json = ?6
+    \\WHERE entity_id = ?1
+;
+const entity_upsert_insert_sql =
+    \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
+    \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
+    \\    ontology_id = excluded.ontology_id,
+    \\    entity_type = excluded.entity_type,
+    \\    name = excluded.name,
+    \\    confidence = excluded.confidence,
+    \\    metadata_json = excluded.metadata_json
+;
+const entity_ensure_insert_sql =
+    \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
+    \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    \\ON CONFLICT DO NOTHING
+;
+const relation_select_by_external_sql = "SELECT relation_id FROM relations_raw WHERE workspace_id = ?1 AND external_id = ?2";
+const relation_select_by_natural_sql =
+    \\SELECT relation_id FROM relations_raw
+    \\WHERE workspace_id = ?1
+    \\  AND edge_type = ?2
+    \\  AND source_entity_id = ?3
+    \\  AND target_entity_id = ?4
+    \\  AND valid_from IS ?5
+    \\  AND valid_to IS ?6
+    \\LIMIT 1
+;
+const relation_update_by_id_sql =
+    \\UPDATE relations_raw
+    \\SET ontology_id = ?2,
+    \\    edge_type = ?3,
+    \\    source_entity_id = ?4,
+    \\    target_entity_id = ?5,
+    \\    valid_from = ?6,
+    \\    valid_to = ?7,
+    \\    confidence = ?8,
+    \\    metadata_json = ?9
+    \\WHERE relation_id = ?1
+;
+const relation_upsert_insert_sql =
+    \\INSERT INTO relations_raw(workspace_id, ontology_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
+    \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+    \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
+    \\    ontology_id = excluded.ontology_id,
+    \\    edge_type = excluded.edge_type,
+    \\    source_entity_id = excluded.source_entity_id,
+    \\    target_entity_id = excluded.target_entity_id,
+    \\    valid_from = excluded.valid_from,
+    \\    valid_to = excluded.valid_to,
+    \\    confidence = excluded.confidence,
+    \\    metadata_json = excluded.metadata_json
+;
+
+/// Borrows a cached prepared statement when one is supplied, otherwise
+/// prepares (and later finalizes) a fresh one. Cached statements are reset
+/// on release so no read cursor stays open across the caller's transaction.
+const StmtLease = struct {
+    stmt: *c.sqlite3_stmt,
+    owned: bool,
+
+    fn acquire(db: Database, cached: ?*c.sqlite3_stmt, sql: []const u8) !StmtLease {
+        if (cached) |stmt| {
+            try facet_sqlite.resetStatement(stmt);
+            return .{ .stmt = stmt, .owned = false };
+        }
+        return .{ .stmt = try facet_sqlite.prepare(db, sql), .owned = true };
+    }
+
+    fn release(self: StmtLease) void {
+        if (self.owned) {
+            facet_sqlite.finalize(self.stmt);
+        } else {
+            facet_sqlite.resetStatement(self.stmt) catch {};
+        }
+    }
+};
+
+/// Prepared-statement cache for the raw entity/relation auto-upsert helpers.
+/// Bulk import paths call these once per row; re-preparing ~10 statements per
+/// row dominated import time. Keep the cache alive for the whole batch and
+/// pass it to the `*Cached` variants.
+pub const RawGraphUpsertCache = struct {
+    entity_select_by_external: *c.sqlite3_stmt,
+    entity_select_by_natural: *c.sqlite3_stmt,
+    entity_update_by_id: *c.sqlite3_stmt,
+    entity_upsert_insert: *c.sqlite3_stmt,
+    entity_ensure_insert: *c.sqlite3_stmt,
+    relation_select_by_external: *c.sqlite3_stmt,
+    relation_select_by_natural: *c.sqlite3_stmt,
+    relation_update_by_id: *c.sqlite3_stmt,
+    relation_upsert_insert: *c.sqlite3_stmt,
+
+    pub fn init(db: Database) !RawGraphUpsertCache {
+        const entity_select_by_external = try facet_sqlite.prepare(db, entity_select_by_external_sql);
+        errdefer facet_sqlite.finalize(entity_select_by_external);
+        const entity_select_by_natural = try facet_sqlite.prepare(db, entity_select_by_natural_sql);
+        errdefer facet_sqlite.finalize(entity_select_by_natural);
+        const entity_update_by_id = try facet_sqlite.prepare(db, entity_update_by_id_sql);
+        errdefer facet_sqlite.finalize(entity_update_by_id);
+        const entity_upsert_insert = try facet_sqlite.prepare(db, entity_upsert_insert_sql);
+        errdefer facet_sqlite.finalize(entity_upsert_insert);
+        const entity_ensure_insert = try facet_sqlite.prepare(db, entity_ensure_insert_sql);
+        errdefer facet_sqlite.finalize(entity_ensure_insert);
+        const relation_select_by_external = try facet_sqlite.prepare(db, relation_select_by_external_sql);
+        errdefer facet_sqlite.finalize(relation_select_by_external);
+        const relation_select_by_natural = try facet_sqlite.prepare(db, relation_select_by_natural_sql);
+        errdefer facet_sqlite.finalize(relation_select_by_natural);
+        const relation_update_by_id = try facet_sqlite.prepare(db, relation_update_by_id_sql);
+        errdefer facet_sqlite.finalize(relation_update_by_id);
+        const relation_upsert_insert = try facet_sqlite.prepare(db, relation_upsert_insert_sql);
+        errdefer facet_sqlite.finalize(relation_upsert_insert);
+        return .{
+            .entity_select_by_external = entity_select_by_external,
+            .entity_select_by_natural = entity_select_by_natural,
+            .entity_update_by_id = entity_update_by_id,
+            .entity_upsert_insert = entity_upsert_insert,
+            .entity_ensure_insert = entity_ensure_insert,
+            .relation_select_by_external = relation_select_by_external,
+            .relation_select_by_natural = relation_select_by_natural,
+            .relation_update_by_id = relation_update_by_id,
+            .relation_upsert_insert = relation_upsert_insert,
+        };
+    }
+
+    pub fn deinit(self: *const RawGraphUpsertCache) void {
+        facet_sqlite.finalize(self.entity_select_by_external);
+        facet_sqlite.finalize(self.entity_select_by_natural);
+        facet_sqlite.finalize(self.entity_update_by_id);
+        facet_sqlite.finalize(self.entity_upsert_insert);
+        facet_sqlite.finalize(self.entity_ensure_insert);
+        facet_sqlite.finalize(self.relation_select_by_external);
+        facet_sqlite.finalize(self.relation_select_by_natural);
+        facet_sqlite.finalize(self.relation_update_by_id);
+        facet_sqlite.finalize(self.relation_upsert_insert);
+    }
+};
+
 pub fn upsertEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
-    const existing_id = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
-        error.NotFound => selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
+    return upsertEntityRawAutoWith(db, null, spec);
+}
+
+pub fn upsertEntityRawAutoCached(db: Database, cache: *const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    return upsertEntityRawAutoWith(db, cache, spec);
+}
+
+fn upsertEntityRawAutoWith(db: Database, cache: ?*const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    const existing_id = selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectEntityRawIdByNaturalKeyWith(db, cache, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
             error.NotFound => null,
             else => return natural_err,
         },
         else => return err,
     };
     if (existing_id) |id| {
-        try updateEntityRawAutoById(db, id, spec);
+        try updateEntityRawAutoByIdWith(db, cache, id, spec);
         return id;
     }
 
-    const sql =
-        \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
-        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
-        \\    ontology_id = excluded.ontology_id,
-        \\    entity_type = excluded.entity_type,
-        \\    name = excluded.name,
-        \\    confidence = excluded.confidence,
-        \\    metadata_json = excluded.metadata_json
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
-    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
-    try facet_sqlite.bindText(stmt, 3, spec.external_id);
-    try facet_sqlite.bindText(stmt, 4, spec.entity_type);
-    try facet_sqlite.bindText(stmt, 5, spec.name);
-    if (c.sqlite3_bind_double(stmt, 6, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
-    try facet_sqlite.bindText(stmt, 7, spec.metadata_json);
-    try facet_sqlite.stepDone(stmt);
-    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+    try insertEntityRawAutoWith(db, cache, spec, .upsert);
+    return try selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id);
 }
 
 /// Insert-if-missing variant for relation endpoints: resolves the entity id
@@ -977,8 +1131,16 @@ pub fn upsertEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
 /// import) already wrote. The full upsert would clobber a human-readable
 /// name with the edge's raw external id.
 pub fn ensureEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
-    const existing_id = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
-        error.NotFound => selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
+    return ensureEntityRawAutoWith(db, null, spec);
+}
+
+pub fn ensureEntityRawAutoCached(db: Database, cache: *const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    return ensureEntityRawAutoWith(db, cache, spec);
+}
+
+fn ensureEntityRawAutoWith(db: Database, cache: ?*const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    const existing_id = selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectEntityRawIdByNaturalKeyWith(db, cache, spec.workspace_id, spec.entity_type, spec.name) catch |natural_err| switch (natural_err) {
             error.NotFound => null,
             else => return natural_err,
         },
@@ -986,13 +1148,47 @@ pub fn ensureEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
     };
     if (existing_id) |id| return id;
 
-    const sql =
-        \\INSERT INTO entities_raw(workspace_id, ontology_id, external_id, entity_type, name, confidence, metadata_json)
-        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        \\ON CONFLICT DO NOTHING
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
+    try insertEntityRawAutoWith(db, cache, spec, .ensure);
+    return try selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id);
+}
+
+/// Bundle-import resolution (strict): a bundle row carrying an explicit
+/// external_id must resolve through it only. The natural-key fallback used by
+/// `upsertEntityRawAuto` silently merged distinct entities (legal duplicates
+/// from pre-UNIQUE exports), dropping the incoming external_id and rewiring
+/// relations onto the wrong entity.
+pub fn upsertEntityRawByExternalIdStrict(db: Database, spec: EntityRawAutoSpec) !u64 {
+    const existing_id: ?u64 = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (existing_id) |id| {
+        try updateEntityRawAutoById(db, id, spec);
+        return id;
+    }
+    if (selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name)) |conflict_id| {
+        std.log.warn(
+            "bundle import: entity external_id '{s}' is new, but workspace '{s}' already has a '{s}' named '{s}' (entity_id {d}) under a different identity; refusing to merge them",
+            .{ spec.external_id, spec.workspace_id, spec.entity_type, spec.name, conflict_id },
+        );
+        return error.EntityNaturalKeyCollision;
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    }
+    try insertEntityRawAutoWith(db, null, spec, .upsert);
+    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+}
+
+const EntityInsertKind = enum { upsert, ensure };
+
+fn insertEntityRawAutoWith(db: Database, cache: ?*const RawGraphUpsertCache, spec: EntityRawAutoSpec, kind: EntityInsertKind) !void {
+    const lease = switch (kind) {
+        .upsert => try StmtLease.acquire(db, if (cache) |cc| cc.entity_upsert_insert else null, entity_upsert_insert_sql),
+        .ensure => try StmtLease.acquire(db, if (cache) |cc| cc.entity_ensure_insert else null, entity_ensure_insert_sql),
+    };
+    defer lease.release();
+    const stmt = lease.stmt;
     try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
     try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
     try facet_sqlite.bindText(stmt, 3, spec.external_id);
@@ -1001,21 +1197,16 @@ pub fn ensureEntityRawAuto(db: Database, spec: EntityRawAutoSpec) !u64 {
     if (c.sqlite3_bind_double(stmt, 6, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 7, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
-    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
 }
 
 fn updateEntityRawAutoById(db: Database, entity_id: u64, spec: EntityRawAutoSpec) !void {
-    const sql =
-        \\UPDATE entities_raw
-        \\SET ontology_id = ?2,
-        \\    entity_type = ?3,
-        \\    name = ?4,
-        \\    confidence = ?5,
-        \\    metadata_json = ?6
-        \\WHERE entity_id = ?1
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
+    return updateEntityRawAutoByIdWith(db, null, entity_id, spec);
+}
+
+fn updateEntityRawAutoByIdWith(db: Database, cache: ?*const RawGraphUpsertCache, entity_id: u64, spec: EntityRawAutoSpec) !void {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.entity_update_by_id else null, entity_update_by_id_sql);
+    defer lease.release();
+    const stmt = lease.stmt;
     try facet_sqlite.bindInt64(stmt, 1, entity_id);
     try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
     try facet_sqlite.bindText(stmt, 3, spec.entity_type);
@@ -1026,24 +1217,32 @@ fn updateEntityRawAutoById(db: Database, entity_id: u64, spec: EntityRawAutoSpec
 }
 
 pub fn selectEntityRawIdByExternalId(db: Database, workspace_id: []const u8, external_id: []const u8) !u64 {
-    const stmt = try facet_sqlite.prepare(db, "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND external_id = ?2");
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, external_id);
-    const rc = c.sqlite3_step(stmt);
-    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    return selectEntityRawIdByExternalIdWith(db, null, workspace_id, external_id);
+}
+
+fn selectEntityRawIdByExternalIdWith(db: Database, cache: ?*const RawGraphUpsertCache, workspace_id: []const u8, external_id: []const u8) !u64 {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.entity_select_by_external else null, entity_select_by_external_sql);
+    defer lease.release();
+    try facet_sqlite.bindText(lease.stmt, 1, workspace_id);
+    try facet_sqlite.bindText(lease.stmt, 2, external_id);
+    const rc = c.sqlite3_step(lease.stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(lease.stmt, 0));
     if (rc == c.SQLITE_DONE) return error.NotFound;
     return error.StepFailed;
 }
 
 pub fn selectEntityRawIdByNaturalKey(db: Database, workspace_id: []const u8, entity_type: []const u8, name: []const u8) !u64 {
-    const stmt = try facet_sqlite.prepare(db, "SELECT entity_id FROM entities_raw WHERE workspace_id = ?1 AND entity_type = ?2 AND name = ?3");
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, entity_type);
-    try facet_sqlite.bindText(stmt, 3, name);
-    const rc = c.sqlite3_step(stmt);
-    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    return selectEntityRawIdByNaturalKeyWith(db, null, workspace_id, entity_type, name);
+}
+
+fn selectEntityRawIdByNaturalKeyWith(db: Database, cache: ?*const RawGraphUpsertCache, workspace_id: []const u8, entity_type: []const u8, name: []const u8) !u64 {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.entity_select_by_natural else null, entity_select_by_natural_sql);
+    defer lease.release();
+    try facet_sqlite.bindText(lease.stmt, 1, workspace_id);
+    try facet_sqlite.bindText(lease.stmt, 2, entity_type);
+    try facet_sqlite.bindText(lease.stmt, 3, name);
+    const rc = c.sqlite3_step(lease.stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(lease.stmt, 0));
     if (rc == c.SQLITE_DONE) return error.NotFound;
     return error.StepFailed;
 }
@@ -1077,6 +1276,7 @@ pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
         \\    valid_to = excluded.valid_to,
         \\    confidence = excluded.confidence,
         \\    metadata_json = excluded.metadata_json
+        \\WHERE relations_raw.workspace_id = excluded.workspace_id
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
@@ -1092,6 +1292,15 @@ pub fn upsertRelationRaw(db: Database, spec: RelationRawSpec) !void {
     if (c.sqlite3_bind_double(stmt, 10, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
     try facet_sqlite.bindText(stmt, 11, spec.metadata_json);
     try facet_sqlite.stepDone(stmt);
+    // See upsertEntityRaw: cross-workspace explicit-id collisions must fail
+    // loudly instead of clobbering (or silently skipping) the other row.
+    if (c.sqlite3_changes(db.handle) == 0) {
+        std.log.warn(
+            "relations_raw upsert: relation_id {d} already belongs to another workspace (attempted workspace '{s}')",
+            .{ spec.relation_id, spec.workspace_id },
+        );
+        return error.WorkspaceMismatch;
+    }
 }
 
 pub const RelationRawAutoSpec = struct {
@@ -1108,62 +1317,49 @@ pub const RelationRawAutoSpec = struct {
 };
 
 pub fn upsertRelationRawAuto(db: Database, spec: RelationRawAutoSpec) !u64 {
-    const existing_id = selectRelationRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
-        error.NotFound => selectRelationRawIdByNaturalKey(db, spec) catch |natural_err| switch (natural_err) {
+    return upsertRelationRawAutoWith(db, null, spec);
+}
+
+pub fn upsertRelationRawAutoCached(db: Database, cache: *const RawGraphUpsertCache, spec: RelationRawAutoSpec) !u64 {
+    return upsertRelationRawAutoWith(db, cache, spec);
+}
+
+fn upsertRelationRawAutoWith(db: Database, cache: ?*const RawGraphUpsertCache, spec: RelationRawAutoSpec) !u64 {
+    const existing_id = selectRelationRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => selectRelationRawIdByNaturalKeyWith(db, cache, spec) catch |natural_err| switch (natural_err) {
             error.NotFound => null,
             else => return natural_err,
         },
         else => return err,
     };
     if (existing_id) |id| {
-        try updateRelationRawAutoById(db, id, spec);
+        try updateRelationRawAutoByIdWith(db, cache, id, spec);
         return id;
     }
 
-    const sql =
-        \\INSERT INTO relations_raw(workspace_id, ontology_id, external_id, edge_type, source_entity_id, target_entity_id, valid_from, valid_to, confidence, metadata_json)
-        \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        \\ON CONFLICT(workspace_id, external_id) DO UPDATE SET
-        \\    ontology_id = excluded.ontology_id,
-        \\    edge_type = excluded.edge_type,
-        \\    source_entity_id = excluded.source_entity_id,
-        \\    target_entity_id = excluded.target_entity_id,
-        \\    valid_from = excluded.valid_from,
-        \\    valid_to = excluded.valid_to,
-        \\    confidence = excluded.confidence,
-        \\    metadata_json = excluded.metadata_json
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
-    try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
-    try facet_sqlite.bindText(stmt, 3, spec.external_id);
-    try facet_sqlite.bindText(stmt, 4, spec.edge_type);
-    try facet_sqlite.bindInt64(stmt, 5, spec.source_entity_id);
-    try facet_sqlite.bindInt64(stmt, 6, spec.target_entity_id);
-    if (spec.valid_from) |v| try facet_sqlite.bindText(stmt, 7, v) else try facet_sqlite.bindNull(stmt, 7);
-    if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 8, v) else try facet_sqlite.bindNull(stmt, 8);
-    if (c.sqlite3_bind_double(stmt, 9, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
-    try facet_sqlite.bindText(stmt, 10, spec.metadata_json);
-    try facet_sqlite.stepDone(stmt);
-    return try selectRelationRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+    {
+        const lease = try StmtLease.acquire(db, if (cache) |cc| cc.relation_upsert_insert else null, relation_upsert_insert_sql);
+        defer lease.release();
+        const stmt = lease.stmt;
+        try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+        try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
+        try facet_sqlite.bindText(stmt, 3, spec.external_id);
+        try facet_sqlite.bindText(stmt, 4, spec.edge_type);
+        try facet_sqlite.bindInt64(stmt, 5, spec.source_entity_id);
+        try facet_sqlite.bindInt64(stmt, 6, spec.target_entity_id);
+        if (spec.valid_from) |v| try facet_sqlite.bindText(stmt, 7, v) else try facet_sqlite.bindNull(stmt, 7);
+        if (spec.valid_to) |v| try facet_sqlite.bindText(stmt, 8, v) else try facet_sqlite.bindNull(stmt, 8);
+        if (c.sqlite3_bind_double(stmt, 9, spec.confidence) != c.SQLITE_OK) return error.BindFailed;
+        try facet_sqlite.bindText(stmt, 10, spec.metadata_json);
+        try facet_sqlite.stepDone(stmt);
+    }
+    return try selectRelationRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id);
 }
 
-fn updateRelationRawAutoById(db: Database, relation_id: u64, spec: RelationRawAutoSpec) !void {
-    const sql =
-        \\UPDATE relations_raw
-        \\SET ontology_id = ?2,
-        \\    edge_type = ?3,
-        \\    source_entity_id = ?4,
-        \\    target_entity_id = ?5,
-        \\    valid_from = ?6,
-        \\    valid_to = ?7,
-        \\    confidence = ?8,
-        \\    metadata_json = ?9
-        \\WHERE relation_id = ?1
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
+fn updateRelationRawAutoByIdWith(db: Database, cache: ?*const RawGraphUpsertCache, relation_id: u64, spec: RelationRawAutoSpec) !void {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.relation_update_by_id else null, relation_update_by_id_sql);
+    defer lease.release();
+    const stmt = lease.stmt;
     try facet_sqlite.bindInt64(stmt, 1, relation_id);
     try facet_sqlite.bindText(stmt, 2, spec.ontology_id);
     try facet_sqlite.bindText(stmt, 3, spec.edge_type);
@@ -1177,29 +1373,28 @@ fn updateRelationRawAutoById(db: Database, relation_id: u64, spec: RelationRawAu
 }
 
 pub fn selectRelationRawIdByExternalId(db: Database, workspace_id: []const u8, external_id: []const u8) !u64 {
-    const stmt = try facet_sqlite.prepare(db, "SELECT relation_id FROM relations_raw WHERE workspace_id = ?1 AND external_id = ?2");
-    defer facet_sqlite.finalize(stmt);
-    try facet_sqlite.bindText(stmt, 1, workspace_id);
-    try facet_sqlite.bindText(stmt, 2, external_id);
-    const rc = c.sqlite3_step(stmt);
-    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(stmt, 0));
+    return selectRelationRawIdByExternalIdWith(db, null, workspace_id, external_id);
+}
+
+fn selectRelationRawIdByExternalIdWith(db: Database, cache: ?*const RawGraphUpsertCache, workspace_id: []const u8, external_id: []const u8) !u64 {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.relation_select_by_external else null, relation_select_by_external_sql);
+    defer lease.release();
+    try facet_sqlite.bindText(lease.stmt, 1, workspace_id);
+    try facet_sqlite.bindText(lease.stmt, 2, external_id);
+    const rc = c.sqlite3_step(lease.stmt);
+    if (rc == c.SQLITE_ROW) return @intCast(c.sqlite3_column_int64(lease.stmt, 0));
     if (rc == c.SQLITE_DONE) return error.NotFound;
     return error.StepFailed;
 }
 
 pub fn selectRelationRawIdByNaturalKey(db: Database, spec: RelationRawAutoSpec) !u64 {
-    const sql =
-        \\SELECT relation_id FROM relations_raw
-        \\WHERE workspace_id = ?1
-        \\  AND edge_type = ?2
-        \\  AND source_entity_id = ?3
-        \\  AND target_entity_id = ?4
-        \\  AND valid_from IS ?5
-        \\  AND valid_to IS ?6
-        \\LIMIT 1
-    ;
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
+    return selectRelationRawIdByNaturalKeyWith(db, null, spec);
+}
+
+fn selectRelationRawIdByNaturalKeyWith(db: Database, cache: ?*const RawGraphUpsertCache, spec: RelationRawAutoSpec) !u64 {
+    const lease = try StmtLease.acquire(db, if (cache) |cc| cc.relation_select_by_natural else null, relation_select_by_natural_sql);
+    defer lease.release();
+    const stmt = lease.stmt;
     try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
     try facet_sqlite.bindText(stmt, 2, spec.edge_type);
     try facet_sqlite.bindInt64(stmt, 3, spec.source_entity_id);
@@ -1512,13 +1707,13 @@ test "ensureEntityRawAuto keeps the name and metadata written by the facet pass"
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsE" });
-    try ensureOntology(db, .{ .ontology_id = "wsE::core", .workspace_id = "wsE", .name = "core" });
+    try ensureWorkspace(db, .{ .workspace_id = "wse" });
+    try ensureOntology(db, .{ .ontology_id = "wse::core", .workspace_id = "wse", .name = "core" });
 
     // Facet pass writes the human-readable name.
     const id = try upsertEntityRawAuto(db, .{
-        .workspace_id = "wsE",
-        .ontology_id = "wsE::core",
+        .workspace_id = "wse",
+        .ontology_id = "wse::core",
         .external_id = "lot:0001",
         .entity_type = "lot",
         .name = "Lot 1 - Maison Bleue",
@@ -1529,8 +1724,8 @@ test "ensureEntityRawAuto keeps the name and metadata written by the facet pass"
     // Edge pass resolves the endpoint with the raw external id as name;
     // it must not clobber the existing row.
     const resolved = try ensureEntityRawAuto(db, .{
-        .workspace_id = "wsE",
-        .ontology_id = "wsE::core",
+        .workspace_id = "wse",
+        .ontology_id = "wse::core",
         .external_id = "lot:0001",
         .entity_type = "lot",
         .name = "lot:0001",
@@ -1552,21 +1747,21 @@ test "ensureWorkspace bootstraps the default ontology with the source.* namespac
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
 
-    const default_id = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
+    const default_id = (try defaultOntology(db, std.testing.allocator, "wsx")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(default_id);
-    try std.testing.expectEqualStrings("wsX::default", default_id);
+    try std.testing.expectEqualStrings("wsx::default", default_id);
 
-    try ensureOntology(db, .{ .ontology_id = "wsX::core", .workspace_id = "wsX", .name = "core" });
-    try setDefaultOntology(db, "wsX", "wsX::core");
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
-    const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
+    try ensureOntology(db, .{ .ontology_id = "wsx::core", .workspace_id = "wsx", .name = "core" });
+    try setDefaultOntology(db, "wsx", "wsx::core");
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
+    const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsx")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(explicit_default);
-    try std.testing.expectEqualStrings("wsX::core", explicit_default);
+    try std.testing.expectEqualStrings("wsx::core", explicit_default);
 
     const sql_dims =
         \\SELECT COUNT(*) FROM ontology_dimensions
@@ -1583,18 +1778,18 @@ test "ensureDefaultOntology preserves explicit workspace default" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
-    try ensureWorkspace(db, .{ .workspace_id = "wsZ" });
-    try ensureOntology(db, .{ .ontology_id = "wsZ::core", .workspace_id = "wsZ", .name = "core" });
-    try setDefaultOntology(db, "wsZ", "wsZ::core");
+    try ensureWorkspace(db, .{ .workspace_id = "wsz" });
+    try ensureOntology(db, .{ .ontology_id = "wsz::core", .workspace_id = "wsz", .name = "core" });
+    try setDefaultOntology(db, "wsz", "wsz::core");
 
-    const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsZ");
+    const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsz");
     defer std.testing.allocator.free(resolved);
-    try std.testing.expectEqualStrings("wsZ::core", resolved);
+    try std.testing.expectEqualStrings("wsz::core", resolved);
 
-    const default_id = (try defaultOntology(db, std.testing.allocator, "wsZ")) orelse
+    const default_id = (try defaultOntology(db, std.testing.allocator, "wsz")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(default_id);
-    try std.testing.expectEqualStrings("wsZ::core", default_id);
+    try std.testing.expectEqualStrings("wsz::core", default_id);
 }
 
 test "ensureDefaultOntology is idempotent and returns an owned id" {
@@ -1602,12 +1797,12 @@ test "ensureDefaultOntology is idempotent and returns an owned id" {
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsY" });
-    const first = try ensureDefaultOntology(db, std.testing.allocator, "wsY");
+    try ensureWorkspace(db, .{ .workspace_id = "wsy" });
+    const first = try ensureDefaultOntology(db, std.testing.allocator, "wsy");
     defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("wsY::default", first);
+    try std.testing.expectEqualStrings("wsy::default", first);
 
-    const second = try ensureDefaultOntology(db, std.testing.allocator, "wsY");
+    const second = try ensureDefaultOntology(db, std.testing.allocator, "wsy");
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
 
@@ -1636,6 +1831,34 @@ test "ensureWorkspace and ensureCollection are idempotent" {
         .chunk_bits = 8,
     });
     try std.testing.expect(try collectionExists(db, "ws1::legal"));
+}
+
+test "ensureWorkspace canonicalizes ids so accent/case variants map to one row" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Simulate the CLI/HTTP boundary: external ids are slugged before use, then
+    // handed to ensureWorkspace. Distinct accent/case spellings of the same name
+    // must therefore collapse to a single workspace row.
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    inline for (.{ "Café", "CAFÉ", "cafe" }) |raw| {
+        fba.reset();
+        const id = try workspace_slug.canonicalize(fba.allocator(), raw);
+        try std.testing.expectEqualStrings("cafe", id);
+        try ensureWorkspace(db, .{ .workspace_id = id });
+    }
+    try std.testing.expect(try workspaceExists(db, "cafe"));
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = 'cafe'");
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+
+    // The un-canonical spellings never created their own rows.
+    try std.testing.expect(!(try workspaceExists(db, "Café")));
+    try std.testing.expect(!(try workspaceExists(db, "CAFÉ")));
 }
 
 test "loadOntologyBundle persists namespaces, dimensions, values, types" {
@@ -2041,6 +2264,167 @@ test "raw graph auto ids are idempotent when llm external ids change" {
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(count_stmt));
     try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(count_stmt, 0));
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(count_stmt, 1));
+}
+
+test "explicit-id upserts reject cross-workspace collisions" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws_guard_a" });
+    try ensureWorkspace(db, .{ .workspace_id = "ws_guard_b" });
+    try ensureOntology(db, .{ .ontology_id = "ws_guard_a::core", .workspace_id = "ws_guard_a", .name = "core" });
+    try ensureOntology(db, .{ .ontology_id = "ws_guard_b::core", .workspace_id = "ws_guard_b", .name = "core" });
+
+    try upsertEntityRaw(db, .{
+        .workspace_id = "ws_guard_a",
+        .ontology_id = "ws_guard_a::core",
+        .entity_id = 900,
+        .entity_type = "person",
+        .name = "Owner A",
+    });
+    try upsertEntityRaw(db, .{
+        .workspace_id = "ws_guard_a",
+        .ontology_id = "ws_guard_a::core",
+        .entity_id = 901,
+        .entity_type = "person",
+        .name = "Owner A2",
+    });
+    // Same-workspace re-upsert still updates.
+    try upsertEntityRaw(db, .{
+        .workspace_id = "ws_guard_a",
+        .ontology_id = "ws_guard_a::core",
+        .entity_id = 900,
+        .entity_type = "person",
+        .name = "Owner A renamed",
+    });
+    // Cross-workspace explicit-id collision must fail hard, not rewrite ws_a's row.
+    try std.testing.expectError(error.WorkspaceMismatch, upsertEntityRaw(db, .{
+        .workspace_id = "ws_guard_b",
+        .ontology_id = "ws_guard_b::core",
+        .entity_id = 900,
+        .entity_type = "person",
+        .name = "Intruder",
+    }));
+
+    try upsertRelationRaw(db, .{
+        .workspace_id = "ws_guard_a",
+        .ontology_id = "ws_guard_a::core",
+        .relation_id = 950,
+        .edge_type = "knows",
+        .source_entity_id = 900,
+        .target_entity_id = 901,
+    });
+    try std.testing.expectError(error.WorkspaceMismatch, upsertRelationRaw(db, .{
+        .workspace_id = "ws_guard_b",
+        .ontology_id = "ws_guard_b::core",
+        .relation_id = 950,
+        .edge_type = "knows",
+        .source_entity_id = 900,
+        .target_entity_id = 901,
+    }));
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT name, workspace_id FROM entities_raw WHERE entity_id = 900");
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqualStrings("Owner A renamed", std.mem.span(c.sqlite3_column_text(stmt, 0)));
+    try std.testing.expectEqualStrings("ws_guard_a", std.mem.span(c.sqlite3_column_text(stmt, 1)));
+}
+
+test "upsertEntityRawByExternalIdStrict refuses natural-key merges" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws_strict" });
+    try ensureOntology(db, .{ .ontology_id = "ws_strict::core", .workspace_id = "ws_strict", .name = "core" });
+
+    const first = try upsertEntityRawByExternalIdStrict(db, .{
+        .workspace_id = "ws_strict",
+        .ontology_id = "ws_strict::core",
+        .external_id = "lot:1",
+        .entity_type = "lot",
+        .name = "Lot 1",
+    });
+    // Same external_id resolves to the same row.
+    const again = try upsertEntityRawByExternalIdStrict(db, .{
+        .workspace_id = "ws_strict",
+        .ontology_id = "ws_strict::core",
+        .external_id = "lot:1",
+        .entity_type = "lot",
+        .name = "Lot 1 (updated)",
+    });
+    try std.testing.expectEqual(first, again);
+    // A different external_id with the same natural key is a hard error,
+    // not a silent merge.
+    try std.testing.expectError(error.EntityNaturalKeyCollision, upsertEntityRawByExternalIdStrict(db, .{
+        .workspace_id = "ws_strict",
+        .ontology_id = "ws_strict::core",
+        .external_id = "lot:1-bis",
+        .entity_type = "lot",
+        .name = "Lot 1 (updated)",
+    }));
+}
+
+test "cached raw graph upserts match the uncached helpers" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    try ensureWorkspace(db, .{ .workspace_id = "ws_cache" });
+    try ensureOntology(db, .{ .ontology_id = "ws_cache::core", .workspace_id = "ws_cache", .name = "core" });
+
+    const cache = try RawGraphUpsertCache.init(db);
+    defer cache.deinit();
+
+    const a = try upsertEntityRawAutoCached(db, &cache, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "person:a",
+        .entity_type = "person",
+        .name = "Ada",
+    });
+    const b = try ensureEntityRawAutoCached(db, &cache, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "person:b",
+        .entity_type = "person",
+        .name = "Bea",
+    });
+    try std.testing.expectEqual(a, try upsertEntityRawAuto(db, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "person:a",
+        .entity_type = "person",
+        .name = "Ada",
+    }));
+    try std.testing.expectEqual(b, try ensureEntityRawAutoCached(db, &cache, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "person:b",
+        .entity_type = "person",
+        .name = "person:b",
+    }));
+
+    const rel = try upsertRelationRawAutoCached(db, &cache, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "knows:a:b",
+        .edge_type = "knows",
+        .source_entity_id = a,
+        .target_entity_id = b,
+    });
+    const rel_again = try upsertRelationRawAutoCached(db, &cache, .{
+        .workspace_id = "ws_cache",
+        .ontology_id = "ws_cache::core",
+        .external_id = "knows:a:b",
+        .edge_type = "knows",
+        .source_entity_id = a,
+        .target_entity_id = b,
+        .confidence = 0.5,
+    });
+    try std.testing.expectEqual(rel, rel_again);
+    try std.testing.expectEqual(rel, try selectRelationRawIdByExternalId(db, "ws_cache", "knows:a:b"));
 }
 
 test "isOntologyFrozen reflects ontologies.frozen column" {

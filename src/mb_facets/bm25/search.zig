@@ -16,264 +16,11 @@ pub const SearchOptions = struct {
     b: f64 = 0.75,
 };
 
-/// Search result
-pub const SearchResult = struct {
-    doc_id: i64,
-    score: f64,
-};
-
-/// Tokenize query text into individual terms
-fn tokenizeQuery(query_text: []const u8, config_name: []const u8, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-    const query_tokens = try tokenizer.tokenize(query_text, config_name, allocator);
-    if (query_tokens.items.len == 0) {
-        query_tokens.deinit(allocator);
-        return std.ArrayList([]const u8).empty;
-    }
-    return query_tokens;
-}
-
-/// Expand query terms to term hashes and combine document sets
-/// Expands the query into term hashes (written to out_hashes/out_count so
-/// scoring reuses them) and returns the OR of their document sets. The
-/// previous shape forced callers to run the whole expansion twice.
-fn expandQueryTerms(table_id: c.Oid, query_tokens: std.ArrayList([]const u8), config_name: []const u8, options: SearchOptions, allocator: std.mem.Allocator, out_hashes: *[64]i64, out_count: *usize) !?*c.roaring_bitmap_t {
-    const MAX_QUERY_HASHES = 64;
-    const expanded_hashes_arr = out_hashes;
-    var expanded_hashes_count: usize = 0;
-    out_count.* = 0;
-
-    var combined_bitmap: ?*c.roaring_bitmap_t = null;
-
-    // Try to connect - may already be connected from caller
-    const conn_result = c.SPI_connect();
-    const need_finish = (conn_result == c.SPI_OK_CONNECT);
-    if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
-        utils.elog(c.ERROR, "SPI_connect failed unexpectedly");
-        return error.SPIConnectFailed;
-    }
-    defer if (need_finish) {
-        _ = c.SPI_finish();
-    };
-
-    var custom_stopwords = try stopwords.loadWithExistingConnection(config_name, allocator);
-    defer custom_stopwords.deinit();
-
-    // Expand query terms to hashes (prefix/fuzzy matching)
-    for (query_tokens.items) |query_term| {
-        if (custom_stopwords.contains(query_term)) continue;
-
-        var matching_hashes = try findMatchingTermHashesInternal(table_id, query_term, options, allocator);
-        defer matching_hashes.deinit(allocator);
-
-        for (matching_hashes.items) |hash| {
-            if (expanded_hashes_count < MAX_QUERY_HASHES) {
-                expanded_hashes_arr[expanded_hashes_count] = hash;
-                expanded_hashes_count += 1;
-            }
-        }
-    }
-
-    out_count.* = expanded_hashes_count;
-    if (expanded_hashes_count == 0) {
-        return null;
-    }
-
-    // Get document sets for all term hashes and combine (OR operation)
-    for (expanded_hashes_arr[0..expanded_hashes_count]) |term_hash| {
-        const doc_set = try getDocumentSetByHashInternal(table_id, term_hash, allocator);
-        defer if (doc_set) |ds| roaring_index.free(ds);
-
-        if (doc_set) |ds| {
-            if (combined_bitmap) |combined| {
-                roaring_index.orInPlace(combined, ds);
-            } else {
-                combined_bitmap = roaring_index.copy(ds);
-            }
-        }
-    }
-
-    return combined_bitmap;
-}
-
-/// Calculate BM25 scores for documents matching the query
-fn calculateScores(table_id: c.Oid, combined_bitmap: *c.roaring_bitmap_t, expanded_hashes: []i64, stats: *const scoring.CollectionStats, options: SearchOptions, allocator: std.mem.Allocator) !std.ArrayList(SearchResult) {
-    var results = std.ArrayList(SearchResult).empty;
-
-    // Collect doc_ids first
-    var doc_ids = std.ArrayList(i64).empty;
-    defer doc_ids.deinit(allocator);
-
-    var iter = roaring_index.Iterator.init(combined_bitmap);
-    while (iter.hasValue()) {
-        try doc_ids.append(allocator, @intCast(iter.currentValue()));
-        iter.advance();
-    }
-
-    // Try to connect - may already be connected from caller
-    const conn_result = c.SPI_connect();
-    const need_finish = (conn_result == c.SPI_OK_CONNECT);
-    if (conn_result != c.SPI_OK_CONNECT and conn_result != c.SPI_ERROR_CONNECT) {
-        utils.elog(c.ERROR, "SPI_connect failed unexpectedly");
-        return error.SPIConnectFailed;
-    }
-    defer if (need_finish) {
-        _ = c.SPI_finish();
-    };
-
-    for (doc_ids.items) |doc_id| {
-        const score = try calculateDocumentScore(table_id, doc_id, expanded_hashes, stats, options);
-        if (score > 0.0) {
-            try results.append(allocator, SearchResult{
-                .doc_id = doc_id,
-                .score = score,
-            });
-        }
-    }
-
-    return results;
-}
-
-/// Calculate BM25 score for a single document
-fn calculateDocumentScore(table_id: c.Oid, doc_id: i64, expanded_hashes: []i64, stats: *const scoring.CollectionStats, options: SearchOptions) !f64 {
-    // Use stack-allocated arrays for term frequencies
-    const MAX_TERMS = 64;
-    var term_freq_hashes: [MAX_TERMS]i64 = undefined;
-    var term_freq_values: [MAX_TERMS]i32 = undefined;
-    var term_freq_count: usize = 0;
-
-    for (expanded_hashes) |term_hash| {
-        if (term_freq_count >= MAX_TERMS) break;
-
-        // Query term frequency using stack-allocated buffer
-        var query_buf: [256]u8 = undefined;
-        const query = std.fmt.bufPrintZ(&query_buf, "SELECT frequency FROM facets.bm25_term_frequencies WHERE table_id = {d} AND term_hash = {d} AND doc_id = {d}", .{ table_id, term_hash, doc_id }) catch continue;
-
-        const ret = c.SPI_execute(query.ptr, true, 1);
-
-        if (ret == c.SPI_OK_SELECT and c.SPI_processed > 0 and c.SPI_tuptable != null) {
-            const tuple = c.SPI_tuptable.*.vals[0];
-            const tupdesc = c.SPI_tuptable.*.tupdesc;
-            var isnull: bool = false;
-            const freq_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull);
-
-            if (!isnull) {
-                const freq: i32 = @intCast(c.DatumGetInt32(freq_datum));
-                if (freq > 0) {
-                    term_freq_hashes[term_freq_count] = term_hash;
-                    term_freq_values[term_freq_count] = freq;
-                    term_freq_count += 1;
-                }
-            }
-        }
-    }
-
-    if (term_freq_count == 0) {
-        return 0.0;
-    }
-
-    // Get document length using stack buffer
-    var doc_len_query_buf: [256]u8 = undefined;
-    const doc_len_query = std.fmt.bufPrintZ(&doc_len_query_buf, "SELECT doc_length FROM facets.bm25_documents WHERE table_id = {d} AND doc_id = {d}", .{ table_id, doc_id }) catch return 0.0;
-
-    var doc_length: i32 = 0;
-    const doc_ret = c.SPI_execute(doc_len_query.ptr, true, 1);
-    if (doc_ret == c.SPI_OK_SELECT and c.SPI_processed > 0 and c.SPI_tuptable != null) {
-        var doc_isnull: bool = false;
-        const doc_len_datum = c.SPI_getbinval(c.SPI_tuptable.*.vals[0], c.SPI_tuptable.*.tupdesc, 1, &doc_isnull);
-        if (!doc_isnull) {
-            doc_length = @intCast(c.DatumGetInt32(doc_len_datum));
-        }
-    }
-
-    // Calculate BM25 score manually using stack arrays
-    var score: f64 = 0.0;
-    var avgdl = stats.avg_document_length;
-    if (!(avgdl > 0.0)) avgdl = 1.0;
-    const doc_len_f = @as(f64, @floatFromInt(doc_length));
-
-    // For each query term hash, calculate BM25 component
-    for (expanded_hashes) |query_hash| {
-        // Find frequency for this hash in our stack array
-        var tf: i32 = 0;
-        for (0..term_freq_count) |i| {
-            if (term_freq_hashes[i] == query_hash) {
-                tf = term_freq_values[i];
-                break;
-            }
-        }
-
-        if (tf == 0) continue;
-
-        // Get IDF from stats
-        const idf = scoring.calculateIDFByHash(query_hash, stats);
-        if (idf == 0.0) continue;
-
-        // Calculate BM25 component
-        const tf_f = @as(f64, @floatFromInt(tf));
-        const numerator = tf_f * (options.k1 + 1.0);
-        const denominator = tf_f + options.k1 * (1.0 - options.b + options.b * (doc_len_f / avgdl));
-
-        score += idf * (numerator / denominator);
-    }
-
-    return score;
-}
-
-/// Rank and limit search results
-fn rankResults(results: *std.ArrayList(SearchResult), limit: i32) void {
-    // Sort by score descending
-    std.mem.sort(SearchResult, results.items, {}, struct {
-        fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-            return a.score > b.score; // Descending
-        }
-    }.lessThan);
-
-    // Limit results
-    if (results.items.len > @as(usize, @intCast(limit))) {
-        results.shrinkRetainingCapacity(@as(usize, @intCast(limit)));
-    }
-}
-
-/// Search documents using BM25
-/// This function avoids nested SPI by doing operations in separate phases
-pub fn search(table_id: c.Oid, query_text: []const u8, config_name: []const u8, options: SearchOptions, limit: i32, allocator: std.mem.Allocator) !std.ArrayList(SearchResult) {
-    // Phase 1: Tokenize query
-    var query_tokens = try tokenizeQuery(query_text, config_name, allocator);
-    defer {
-        for (query_tokens.items) |token| {
-            allocator.free(token);
-        }
-        query_tokens.deinit(allocator);
-    }
-
-    if (query_tokens.items.len == 0) {
-        return std.ArrayList(SearchResult).empty;
-    }
-
-    // Phase 2: Expand query terms once; the hashes feed scoring below.
-    var expanded_hashes_arr: [64]i64 = undefined;
-    var expanded_hashes_count: usize = 0;
-    const combined_bitmap = try expandQueryTerms(table_id, query_tokens, config_name, options, allocator, &expanded_hashes_arr, &expanded_hashes_count);
-    defer if (combined_bitmap) |bm| roaring_index.free(bm);
-
-    if (combined_bitmap == null or roaring_index.isEmpty(combined_bitmap.?)) {
-        return std.ArrayList(SearchResult).empty;
-    }
-
-    const expanded_hashes = expanded_hashes_arr[0..expanded_hashes_count];
-
-    // Phase 3: Load statistics scoped to the query's expanded terms
-    var stats = try scoring.loadStatisticsForTerms(table_id, expanded_hashes, allocator);
-    defer stats.deinit();
-
-    // Phase 4: Calculate BM25 scores
-    var results = try calculateScores(table_id, combined_bitmap.?, expanded_hashes, &stats, options, allocator);
-
-    // Phase 5: Rank and limit results
-    rankResults(&results, limit);
-
-    return results;
-}
+// NOTE: the former `pub fn search()` (and its helpers tokenizeQuery,
+// expandQueryTerms, calculateScores, calculateDocumentScore, rankResults,
+// SearchResult) was removed: it had no callers left (main.zig routes ranked
+// search through search_native.searchNative) and scored documents with one
+// SPI SELECT per (document, term) pair, i.e. O(docs x terms) round trips.
 
 /// Get roaring bitmap of documents matching query
 /// If SPI is already connected, use getMatchesBitmapWithExistingConnection instead
@@ -321,9 +68,12 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
 
     var combined_bitmap: ?*c.roaring_bitmap_t = null;
 
-    // Expand query terms to hashes
+    // Expand query terms to hashes. Deduplicate: repeated query terms (or
+    // prefix/fuzzy expansions converging on the same term) would otherwise
+    // burn MAX_QUERY_HASHES slots and re-fetch the same posting bitmap.
     utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 2 - Expanding query terms to hashes", .{});
-    for (query_tokens.items) |query_term| {
+    var truncated = false;
+    expand: for (query_tokens.items) |query_term| {
         if (custom_stopwords.contains(query_term)) continue;
 
         utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Processing token: {s}", .{query_term});
@@ -331,11 +81,18 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
         defer matching_hashes.deinit(allocator);
 
         for (matching_hashes.items) |hash| {
-            if (expanded_hashes_count < MAX_QUERY_HASHES) {
-                expanded_hashes_arr[expanded_hashes_count] = hash;
-                expanded_hashes_count += 1;
+            if (containsHash(expanded_hashes_arr[0..expanded_hashes_count], hash)) continue;
+            if (expanded_hashes_count >= MAX_QUERY_HASHES) {
+                truncated = true;
+                break :expand;
             }
+            expanded_hashes_arr[expanded_hashes_count] = hash;
+            expanded_hashes_count += 1;
         }
+    }
+    if (truncated) {
+        // Previously silent: extra terms simply vanished from the match set.
+        utils.elogFmt(c.WARNING, "getMatchesBitmap: query expansion truncated at {d} distinct term hashes; remaining terms ignored", .{MAX_QUERY_HASHES});
     }
     utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Phase 2 - Expanded to {d} hashes", .{expanded_hashes_count});
 
@@ -379,6 +136,13 @@ pub fn getMatchesBitmap(table_id: c.Oid, query_text: []const u8, config_name: []
         utils.elogFmt(c.DEBUG3, "[TRACE] getMatchesBitmap: Returning null (no bitmap)", .{});
     }
     return combined_bitmap;
+}
+
+fn containsHash(hashes: []const i64, candidate: i64) bool {
+    for (hashes) |hash| {
+        if (hash == candidate) return true;
+    }
+    return false;
 }
 
 /// Internal version of findMatchingTermHashes (assumes SPI is connected)
@@ -537,14 +301,10 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
             _ = c.SPI_finish();
         };
 
-        // Get term frequencies for this document
+        // Get term frequencies for this document in one statement (was one
+        // SELECT per query term).
         utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Getting term frequencies", .{});
-        for (query_hashes.items) |term_hash| {
-            const freq = try getTermFrequencyByHashInternal(table_id, term_hash, doc_id, allocator);
-            if (freq > 0) {
-                term_freqs.putAssumeCapacity(term_hash, freq);
-            }
-        }
+        try loadTermFrequenciesForDocInternal(table_id, doc_id, query_hashes.items, &term_freqs, allocator);
 
         // Get document length
         utils.elogFmt(c.DEBUG3, "[TRACE] calculateScore: Getting document length", .{});
@@ -562,32 +322,55 @@ pub fn calculateScore(table_id: c.Oid, query_text: []const u8, doc_id: i64, conf
     return scoring.calculateBM25ByHash(query_hashes.items, term_freqs, doc_length, &stats, options.k1, options.b);
 }
 
-/// Internal version of getTermFrequencyByHash (assumes SPI is connected)
-fn getTermFrequencyByHashInternal(table_id: c.Oid, term_hash: i64, doc_id: i64, allocator: std.mem.Allocator) !i32 {
-    _ = allocator; // Not needed - use stack buffer
+/// Loads the frequencies of `term_hashes` for one document in a single
+/// SELECT ... IN (...) statement (assumes SPI is connected). The map must be
+/// pre-sized to at least `term_hashes.len` entries; the row count is bounded
+/// by the number of distinct hashes.
+fn loadTermFrequenciesForDocInternal(
+    table_id: c.Oid,
+    doc_id: i64,
+    term_hashes: []const i64,
+    term_freqs: *std.AutoHashMap(i64, i32),
+    allocator: std.mem.Allocator,
+) !void {
+    if (term_hashes.len == 0) return;
 
-    // Use stack-allocated buffer to avoid palloc issues during SPI
-    var query_buf: [256]u8 = undefined;
-    const query = std.fmt.bufPrintZ(&query_buf, "SELECT frequency FROM facets.bm25_term_frequencies WHERE table_id = {d} AND term_hash = {d} AND doc_id = {d}", .{ table_id, term_hash, doc_id }) catch {
-        return error.BufferTooSmall;
-    };
-
-    const ret = c.SPI_execute(query.ptr, true, 1);
-    if (ret != c.SPI_OK_SELECT or c.SPI_processed == 0) {
-        return 0;
+    var in_list = std.ArrayList(u8).empty;
+    defer in_list.deinit(allocator);
+    for (term_hashes, 0..) |hash, index| {
+        if (index != 0) try in_list.append(allocator, ',');
+        var num_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&num_buf, "{d}", .{hash}) catch unreachable;
+        try in_list.appendSlice(allocator, text);
     }
 
-    const tuple = c.SPI_tuptable.*.vals[0];
-    const tupdesc = c.SPI_tuptable.*.tupdesc;
+    const query = try std.fmt.allocPrintSentinel(
+        allocator,
+        "SELECT term_hash, frequency FROM facets.bm25_term_frequencies WHERE table_id = {d} AND doc_id = {d} AND term_hash IN ({s})",
+        .{ table_id, doc_id, in_list.items },
+        0,
+    );
+    defer allocator.free(query);
 
-    var isnull: bool = false;
-    const freq_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull);
+    const ret = c.SPI_execute(query.ptr, true, 0);
+    if (ret != c.SPI_OK_SELECT or c.SPI_tuptable == null) return;
 
-    if (isnull) {
-        return 0;
+    var i: u64 = 0;
+    while (i < c.SPI_processed) : (i += 1) {
+        const tuple = c.SPI_tuptable.*.vals[@intCast(i)];
+        const tupdesc = c.SPI_tuptable.*.tupdesc;
+
+        var isnull_hash: bool = false;
+        var isnull_freq: bool = false;
+        const hash_datum = c.SPI_getbinval(tuple, tupdesc, 1, &isnull_hash);
+        const freq_datum = c.SPI_getbinval(tuple, tupdesc, 2, &isnull_freq);
+        if (isnull_hash or isnull_freq) continue;
+
+        const freq: i32 = @intCast(c.DatumGetInt32(freq_datum));
+        if (freq > 0) {
+            term_freqs.putAssumeCapacity(c.DatumGetInt64(hash_datum), freq);
+        }
     }
-
-    return @intCast(c.DatumGetInt32(freq_datum));
 }
 
 /// Internal version of getDocumentLength (assumes SPI is connected)

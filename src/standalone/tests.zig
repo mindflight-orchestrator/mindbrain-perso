@@ -20,6 +20,7 @@ comptime {
     _ = @import("document_business_extract_test.zig");
     _ = @import("llm_context_budget.zig");
     _ = @import("business_entity_normalize.zig");
+    _ = @import("business_edge_normalize.zig");
     _ = @import("facet_parity_test.zig");
     _ = @import("bm25_stopwords_sqlite.zig");
     _ = @import("answer_artifacts.zig");
@@ -45,7 +46,14 @@ comptime {
     _ = @import("llm.zig");
     _ = @import("llm/anthropic/client.zig");
     _ = @import("llm/gemini/client.zig");
+    _ = @import("llm/http_client.zig");
+    _ = @import("llm/manager.zig");
+    _ = @import("llm/openai_compat/audio.zig");
+    _ = @import("llm/openai_compat/chat.zig");
+    _ = @import("llm/openai_compat/embeddings.zig");
+    _ = @import("llm/openai_compat/endpoints.zig");
     _ = @import("llm/openai_compat/responses.zig");
+    _ = @import("llm/openai_compat/stream.zig");
     _ = @import("llm_client.zig");
     _ = @import("llm_provider.zig");
     _ = @import("nanoid.zig");
@@ -56,11 +64,14 @@ comptime {
     _ = @import("ontology_sqlite.zig");
     _ = @import("owl2_import.zig");
     _ = @import("pragma_dsl.zig");
+    _ = @import("pragma_projection_types.zig");
     _ = @import("pragma_sqlite.zig");
+    _ = @import("qualification_normalize.zig");
     _ = @import("query_executor.zig");
     _ = @import("quality_convergence.zig");
     _ = @import("queue_sqlite.zig");
     _ = @import("reference_extractor.zig");
+    _ = @import("reindex_http.zig");
     _ = @import("search_compact_store.zig");
     _ = @import("search_sqlite.zig");
     _ = @import("search_store.zig");
@@ -69,10 +80,14 @@ comptime {
     _ = @import("structured_import_drift.zig");
     _ = @import("structured_import_semantics.zig");
     _ = @import("sqlite_schema.zig");
+    _ = @import("syndic_profile_seed.zig");
     _ = @import("tokenization_sqlite.zig");
+    // `tool.zig` is intentionally absent: it imports the `mindbrain` module, so it
+    // gets its own test root in build.zig (see `tool_tests`).
     _ = @import("toon_exports.zig");
     _ = @import("vector_blob.zig");
     _ = @import("vector_distance.zig");
     _ = @import("vector_sqlite_exact.zig");
+    _ = @import("workspace_slug.zig");
     _ = @import("workspace_sqlite.zig");
 }

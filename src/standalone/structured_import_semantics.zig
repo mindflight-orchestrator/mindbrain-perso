@@ -43,7 +43,11 @@ pub fn inferSemanticsJson(allocator: std.mem.Allocator, opts: InferOptions) ![]u
     const tables = try buildTableSemantics(a, model.value, mapping_value);
     const columns = try buildColumnSemantics(a, model.value);
     const relations = try buildRelationSemantics(a, model.value, mapping_value);
-    const mappings = try buildSourceMappingsFromPaths(a, workspace_id.string, opts.mapping_path);
+    // Reuse the mapping parsed above instead of reading the file a second time.
+    const mappings = if (mapping_value) |mv|
+        try buildSourceMappings(a, workspace_id.string, mv)
+    else
+        std.json.Value{ .array = std.json.Array.init(a) };
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -113,7 +117,7 @@ pub fn registerSemanticsJson(
                 const schema = jsonStringOr(item.object, "table_schema", "structured") orelse "structured";
                 const table_name = item.object.get("table_name") orelse continue;
                 if (table_name != .string) continue;
-                const table_id = try resolveTableId(db, workspace_id, schema, table_name.string);
+                const table_id = try resolveOrAllocateTableId(db, workspace_id, schema, table_name.string);
                 const notes = try buildTableNotesJson(allocator, item.object);
                 defer if (notes) |n| allocator.free(n);
                 const key_column = jsonStringOr(item.object, "key_column", "record_id") orelse "record_id";
@@ -145,7 +149,7 @@ pub fn registerSemanticsJson(
                 const table_name = item.object.get("table_name") orelse continue;
                 const column_name = item.object.get("column_name") orelse continue;
                 if (table_name != .string or column_name != .string) continue;
-                const table_id = try resolveTableId(db, workspace_id, schema, table_name.string);
+                const table_id = try requireTableId(db, workspace_id, schema, table_name.string);
                 const column_id = try workspace_sqlite.nextColumnSemanticId(db);
                 const role = jsonStringOr(item.object, "column_role", "unknown") orelse "unknown";
                 const data_type = jsonStringOr(item.object, "semantic_type", null);
@@ -175,8 +179,8 @@ pub fn registerSemanticsJson(
                 const to_schema = jsonStringOr(item.object, "to_schema", "structured") orelse "structured";
                 const to_table = item.object.get("to_table") orelse continue;
                 if (from_table != .string or to_table != .string) continue;
-                const source_table_id = try resolveTableId(db, workspace_id, from_schema, from_table.string);
-                const target_table_id = try resolveTableId(db, workspace_id, to_schema, to_table.string);
+                const source_table_id = try requireTableId(db, workspace_id, from_schema, from_table.string);
+                const target_table_id = try requireTableId(db, workspace_id, to_schema, to_table.string);
                 const relation_id = try workspace_sqlite.nextRelationSemanticId(db);
                 const fk_column = jsonStringOr(item.object, "fk_column", "") orelse "";
                 const relation_kind = jsonStringOr(item.object, "relation_kind", "unknown") orelse "unknown";
@@ -211,7 +215,7 @@ pub fn registerSemanticsJson(
                 const target_table = jsonStringOr(item.object, "target_table", null);
                 var target_table_id: ?u64 = null;
                 if (target_table) |table_name| {
-                    target_table_id = try resolveTableId(db, workspace_id, "structured", table_name);
+                    target_table_id = try requireTableId(db, workspace_id, "structured", table_name);
                 }
                 const mapping_id = try workspace_sqlite.nextSourceMappingId(db);
                 const metadata = jsonStringOr(item.object, "metadata_json", "{}") orelse "{}";
@@ -225,9 +229,24 @@ pub fn registerSemanticsJson(
     return report;
 }
 
-fn resolveTableId(db: facet_sqlite.Database, workspace_id: []const u8, schema: []const u8, table_name: []const u8) !u64 {
+/// Registration path: resolve the table's id, allocating a fresh one when
+/// the table is not registered yet. Only safe because the caller inserts the
+/// table_semantics row immediately, inside the same transaction.
+fn resolveOrAllocateTableId(db: facet_sqlite.Database, workspace_id: []const u8, schema: []const u8, table_name: []const u8) !u64 {
     if (try workspace_sqlite.lookupTableId(db, workspace_id, schema, table_name)) |existing| return existing;
     return workspace_sqlite.nextTableId(db);
+}
+
+/// Reference path (columns / relations / source mappings): the table must
+/// already be registered. Minting MAX+1 here handed the same phantom id to
+/// every unknown table, producing bogus self-relations and dangling FKs.
+fn requireTableId(db: facet_sqlite.Database, workspace_id: []const u8, schema: []const u8, table_name: []const u8) !u64 {
+    if (try workspace_sqlite.lookupTableId(db, workspace_id, schema, table_name)) |existing| return existing;
+    std.log.err(
+        "register-semantics: unknown table '{s}.{s}' in workspace '{s}'; declare it under table_semantics before referencing it",
+        .{ schema, table_name, workspace_id },
+    );
+    return error.UnknownTable;
 }
 
 const EntityMappingHints = struct {
@@ -416,17 +435,6 @@ fn appendRelationRow(
     try out.append(.{ .object = row });
 }
 
-fn buildSourceMappingsFromPaths(allocator: std.mem.Allocator, workspace_id: []const u8, mapping_path: ?[]const u8) !std.json.Value {
-    const mp = mapping_path orelse return .{ .array = std.json.Array.init(allocator) };
-
-    const mapping_text = try structured_import.readJsonFile(allocator, mp);
-    defer allocator.free(mapping_text);
-    var mapping = try std.json.parseFromSlice(std.json.Value, allocator, mapping_text, .{});
-    defer mapping.deinit();
-
-    return buildSourceMappings(allocator, workspace_id, mapping.value);
-}
-
 fn buildSourceMappings(allocator: std.mem.Allocator, workspace_id: []const u8, mapping: std.json.Value) !std.json.Value {
     var out = std.json.Array.init(allocator);
 
@@ -523,7 +531,9 @@ fn appendInputProfilesFromDir(allocator: std.mem.Allocator, profiles: *std.json.
                                 const entity_val = entities.object.get(entity_name) orelse continue;
                                 if (entity_val != .object) continue;
                                 const csv_rel = jsonStringOr(entity_val.object, "csv", null) orelse continue;
-                                if (std.mem.endsWith(u8, csv_rel, name)) break :blk try allocator.dupe(u8, entity_name);
+                                // Compare basenames: an endsWith match let
+                                // "b.csv" claim "ab.csv" and mislabel tables.
+                                if (std.mem.eql(u8, std.fs.path.basename(csv_rel), name)) break :blk try allocator.dupe(u8, entity_name);
                             }
                         }
                     }
@@ -621,6 +631,11 @@ fn jsonAppendEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text
         '\n' => try buf.appendSlice(allocator, "\\n"),
         '\r' => try buf.appendSlice(allocator, "\\r"),
         '\t' => try buf.appendSlice(allocator, "\\t"),
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => |ctrl| {
+            var esc_buf: [6]u8 = undefined;
+            const esc = std.fmt.bufPrint(&esc_buf, "\\u{x:0>4}", .{ctrl}) catch unreachable;
+            try buf.appendSlice(allocator, esc);
+        },
         else => try buf.append(allocator, c),
     };
 }

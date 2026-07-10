@@ -46,18 +46,22 @@ pub fn validateDrift(allocator: std.mem.Allocator, opts: DriftOptions) !DriftRep
     }
 
     var observed = std.StringHashMap(void).init(allocator);
-    defer observed.deinit();
+    defer {
+        var observed_keys = observed.keyIterator();
+        while (observed_keys.next()) |key| allocator.free(key.*);
+        observed.deinit();
+    }
 
     if (opts.input_path) |input_path| {
         var bundle = try structured_import.readTabularBundle(allocator, input_path);
         defer bundle.deinit(allocator);
         for (bundle.tables) |named| {
             for (named.table.headers) |header| {
-                try observed.put(try std.fmt.allocPrint(allocator, "{s}.{s}", .{ named.name, header }), {});
+                try putOwnedKey(allocator, &observed, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ named.name, header }));
             }
         }
     } else if (opts.input_dir) |input_dir| {
-        try collectObservedFromDir(allocator, input_dir, opts.mapping_path, &observed, &errors);
+        try collectObservedFromDir(allocator, input_dir, opts.mapping_path, &observed, &errors, &warnings, opts.strict);
     } else if (opts.mapping_path) |mp| {
         const mapping_text = try structured_import.readJsonFile(allocator, mp);
         defer allocator.free(mapping_text);
@@ -67,7 +71,7 @@ pub fn validateDrift(allocator: std.mem.Allocator, opts: DriftOptions) !DriftRep
         defer bundle.deinit(allocator);
         for (bundle.tables) |named| {
             for (named.table.headers) |header| {
-                try observed.put(try std.fmt.allocPrint(allocator, "{s}.{s}", .{ named.name, header }), {});
+                try putOwnedKey(allocator, &observed, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ named.name, header }));
             }
         }
     }
@@ -96,7 +100,11 @@ pub fn validateDrift(allocator: std.mem.Allocator, opts: DriftOptions) !DriftRep
 
     if (observed.count() > 0) {
         var known = std.StringHashMap(void).init(allocator);
-        defer known.deinit();
+        defer {
+            var known_keys = known.keyIterator();
+            while (known_keys.next()) |key| allocator.free(key.*);
+            known.deinit();
+        }
         for (entity_types.array.items) |item| {
             if (item != .object) continue;
             const entity_name = item.object.get("name") orelse continue;
@@ -108,7 +116,7 @@ pub fn validateDrift(allocator: std.mem.Allocator, opts: DriftOptions) !DriftRep
                 const column_name = facet.object.get("name") orelse continue;
                 if (column_name != .string) continue;
                 const key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ entity_name.string, column_name.string });
-                try known.put(key, {});
+                try putOwnedKey(allocator, &known, key);
             }
         }
         var it = observed.keyIterator();
@@ -134,14 +142,25 @@ pub fn validateDrift(allocator: std.mem.Allocator, opts: DriftOptions) !DriftRep
     };
 }
 
+/// Puts an owned key into a string-keyed set; frees the key when the entry
+/// already exists (`put` would keep the old key and leak the new one).
+fn putOwnedKey(allocator: std.mem.Allocator, map: *std.StringHashMap(void), key: []const u8) !void {
+    const entry = map.getOrPut(key) catch |err| {
+        allocator.free(key);
+        return err;
+    };
+    if (entry.found_existing) allocator.free(key);
+}
+
 fn collectObservedFromDir(
     allocator: std.mem.Allocator,
     input_dir: []const u8,
     mapping_path: ?[]const u8,
     observed: *std.StringHashMap(void),
     errors: *std.ArrayList([]const u8),
+    warnings: *std.ArrayList([]const u8),
+    strict: bool,
 ) !void {
-    _ = errors;
     // The parsed tree must outlive the directory loop below, which reads
     // strings borrowed from it.
     var mapping_parsed: ?std.json.Parsed(std.json.Value) = null;
@@ -162,7 +181,17 @@ fn collectObservedFromDir(
         if (entry.kind != .file) continue;
         const full_path = try std.fs.path.join(allocator, &.{ input_dir, entry.name });
         defer allocator.free(full_path);
-        var table = structured_import.readTableFile(allocator, full_path) catch continue;
+        var table = structured_import.readTableFile(allocator, full_path) catch |err| {
+            // Unreadable tabular inputs used to be skipped silently, so
+            // strict validation could never fail on them. Other files
+            // (mapping/model JSON living in the same dir) stay best-effort.
+            const is_tabular = std.mem.endsWith(u8, entry.name, ".csv") or std.mem.endsWith(u8, entry.name, ".toon");
+            if (is_tabular) {
+                const msg = try std.fmt.allocPrint(allocator, "unreadable input file: {s} ({s})", .{ full_path, @errorName(err) });
+                if (strict) try errors.append(allocator, msg) else try warnings.append(allocator, msg);
+            }
+            continue;
+        };
         defer table.deinit(allocator);
         const table_name = blk: {
             if (mapping_value) |map_value| {
@@ -174,7 +203,9 @@ fn collectObservedFromDir(
                                 if (entity_val != .object) continue;
                                 const csv_val = entity_val.object.get("csv") orelse continue;
                                 if (csv_val != .string) continue;
-                                if (std.mem.endsWith(u8, csv_val.string, entry.name)) break :blk try allocator.dupe(u8, entity_name);
+                                // Compare basenames: an endsWith match let
+                                // "b.csv" claim "ab.csv" and mislabel tables.
+                                if (std.mem.eql(u8, std.fs.path.basename(csv_val.string), entry.name)) break :blk try allocator.dupe(u8, entity_name);
                             }
                         }
                     }
@@ -184,7 +215,7 @@ fn collectObservedFromDir(
         };
         defer allocator.free(table_name);
         for (table.headers) |header| {
-            try observed.put(try std.fmt.allocPrint(allocator, "{s}.{s}", .{ table_name, header }), {});
+            try putOwnedKey(allocator, observed, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ table_name, header }));
         }
     }
 }
@@ -205,8 +236,6 @@ fn compareRegisteredColumns(
     warnings: *std.ArrayList([]const u8),
     strict: bool,
 ) !void {
-    _ = strict;
-    _ = errors;
     const sql =
         \\SELECT table_name, column_name
         \\FROM column_semantics
@@ -227,7 +256,9 @@ fn compareRegisteredColumns(
         defer allocator.free(key);
         if (observed.count() > 0 and !observed.contains(key)) {
             const msg = try std.fmt.allocPrint(allocator, "registered column not in observed input: {s}", .{key});
-            try warnings.append(allocator, msg);
+            // Honor strict mode: this drift class silently stayed a warning
+            // before, so strict validation could never fail on it.
+            if (strict) try errors.append(allocator, msg) else try warnings.append(allocator, msg);
         }
     }
 }

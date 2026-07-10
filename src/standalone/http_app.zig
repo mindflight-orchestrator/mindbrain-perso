@@ -5,6 +5,7 @@ const facts_sqlite = @import("facts_sqlite.zig");
 const graph_diagnostics = @import("graph_diagnostics.zig");
 const graph_pattern_bridge = @import("graph_pattern_bridge.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
+const workspace_slug = @import("workspace_slug.zig");
 const helper_api = @import("helper_api.zig");
 const hybrid_search = @import("hybrid_search.zig");
 const interfaces = @import("interfaces.zig");
@@ -186,6 +187,7 @@ const OntologyImportRequest = struct {
     input_path: []const u8,
     name: ?[]const u8 = null,
     materialize_graph: bool = false,
+    merge: bool = false,
 };
 
 const OntologyCompileLinkmlRequest = struct {
@@ -638,6 +640,11 @@ pub const MindbrainHttpApp = struct {
             const response = try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "BEGIN IMMEDIATE", err, null);
             return response;
         };
+        // If registering the session fails below, the open transaction must
+        // not survive on the shared writer connection.
+        errdefer self.writer_db.exec("ROLLBACK") catch |rollback_err| {
+            self.recordWriterError(self.writer_db, "ROLLBACK", rollback_err);
+        };
 
         self.sql_sessions_mutex.lockUncancelable(self.io);
         defer self.sql_sessions_mutex.unlock(self.io);
@@ -851,13 +858,33 @@ pub const MindbrainHttpApp = struct {
         }
 
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK or stmt == null) {
+        var tail_ptr: [*c]const u8 = null;
+        if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &stmt, &tail_ptr) != c.SQLITE_OK or stmt == null) {
             self.recordWriterSqliteResponseError(db, "prepare", error.PrepareFailed);
             return try self.sqliteErrorResponse(allocator, db, .bad_request, "prepare", error.PrepareFailed, null);
         }
         defer _ = c.sqlite3_finalize(stmt.?);
 
-        bindSqlParams(stmt.?, params) catch |err| switch (err) {
+        // prepare_v2 only compiles the first statement; anything left in the
+        // tail (beyond whitespace/comments) would be silently dropped. Reject
+        // instead of pretending the whole request ran.
+        if (tail_ptr != null) {
+            const tail_offset: usize = @intFromPtr(tail_ptr) - @intFromPtr(sql.ptr);
+            const tail = trimSqlPrefix(sql[tail_offset..]);
+            if (tail.len != 0) {
+                self.recordWriterSqliteResponseError(db, "prepare", error.UnsupportedMultiStatement);
+                return try self.sqliteErrorResponse(
+                    allocator,
+                    db,
+                    .bad_request,
+                    "prepare",
+                    error.UnsupportedMultiStatement,
+                    null,
+                );
+            }
+        }
+
+        bindSqlParams(allocator, stmt.?, params) catch |err| switch (err) {
             error.BindFailed => {
                 self.recordWriterSqliteResponseError(db, "bind", err);
                 return try self.sqliteErrorResponse(allocator, db, .bad_request, "bind", err, null);
@@ -985,6 +1012,8 @@ pub const MindbrainHttpApp = struct {
                 const status: http.Status = switch (err) {
                     error.BadRequest => .bad_request,
                     error.RequestTooLarge => .bad_request,
+                    error.UnsupportedQuery => .bad_request,
+                    error.InvalidWorkspaceId => .bad_request,
                     error.NotFound => .not_found,
                     error.Forbidden => .forbidden,
                     error.MethodNotAllowed => .method_not_allowed,
@@ -1298,8 +1327,7 @@ pub const MindbrainHttpApp = struct {
         const content = write_request.content orelse return error.BadRequest;
         if (schema_id.len == 0 or content.len == 0) return error.BadRequest;
 
-        const workspace_id = write_request.workspace_id orelse "default";
-        if (workspace_id.len == 0) return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, write_request.workspace_id orelse "default");
 
         const facets_json = write_request.facets_json orelse "{}";
         facts_sqlite.validateFacetsJsonObject(allocator, facets_json) catch return error.BadRequest;
@@ -1506,7 +1534,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const projection_id = (try queryValue(allocator, query, "projection_id")) orelse return error.BadRequest;
         const collection_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "collection_id"));
         const include_evidence = parseBoolQuery((try queryValue(allocator, query, "include_evidence")) orelse "false");
@@ -1581,7 +1609,7 @@ pub const MindbrainHttpApp = struct {
             .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
         );
 
-        if (search_request.workspace_id.len == 0) return error.BadRequest;
+        const search_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, search_request.workspace_id);
         if (search_request.limit == 0 or search_request.limit > 1000) return error.BadRequest;
         if (search_request.vector_weight < 0.0 or search_request.vector_weight > 1.0) return error.BadRequest;
 
@@ -1597,7 +1625,7 @@ pub const MindbrainHttpApp = struct {
 
         const table_id = (try search_sqlite.resolveSearchTableId(
             db,
-            search_request.workspace_id,
+            search_workspace_id,
             search_request.table_id,
             search_request.collection_id,
         )) orelse return error.BadRequest;
@@ -1610,7 +1638,7 @@ pub const MindbrainHttpApp = struct {
         const bm25_matches = if (search_request.query.len == 0)
             try allocator.alloc(search_sqlite.Bm25Match, 0)
         else if (table_id == 1)
-            try search_sqlite.searchFts5Bm25Workspace(db, allocator, table_id, search_request.workspace_id, search_request.query, candidate_limit)
+            try search_sqlite.searchFts5Bm25Workspace(db, allocator, table_id, search_workspace_id, search_request.query, candidate_limit)
         else
             try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit);
         defer allocator.free(bm25_matches);
@@ -1622,7 +1650,7 @@ pub const MindbrainHttpApp = struct {
                 db,
                 allocator,
                 table_id,
-                search_request.workspace_id,
+                search_workspace_id,
                 query_vector_f32,
                 candidate_limit,
                 .cosine,
@@ -1657,7 +1685,7 @@ pub const MindbrainHttpApp = struct {
             "empty";
 
         const payload = .{
-            .workspace_id = search_request.workspace_id,
+            .workspace_id = search_workspace_id,
             .collection_id = search_request.collection_id,
             .table_id = table_id,
             .query = search_request.query,
@@ -1681,7 +1709,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const query_text = (try queryValue(allocator, query, "query")) orelse "";
         const collection_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "collection_id"));
         const metadata_filters = normalizeOptionalQueryValue(try queryValue(allocator, query, "metadata_filters"));
@@ -1742,7 +1770,7 @@ pub const MindbrainHttpApp = struct {
             body,
             .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
         );
-        if (reindex_request.workspace_id.len == 0) return error.BadRequest;
+        const reindex_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, reindex_request.workspace_id);
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
@@ -1753,12 +1781,12 @@ pub const MindbrainHttpApp = struct {
         const result = try reindex_http.reindexGraph(
             allocator,
             &self.writer_db,
-            reindex_request.workspace_id,
+            reindex_workspace_id,
             reindex_request.document_table_id,
         );
 
         const payload = .{
-            .workspace_id = reindex_request.workspace_id,
+            .workspace_id = reindex_workspace_id,
             .projected_count = result.projected_count,
             .document_table_id = result.document_table_id,
             .adjacency_rebuilt = result.adjacency_rebuilt,
@@ -1792,9 +1820,8 @@ pub const MindbrainHttpApp = struct {
             body,
             .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
         );
-        if (reindex_request.workspace_id.len == 0 or reindex_request.collection_id.len == 0) {
-            return error.BadRequest;
-        }
+        if (reindex_request.collection_id.len == 0) return error.BadRequest;
+        const reindex_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, reindex_request.workspace_id);
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
@@ -1805,13 +1832,13 @@ pub const MindbrainHttpApp = struct {
         const result = try reindex_http.reindexAll(
             allocator,
             &self.writer_db,
-            reindex_request.workspace_id,
+            reindex_workspace_id,
             reindex_request.collection_id,
             reindex_request.table_id,
         );
 
         const payload = .{
-            .workspace_id = reindex_request.workspace_id,
+            .workspace_id = reindex_workspace_id,
             .collection_id = reindex_request.collection_id,
             .table_id = reindex_request.table_id,
             .graph_projected = result.graph_projected,
@@ -1832,7 +1859,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const collection_id = (try queryValue(allocator, query, "collection_id")) orelse return error.BadRequest;
         const namespace = try queryValue(allocator, query, "namespace");
         defer if (namespace) |value| allocator.free(value);
@@ -1887,7 +1914,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
@@ -1942,7 +1969,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
         const ontology_id = try resolveOntologyIdForRequest(allocator, db, workspace_id, normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id")));
         defer allocator.free(ontology_id);
 
@@ -1980,7 +2007,7 @@ pub const MindbrainHttpApp = struct {
                 try out.writer.writeAll(",\"label\":");
                 try writeOptionalJsonString(&out.writer, if (label) |value| value else entity_type);
                 try out.writer.writeAll(",\"metadata\":");
-                try out.writer.writeAll(metadata);
+                try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
                 try out.writer.writeAll("}");
             }
         }
@@ -2018,7 +2045,7 @@ pub const MindbrainHttpApp = struct {
                 try writeOptionalJsonString(&out.writer, target_type);
                 try out.writer.print(",\"directed\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 1) != 0});
                 try out.writer.writeAll(",\"metadata\":");
-                try out.writer.writeAll(metadata);
+                try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
                 try out.writer.writeAll("}");
             }
         }
@@ -2061,7 +2088,7 @@ pub const MindbrainHttpApp = struct {
             try out.writer.writeAll(",\"label\":");
             try writeOptionalJsonString(&out.writer, label);
             try out.writer.writeAll(",\"metadata\":");
-            try out.writer.writeAll(metadata);
+            try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
         } else if (std.mem.eql(u8, kind, "edge")) {
             const stmt = try facet_sqlite.prepare(db,
                 \\SELECT directed, source_entity_type, target_entity_type, metadata_json
@@ -2090,7 +2117,7 @@ pub const MindbrainHttpApp = struct {
             try writeOptionalJsonString(&out.writer, target_type);
             try out.writer.print(",\"directed\":{}", .{facet_sqlite.c.sqlite3_column_int64(stmt, 0) != 0});
             try out.writer.writeAll(",\"metadata\":");
-            try out.writer.writeAll(metadata);
+            try writeRawJsonObject(&out.writer, try allocator.dupe(u8, metadata), allocator);
         } else {
             return error.BadRequest;
         }
@@ -2105,7 +2132,7 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const ontology_id = (try queryValue(allocator, query, "ontology_id")) orelse return error.BadRequest;
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
         try verifyOntologyWorkspaceAccess(allocator, db, ontology_id, workspace_id);
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2171,7 +2198,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
         const ontology_id = try resolveOntologyIdForRequest(allocator, db, workspace_id, normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id")));
         defer allocator.free(ontology_id);
         try verifyOntologyWorkspaceAccess(allocator, db, ontology_id, workspace_id);
@@ -2346,7 +2373,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const default_ontology_id = try loadDefaultOntologyId(allocator, db, workspace_id);
         defer if (default_ontology_id) |value| allocator.free(value);
 
@@ -2401,7 +2428,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
@@ -2430,7 +2457,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
@@ -2452,7 +2479,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
         const ontology_id_text = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const ontology_id = if (ontology_id_text) |value| value else blk: {
             const ws = workspace_id orelse return error.BadRequest;
@@ -2470,7 +2497,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
@@ -2492,7 +2519,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const ontology_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "ontology_id"));
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
@@ -2517,6 +2544,7 @@ pub const MindbrainHttpApp = struct {
         body_buffer: []u8,
     ) !Response {
         const run_request = try self.parseGraphRuleEvaluationRunRequest(allocator, request, body_buffer);
+        const run_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, run_request.workspace_id);
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
@@ -2524,7 +2552,7 @@ pub const MindbrainHttpApp = struct {
             return try self.writerSessionBusyResponse(allocator);
         }
         var run = graph_diagnostics.runRuleEvaluations(self.writer_db, allocator, .{
-            .workspace_id = run_request.workspace_id,
+            .workspace_id = run_workspace_id,
             .ontology_id = run_request.ontology_id,
             .limit = run_request.limit,
             .create_remediation_actions = run_request.create_remediation_actions,
@@ -2549,6 +2577,7 @@ pub const MindbrainHttpApp = struct {
         body_buffer: []u8,
     ) !Response {
         const run_request = try self.parseQualityConvergenceRunRequest(allocator, request, body_buffer);
+        const run_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, run_request.workspace_id);
 
         if (run_request.persist) {
             self.writer_mutex.lockUncancelable(self.io);
@@ -2557,7 +2586,7 @@ pub const MindbrainHttpApp = struct {
                 return try self.writerSessionBusyResponse(allocator);
             }
             var result = quality_convergence.runConvergence(self.writer_db, allocator, .{
-                .workspace_id = run_request.workspace_id,
+                .workspace_id = run_workspace_id,
                 .ontology_id = run_request.ontology_id,
                 .persist = true,
                 .limit = run_request.limit,
@@ -2579,7 +2608,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
         var result = try quality_convergence.runConvergence(db, allocator, .{
-            .workspace_id = run_request.workspace_id,
+            .workspace_id = run_workspace_id,
             .ontology_id = run_request.ontology_id,
             .persist = false,
             .limit = run_request.limit,
@@ -2597,7 +2626,7 @@ pub const MindbrainHttpApp = struct {
         var db = try self.openDb();
         defer db.close();
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
         else
@@ -2705,9 +2734,13 @@ pub const MindbrainHttpApp = struct {
         allocator: std.mem.Allocator,
         import_request: OntologyImportRequest,
     ) !Response {
-        if (import_request.workspace_id.len == 0 or import_request.ontology_id.len == 0 or import_request.input_path.len == 0) {
+        if (import_request.ontology_id.len == 0 or import_request.input_path.len == 0) {
             return error.BadRequest;
         }
+        // Canonicalize before the import: owl2_import keys triples/entities by
+        // this workspace_id, and ensureWorkspace canonicalizes the workspace row,
+        // so they must agree.
+        const import_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, import_request.workspace_id);
 
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
@@ -2726,12 +2759,13 @@ pub const MindbrainHttpApp = struct {
         const summary = try owl2_import.importNTriplesReader(
             self.writer_db,
             allocator,
-            import_request.workspace_id,
+            import_workspace_id,
             import_request.ontology_id,
             &fr.interface,
             .{
                 .ontology_name = import_request.name,
                 .materialize_graph = import_request.materialize_graph,
+                .merge = import_request.merge,
             },
         );
         self.writer_completed += 1;
@@ -2761,16 +2795,17 @@ pub const MindbrainHttpApp = struct {
         allocator: std.mem.Allocator,
         compile_request: OntologyCompileLinkmlRequest,
     ) !Response {
-        if (compile_request.workspace_id.len == 0 or compile_request.ontology_id.len == 0 or compile_request.input_path.len == 0) {
+        if (compile_request.ontology_id.len == 0 or compile_request.input_path.len == 0) {
             return error.BadRequest;
         }
+        const compile_workspace_id = try canonicalizeRequiredWorkspaceId(allocator, compile_request.workspace_id);
         if (compile_request.profile) |profile| {
             if (!std.mem.eql(u8, profile, "syndic")) return error.BadRequest;
         }
 
         var result = try linkml_interchange.compileLinkmlToBundle(allocator, .{
             .input_path = compile_request.input_path,
-            .workspace_id = compile_request.workspace_id,
+            .workspace_id = compile_workspace_id,
             .ontology_id = compile_request.ontology_id,
             .ontology_name = compile_request.name,
         });
@@ -2786,14 +2821,14 @@ pub const MindbrainHttpApp = struct {
         }
 
         try collections_sqlite.ensureWorkspace(self.writer_db, .{
-            .workspace_id = compile_request.workspace_id,
+            .workspace_id = compile_workspace_id,
             .domain_profile = if (compile_request.profile != null) "syndic" else null,
         });
         try linkml_interchange.importCompiledBundle(self.writer_db, allocator, result.bundle_json);
         if (compile_request.profile != null) {
-            try syndic_profile_seed.seedSyndicProfile(self.writer_db, compile_request.workspace_id, compile_request.ontology_id);
+            try syndic_profile_seed.seedSyndicProfile(self.writer_db, compile_workspace_id, compile_request.ontology_id);
         }
-        try collections_sqlite.setDefaultOntology(self.writer_db, compile_request.workspace_id, compile_request.ontology_id);
+        try collections_sqlite.setDefaultOntology(self.writer_db, compile_workspace_id, compile_request.ontology_id);
 
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{
@@ -3146,6 +3181,17 @@ pub const MindbrainHttpApp = struct {
                     .{@errorName(err)},
                 ),
             },
+            // HOPS queries carrying predicates the pattern engine cannot evaluate
+            // are a client error (unsupported request shape), not a server fault.
+            error.UnsupportedQuery => return .{
+                .status = .bad_request,
+                .content_type = "application/json; charset=utf-8",
+                .body = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"unsupported_query\",\"message\":\"{s}\"}}",
+                    .{@errorName(err)},
+                ),
+            },
             else => |e| return e,
         };
         defer allocator.free(payload);
@@ -3365,7 +3411,7 @@ pub const MindbrainHttpApp = struct {
 
         const entity_id_text = (try queryValue(allocator, query, "entity_id")) orelse return error.BadRequest;
         const entity_id = try parseQueryInt(u32, entity_id_text);
-        const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_filter = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
 
         const stmt = try facet_sqlite.prepare(db,
             \\SELECT entity_id, workspace_id, entity_type, name, confidence, metadata_json, deprecated_at, created_at_unix
@@ -3412,7 +3458,7 @@ pub const MindbrainHttpApp = struct {
 
         const relation_id_text = (try queryValue(allocator, query, "relation_id")) orelse return error.BadRequest;
         const relation_id = try parseQueryInt(u32, relation_id_text);
-        const workspace_filter = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_filter = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
 
         const stmt = try facet_sqlite.prepare(db,
             \\SELECT relation_id, workspace_id, relation_type, source_id, target_id, valid_from_unix, valid_to_unix, confidence, deprecated_at, run_id, patch_id, metadata_json, created_at_unix
@@ -3425,8 +3471,8 @@ pub const MindbrainHttpApp = struct {
         const workspace_id = try helper_api.dupeColText(allocator, stmt, 1);
         defer allocator.free(workspace_id);
         if (workspace_filter) |ws| if (!std.mem.eql(u8, ws, workspace_id)) return error.NotFound;
-        const source_id: u32 = @intCast(facet_sqlite.c.sqlite3_column_int64(stmt, 3));
-        const target_id: u32 = @intCast(facet_sqlite.c.sqlite3_column_int64(stmt, 4));
+        const source_id: u32 = try colIdU32(stmt, 3);
+        const target_id: u32 = try colIdU32(stmt, 4);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
@@ -3632,7 +3678,7 @@ pub const MindbrainHttpApp = struct {
         const id = if (by_domain) blk: {
             break :blk (try queryValue(allocator, query, "domain_or_workspace")) orelse return error.BadRequest;
         } else blk: {
-            break :blk (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+            break :blk try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         };
 
         var resolved_workspace_id: ?[]const u8 = null;
@@ -3679,7 +3725,7 @@ pub const MindbrainHttpApp = struct {
         const workspace_or_domain = if (by_domain) blk: {
             break :blk (try queryValue(allocator, query, "domain_or_workspace")) orelse return error.BadRequest;
         } else blk: {
-            break :blk (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest;
+            break :blk try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
         };
 
         const body = if (by_domain) blk: {
@@ -3695,6 +3741,12 @@ pub const MindbrainHttpApp = struct {
         };
     }
 
+    /// Upper bounds for graph traversal endpoints: unbounded hops/depth or
+    /// seed lists let a single request materialize an entire connected
+    /// component in memory (streamSubgraph buffers every event).
+    const max_graph_traversal_depth: usize = 10;
+    const max_graph_seed_ids: usize = 100;
+
     fn handleGraphPath(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {
         var db = try self.openDb();
         defer db.close();
@@ -3705,10 +3757,14 @@ pub const MindbrainHttpApp = struct {
             try parseQueryInt(usize, value)
         else
             4;
+        if (max_depth > max_graph_traversal_depth) return error.BadRequest;
         const edge_labels = try queryValues(allocator, query, "edge_label");
         defer allocator.free(edge_labels);
 
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse self.default_workspace_id_owned;
+        const workspace_id = if (try queryValue(allocator, query, "workspace_id")) |raw|
+            try canonicalizeRequiredWorkspaceId(allocator, raw)
+        else
+            self.default_workspace_id_owned;
         const body = try graph_sqlite.shortestPathToonWorkspace(
             db,
             allocator,
@@ -3733,12 +3789,13 @@ pub const MindbrainHttpApp = struct {
         defer allocator.free(seed_ids_text);
         const seed_ids = try parseCsvU32List(allocator, seed_ids_text);
         defer allocator.free(seed_ids);
-        if (seed_ids.len == 0) return error.BadRequest;
+        if (seed_ids.len == 0 or seed_ids.len > max_graph_seed_ids) return error.BadRequest;
 
         const hops = if (try queryValue(allocator, query, "hops")) |value|
             try parseQueryInt(usize, value)
         else
             2;
+        if (hops > max_graph_traversal_depth) return error.BadRequest;
 
         const edge_types_text = try queryValue(allocator, query, "edge_types");
         defer if (edge_types_text) |value| allocator.free(value);
@@ -3751,7 +3808,7 @@ pub const MindbrainHttpApp = struct {
         const format_text = try queryValue(allocator, query, "format");
         defer if (format_text) |value| allocator.free(value);
         const json_format = format_text != null and std.mem.eql(u8, format_text.?, "json");
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
 
         const events = try graph_sqlite.streamSubgraph(
             db,
@@ -3792,7 +3849,10 @@ pub const MindbrainHttpApp = struct {
         defer db.close();
 
         const start = (try queryValue(allocator, query, "start")) orelse return error.BadRequest;
-        const workspace_id = (try queryValue(allocator, query, "workspace_id")) orelse self.default_workspace_id_owned;
+        const workspace_id = if (try queryValue(allocator, query, "workspace_id")) |raw|
+            try canonicalizeRequiredWorkspaceId(allocator, raw)
+        else
+            self.default_workspace_id_owned;
         const direction = if (try queryValue(allocator, query, "direction")) |value|
             parseDirection(value) orelse return error.BadRequest
         else
@@ -3801,6 +3861,7 @@ pub const MindbrainHttpApp = struct {
             try parseQueryInt(usize, value)
         else
             3;
+        if (depth > max_graph_traversal_depth) return error.BadRequest;
         const target = try queryValue(allocator, query, "target");
         const edge_labels = try queryValues(allocator, query, "edge_label");
         defer allocator.free(edge_labels);
@@ -3843,6 +3904,7 @@ pub const MindbrainHttpApp = struct {
             try parseQueryInt(usize, value)
         else
             15;
+        if (limit == 0 or limit > 500) return error.BadRequest;
 
         const rows = try pragma_sqlite.packContextScoped(db, allocator, user_id, query_text, scope, limit);
         defer {
@@ -3871,12 +3933,13 @@ pub const MindbrainHttpApp = struct {
 
         const agent_id = (try queryValue(allocator, query, "agent_id")) orelse return error.BadRequest;
         const query_text = (try queryValue(allocator, query, "query")) orelse "";
-        const workspace_id = normalizeOptionalQueryValue(try queryValue(allocator, query, "workspace_id"));
+        const workspace_id = try canonicalizeOptionalWorkspaceId(allocator, try queryValue(allocator, query, "workspace_id"));
         const scope = try queryValue(allocator, query, "scope");
         const limit = if (try queryValue(allocator, query, "limit")) |value|
             try parseQueryInt(usize, value)
         else
             15;
+        if (limit == 0 or limit > 500) return error.BadRequest;
 
         const rows = try ontology_sqlite.materializePackProjections(
             db,
@@ -4009,6 +4072,7 @@ pub const MindbrainHttpApp = struct {
             try parseQueryInt(usize, value)
         else
             15;
+        if (limit == 0 or limit > 500) return error.BadRequest;
 
         const rows = try ontology_sqlite.materializeRelevanceProjections(
             db,
@@ -4088,7 +4152,7 @@ pub const MindbrainHttpApp = struct {
         }
     }
 
-    fn bindSqlParams(stmt: *facet_sqlite.c.sqlite3_stmt, params: []const std.json.Value) !void {
+    fn bindSqlParams(allocator: std.mem.Allocator, stmt: *facet_sqlite.c.sqlite3_stmt, params: []const std.json.Value) !void {
         const c = facet_sqlite.c;
         for (params, 0..) |param, idx| {
             const bind_index: c_int = @intCast(idx + 1);
@@ -4107,11 +4171,11 @@ pub const MindbrainHttpApp = struct {
                     }
                 },
                 .array, .object => {
-                    var json_buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+                    var json_buf: std.Io.Writer.Allocating = .init(allocator);
                     defer json_buf.deinit();
                     try json_buf.writer.print("{f}", .{std.json.fmt(param, .{})});
                     const json_text = try json_buf.toOwnedSlice();
-                    defer std.heap.page_allocator.free(json_text);
+                    defer allocator.free(json_text);
                     if (c.sqlite3_bind_text(stmt, bind_index, json_text.ptr, @intCast(json_text.len), facet_sqlite.sqliteTransient()) != c.SQLITE_OK) {
                         return error.BindFailed;
                     }
@@ -4120,26 +4184,52 @@ pub const MindbrainHttpApp = struct {
         }
     }
 
+    /// Counts SQL statements, skipping string literals and both comment
+    /// styles: a `;` inside `--`/`/* */` comments must not split statements,
+    /// and comment-only segments must not count as statements.
     fn countSqlStatements(sql: []const u8) usize {
         var count: usize = 0;
         var i: usize = 0;
+        var in_statement = false;
+        var in_single = false;
+        var in_double = false;
         while (i < sql.len) {
-            while (i < sql.len and std.ascii.isWhitespace(sql[i])) : (i += 1) {}
-            if (i >= sql.len) break;
-            count += 1;
-            var in_single = false;
-            var in_double = false;
-            while (i < sql.len) : (i += 1) {
-                const ch = sql[i];
-                if (ch == '\'' and !in_double) {
-                    in_single = !in_single;
-                } else if (ch == '"' and !in_single) {
-                    in_double = !in_double;
-                } else if (ch == ';' and !in_single and !in_double) {
-                    i += 1;
-                    break;
-                }
+            const ch = sql[i];
+            if (in_single) {
+                if (ch == '\'') in_single = false;
+                i += 1;
+                continue;
             }
+            if (in_double) {
+                if (ch == '"') in_double = false;
+                i += 1;
+                continue;
+            }
+            if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+                i = std.mem.indexOfScalarPos(u8, sql, i + 2, '\n') orelse sql.len;
+                continue;
+            }
+            if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+                const end = std.mem.indexOfPos(u8, sql, i + 2, "*/") orelse sql.len;
+                i = if (end == sql.len) sql.len else end + 2;
+                continue;
+            }
+            if (ch == ';') {
+                in_statement = false;
+                i += 1;
+                continue;
+            }
+            if (std.ascii.isWhitespace(ch)) {
+                i += 1;
+                continue;
+            }
+            if (ch == '\'') in_single = true;
+            if (ch == '"') in_double = true;
+            if (!in_statement) {
+                in_statement = true;
+                count += 1;
+            }
+            i += 1;
         }
         return count;
     }
@@ -4450,6 +4540,20 @@ fn normalizeOptionalQueryValue(value: ?[]const u8) ?[]const u8 {
     return text;
 }
 
+/// Canonicalize a workspace_id read from an HTTP request/query so lookups resolve
+/// to the same row that the (canonicalizing) creation path persisted. A
+/// blank/"null"/"nil" input stays null, which handlers treat as "all workspaces".
+fn canonicalizeOptionalWorkspaceId(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    const text = normalizeOptionalQueryValue(value) orelse return null;
+    return try workspace_slug.canonicalize(allocator, text);
+}
+
+/// Canonicalize a required workspace_id, rejecting a blank/un-foldable value.
+fn canonicalizeRequiredWorkspaceId(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (value.len == 0) return error.BadRequest;
+    return try workspace_slug.canonicalize(allocator, value);
+}
+
 fn normalizeOptionalText(value: ?[]const u8) ?[]const u8 {
     const text = value orelse return null;
     if (text.len == 0) return null;
@@ -4487,6 +4591,15 @@ fn loadGhostcrabGraphSearchEntities(
     metadata_filters: ?[]const u8,
     limit: usize,
 ) ![]GhostcrabGraphSearchRow {
+    if (limit == 0) return try allocator.alloc(GhostcrabGraphSearchRow, 0);
+
+    const query_terms = try splitSimpleTerms(allocator, query_text);
+    defer freeStringSlice(allocator, query_terms);
+
+    // entity_type filtering happens in SQL (json_each over a JSON array of
+    // requested types) and the no-query path is bounded with LIMIT, so a
+    // request never scans/dupes the whole workspace. The scored path cannot
+    // LIMIT in SQL (scores are computed here) but keeps only a bounded top-k.
     const sql =
         \\SELECT entity_id, entity_type, name, confidence, metadata_json
         \\FROM graph_entity e
@@ -4499,17 +4612,26 @@ fn loadGhostcrabGraphSearchEntities(
         \\    WHERE json_extract(e.metadata_json, '$.' || f.key) IS NOT f.value
         \\       OR json_extract(e.metadata_json, '$.' || f.key) IS NULL
         \\  ))
+        \\  AND (?4 IS NULL OR entity_type IN (SELECT value FROM json_each(?4)))
         \\ORDER BY confidence DESC, entity_id ASC
+        \\LIMIT ?5
     ;
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
 
+    const entity_types_json: ?[]u8 = if (entity_types.len == 0)
+        null
+    else
+        try std.json.Stringify.valueAlloc(allocator, entity_types, .{});
+    defer if (entity_types_json) |value| allocator.free(value);
+
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try bindOptionalText(stmt, 2, collection_id);
     try bindOptionalText(stmt, 3, metadata_filters);
-
-    const query_terms = try splitSimpleTerms(allocator, query_text);
-    defer freeStringSlice(allocator, query_terms);
+    try bindOptionalText(stmt, 4, entity_types_json);
+    // Without query terms rows rank by confidence, which matches the SQL
+    // ORDER BY, so the limit can be pushed down. -1 = no LIMIT in SQLite.
+    try facet_sqlite.bindInt64(stmt, 5, if (query_terms.len == 0) @as(i64, @intCast(limit)) else @as(i64, -1));
 
     var rows = std.ArrayList(GhostcrabGraphSearchRow).empty;
     errdefer {
@@ -4520,6 +4642,7 @@ fn loadGhostcrabGraphSearchEntities(
         }
         rows.deinit(allocator);
     }
+    try rows.ensureTotalCapacityPrecise(allocator, limit);
 
     const c = facet_sqlite.c;
     while (true) {
@@ -4528,49 +4651,56 @@ fn loadGhostcrabGraphSearchEntities(
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
         const entity_type = try helper_api.dupeColText(allocator, stmt, 1);
-        if (!matchesAnyString(entity_type, entity_types)) {
-            allocator.free(entity_type);
-            continue;
-        }
-
+        errdefer allocator.free(entity_type);
         const name = try helper_api.dupeColText(allocator, stmt, 2);
+        errdefer allocator.free(name);
         const metadata_json = try helper_api.dupeColText(allocator, stmt, 4);
+        errdefer allocator.free(metadata_json);
+
         const score = graphSearchScore(query_terms, entity_type, name, metadata_json);
-        if (query_terms.len > 0 and score <= 0) {
+        const candidate = GhostcrabGraphSearchRow{
+            .entity_id = try colIdU32(stmt, 0),
+            .entity_type = entity_type,
+            .name = name,
+            .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
+            .metadata_json = metadata_json,
+            .score = if (query_terms.len == 0) @as(f32, @floatCast(c.sqlite3_column_double(stmt, 3))) else score,
+        };
+        const drop = (query_terms.len > 0 and score <= 0) or
+            (rows.items.len >= limit and !ghostcrabGraphSearchRowRanksBefore(candidate, rows.items[rows.items.len - 1]));
+        if (drop) {
             allocator.free(entity_type);
             allocator.free(name);
             allocator.free(metadata_json);
             continue;
         }
 
-        try rows.append(allocator, .{
-            .entity_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
-            .entity_type = entity_type,
-            .name = name,
-            .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
-            .metadata_json = metadata_json,
-            .score = if (query_terms.len == 0) @as(f32, @floatCast(c.sqlite3_column_double(stmt, 3))) else score,
-        });
-    }
-
-    std.mem.sort(GhostcrabGraphSearchRow, rows.items, {}, struct {
-        fn lessThan(_: void, lhs: GhostcrabGraphSearchRow, rhs: GhostcrabGraphSearchRow) bool {
-            if (lhs.score != rhs.score) return lhs.score > rhs.score;
-            if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;
-            return lhs.entity_id < rhs.entity_id;
+        // Bounded top-k: keep the list sorted, evict the current worst once
+        // full. limit is capped by the handler, so the shift stays cheap.
+        var pos: usize = rows.items.len;
+        while (pos > 0 and ghostcrabGraphSearchRowRanksBefore(candidate, rows.items[pos - 1])) : (pos -= 1) {}
+        try rows.insert(allocator, pos, candidate);
+        if (rows.items.len > limit) {
+            const evicted = rows.pop().?;
+            allocator.free(evicted.entity_type);
+            allocator.free(evicted.name);
+            allocator.free(evicted.metadata_json);
         }
-    }.lessThan);
-
-    if (rows.items.len > limit) {
-        for (rows.items[limit..]) |row| {
-            allocator.free(row.entity_type);
-            allocator.free(row.name);
-            allocator.free(row.metadata_json);
-        }
-        rows.shrinkRetainingCapacity(limit);
     }
 
     return rows.toOwnedSlice(allocator);
+}
+
+/// Checked i64 -> u32 read of an id column: a corrupt or out-of-range id in
+/// the database must surface as an error, not an @intCast panic per request.
+fn colIdU32(stmt: *facet_sqlite.c.sqlite3_stmt, col: c_int) !u32 {
+    return std.math.cast(u32, facet_sqlite.c.sqlite3_column_int64(stmt, col)) orelse error.InvalidRowId;
+}
+
+fn ghostcrabGraphSearchRowRanksBefore(lhs: GhostcrabGraphSearchRow, rhs: GhostcrabGraphSearchRow) bool {
+    if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;
+    return lhs.entity_id < rhs.entity_id;
 }
 
 fn deinitGhostcrabGraphSearchRows(allocator: std.mem.Allocator, rows: []GhostcrabGraphSearchRow) void {
@@ -4597,14 +4727,6 @@ fn splitSimpleTerms(allocator: std.mem.Allocator, query_text: []const u8) ![]con
 fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| allocator.free(value);
     allocator.free(values);
-}
-
-fn matchesAnyString(value: []const u8, candidates: []const []const u8) bool {
-    if (candidates.len == 0) return true;
-    for (candidates) |candidate| {
-        if (std.mem.eql(u8, value, candidate)) return true;
-    }
-    return false;
 }
 
 fn graphSearchScore(terms: []const []const u8, entity_type: []const u8, name: []const u8, metadata_json: []const u8) f32 {
@@ -4678,7 +4800,7 @@ fn loadGhostcrabProjectionEntities(
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
         try rows.append(allocator, .{
-            .entity_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .entity_id = try colIdU32(stmt, 0),
             .entity_type = try helper_api.dupeColText(allocator, stmt, 1),
             .name = try helper_api.dupeColText(allocator, stmt, 2),
             .confidence = @floatCast(c.sqlite3_column_double(stmt, 3)),
@@ -4753,13 +4875,19 @@ fn loadGhostcrabProjectionEvidence(
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
+        // Read (and validate) the ids before duplicating any text columns so
+        // an invalid id cannot leak the dupes.
+        const relation_id = try colIdU32(stmt, 0);
+        const source_id = try colIdU32(stmt, 2);
+        const target_id = try colIdU32(stmt, 3);
+        const evidence_entity_id = try colIdU32(stmt, 5);
         try rows.append(allocator, .{
-            .relation_id = @intCast(c.sqlite3_column_int64(stmt, 0)),
+            .relation_id = relation_id,
             .relation_type = try helper_api.dupeColText(allocator, stmt, 1),
-            .source_id = @intCast(c.sqlite3_column_int64(stmt, 2)),
-            .target_id = @intCast(c.sqlite3_column_int64(stmt, 3)),
+            .source_id = source_id,
+            .target_id = target_id,
             .relation_metadata_json = try helper_api.dupeColText(allocator, stmt, 4),
-            .evidence_entity_id = @intCast(c.sqlite3_column_int64(stmt, 5)),
+            .evidence_entity_id = evidence_entity_id,
             .evidence_entity_type = try helper_api.dupeColText(allocator, stmt, 6),
             .evidence_name = try helper_api.dupeColText(allocator, stmt, 7),
             .evidence_confidence = @floatCast(c.sqlite3_column_double(stmt, 8)),
@@ -5150,7 +5278,11 @@ fn writeOntologySeedEdges(allocator: std.mem.Allocator, db: facet_sqlite.Databas
 }
 
 fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Database, ontology_id: []const u8, type_name: []const u8, writer: *std.Io.Writer) !void {
-    const like_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{type_name});
+    // Escape LIKE metacharacters so a type_name of "%"/"_" matches literally
+    // instead of dumping every triple in the ontology.
+    const escaped_type_name = try escapeSqlLikePattern(allocator, type_name);
+    defer allocator.free(escaped_type_name);
+    const like_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{escaped_type_name});
     defer allocator.free(like_pattern);
     const class_uri = try std.fmt.allocPrint(allocator, "studio:class:{s}", .{type_name});
     defer allocator.free(class_uri);
@@ -5160,7 +5292,7 @@ fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Datab
         \\WHERE ontology_id = ?1
         \\  AND (
         \\    subject = ?2 OR predicate = ?2 OR object_value = ?2 OR object_value = ?4
-        \\    OR subject LIKE ?3 OR predicate LIKE ?3 OR object_value LIKE ?3
+        \\    OR subject LIKE ?3 ESCAPE '\' OR predicate LIKE ?3 ESCAPE '\' OR object_value LIKE ?3 ESCAPE '\'
         \\  )
         \\ORDER BY triple_index
     );
@@ -5190,6 +5322,19 @@ fn writeOntologyTypeTriples(allocator: std.mem.Allocator, db: facet_sqlite.Datab
         try writeRawJsonObject(writer, try helper_api.dupeColText(allocator, stmt, 9), allocator);
         try writer.writeAll("}");
     }
+}
+
+/// Escapes `%`, `_`, and `\` so a user-supplied value can be embedded in a
+/// LIKE pattern (used with `ESCAPE '\'`) without acting as a wildcard.
+fn escapeSqlLikePattern(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, value.len);
+    for (value) |ch| {
+        if (ch == '%' or ch == '_' or ch == '\\') try out.append(allocator, '\\');
+        try out.append(allocator, ch);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn writeEntityFacets(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, entity_id: u32, writer: *std.Io.Writer) !void {
@@ -6155,6 +6300,22 @@ test "http sql writer lane classifier separates reads from writes" {
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("CREATE TABLE t(id INTEGER)", &.{}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("INSERT INTO t(id) VALUES (?)", &.{std.json.Value{ .integer = 1 }}));
     try std.testing.expect(MindbrainHttpApp.shouldUseWriterLane("SELECT 1; SELECT 2", &.{}));
+}
+
+test "http countSqlStatements is comment-aware" {
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT 1"));
+    try std.testing.expectEqual(@as(usize, 2), MindbrainHttpApp.countSqlStatements("SELECT 1; SELECT 2"));
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT 1;"));
+    // Semicolons inside comments must not split statements.
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT 1 -- trailing; comment"));
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT /* a; b */ 1"));
+    // Comment-only segments are not statements.
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT 1; -- done"));
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("/* lead */ SELECT 1; /* tail */"));
+    try std.testing.expectEqual(@as(usize, 0), MindbrainHttpApp.countSqlStatements(" -- nothing\n/* here */"));
+    // Semicolons inside string literals must not split statements.
+    try std.testing.expectEqual(@as(usize, 1), MindbrainHttpApp.countSqlStatements("SELECT 'a;b'"));
+    try std.testing.expectEqual(@as(usize, 2), MindbrainHttpApp.countSqlStatements("SELECT 'a;b'; SELECT \";\""));
 }
 
 test "http search embedding request converts finite JSON numbers to f32" {

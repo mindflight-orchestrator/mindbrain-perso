@@ -2,6 +2,7 @@ const std = @import("std");
 const interfaces = @import("interfaces.zig");
 const roaring = @import("roaring.zig");
 const toon_exports = @import("toon_exports.zig");
+const facet_sqlite = @import("facet_sqlite.zig");
 
 pub const Error = error{
     TableNotFound,
@@ -337,6 +338,19 @@ pub fn countFacetValues(
     facet_name: []const u8,
     filter_bitmap: ?roaring.Bitmap,
 ) ![]interfaces.FacetCount {
+    // SQLite-backed repositories get a single ordered scan of facet_postings;
+    // the generic path below issues one getPostings query (plus a full blob
+    // decode) per facet value, which is an N+1 on the production hot path.
+    if (facet_sqlite.facetRepositoryIsSqliteBacked(repository)) {
+        return facet_sqlite.countFacetValuesSingleScan(
+            facet_sqlite.facetRepositoryDatabase(repository),
+            allocator,
+            table_name,
+            facet_name,
+            filter_bitmap,
+        );
+    }
+
     const table_config = try repository.getTableConfigFn(repository.ctx, allocator, table_name);
     const maybe_facet_id = try repository.getFacetIdFn(repository.ctx, allocator, table_config.table_id, facet_name);
     if (maybe_facet_id == null) return &.{};

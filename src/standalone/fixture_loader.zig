@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zig16_compat.zig");
 
 pub const Error = error{
     QueryNotFound,
@@ -115,7 +116,9 @@ pub fn loadFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) !Load
 }
 
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !LoadedFixture {
-    const json_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
+    // compat.io() resolves to the process-configured Io in executables and
+    // std.testing.io under tests, so this lib export works outside tests too.
+    const json_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(1024 * 1024));
     defer allocator.free(json_bytes);
     return loadFromSlice(allocator, json_bytes);
 }
