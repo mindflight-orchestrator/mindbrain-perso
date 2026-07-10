@@ -58,7 +58,7 @@ pub fn executePostgresAst(
         var attempt: usize = 0;
         while (attempt < 8) : (attempt += 1) {
             var raw: [8]u8 = undefined;
-            std.crypto.random.bytes(&raw);
+            zig16_compat.io().random(&raw);
             const hex = std.fmt.bytesToHex(raw, .lower);
             const candidate = std.fmt.bufPrint(&tag_buf, "$gpq{s}$", .{hex}) catch unreachable;
             if (std.mem.indexOf(u8, ast_json, candidate) == null and
