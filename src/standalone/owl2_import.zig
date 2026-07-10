@@ -442,6 +442,16 @@ pub fn importNTriplesReader(
     if (!options.merge) try deleteOntologyRows(db, workspace_id, ontology_id);
     try seedOwlNamespaces(db, ontology_id);
 
+    // triple_index is positional and UNIQUE per ontology. In replace mode the old
+    // rows are gone so this is 0; in merge mode we must continue past the highest
+    // existing index, otherwise the new triples would overwrite rows 1..n of the
+    // previous import (ON CONFLICT(ontology_id, triple_index)) instead of appending.
+    const triple_base: usize = @intCast(try countRowsBound(
+        db,
+        "SELECT COALESCE(MAX(triple_index), 0) FROM ontology_triples_raw WHERE ontology_id = ?1",
+        ontology_id,
+    ));
+
     var session = try ImportSession.init(db, persistent_arena.allocator(), workspace_id, ontology_id, options.materialize_graph);
     defer session.deinit();
 
@@ -461,7 +471,7 @@ pub fn importNTriplesReader(
         const triple = try parseNTripleLine(scratch, line);
         summary.triples += 1;
         try session.upsertTriple(
-            summary.triples,
+            triple_base + summary.triples,
             triple.subject.kind.label(),
             triple.subject.value,
             triple.predicate,
@@ -1268,45 +1278,129 @@ test "re-importing an ontology replaces its previous content" {
     );
 }
 
-test "re-importing an ontology with merge=true keeps existing content" {
+test "merge accumulates a second import's new content on top of the first" {
     const allocator = std.testing.allocator;
     var db = try Database.open(":memory:");
     defer db.close();
     try db.applyStandaloneSchema();
 
-    // Longer initial import: a class plus two "knows" relations (3 triples,
-    // triple_index 1..3, and materialized alice/bob graph entities).
+    // First file: alice<->bob (2 triples, triple_index 1..2, entities alice/bob).
     const first =
-        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
         \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
         \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
         \\
     ;
-    _ = try importNTriples(db, allocator, "ws-merge", "onto-merge", first, .{
-        .materialize_graph = true,
-    });
+    _ = try importNTriples(db, allocator, "ws-merge", "onto-merge", first, .{ .materialize_graph = true });
     try std.testing.expectEqual(
-        @as(i64, 3),
+        @as(i64, 2),
         try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
     );
-    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-merge' AND name = 'alice'") > 0);
 
-    // Shorter re-import with merge=true must NOT delete the previous rows: the
-    // trailing knows-triples (index 2..3) and the alice/bob entities survive.
+    // Second file with genuinely NEW content merged on top: carol<->dave.
     const second =
-        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#carol> <http://x.example/ns#knows> <http://a.example/ns#dave> .
+        \\<http://a.example/ns#dave> <http://x.example/ns#knows> <http://a.example/ns#carol> .
         \\
     ;
     const summary = try importNTriples(db, allocator, "ws-merge", "onto-merge", second, .{
         .materialize_graph = true,
         .merge = true,
     });
-    try std.testing.expectEqual(@as(usize, 1), summary.triples);
-    // Stale triples survive under merge (replace mode would leave only 1).
+    try std.testing.expectEqual(@as(usize, 2), summary.triples);
+
+    // Raw triples APPEND (indices 3..4), not overwrite 1..2: total is 4, and both
+    // the first import's and the second import's relations are exported.
     try std.testing.expectEqual(
-        @as(i64, 3),
+        @as(i64, 4),
         try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
     );
-    // The alice/bob entities from the first import are still present.
-    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-merge' AND name = 'alice'") > 0);
+    const exported = try exportNTriples(db, allocator, "onto-merge");
+    defer allocator.free(exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "#alice> <http://x.example/ns#knows> <http://a.example/ns#bob>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "#carol> <http://x.example/ns#knows> <http://a.example/ns#dave>") != null);
+
+    // The semantic layer unions by identity: entities from both imports coexist.
+    for ([_][]const u8{ "alice", "bob", "carol", "dave" }) |name| {
+        const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-merge' AND name = ?1");
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, name);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        try std.testing.expect(c.sqlite3_column_int64(stmt, 0) > 0);
+    }
+}
+
+test "replace of one ontology leaves a sibling ontology in the same workspace intact" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Two ontologies under ONE workspace, disjoint IRI namespaces.
+    const onto_a =
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
+        \\
+    ;
+    const onto_b =
+        \\<http://b.example/ns#carol> <http://y.example/ns#likes> <http://b.example/ns#dave> .
+        \\<http://b.example/ns#dave> <http://y.example/ns#likes> <http://b.example/ns#carol> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-shared", "onto-a", onto_a, .{ .materialize_graph = true });
+    _ = try importNTriples(db, allocator, "ws-shared", "onto-b", onto_b, .{ .materialize_graph = true });
+    const b_triples_before = try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-b");
+    try std.testing.expect(b_triples_before > 0);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-shared' AND name = 'carol'") > 0);
+
+    // Replace onto-a with a shorter version: onto-b must be untouched.
+    const onto_a_shorter =
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-shared", "onto-a", onto_a_shorter, .{ .materialize_graph = true });
+
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-a"),
+    );
+    // onto-b's triples and entities are exactly as before.
+    try std.testing.expectEqual(
+        b_triples_before,
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-b"),
+    );
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-shared' AND name = 'carol'") > 0);
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-shared' AND name = 'dave'") > 0);
+}
+
+test "replace with materialize_graph=false clears the previously materialized graph" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const triples =
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-mat", "onto-mat", triples, .{ .materialize_graph = true });
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-mat'") > 0);
+
+    // Replace (default) deletes the materialized graph rows regardless of the new
+    // import's materialize_graph flag, so a non-materializing re-import cannot
+    // leave stale graph projections behind.
+    _ = try importNTriples(db, allocator, "ws-mat", "onto-mat", triples, .{ .materialize_graph = false });
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-mat'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countRows(db, "SELECT COUNT(*) FROM relations_raw WHERE workspace_id = 'ws-mat'"),
+    );
+    // The raw ontology triples themselves were re-imported and remain.
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-mat"),
+    );
 }
