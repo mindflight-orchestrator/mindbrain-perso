@@ -289,8 +289,10 @@ fn numberIsInteger(value: f64) bool {
     const rounded = @round(value);
     if (@abs(value - rounded) > 1e-9) return false;
     const min_f = @as(f64, @floatFromInt(std.math.minInt(i64)));
+    // maxInt(i64) rounds *up* to 2^63 as f64, so the upper bound must be
+    // exclusive or @intFromFloat safety-panics on 2^63.
     const max_f = @as(f64, @floatFromInt(std.math.maxInt(i64)));
-    return rounded >= min_f and rounded <= max_f;
+    return rounded >= min_f and rounded < max_f;
 }
 
 fn writePredicateValueJson(writer: anytype, value: Predicate.Value) !void {
@@ -636,9 +638,10 @@ fn executeNode(allocator: std.mem.Allocator, db: facet_sqlite.Database, query: Q
     var sql: std.Io.Writer.Allocating = .init(allocator);
     defer sql.deinit();
 
+    try sql.writer.writeAll("SELECT entity_id, entity_type, name, confidence, metadata_json");
+    try appendProjectedNodeMetadataSelects(&sql.writer, query, node.variable, "");
     try sql.writer.writeAll(
-        \\SELECT entity_id, entity_type, name, confidence, metadata_json
-        \\FROM graph_entity
+        \\ FROM graph_entity
         \\WHERE workspace_id = ?1 AND entity_type = ?2 AND deprecated_at IS NULL
     );
     if (node.inline_name != null) try sql.writer.writeAll(" AND name = ?3");
@@ -681,6 +684,7 @@ fn executeEdge(allocator: std.mem.Allocator, db: facet_sqlite.Database, query: Q
         \\       dst.entity_id, dst.entity_type, dst.name, dst.confidence, dst.metadata_json
     );
     try appendProjectedRelationPropertySelects(&sql.writer, query, edge.relation_variable);
+    try appendProjectedEdgeMetadataSelects(&sql.writer, query, edge);
     try sql.writer.writeAll(
         \\ FROM graph_entity src
         \\JOIN graph_relation r ON r.workspace_id = src.workspace_id AND r.source_id = src.entity_id
@@ -848,13 +852,30 @@ fn executeHops(allocator: std.mem.Allocator, db: facet_sqlite.Database, query: Q
     if (hops.min != 1) return Error.UnsupportedQuery;
 
     const relation_types = relationTypeFilter(query, edge.relation_variable) orelse return Error.UnsupportedQuery;
+    // The walk can only apply the relation-type IN filter; any other
+    // predicate would be silently ignored, so reject it instead of
+    // returning rows the query text says were filtered.
+    for (query.predicates) |predicate| {
+        if (!isHopsRelationTypePredicate(predicate, edge.relation_variable)) return Error.UnsupportedQuery;
+    }
+
     const type_sql = try placeholders(allocator, 4, relation_types.len);
     defer allocator.free(type_sql);
     const max_index: c_int = 4 + @as(c_int, @intCast(relation_types.len));
     const min_index = max_index + 1;
     const limit_index = min_index + 1;
+    const target_type_index = limit_index + 1;
+
+    var extra_selects: std.Io.Writer.Allocating = .init(allocator);
+    defer extra_selects.deinit();
+    try appendProjectedNodeMetadataSelects(&extra_selects.writer, query, edge.target.variable, "e");
+    const extra_selects_sql = try extra_selects.toOwnedSlice();
+    defer allocator.free(extra_selects_sql);
 
     const seed_name = edge.source.inline_name orelse return Error.UnsupportedQuery;
+    // GROUP BY dedupes entities reachable at several depths (the UNION is
+    // on (entity_id, depth)); the join is additionally guarded by the
+    // workspace and filtered to the declared target entity type.
     const sql = try std.fmt.allocPrint(allocator,
         \\WITH RECURSIVE walk(entity_id, depth) AS (
         \\  SELECT entity_id, 0 FROM graph_entity
@@ -867,13 +888,14 @@ fn executeHops(allocator: std.mem.Allocator, db: facet_sqlite.Database, query: Q
         \\    AND r.relation_type IN ({s})
         \\    AND walk.depth < ?{}
         \\)
-        \\SELECT e.entity_id, e.entity_type, e.name, e.confidence, e.metadata_json
+        \\SELECT e.entity_id, e.entity_type, e.name, e.confidence, e.metadata_json{s}
         \\FROM walk
         \\JOIN graph_entity e ON e.entity_id = walk.entity_id
-        \\WHERE walk.depth >= ?{} AND e.deprecated_at IS NULL
-        \\ORDER BY walk.depth, e.entity_id
+        \\WHERE walk.depth >= ?{} AND e.workspace_id = ?1 AND e.entity_type = ?{} AND e.deprecated_at IS NULL
+        \\GROUP BY e.entity_id
+        \\ORDER BY MIN(walk.depth), e.entity_id
         \\LIMIT ?{}
-    , .{ type_sql, max_index, min_index, limit_index });
+    , .{ type_sql, max_index, extra_selects_sql, min_index, target_type_index, limit_index });
     defer allocator.free(sql);
 
     const stmt = try facet_sqlite.prepare(db, sql);
@@ -889,8 +911,15 @@ fn executeHops(allocator: std.mem.Allocator, db: facet_sqlite.Database, query: Q
     try facet_sqlite.bindInt64(stmt, max_index, hops.max);
     try facet_sqlite.bindInt64(stmt, min_index, hops.min);
     try facet_sqlite.bindInt64(stmt, limit_index, query.limit);
+    try facet_sqlite.bindText(stmt, target_type_index, edge.target.entity_type);
 
     return try rowsToJson(allocator, stmt, query, null);
+}
+
+fn isHopsRelationTypePredicate(predicate: Predicate, relation_var: []const u8) bool {
+    if (!startsWithVariable(predicate.path, relation_var)) return false;
+    if (!std.mem.eql(u8, predicate.path[relation_var.len + 1 ..], "relation_type")) return false;
+    return predicate.op == .in and predicate.value == .list_text;
 }
 
 fn placeholders(allocator: std.mem.Allocator, start_index: c_int, count: usize) ![]u8 {
@@ -972,6 +1001,11 @@ fn rowsToJson(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, query: Query,
 }
 
 fn writeProjectedValue(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, query: Query, edge: ?EdgePattern, field: []const u8) !void {
+    // Node metadata.<key> projections are extracted in SQL (json_quote of
+    // json_extract) instead of re-parsing the whole metadata JSON per row.
+    if (projectedNodeMetadataIndex(query, field)) |meta_index| {
+        return writeExtractedJson(writer, stmt, nodeMetadataExtractBase(query) + @as(c_int, @intCast(meta_index)));
+    }
     if (edge) |edge_pattern| {
         if (startsWithVariable(field, edge_pattern.source.variable)) return writeNodeField(writer, stmt, field, edge_pattern.source.variable, 0);
         if (startsWithVariable(field, edge_pattern.relation_variable)) return writeRelationField(writer, stmt, query, field, edge_pattern.relation_variable);
@@ -995,7 +1029,7 @@ fn writeNodeField(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, field: []const 
     if (std.mem.eql(u8, path, "name")) return writeSqliteTextJson(writer, stmt, offset + 2);
     if (std.mem.eql(u8, path, "confidence")) return writer.print("{d}", .{c.sqlite3_column_double(stmt, offset + 3)});
     if (std.mem.eql(u8, path, "metadata")) return writeRawJsonObject(writer, stmt, offset + 4);
-    if (std.mem.startsWith(u8, path, "metadata.")) return writeJsonExtract(writer, stmt, offset + 4, path["metadata.".len..]);
+    // metadata.<key> is handled by the SQL extract columns in writeProjectedValue.
     return writer.writeAll("null");
 }
 
@@ -1039,14 +1073,77 @@ fn writeRawJsonObject(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, col: c_int)
     return writer.writeAll(text);
 }
 
-fn writeJsonExtract(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, metadata_col: c_int, key: []const u8) !void {
-    const ptr = c.sqlite3_column_text(stmt, metadata_col) orelse return writer.writeAll("null");
-    const text = ptr[0..@intCast(c.sqlite3_column_bytes(stmt, metadata_col))];
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, text, .{}) catch return writer.writeAll("null");
-    defer parsed.deinit();
-    if (parsed.value != .object) return writer.writeAll("null");
-    const value = parsed.value.object.get(key) orelse return writer.writeAll("null");
-    return writer.print("{f}", .{std.json.fmt(value, .{})});
+/// Emits the pre-extracted `json_quote(json_extract(...))` column text; the
+/// column already holds valid JSON (or SQL NULL when metadata is absent).
+fn writeExtractedJson(writer: *std.Io.Writer, stmt: *c.sqlite3_stmt, col: c_int) !void {
+    if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return writer.writeAll("null");
+    const ptr = c.sqlite3_column_text(stmt, col) orelse return writer.writeAll("null");
+    const text = ptr[0..@intCast(c.sqlite3_column_bytes(stmt, col))];
+    if (text.len == 0) return writer.writeAll("null");
+    return writer.writeAll(text);
+}
+
+fn projectedNodeMetadataKey(field: []const u8, variable: []const u8) ?[]const u8 {
+    if (!startsWithVariable(field, variable)) return null;
+    const suffix = field[variable.len + 1 ..];
+    if (!std.mem.startsWith(u8, suffix, "metadata.")) return null;
+    return suffix["metadata.".len..];
+}
+
+/// Appends `, json_quote(json_extract(<alias>.metadata_json, '$.<key>'))`
+/// select columns for every projected `<variable>.metadata.<key>` field.
+/// Keys were validated by `validateJsonPathKey` (identifier chars and '-'),
+/// so splicing them into the SQL text is safe — the WHERE path already does
+/// the same in `appendNodePathSql`.
+fn appendProjectedNodeMetadataSelects(writer: *std.Io.Writer, query: Query, variable: []const u8, alias: []const u8) !void {
+    if (query.project != .fields) return;
+    for (query.project.fields) |field| {
+        const key = projectedNodeMetadataKey(field, variable) orelse continue;
+        if (alias.len == 0) {
+            try writer.print(", json_quote(json_extract(metadata_json, '$.{s}'))", .{key});
+        } else {
+            try writer.print(", json_quote(json_extract({s}.metadata_json, '$.{s}'))", .{ alias, key });
+        }
+    }
+}
+
+/// Edge-query variant: one pass over the projected fields so the emitted
+/// column order matches `projectedNodeMetadataIndex`.
+fn appendProjectedEdgeMetadataSelects(writer: *std.Io.Writer, query: Query, edge: EdgePattern) !void {
+    if (query.project != .fields) return;
+    for (query.project.fields) |field| {
+        if (projectedNodeMetadataKey(field, edge.source.variable)) |key| {
+            try writer.print(", json_quote(json_extract(src.metadata_json, '$.{s}'))", .{key});
+        } else if (projectedNodeMetadataKey(field, edge.target.variable)) |key| {
+            try writer.print(", json_quote(json_extract(dst.metadata_json, '$.{s}'))", .{key});
+        }
+    }
+}
+
+/// Position of `wanted` among the projected node-metadata fields, matching
+/// the order the extract columns were appended in.
+fn projectedNodeMetadataIndex(query: Query, wanted: []const u8) ?usize {
+    if (query.project != .fields) return null;
+    var index: usize = 0;
+    for (query.project.fields) |field| {
+        const is_meta = switch (query.match) {
+            .node => |node| projectedNodeMetadataKey(field, node.variable) != null,
+            .edge => |edge| projectedNodeMetadataKey(field, edge.source.variable) != null or
+                projectedNodeMetadataKey(field, edge.target.variable) != null,
+        };
+        if (!is_meta) continue;
+        if (std.mem.eql(u8, field, wanted)) return index;
+        index += 1;
+    }
+    return null;
+}
+
+/// First column index of the node-metadata extract block for each query shape.
+fn nodeMetadataExtractBase(query: Query) c_int {
+    return switch (query.match) {
+        .node => 5,
+        .edge => |edge| if (query.hops != null) 5 else 14 + countProjectedRelationProperties(query, edge.relation_variable) * 3,
+    };
 }
 
 fn startsWithVariable(path: []const u8, variable: []const u8) bool {
@@ -1419,6 +1516,61 @@ test "graph pattern executor runs hops and projection bundle syntax" {
     defer std.testing.allocator.free(bundle_json);
     try std.testing.expect(std.mem.indexOf(u8, bundle_json, "\"bundle\":\"projection_get\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundle_json, "keyword opportunity set") != null);
+}
+
+test "graph pattern hops applies target type filter, dedupes, and rejects unsupported predicates" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try setupGraphPatternFixture(db);
+    // Extra direct edge: the unit is now reachable at depth 1 and depth 2,
+    // which duplicated the row before the GROUP BY dedupe.
+    try db.exec(
+        \\INSERT INTO graph_relation(relation_id, workspace_id, relation_type, source_id, target_id, confidence, metadata_json) VALUES
+        \\  (14, 'immeuble-demo', 'contains', 1, 3, 1.0, '{}');
+    );
+
+    const hops_json = try executeSqlite(std.testing.allocator, db,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (b:building {name: 'Résidence Les Tilleuls'})-[r:contains]->(x:unit)
+        \\HOPS 1..2
+        \\WHERE r.relation_type IN ('contains')
+        \\PROJECT x.entity_id, x.name, x.metadata.lot
+        \\LIMIT 20
+    );
+    defer std.testing.allocator.free(hops_json);
+
+    // Type filter: the intermediate block must not appear even though the
+    // walk passes through it.
+    try std.testing.expect(std.mem.indexOf(u8, hops_json, "Tilleuls Bloc A") == null);
+    // Dedupe: exactly one row for the doubly-reachable unit.
+    try std.testing.expect(std.mem.indexOf(u8, hops_json, "\"returned\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hops_json, "Tilleuls Appartement A3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hops_json, "\"A3\"") != null);
+
+    // Node predicates cannot be evaluated on the hops path: reject rather
+    // than silently ignore them.
+    try std.testing.expectError(Error.UnsupportedQuery, executeSqlite(std.testing.allocator, db,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (b:building {name: 'Résidence Les Tilleuls'})-[r:contains]->(x:unit)
+        \\HOPS 1..2
+        \\WHERE r.relation_type IN ('contains') AND x.name = 'Tilleuls Appartement A3'
+        \\PROJECT x.entity_id, x.name
+        \\LIMIT 20
+    ));
+}
+
+test "graph pattern integer boundary values do not overflow int projection" {
+    // maxInt(i64) rounds up to 2^63 as f64; it must be emitted as a plain
+    // number instead of tripping the @intFromFloat safety check.
+    const ast = try parseToJsonAst(std.testing.allocator,
+        \\WORKSPACE immeuble-demo
+        \\MATCH (u:unit)
+        \\WHERE u.metadata.big = 9223372036854775807
+        \\PROJECT u.name
+        \\LIMIT 1
+    );
+    defer std.testing.allocator.free(ast);
+    try std.testing.expect(std.mem.indexOf(u8, ast, "\"value_number\":") != null);
 }
 
 test "graph pattern parser rejects key invalid syntaxes" {

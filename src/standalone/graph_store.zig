@@ -36,14 +36,14 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         for (self.outgoing.items) |*entry| {
             entry.bitmap.deinit();
-            self.allocator.free(entry.relation_ids);
+            self.allocator.free(entry.relation_ids.ptr[0..entry.capacity]);
         }
         self.outgoing.deinit(self.allocator);
         self.outgoing_index.deinit();
 
         for (self.incoming.items) |*entry| {
             entry.bitmap.deinit();
-            self.allocator.free(entry.relation_ids);
+            self.allocator.free(entry.relation_ids.ptr[0..entry.capacity]);
         }
         self.incoming.deinit(self.allocator);
         self.incoming_index.deinit();
@@ -288,7 +288,10 @@ pub const Store = struct {
 
 const AdjacencyEntry = struct {
     entity_id: u32,
+    /// Used prefix of the backing buffer; `capacity` is the allocated
+    /// length so per-edge appends stay amortized O(1).
     relation_ids: []u32,
+    capacity: usize,
     bitmap: roaring.Bitmap,
 };
 
@@ -299,18 +302,28 @@ fn upsertAdjacency(
     entity_id: u32,
     relation_ids: []const u32,
 ) !void {
+    // Build the replacement first: deinit-ing the old entry before a
+    // fallible rebuild left a dangling buffer/bitmap on allocation failure.
+    const new_ids = try allocator.dupe(u32, relation_ids);
+    errdefer allocator.free(new_ids);
+    var new_bitmap = try roaring.Bitmap.fromSlice(relation_ids);
+    errdefer new_bitmap.deinit();
+
     if (index.get(entity_id)) |entry_index| {
-        allocator.free(entries.items[entry_index].relation_ids);
-        entries.items[entry_index].bitmap.deinit();
-        entries.items[entry_index].relation_ids = try allocator.dupe(u32, relation_ids);
-        entries.items[entry_index].bitmap = try roaring.Bitmap.fromSlice(relation_ids);
+        const entry = &entries.items[entry_index];
+        allocator.free(entry.relation_ids.ptr[0..entry.capacity]);
+        entry.bitmap.deinit();
+        entry.relation_ids = new_ids;
+        entry.capacity = new_ids.len;
+        entry.bitmap = new_bitmap;
         return;
     }
 
     try entries.append(allocator, .{
         .entity_id = entity_id,
-        .relation_ids = try allocator.dupe(u32, relation_ids),
-        .bitmap = try roaring.Bitmap.fromSlice(relation_ids),
+        .relation_ids = new_ids,
+        .capacity = new_ids.len,
+        .bitmap = new_bitmap,
     });
     try index.put(entity_id, entries.items.len - 1);
 }
@@ -323,22 +336,36 @@ fn appendAdjacencyRelation(
     relation_id: u32,
 ) !void {
     if (index.get(entity_id)) |entry_index| {
-        const old_ids = entries.items[entry_index].relation_ids;
-        const relation_ids = try allocator.alloc(u32, old_ids.len + 1);
-        @memcpy(relation_ids[0..old_ids.len], old_ids);
-        relation_ids[old_ids.len] = relation_id;
-        allocator.free(old_ids);
-        entries.items[entry_index].bitmap.deinit();
-        entries.items[entry_index].relation_ids = relation_ids;
-        entries.items[entry_index].bitmap = try roaring.Bitmap.fromSlice(relation_ids);
+        const entry = &entries.items[entry_index];
+        const len = entry.relation_ids.len;
+        if (len == entry.capacity) {
+            // Geometric growth instead of an exact-fit realloc + full
+            // roaring rebuild per appended edge (was O(deg²) per entity).
+            const new_capacity = @max(entry.capacity * 2, 4);
+            if (entry.capacity == 0) {
+                const new_buf = try allocator.alloc(u32, new_capacity);
+                entry.relation_ids = new_buf[0..0];
+            } else {
+                const new_buf = try allocator.realloc(entry.relation_ids.ptr[0..entry.capacity], new_capacity);
+                entry.relation_ids = new_buf[0..len];
+            }
+            entry.capacity = new_capacity;
+        }
+        entry.relation_ids = entry.relation_ids.ptr[0 .. len + 1];
+        entry.relation_ids[len] = relation_id;
+        entry.bitmap.add(relation_id);
         return;
     }
 
-    const relation_ids = try allocator.dupe(u32, &.{relation_id});
+    const new_ids = try allocator.dupe(u32, &.{relation_id});
+    errdefer allocator.free(new_ids);
+    var new_bitmap = try roaring.Bitmap.fromSlice(new_ids);
+    errdefer new_bitmap.deinit();
     try entries.append(allocator, .{
         .entity_id = entity_id,
-        .relation_ids = relation_ids,
-        .bitmap = try roaring.Bitmap.fromSlice(relation_ids),
+        .relation_ids = new_ids,
+        .capacity = new_ids.len,
+        .bitmap = new_bitmap,
     });
     try index.put(entity_id, entries.items.len - 1);
 }
@@ -644,8 +671,9 @@ pub fn kHops(
         if (next_frontier.isEmpty()) break;
         visited.orInPlace(next_frontier);
 
-        frontier.deinit();
-        frontier = try next_frontier.clone();
+        // Swap instead of deinit + fallible clone: a failed clone after the
+        // deinit would leave the deferred deinit double-freeing `frontier`.
+        std.mem.swap(roaring.Bitmap, &frontier, &next_frontier);
     }
 
     return visited;
@@ -683,8 +711,8 @@ pub fn shortestPathHops(
         if (next_frontier.isEmpty()) return null;
 
         visited.orInPlace(next_frontier);
-        frontier.deinit();
-        frontier = try next_frontier.clone();
+        // Swap instead of deinit + fallible clone (double-free hazard).
+        std.mem.swap(roaring.Bitmap, &frontier, &next_frontier);
     }
 
     return null;
@@ -741,8 +769,8 @@ pub fn shortestPath(
         if (next_frontier.isEmpty()) return null;
 
         visited.orInPlace(next_frontier);
-        frontier.deinit();
-        frontier = try next_frontier.clone();
+        // Swap instead of deinit + fallible clone (double-free hazard).
+        std.mem.swap(roaring.Bitmap, &frontier, &next_frontier);
     }
 
     return null;
@@ -809,6 +837,46 @@ test "graph store performs k-hop traversal with edge type filtering" {
     const fast_ids = try fast_result.toArray(std.testing.allocator);
     defer std.testing.allocator.free(fast_ids);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4 }, fast_ids);
+}
+
+test "graph store incremental adjacency appends keep list and bitmap in sync" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    // Grow one entity's adjacency past several capacity doublings, mixing
+    // append-created and setOutgoing-created entries.
+    try store.setOutgoing(1, &.{});
+    var relation_id: u32 = 100;
+    while (relation_id < 120) : (relation_id += 1) {
+        try store.addRelation(.{
+            .relation_id = relation_id,
+            .source_id = 1,
+            .target_id = relation_id + 1000,
+            .relation_type = "works_for",
+        });
+        try store.appendOutgoing(1, relation_id);
+        try store.appendIncoming(relation_id + 1000, relation_id);
+    }
+
+    const entry_index = store.outgoing_index.get(1).?;
+    const entry = store.outgoing.items[entry_index];
+    try std.testing.expectEqual(@as(usize, 20), entry.relation_ids.len);
+    try std.testing.expect(entry.capacity >= entry.relation_ids.len);
+    for (entry.relation_ids, 0..) |id, index| {
+        try std.testing.expectEqual(@as(u32, 100) + @as(u32, @intCast(index)), id);
+        try std.testing.expect(entry.bitmap.contains(id));
+    }
+
+    // Replacing via setOutgoing after appends must not leak or corrupt.
+    try store.setOutgoing(1, &.{ 100, 101 });
+    const replaced = store.outgoing.items[store.outgoing_index.get(1).?];
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101 }, replaced.relation_ids);
+
+    var seed = try roaring.Bitmap.fromSlice(&.{1});
+    defer seed.deinit();
+    var result = try kHops(std.testing.allocator, store.asRepository(), seed, 1, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
 }
 
 test "graph store computes shortest path hop count with filters" {
