@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const facet_sqlite = @import("facet_sqlite.zig");
+pub const workspace_slug = @import("workspace_slug.zig");
 
 pub const Database = facet_sqlite.Database;
 pub const Error = facet_sqlite.Error;
@@ -305,6 +306,12 @@ pub const DocumentLinkRawSpec = struct {
 // ---- Workspaces / collections / settings ----------------------------------
 
 pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
+    // The workspace_id is expected to already be canonical: external callers (CLI,
+    // HTTP) slug it at the boundary. This function does NOT canonicalize, so it
+    // cannot diverge from sibling inserts that reuse the same id under a deferred
+    // FK check (bundle import keys a workspace and all its children off one id).
+    const workspace_id = spec.workspace_id;
+
     const sql =
         \\INSERT INTO workspaces(id, workspace_id, label, description, domain_profile, status)
         \\VALUES(?1, ?1, COALESCE(?2, ?1), COALESCE(?3, ''), COALESCE(?4, 'generic'), 'active')
@@ -317,7 +324,7 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
 
-    try facet_sqlite.bindText(stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
     if (spec.label) |label| try facet_sqlite.bindText(stmt, 2, label) else try facet_sqlite.bindNull(stmt, 2);
     if (spec.description) |desc| try facet_sqlite.bindText(stmt, 3, desc) else try facet_sqlite.bindNull(stmt, 3);
     if (spec.domain_profile) |profile| try facet_sqlite.bindText(stmt, 4, profile) else try facet_sqlite.bindNull(stmt, 4);
@@ -329,7 +336,7 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
     ;
     const settings_stmt = try facet_sqlite.prepare(db, settings_sql);
     defer facet_sqlite.finalize(settings_stmt);
-    try facet_sqlite.bindText(settings_stmt, 1, spec.workspace_id);
+    try facet_sqlite.bindText(settings_stmt, 1, workspace_id);
     try facet_sqlite.stepDone(settings_stmt);
 
     if (spec.bootstrap_default_ontology) {
@@ -337,18 +344,18 @@ pub fn ensureWorkspace(db: Database, spec: WorkspaceSpec) !void {
         // `source.*` namespace is always available, even before any explicit
         // ontology has been declared. Idempotent.
         var default_id_buf: [256]u8 = undefined;
-        const default_id_slice = try formatDefaultOntologyId(&default_id_buf, spec.workspace_id);
+        const default_id_slice = try formatDefaultOntologyId(&default_id_buf, workspace_id);
         try ensureOntology(db, .{
             .ontology_id = default_id_slice,
-            .workspace_id = spec.workspace_id,
+            .workspace_id = workspace_id,
             .name = "default",
             .source_kind = "auto",
         });
         // Only bootstrap default_ontology_id when none is set. Later
         // ensureWorkspace calls (e.g. document-ingest) must not clobber an explicit
         // default such as ws::core set by ontology-compile-linkml.
-        if (try defaultOntologyIsUnset(db, spec.workspace_id)) {
-            try setDefaultOntology(db, spec.workspace_id, default_id_slice);
+        if (try defaultOntologyIsUnset(db, workspace_id)) {
+            try setDefaultOntology(db, workspace_id, default_id_slice);
         }
         try ensureSourceNamespace(db, default_id_slice);
     }
@@ -1700,13 +1707,13 @@ test "ensureEntityRawAuto keeps the name and metadata written by the facet pass"
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsE" });
-    try ensureOntology(db, .{ .ontology_id = "wsE::core", .workspace_id = "wsE", .name = "core" });
+    try ensureWorkspace(db, .{ .workspace_id = "wse" });
+    try ensureOntology(db, .{ .ontology_id = "wse::core", .workspace_id = "wse", .name = "core" });
 
     // Facet pass writes the human-readable name.
     const id = try upsertEntityRawAuto(db, .{
-        .workspace_id = "wsE",
-        .ontology_id = "wsE::core",
+        .workspace_id = "wse",
+        .ontology_id = "wse::core",
         .external_id = "lot:0001",
         .entity_type = "lot",
         .name = "Lot 1 - Maison Bleue",
@@ -1717,8 +1724,8 @@ test "ensureEntityRawAuto keeps the name and metadata written by the facet pass"
     // Edge pass resolves the endpoint with the raw external id as name;
     // it must not clobber the existing row.
     const resolved = try ensureEntityRawAuto(db, .{
-        .workspace_id = "wsE",
-        .ontology_id = "wsE::core",
+        .workspace_id = "wse",
+        .ontology_id = "wse::core",
         .external_id = "lot:0001",
         .entity_type = "lot",
         .name = "lot:0001",
@@ -1740,21 +1747,21 @@ test "ensureWorkspace bootstraps the default ontology with the source.* namespac
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
 
-    const default_id = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
+    const default_id = (try defaultOntology(db, std.testing.allocator, "wsx")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(default_id);
-    try std.testing.expectEqualStrings("wsX::default", default_id);
+    try std.testing.expectEqualStrings("wsx::default", default_id);
 
-    try ensureOntology(db, .{ .ontology_id = "wsX::core", .workspace_id = "wsX", .name = "core" });
-    try setDefaultOntology(db, "wsX", "wsX::core");
-    try ensureWorkspace(db, .{ .workspace_id = "wsX" });
-    const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsX")) orelse
+    try ensureOntology(db, .{ .ontology_id = "wsx::core", .workspace_id = "wsx", .name = "core" });
+    try setDefaultOntology(db, "wsx", "wsx::core");
+    try ensureWorkspace(db, .{ .workspace_id = "wsx" });
+    const explicit_default = (try defaultOntology(db, std.testing.allocator, "wsx")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(explicit_default);
-    try std.testing.expectEqualStrings("wsX::core", explicit_default);
+    try std.testing.expectEqualStrings("wsx::core", explicit_default);
 
     const sql_dims =
         \\SELECT COUNT(*) FROM ontology_dimensions
@@ -1771,18 +1778,18 @@ test "ensureDefaultOntology preserves explicit workspace default" {
     var db = try Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
-    try ensureWorkspace(db, .{ .workspace_id = "wsZ" });
-    try ensureOntology(db, .{ .ontology_id = "wsZ::core", .workspace_id = "wsZ", .name = "core" });
-    try setDefaultOntology(db, "wsZ", "wsZ::core");
+    try ensureWorkspace(db, .{ .workspace_id = "wsz" });
+    try ensureOntology(db, .{ .ontology_id = "wsz::core", .workspace_id = "wsz", .name = "core" });
+    try setDefaultOntology(db, "wsz", "wsz::core");
 
-    const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsZ");
+    const resolved = try ensureDefaultOntology(db, std.testing.allocator, "wsz");
     defer std.testing.allocator.free(resolved);
-    try std.testing.expectEqualStrings("wsZ::core", resolved);
+    try std.testing.expectEqualStrings("wsz::core", resolved);
 
-    const default_id = (try defaultOntology(db, std.testing.allocator, "wsZ")) orelse
+    const default_id = (try defaultOntology(db, std.testing.allocator, "wsz")) orelse
         return error.MissingDefaultOntology;
     defer std.testing.allocator.free(default_id);
-    try std.testing.expectEqualStrings("wsZ::core", default_id);
+    try std.testing.expectEqualStrings("wsz::core", default_id);
 }
 
 test "ensureDefaultOntology is idempotent and returns an owned id" {
@@ -1790,12 +1797,12 @@ test "ensureDefaultOntology is idempotent and returns an owned id" {
     defer db.close();
     try db.applyStandaloneSchema();
 
-    try ensureWorkspace(db, .{ .workspace_id = "wsY" });
-    const first = try ensureDefaultOntology(db, std.testing.allocator, "wsY");
+    try ensureWorkspace(db, .{ .workspace_id = "wsy" });
+    const first = try ensureDefaultOntology(db, std.testing.allocator, "wsy");
     defer std.testing.allocator.free(first);
-    try std.testing.expectEqualStrings("wsY::default", first);
+    try std.testing.expectEqualStrings("wsy::default", first);
 
-    const second = try ensureDefaultOntology(db, std.testing.allocator, "wsY");
+    const second = try ensureDefaultOntology(db, std.testing.allocator, "wsy");
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
 
@@ -1824,6 +1831,34 @@ test "ensureWorkspace and ensureCollection are idempotent" {
         .chunk_bits = 8,
     });
     try std.testing.expect(try collectionExists(db, "ws1::legal"));
+}
+
+test "ensureWorkspace canonicalizes ids so accent/case variants map to one row" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Simulate the CLI/HTTP boundary: external ids are slugged before use, then
+    // handed to ensureWorkspace. Distinct accent/case spellings of the same name
+    // must therefore collapse to a single workspace row.
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    inline for (.{ "Café", "CAFÉ", "cafe" }) |raw| {
+        fba.reset();
+        const id = try workspace_slug.canonicalize(fba.allocator(), raw);
+        try std.testing.expectEqualStrings("cafe", id);
+        try ensureWorkspace(db, .{ .workspace_id = id });
+    }
+    try std.testing.expect(try workspaceExists(db, "cafe"));
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = 'cafe'");
+    defer facet_sqlite.finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+
+    // The un-canonical spellings never created their own rows.
+    try std.testing.expect(!(try workspaceExists(db, "Café")));
+    try std.testing.expect(!(try workspaceExists(db, "CAFÉ")));
 }
 
 test "loadOntologyBundle persists namespaces, dimensions, values, types" {

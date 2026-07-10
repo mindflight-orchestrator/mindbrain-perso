@@ -88,5 +88,6 @@ comptime {
     _ = @import("vector_blob.zig");
     _ = @import("vector_distance.zig");
     _ = @import("vector_sqlite_exact.zig");
+    _ = @import("workspace_slug.zig");
     _ = @import("workspace_sqlite.zig");
 }

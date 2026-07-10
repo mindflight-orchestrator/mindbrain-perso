@@ -49,6 +49,11 @@ pub const Triple = struct {
 pub const ImportOptions = struct {
     ontology_name: ?[]const u8 = null,
     materialize_graph: bool = false,
+    /// replace (default, merge=false): deletes this ontology_id's triples,
+    /// relations, entities and materialized graph rows before re-inserting, so a
+    /// re-import of a shorter ontology leaves no stale rows. merge (true): keeps
+    /// existing rows and accumulates the newly imported triples on top of them.
+    merge: bool = false,
 };
 
 pub const ImportSummary = struct {
@@ -434,7 +439,7 @@ pub fn importNTriplesReader(
         .source_kind = "owl2",
         .metadata_json = "{\"format\":\"ntriples\"}",
     });
-    try deleteOntologyRows(db, workspace_id, ontology_id);
+    if (!options.merge) try deleteOntologyRows(db, workspace_id, ontology_id);
     try seedOwlNamespaces(db, ontology_id);
 
     var session = try ImportSession.init(db, persistent_arena.allocator(), workspace_id, ontology_id, options.materialize_graph);
@@ -1261,4 +1266,47 @@ test "re-importing an ontology replaces its previous content" {
         "<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .\n",
         exported,
     );
+}
+
+test "re-importing an ontology with merge=true keeps existing content" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Longer initial import: a class plus two "knows" relations (3 triples,
+    // triple_index 1..3, and materialized alice/bob graph entities).
+    const first =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-merge", "onto-merge", first, .{
+        .materialize_graph = true,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
+    );
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-merge' AND name = 'alice'") > 0);
+
+    // Shorter re-import with merge=true must NOT delete the previous rows: the
+    // trailing knows-triples (index 2..3) and the alice/bob entities survive.
+    const second =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\
+    ;
+    const summary = try importNTriples(db, allocator, "ws-merge", "onto-merge", second, .{
+        .materialize_graph = true,
+        .merge = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), summary.triples);
+    // Stale triples survive under merge (replace mode would leave only 1).
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
+    );
+    // The alice/bob entities from the first import are still present.
+    try std.testing.expect(try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-merge' AND name = 'alice'") > 0);
 }

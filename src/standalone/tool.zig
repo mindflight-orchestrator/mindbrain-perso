@@ -31,6 +31,7 @@ const toon_exports = mindbrain.toon_exports;
 const db_benchmark = mindbrain.db_benchmark;
 const vector_blob = mindbrain.vector_blob;
 const workspace_sqlite = mindbrain.workspace_sqlite;
+const workspace_slug = collections_sqlite.workspace_slug;
 const qualification_normalize = mindbrain.qualification_normalize;
 const qualification_apply = mindbrain.qualification_apply;
 const business_edge_normalize = mindbrain.business_edge_normalize;
@@ -465,7 +466,7 @@ fn printUsage() !void {
         \\  mindbrain-standalone-tool collection-create --db <sqlite_path> --workspace-id <id> --collection-id <id> --name <name> [--chunk-bits <n>] [--language <lang>]
         \\  mindbrain-standalone-tool ontology-register --db <sqlite_path> --workspace-id <id> --ontology-id <id> --name <name> [--version <v>] [--source-kind <kind>]
         \\  mindbrain-standalone-tool ontology-attach --db <sqlite_path> --workspace-id <id> --collection-id <id> --ontology-id <id> [--role <role>]
-        \\  mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph]
+        \\  mindbrain-standalone-tool ontology-import --db <sqlite_path> --workspace-id <id> --ontology-id <id> --input <file.nt> [--name <name>] [--materialize-graph] [--replace | --merge]
         \\  mindbrain-standalone-tool ontology-export --db <sqlite_path> --ontology-id <id> [--workspace-id <id> --format ntriples|bundle] [--output <file>]
         \\  mindbrain-standalone-tool ontology-compile-linkml --workspace-id <id> --ontology-id <id> --input <schema.yaml> [--output <bundle.json>] [--ntriples <file.nt>] [--db <sqlite_path>] [--name <name>]
         \\  mindbrain-standalone-tool ontology-export-linkml --ontology-id <id> (--db <sqlite_path> | --input-bundle <bundle.json>) [--output <schema.yaml>]
@@ -541,6 +542,12 @@ fn runWorkspaceExportCommand(allocator: Allocator, args: []const []const u8) !vo
         } else {
             return CliError.InvalidArguments;
         }
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
 
     if (db_path == null or workspace_id == null) {
@@ -785,6 +792,12 @@ fn runGraphDiagnosticsCommand(allocator: Allocator, args: []const []const u8) !v
         }
     }
 
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
+
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
     if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "toon")) return CliError.InvalidArguments;
 
@@ -874,6 +887,12 @@ fn runGraphRuleEvaluationsRunCommand(allocator: Allocator, args: []const []const
         }
     }
 
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
+
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -932,6 +951,12 @@ fn runGraphRuleEvaluationReadCommand(allocator: Allocator, args: []const []const
         }
     }
 
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
+
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -983,6 +1008,12 @@ fn runQualityConvergenceCommand(allocator: Allocator, args: []const []const u8) 
         } else {
             return CliError.InvalidArguments;
         }
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
 
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
@@ -1158,6 +1189,16 @@ fn runCoverageCommand(allocator: Allocator, args: []const []const u8, by_domain:
 
     if (db_path == null or workspace_or_domain == null) {
         return CliError.InvalidArguments;
+    }
+
+    // Only the --workspace-id form is a raw workspace slug; the by-domain form is
+    // resolved against the DB (already-canonical) below, so leave it untouched.
+    var ws_slug_buf: [512]u8 = undefined;
+    if (!by_domain) {
+        if (workspace_or_domain) |w| {
+            var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+            workspace_or_domain = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+        }
     }
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -1885,6 +1926,12 @@ fn runWorkspaceCreateCommand(allocator: Allocator, args: []const []const u8) !vo
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--label")) label = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--description")) description = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -1916,6 +1963,12 @@ fn runCollectionCreateCommand(allocator: Allocator, args: []const []const u8) !v
             chunk_bits = std.fmt.parseInt(u8, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--language")) language = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null or collection_id == null or name == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -1945,6 +1998,12 @@ fn runOntologyRegisterCommand(allocator: Allocator, args: []const []const u8) !v
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--version")) version = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--source-kind")) source_kind = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null or ontology_id == null or name == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -1973,6 +2032,12 @@ fn runOntologyAttachCommand(allocator: Allocator, args: []const []const u8) !voi
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--role")) role = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -1993,6 +2058,12 @@ fn runQualificationVocabListCommand(allocator: Allocator, args: []const []const 
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--taxonomies")) taxonomy_filter = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--facets")) facet_filter = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
@@ -2242,6 +2313,12 @@ fn runDocumentQualifyCommand(allocator: Allocator, args: []const []const u8, env
         } else if (std.mem.eql(u8, arg, "--context-budget-json")) {
             context_budget_json = try requireArg(args, &index);
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null or collection_id == null or taxonomy_filter == null or facet_filter == null) return CliError.InvalidArguments;
     if (!std.mem.eql(u8, target, "doc") and !std.mem.eql(u8, target, "chunk") and !std.mem.eql(u8, target, "both")) return CliError.InvalidArguments;
@@ -3283,6 +3360,12 @@ fn runDocumentBusinessExtractCommand(allocator: Allocator, args: []const []const
             const v = try requireArg(args, &index);
             max_tokens = std.fmt.parseInt(u32, v, 10) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null or collection_id == null or ontology_id == null) return CliError.InvalidArguments;
     if (input_json_path == null and expected_path == null) return CliError.InvalidArguments;
@@ -4974,11 +5057,18 @@ fn runOntologyImportCommand(allocator: Allocator, args: []const []const u8) !voi
     var input_path: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var materialize_graph = false;
+    var merge = false;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--materialize-graph")) materialize_graph = true else return CliError.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--materialize-graph")) materialize_graph = true else if (std.mem.eql(u8, arg, "--merge")) merge = true else if (std.mem.eql(u8, arg, "--replace")) merge = false else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null or ontology_id == null or input_path == null) return CliError.InvalidArguments;
 
@@ -4995,6 +5085,7 @@ fn runOntologyImportCommand(allocator: Allocator, args: []const []const u8) !voi
     const summary = try owl2_import.importNTriplesReader(db, allocator, workspace_id.?, ontology_id.?, &fr.interface, .{
         .ontology_name = name,
         .materialize_graph = materialize_graph,
+        .merge = merge,
     });
     try writeStdout(
         "{{\"ontology_id\":{f},\"triples\":{},\"classes\":{},\"object_properties\":{},\"datatype_properties\":{},\"ontology_relations\":{},\"graph_relations\":{}}}\n",
@@ -5013,6 +5104,12 @@ fn runOntologyExportCommand(allocator: Allocator, args: []const []const u8) !voi
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--format")) format = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or ontology_id == null) return CliError.InvalidArguments;
 
@@ -5071,6 +5168,12 @@ fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ntriples")) ntriples_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (workspace_id == null or ontology_id == null or input_path == null) return CliError.InvalidArguments;
     if (profile != null and !std.mem.eql(u8, profile.?, "syndic")) return CliError.InvalidArguments;
@@ -5172,6 +5275,12 @@ fn runBackupExportCommand(allocator: Allocator, args: []const []const u8) !void 
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--scope")) scope_name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--no-vectors")) include_vectors = false else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
@@ -5349,6 +5458,12 @@ fn runCollectionExportCommand(allocator: Allocator, args: []const []const u8) !v
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--collection-id")) collection_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
@@ -5830,6 +5945,12 @@ fn runDocumentProfileEnqueueCommand(allocator: Allocator, args: []const []const 
         } else if (std.mem.eql(u8, arg, "--include-ext")) {
             include_ext_arg = try requireArg(args, &index);
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
 
     if (db_path == null) return CliError.InvalidArguments;
@@ -7143,6 +7264,12 @@ fn runDocumentIngestCommand(allocator: Allocator, args: []const []const u8) !voi
             options.min_chars = std.fmt.parseInt(usize, v, 10) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null or collection_id == null or doc_id_opt == null) {
         return CliError.InvalidArguments;
     }
@@ -7296,6 +7423,12 @@ fn runExternalLinkAddCommand(allocator: Allocator, args: []const []const u8) !vo
             link_id = std.fmt.parseInt(u64, v, 10) catch return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--metadata-json")) metadata_json = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null or source_collection_id == null or source_doc_id_opt == null or target_uri == null) {
         return CliError.InvalidArguments;
     }
@@ -7349,6 +7482,12 @@ fn runStructuredImportValidateCommand(allocator: Allocator, args: []const []cons
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--strict-drift")) strict_drift = true else if (std.mem.eql(u8, arg, "--strict-provenance")) strict_provenance = true else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (model_path == null) return CliError.InvalidArguments;
     try structured_import.validateBundleWithOptions(allocator, .{
         .model_path = model_path.?,
@@ -7394,6 +7533,12 @@ fn runStructuredImportApplyCommand(allocator: Allocator, args: []const []const u
             const raw = try requireArg(args, &index);
             mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--facets")) facets_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--edges")) edges_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--require-semantics")) require_semantics = true else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
@@ -7452,6 +7597,12 @@ fn runStructuredImportProjectCommand(allocator: Allocator, args: []const []const
             const raw = try requireArg(args, &index);
             mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null or model_path == null or mapping_path == null) return CliError.InvalidArguments;
 
@@ -7543,6 +7694,12 @@ fn runStructuredImportReindexCommand(allocator: Allocator, args: []const []const
             scope = structured_import.ReindexScope.parse(raw) orelse return CliError.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--source-ref")) source_ref = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--since-fingerprint")) since_fingerprint = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -7615,6 +7772,12 @@ fn runStructuredImportRegisterSemanticsCommand(allocator: Allocator, args: []con
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--proposal")) proposal_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
 
     const proposal_json = if (proposal_path) |pp| blk: {
@@ -7684,6 +7847,12 @@ fn runStructuredImportValidateDriftCommand(allocator: Allocator, args: []const [
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--model")) model_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--mapping")) mapping_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input-dir")) input_dir = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--strict")) strict = true else return CliError.InvalidArguments;
     }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
+    }
     if (model_path == null) return CliError.InvalidArguments;
     var report = try structured_import_drift.validateDrift(allocator, .{
         .model_path = model_path.?,
@@ -7717,6 +7886,12 @@ fn runStructuredImportAuditOrphansCommand(allocator: Allocator, args: []const []
             const raw = try requireArg(args, &index);
             max_ratio = std.fmt.parseFloat(f64, raw) catch return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null) return CliError.InvalidArguments;
     var db = try facet_sqlite.Database.open(db_path.?);
@@ -7786,6 +7961,12 @@ fn runStructuredImportLoadWsCommand(allocator: Allocator, args: []const []const 
             const raw = try requireArg(args, &index);
             mode = structured_import.ImportMode.parse(raw) orelse return CliError.InvalidArguments;
         } else return CliError.InvalidArguments;
+    }
+
+    var ws_slug_buf: [512]u8 = undefined;
+    if (workspace_id) |w| {
+        var ws_slug_fba = std.heap.FixedBufferAllocator.init(&ws_slug_buf);
+        workspace_id = try workspace_slug.canonicalize(ws_slug_fba.allocator(), w);
     }
     if (db_path == null or workspace_id == null or mapping_path == null) return CliError.InvalidArguments;
     var db = try facet_sqlite.Database.open(db_path.?);

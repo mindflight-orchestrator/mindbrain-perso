@@ -88,6 +88,11 @@ pub fn upsertWorkspace(
     workspace_id: []const u8,
     domain_profile_json: []const u8,
 ) !void {
+    // The workspace_id is expected to already be canonical: callers coming from
+    // outside the process (CLI, HTTP) slug it at the boundary. This function does
+    // NOT canonicalize, so it never diverges from sibling inserts that reuse the
+    // same id (e.g. bundle import, which keys a workspace and its children off one
+    // id under a deferred FK check).
     // INSERT OR REPLACE would delete and re-insert the row, resetting the
     // columns not listed here (label, description) on every server start.
     const stmt = try prepare(db,
