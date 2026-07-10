@@ -2468,6 +2468,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
                 .context_budget_json = budget_ctx.context_budget_json,
                 .doc_ids = batch,
                 .write_budget_report = false,
+                .preloaded_docs = docs.rows,
             });
             defer prompt.deinit(allocator);
             const part = try callQualificationLlm(allocator, opts, prompt);
@@ -2481,6 +2482,7 @@ fn runLiveDocumentQualification(allocator: Allocator, db: facet_sqlite.Database,
         .model = budget_ctx.model,
         .context_budget_json = budget_ctx.context_budget_json,
         .write_budget_report = false,
+        .preloaded_docs = docs.rows,
     });
     defer prompt.deinit(allocator);
     return try callQualificationLlm(allocator, opts, prompt);
@@ -2555,6 +2557,10 @@ const PromptBudgetContext = struct {
     context_budget_json: ?[]const u8 = null,
     doc_ids: ?[]const u64 = null,
     write_budget_report: bool = true,
+    /// Rows already loaded by the caller. Prompt builders reuse them instead
+    /// of re-scanning documents_raw (and re-duplicating every content blob)
+    /// once per batch.
+    preloaded_docs: ?[]const PromptDocumentRow = null,
 };
 
 const PromptDocumentRow = struct {
@@ -2647,6 +2653,50 @@ fn loadPromptDocuments(
     return .{
         .rows = try rows.toOwnedSlice(allocator),
     };
+}
+
+/// Document rows for one prompt. `owned == false` when the row contents are
+/// borrowed from budget_ctx.preloaded_docs (only the slice is allocated).
+const PromptDocumentSelection = struct {
+    rows: []PromptDocumentRow,
+    owned: bool,
+
+    fn deinit(self: PromptDocumentSelection, allocator: Allocator) void {
+        if (self.owned) {
+            (PromptDocumentList{ .rows = self.rows }).deinit(allocator);
+        } else {
+            allocator.free(self.rows);
+        }
+    }
+};
+
+fn selectPromptDocuments(
+    allocator: Allocator,
+    db: facet_sqlite.Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    limit: usize,
+    budget_ctx: PromptBudgetContext,
+) !PromptDocumentSelection {
+    if (budget_ctx.preloaded_docs) |all_docs| {
+        var rows = std.ArrayList(PromptDocumentRow).empty;
+        errdefer rows.deinit(allocator);
+        if (budget_ctx.doc_ids) |filter| {
+            try rows.ensureTotalCapacityPrecise(allocator, filter.len);
+            // Iterate the loaded list so batch rows keep the loader's
+            // doc_id ordering.
+            for (all_docs) |row| {
+                if (std.mem.indexOfScalar(u64, filter, row.doc_id) != null) {
+                    rows.appendAssumeCapacity(row);
+                }
+            }
+        } else {
+            try rows.appendSlice(allocator, all_docs);
+        }
+        return .{ .rows = try rows.toOwnedSlice(allocator), .owned = false };
+    }
+    const loaded = try loadPromptDocuments(allocator, db, workspace_id, collection_id, limit, budget_ctx.doc_ids);
+    return .{ .rows = loaded.rows, .owned = true };
 }
 
 fn estimateQualificationDocMetadataChars(row: PromptDocumentRow) usize {
@@ -2960,8 +3010,8 @@ fn logBusinessExtractBatchDocs(
     }
 }
 
-fn summarizeBusinessExtractionEnvelope(json: []const u8) struct { entities: usize, relations: usize, entity_documents: usize } {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json, .{
+fn summarizeBusinessExtractionEnvelope(allocator: Allocator, json: []const u8) struct { entities: usize, relations: usize, entity_documents: usize } {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{
         .ignore_unknown_fields = true,
     }) catch return .{ .entities = 0, .relations = 0, .entity_documents = 0 };
     defer parsed.deinit();
@@ -3014,7 +3064,7 @@ fn buildQualificationPrompts(
         \\Documents:
         \\
     ;
-    var docs = try loadPromptDocuments(allocator, db, workspace_id, collection_id, limit, budget_ctx.doc_ids);
+    var docs = try selectPromptDocuments(allocator, db, workspace_id, collection_id, limit, budget_ctx);
     defer docs.deinit(allocator);
 
     var budget = try computePromptDocumentLimits(
@@ -3529,20 +3579,39 @@ fn parseBusinessExtractionEnvelopeJson(
     json: []const u8,
     parse_opts: std.json.ParseOptions,
 ) !std.json.Parsed(BusinessExtractionEnvelope) {
-    const normalized = try sanitizeBusinessExtractionJson(allocator, json);
-    defer allocator.free(normalized);
-    return std.json.parseFromSlice(BusinessExtractionEnvelope, allocator, normalized, parse_opts);
+    // Sanitize on the Value tree and parse the typed envelope straight from
+    // it: stringifying the sanitized tree only to re-parse it doubled the
+    // work for every merged part. Everything (Value tree + typed envelope)
+    // lives in the returned Parsed's arena because metadata_json fields are
+    // std.json.Value and reference the source tree rather than copying it.
+    var parsed = std.json.Parsed(BusinessExtractionEnvelope){
+        .arena = try allocator.create(std.heap.ArenaAllocator),
+        .value = undefined,
+    };
+    errdefer allocator.destroy(parsed.arena);
+    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer parsed.arena.deinit();
+    const arena_alloc = parsed.arena.allocator();
+
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, json, .{
+        .ignore_unknown_fields = true,
+    });
+    try sanitizeBusinessExtractionEnvelopeValue(arena_alloc, &value);
+    parsed.value = try std.json.parseFromValueLeaky(BusinessExtractionEnvelope, arena_alloc, value, parse_opts);
+    return parsed;
 }
 
 fn sanitizeBusinessExtractionJson(allocator: Allocator, json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{
         .ignore_unknown_fields = true,
     });
-    errdefer parsed.deinit();
-    try sanitizeBusinessExtractionEnvelopeValue(allocator, &parsed.value);
-    const out = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
-    parsed.deinit();
-    return out;
+    defer parsed.deinit();
+    // Mutate the tree with the parse arena's allocator: the ObjectMaps/Arrays
+    // are arena-owned, so growing them (or storing synthesized strings) with
+    // any other allocator corrupts/leaks. Everything sanitize allocates must
+    // share the tree's lifetime.
+    try sanitizeBusinessExtractionEnvelopeValue(parsed.arena.allocator(), &parsed.value);
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
 fn ensureEnvelopeArrayField(allocator: Allocator, obj: *std.json.ObjectMap, key: []const u8) !void {
@@ -3679,8 +3748,9 @@ fn sanitizeBusinessExtractionEnvelopeValue(allocator: Allocator, value: *std.jso
                     const edge = row_obj.get("edge_type").?.string;
                     const src = row_obj.get("source_external_id").?.string;
                     const tgt = row_obj.get("target_external_id").?.string;
+                    // `allocator` is the parse arena: the synthesized id must
+                    // outlive this call (stringify + merge dedup read it).
                     const synth = try std.fmt.allocPrint(allocator, "{s}:{s}->{s}", .{ edge, src, tgt });
-                    defer allocator.free(synth);
                     try row_obj.put(allocator, "external_id", .{ .string = synth });
                 }
                 if (row_obj.getPtr("confidence")) |field| coerceJsonConfidence(field) else {
@@ -3888,7 +3958,7 @@ fn runOneExtractBatchLlm(
     try logBusinessExtractBatchDocs("llm_start", job.batch_index, batch_total, job.batch, docs_rows);
     const part = try callBusinessExtractLlm(allocator, opts.*, job.prompt, job.batch_index == 0);
     job.part = part;
-    const summary = summarizeBusinessExtractionEnvelope(part);
+    const summary = summarizeBusinessExtractionEnvelope(allocator, part);
     const done_detail = try std.fmt.allocPrint(
         allocator,
         "entities={d} relations={d} entity_documents={d} json_chars={d}",
@@ -4048,6 +4118,7 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
             .model = budget_ctx.model,
             .context_budget_json = budget_ctx.context_budget_json,
             .write_budget_report = false,
+            .preloaded_docs = docs.rows,
         });
         defer prompt.deinit(allocator);
         return try callBusinessExtractLlm(allocator, opts, prompt, true);
@@ -4075,6 +4146,7 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
                 .context_budget_json = budget_ctx.context_budget_json,
                 .doc_ids = batch,
                 .write_budget_report = false,
+                .preloaded_docs = docs.rows,
             }),
         };
     }
@@ -4086,7 +4158,7 @@ fn runLiveBusinessExtraction(allocator: Allocator, db: facet_sqlite.Database, op
     }
     try writeBusinessExtractProgress("merge_start", 0, parts.items.len, 0, "", 0, "");
     const merged = try mergeBusinessExtractionEnvelopes(allocator, parts.items);
-    const merged_summary = summarizeBusinessExtractionEnvelope(merged);
+    const merged_summary = summarizeBusinessExtractionEnvelope(allocator, merged);
     const merge_detail = try std.fmt.allocPrint(
         allocator,
         "entities={d} relations={d} entity_documents={d} json_chars={d}",
@@ -4117,7 +4189,7 @@ fn buildBusinessExtractionPrompts(
     const user_prefix = try std.fmt.allocPrint(allocator, "Expected coverage contract (cover all listed documents):\n{s}\n\nSource documents:\n\n", .{opts.expected_json});
     defer allocator.free(user_prefix);
 
-    var docs = try loadPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, budget_ctx.doc_ids);
+    var docs = try selectPromptDocuments(allocator, db, opts.workspace_id, opts.collection_id, opts.limit, budget_ctx);
     defer docs.deinit(allocator);
 
     var budget = try computePromptDocumentLimits(
@@ -4758,6 +4830,31 @@ test "sanitizeBusinessExtractionJson fills missing relation fields" {
     try std.testing.expectEqualStrings("b", parsed.value.relations_raw[0].target_external_id);
 }
 
+test "sanitizeBusinessExtractionJson synthesizes relation external_id with valid lifetime" {
+    // Regression: the synthesized external_id used to be freed while still
+    // referenced by the tree (UAF at stringify) and the sanitize pass mutated
+    // arena-owned maps with the caller allocator (invalid free on growth).
+    // Enough relations to force ObjectMap/Array growth inside the arena tree.
+    const raw =
+        \\{"entities_raw":[],"relations_raw":[
+        \\{"edge_type":"contains","source_entity_id":"a","target_entity_id":"b"},
+        \\{"edge_type":"feeds","source_id":"b","target_id":"c","valid_from":2024},
+        \\{"edge_type":"links","from":"c","to":"d","confidence":"0.5"}
+        \\]}
+    ;
+    const normalized = try sanitizeBusinessExtractionJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized);
+
+    var parsed = try std.json.parseFromSlice(BusinessExtractionEnvelope, std.testing.allocator, normalized, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.relations_raw.len);
+    try std.testing.expectEqualStrings("contains:a->b", parsed.value.relations_raw[0].external_id);
+    try std.testing.expectEqualStrings("feeds:b->c", parsed.value.relations_raw[1].external_id);
+    try std.testing.expectEqualStrings("links:c->d", parsed.value.relations_raw[2].external_id);
+}
+
 test "sanitizeBusinessExtractionJson drops entity_documents without doc_id" {
     const raw =
         \\{"entities_raw":[],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"e1","doc_id":null,"confidence":0.9}]}
@@ -4804,10 +4901,15 @@ test "sanitizeBusinessExtractionJson coerces empty numeric strings" {
 }
 
 test "mergeBusinessExtractionEnvelopes preserves entity_documents across doc ids" {
+    // NB: each part must be its own array element (comma-separated); without
+    // the commas the three literals concatenate into one invalid JSON string.
     const parts = [_][]const u8{
         \\{"entities_raw":[{"external_id":"entity:1","entity_type":"building","name":"One"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:1","doc_id":1}]}
+        ,
         \\{"entities_raw":[{"external_id":"entity:2","entity_type":"building","name":"Two"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:2","doc_id":2}]}
+        ,
         \\{"entities_raw":[{"external_id":"entity:3","entity_type":"building","name":"Three"}],"relations_raw":[],"entity_documents_raw":[{"entity_external_id":"entity:3","doc_id":3}]}
+        ,
     };
     const merged = try mergeBusinessExtractionEnvelopes(std.testing.allocator, &parts);
     defer std.testing.allocator.free(merged);
@@ -6107,8 +6209,51 @@ fn persistProfiledDocument(
     const decision = chunking_policy.decide(profile);
     const metadata_json = try profileMetadataJson(allocator, profile_value, decision);
     defer allocator.free(metadata_json);
-    // One transaction per document (autocommit costs a journal sync per
-    // chunk/facet write and leaves partial documents on failure).
+
+    const chunks = if (decision.requires_specialized_splitter)
+        try legal_chunker.chunkLegal(allocator, text, .{
+            .profile = legalProfileFor(decision.profile),
+            .max_chars = decision.options.max_chars,
+            .min_chars = decision.options.min_chars,
+        })
+    else
+        try chunker.chunk(allocator, text, decision.options);
+    defer chunker.freeChunks(allocator, chunks);
+
+    // Phase 1: run every LLM chat + embedding HTTP call BEFORE the write
+    // transaction opens. Holding SQLite's write lock across network round
+    // trips starves every other writer (a hung LLM call would hold it
+    // indefinitely). Failure semantics: if context generation or embedding
+    // fails for ANY chunk, the whole document fails before any write, so a
+    // document is either fully persisted or absent — never half-indexed.
+    var contextuals = std.ArrayList(ChunkContextualMetadata).empty;
+    defer {
+        for (contextuals.items) |ctx| {
+            allocator.free(ctx.context);
+            allocator.free(ctx.contextualized_content);
+        }
+        contextuals.deinit(allocator);
+    }
+    var embeddings = std.ArrayList([]f32).empty;
+    defer {
+        for (embeddings.items) |embedding| allocator.free(embedding);
+        embeddings.deinit(allocator);
+    }
+    if (contextual_options.enabled) {
+        try contextuals.ensureTotalCapacityPrecise(allocator, chunks.len);
+        for (chunks) |ch| {
+            const ctx = try contextualizeChunk(allocator, text, job.source_ref, profile, decision, ch, contextual_options);
+            contextuals.appendAssumeCapacity(ctx);
+        }
+        var texts = try allocator.alloc([]const u8, contextuals.items.len);
+        defer allocator.free(texts);
+        for (contextuals.items, 0..) |ctx, i| texts[i] = ctx.contextualized_content;
+        try embedContextualTexts(allocator, texts, contextual_options, &embeddings);
+    }
+
+    // Phase 2: pure-SQL transaction. One transaction per document (autocommit
+    // costs a journal sync per chunk/facet write and leaves partial documents
+    // on failure).
     var tx = try facet_sqlite.Transaction.begin(db);
     defer tx.deinit();
     try collections_sqlite.upsertDocumentRaw(db, .{
@@ -6121,25 +6266,11 @@ fn persistProfiledDocument(
         .metadata_json = metadata_json,
     });
 
-    const chunks = if (decision.requires_specialized_splitter)
-        try legal_chunker.chunkLegal(allocator, text, .{
-            .profile = legalProfileFor(decision.profile),
-            .max_chars = decision.options.max_chars,
-            .min_chars = decision.options.min_chars,
-        })
-    else
-        try chunker.chunk(allocator, text, decision.options);
-    defer chunker.freeChunks(allocator, chunks);
-
-    for (chunks) |ch| {
-        const contextual = if (contextual_options.enabled)
-            try contextualizeChunk(allocator, text, job.source_ref, profile, decision, ch, contextual_options)
+    for (chunks, 0..) |ch, chunk_i| {
+        const contextual: ?ChunkContextualMetadata = if (contextual_options.enabled)
+            contextuals.items[chunk_i]
         else
             null;
-        defer if (contextual) |ctx| {
-            allocator.free(ctx.context);
-            allocator.free(ctx.contextualized_content);
-        };
         const chunk_metadata_json = try chunkingMetadataJson(allocator, decision, contextual);
         defer allocator.free(chunk_metadata_json);
         try collections_sqlite.upsertChunkRaw(db, .{
@@ -6167,6 +6298,7 @@ fn persistProfiledDocument(
                 job.language,
                 ch.index,
                 ctx.contextualized_content,
+                embeddings.items[chunk_i],
                 contextual_options,
             );
         }
@@ -6185,6 +6317,7 @@ fn indexContextualChunk(
     language: []const u8,
     chunk_index: u32,
     contextualized_content: []const u8,
+    embedding: []const f32,
     options: ContextualRetrievalOptions,
 ) !void {
     if (!options.enabled) return;
@@ -6199,9 +6332,6 @@ fn indexContextualChunk(
         contextualized_content,
         language,
     );
-
-    const embedding = try embedContextualText(allocator, contextualized_content, options);
-    defer allocator.free(embedding);
 
     const blob = try vector_blob.encodeF32Le(allocator, embedding);
     defer allocator.free(blob);
@@ -6238,6 +6368,47 @@ fn embedContextualText(
     defer response.deinit(allocator);
     if (response.vectors.len != 1) return error.InvalidResponse;
     return try allocator.dupe(f32, response.vectors[0].values);
+}
+
+/// Batch size per embeddings request: bounds request payloads while still
+/// amortizing HTTP round trips across a document's chunks.
+const contextual_embedding_batch_size: usize = 64;
+
+/// Embeds `texts` in batched requests, appending one vector per input to
+/// `out` (in input order). Any batch failure aborts the whole call.
+fn embedContextualTexts(
+    allocator: Allocator,
+    texts: []const []const u8,
+    options: ContextualRetrievalOptions,
+    out: *std.ArrayList([]f32),
+) !void {
+    if (texts.len == 0) return;
+    const provider = llm.ProviderConfig{
+        .name = "contextual-embedding",
+        .kind = .openai_compatible,
+        .base_url = options.embedding_base_url orelse return CliError.InvalidArguments,
+        .api_key = options.embedding_api_key,
+        .model = options.embedding_model orelse return CliError.InvalidArguments,
+        .capabilities = &.{.embeddings},
+    };
+    const manager = llm.Manager.init(.{
+        .providers = &.{provider},
+        .default_provider = "contextual-embedding",
+    });
+
+    try out.ensureUnusedCapacity(allocator, texts.len);
+    var start: usize = 0;
+    while (start < texts.len) {
+        const end = @min(start + contextual_embedding_batch_size, texts.len);
+        const batch = texts[start..end];
+        var response = try manager.embedTexts(allocator, mindbrain.zig16_compat.io(), null, batch);
+        defer response.deinit(allocator);
+        if (response.vectors.len != batch.len) return error.InvalidResponse;
+        for (response.vectors) |vector| {
+            out.appendAssumeCapacity(try allocator.dupe(f32, vector.values));
+        }
+        start = end;
+    }
 }
 
 fn chunkSyntheticId(doc_id: u64, chunk_index: u32, chunk_bits: u6) !u64 {
