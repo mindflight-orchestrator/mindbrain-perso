@@ -227,6 +227,13 @@ const QualityRemediationStatusRequest = struct {
     result_json: []const u8 = "{}",
 };
 
+const LiveAnswerViewCreateRequest = struct {
+    workspace_id: []const u8,
+    slug: []const u8,
+    public_label: []const u8,
+    definition: std.json.Value,
+};
+
 pub const DefaultWorkspaceOptions = struct {
     id: []const u8 = "default",
     domain_profile_json: []const u8 = "{\"domain\":\"ghostcrab\"}",
@@ -1173,6 +1180,11 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/quality/remediation/status")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleQualityRemediationStatus(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/artifact")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleGhostcrabArtifactCreate(allocator, request, body_buffer);
         }
 
         if (artifactRouteId(path, "/api/mindbrain/ghostcrab/artifact/", "/refresh")) |artifact_id| {
@@ -3597,10 +3609,11 @@ pub const MindbrainHttpApp = struct {
             .ontology_reconciliation = @hasDecl(@This(), "handleOntologyReconciliation"),
             .quality_convergence = @hasDecl(@This(), "handleQualityConvergenceRun"),
             .quality_remediation_actions = @hasDecl(@This(), "handleQualityRemediationActions"),
+            .live_answer_view_create = @hasDecl(@This(), "handleGhostcrabArtifactCreate"),
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{},"live_answer_view_create":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -3618,6 +3631,7 @@ pub const MindbrainHttpApp = struct {
                 features.ontology_reconciliation,
                 features.quality_convergence,
                 features.quality_remediation_actions,
+                features.live_answer_view_create,
                 self.graph_bitmap_mode.text(),
                 self.graph_bitmap_mode.effectiveText(),
             },
@@ -3995,6 +4009,94 @@ pub const MindbrainHttpApp = struct {
             .content_type = "application/json; charset=utf-8",
             .body = body,
         };
+    }
+
+    fn handleGhostcrabArtifactCreate(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        return self.handleGhostcrabArtifactCreateBody(allocator, body);
+    }
+
+    fn handleGhostcrabArtifactCreateBody(self: *MindbrainHttpApp, allocator: std.mem.Allocator, body: []const u8) !Response {
+        const create_request = std.json.parseFromSliceLeaky(
+            LiveAnswerViewCreateRequest,
+            allocator,
+            body,
+            .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+        ) catch {
+            return jsonResponseWithStatus(allocator, .bad_request, .{
+                .ok = false,
+                .@"error" = .{
+                    .code = "invalid_artifact_request",
+                    .message = "workspace_id, slug, public_label and a non-empty definition object are required",
+                },
+            });
+        };
+        const definition_json = std.json.Stringify.valueAlloc(allocator, create_request.definition, .{}) catch
+            return error.BadRequest;
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writerSessionBlocking()) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const result = answer_artifacts.createLiveAnswerView(
+            self.writer_db,
+            allocator,
+            create_request.workspace_id,
+            create_request.slug,
+            create_request.public_label,
+            definition_json,
+        ) catch |err| switch (err) {
+            error.InvalidArtifactRequest => return jsonResponseWithStatus(allocator, .bad_request, .{
+                .ok = false,
+                .@"error" = .{
+                    .code = "invalid_artifact_request",
+                    .message = "invalid live answer view slug, label or definition",
+                },
+            }),
+            error.MissingWorkspace => return jsonResponseWithStatus(allocator, .not_found, .{
+                .ok = false,
+                .@"error" = .{
+                    .code = "workspace_not_found",
+                    .message = "the requested workspace does not exist",
+                    .workspace_id = create_request.workspace_id,
+                },
+            }),
+            error.ArtifactConflict => return jsonResponseWithStatus(allocator, .conflict, .{
+                .ok = false,
+                .@"error" = .{
+                    .code = "artifact_conflict",
+                    .message = "the live answer artifact id or workspace slug is already bound to a different definition",
+                    .artifact_id = try std.fmt.allocPrint(allocator, "live_answer_view__{s}", .{create_request.slug}),
+                },
+            }),
+            else => return err,
+        };
+        defer result.deinit(allocator);
+        self.writer_completed += 1;
+        return jsonResponseWithStatus(allocator, if (result.created) .created else .ok, .{
+            .ok = true,
+            .created = result.created,
+            .idempotent = result.idempotent,
+            .artifact_id = result.row.artifact_id,
+            .slug = result.row.slug,
+            .workspace_id = result.row.workspace_id,
+            .agent_id = result.row.agent_id,
+            .scope = result.row.scope,
+            .artifact_kind = result.row.artifact_kind,
+            .public_label = result.row.public_label,
+            .lifecycle = result.row.lifecycle,
+            .state = result.row.state,
+            .current_version = result.row.current_version,
+            .payload_json = result.row.payload_json,
+            .legacy_ref = result.row.legacy_ref,
+        });
     }
 
     fn handleGhostcrabArtifactGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8) !Response {
@@ -4947,6 +5049,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/facts/write
         \\  POST /api/mindbrain/search-embedding-upsert
         \\  POST /api/mindbrain/ghostcrab/search
+        \\  POST /api/mindbrain/ghostcrab/artifact
         \\  POST /api/mindbrain/reindex/graph
         \\  POST /api/mindbrain/reindex/all
         \\  GET /health
@@ -4972,6 +5075,9 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
         \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...
+        \\  GET /api/mindbrain/ghostcrab/artifact/{artifact_id}
+        \\  POST /api/mindbrain/ghostcrab/artifact/{artifact_id}/refresh
+        \\  GET /api/mindbrain/ghostcrab/artifact/{artifact_id}/events
         \\
         \\notes:
         \\  Use bracketed IPv6 in MINDBRAIN_HTTP_ADDR / --addr, for example [::1]:8091.
@@ -5871,12 +5977,36 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-other', 'agent-studio', 'ws_api', 'FACT', 'Other context', 0.9, 'active');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-subscope', 'agent-studio', 'ws_api:production', 'STEP', 'Production workspace step', 0.8, 'active');
         \\INSERT INTO projections(id, agent_id, scope, proj_type, content, weight, status) VALUES ('proj-foreign', 'agent-studio', 'ws_other', 'FACT', 'Foreign workspace context', 2.0, 'active');
-        \\INSERT INTO mindbrain_answer_artifacts(artifact_id, slug, workspace_id, artifact_kind, public_label, lifecycle, state, payload_json) VALUES ('live_answer_view__ws_api', 'ws_api', 'ws_api', 'live_answer_view', 'API live view', 'stale', 'dirty', '{}');
     );
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    const artifact_create = try app.handleGhostcrabArtifactCreateBody(arena,
+        \\{"workspace_id":"ws_api","slug":"ws_api","public_label":"API live view","definition":{"business_question":"Who owns Unit 1?","source_plan_id":"analysis_plan__ws_api"}}
+    );
+    try std.testing.expect(artifact_create.status == .created);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_create.body, "\"created\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_create.body, "\"artifact_id\":\"live_answer_view__ws_api\"") != null);
+
+    const artifact_replay = try app.handleGhostcrabArtifactCreateBody(arena,
+        \\{"workspace_id":"ws_api","slug":"ws_api","public_label":"API live view","definition":{"source_plan_id":"analysis_plan__ws_api","business_question":"Who owns Unit 1?"}}
+    );
+    try std.testing.expect(artifact_replay.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_replay.body, "\"idempotent\":true") != null);
+
+    const artifact_conflict = try app.handleGhostcrabArtifactCreateBody(arena,
+        \\{"workspace_id":"ws_api","slug":"ws_api","public_label":"API live view","definition":{"business_question":"Different"}}
+    );
+    try std.testing.expect(artifact_conflict.status == .conflict);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_conflict.body, "\"code\":\"artifact_conflict\"") != null);
+
+    const artifact_missing_workspace = try app.handleGhostcrabArtifactCreateBody(arena,
+        \\{"workspace_id":"missing","slug":"missing","public_label":"Missing","definition":{"summary":"x"}}
+    );
+    try std.testing.expect(artifact_missing_workspace.status == .not_found);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_missing_workspace.body, "\"code\":\"workspace_not_found\"") != null);
 
     const taxonomy = try app.handleOntologyTaxonomyGet(arena, "ontology_id=ws_api%3A%3Acore&workspace_id=ws_api");
     try std.testing.expect(std.mem.indexOf(u8, taxonomy.body, "\"dimension\":\"document_type\"") != null);
@@ -5927,6 +6057,9 @@ test "studio taxonomy and projection endpoints expose taxonomy workspace and rel
 
     const artifact_refresh = try app.handleGhostcrabArtifactRefresh(arena, "live_answer_view__ws_api");
     try std.testing.expect(std.mem.indexOf(u8, artifact_refresh.body, "\"current_version\":2") != null);
+    const artifact_get = try app.handleGhostcrabArtifactGet(arena, "live_answer_view__ws_api");
+    try std.testing.expect(std.mem.indexOf(u8, artifact_get.body, "Who owns Unit 1?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact_get.body, "\\\"materialized\\\":{") != null);
     const artifact_events = try app.handleGhostcrabArtifactEvents(arena, "live_answer_view__ws_api", "");
     try std.testing.expect(std.mem.indexOf(u8, artifact_events.body, "\"event_kind\":\"answer_update_event\"") != null);
 
@@ -5982,6 +6115,7 @@ test "graph diagnostics endpoints expose gap rules and report" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_import\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_compile_linkml\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"ontology_inspect\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"live_answer_view_create\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_configured\":\"dense32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"bitmap_mode_effective\":\"dense32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities.body, "\"direct64_supported\":false") != null);

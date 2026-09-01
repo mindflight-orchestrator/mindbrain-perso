@@ -56,6 +56,16 @@ pub const RepairStats = struct {
     inserted_or_updated: usize = 0,
 };
 
+pub const CreateLiveAnswerViewResult = struct {
+    row: ArtifactRow,
+    created: bool,
+    idempotent: bool,
+
+    pub fn deinit(self: CreateLiveAnswerViewResult, allocator: std.mem.Allocator) void {
+        self.row.deinit(allocator);
+    }
+};
+
 const Candidate = struct {
     kind: []const u8,
     legacy_ref: []const u8,
@@ -107,6 +117,71 @@ pub fn getArtifact(db: Database, allocator: std.mem.Allocator, artifact_id: []co
     return try artifactFromStmt(allocator, stmt);
 }
 
+pub fn createLiveAnswerView(
+    db: Database,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    slug: []const u8,
+    public_label_input: []const u8,
+    definition_json: []const u8,
+) !CreateLiveAnswerViewResult {
+    if (!validExplicitSlug(slug)) return error.InvalidArtifactRequest;
+    const public_label = std.mem.trim(u8, public_label_input, " \t\r\n");
+    if (public_label.len == 0 or public_label.len > 200) return error.InvalidArtifactRequest;
+
+    var definition = std.json.parseFromSlice(std.json.Value, allocator, definition_json, .{}) catch
+        return error.InvalidArtifactRequest;
+    defer definition.deinit();
+    if (definition.value != .object or definition.value.object.count() == 0) {
+        return error.InvalidArtifactRequest;
+    }
+    if (definition.value.object.contains("materialized")) return error.InvalidArtifactRequest;
+
+    const artifact_id = try std.fmt.allocPrint(allocator, "live_answer_view__{s}", .{slug});
+    defer allocator.free(artifact_id);
+
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer db.exec("ROLLBACK") catch {};
+
+    if (!try workspaceExists(db, workspace_id)) return error.MissingWorkspace;
+
+    if (try getArtifact(db, allocator, artifact_id)) |existing| {
+        if (!liveAnswerDefinitionMatches(existing, workspace_id, slug, public_label, definition.value, allocator)) {
+            existing.deinit(allocator);
+            return error.ArtifactConflict;
+        }
+        try db.exec("COMMIT");
+        return .{
+            .row = existing,
+            .created = false,
+            .idempotent = true,
+        };
+    }
+
+    if (try workspaceSlugExists(db, workspace_id, slug)) return error.ArtifactConflict;
+
+    const insert_stmt = try facet_sqlite.prepare(db,
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, workspace_id, artifact_kind, public_label,
+        \\  lifecycle, state, current_version, payload_json, updated_at_unix
+        \\) VALUES (?1, ?2, ?3, 'live_answer_view', ?4, 'stale', 'dirty', 1, ?5, unixepoch())
+    );
+    defer facet_sqlite.finalize(insert_stmt);
+    try facet_sqlite.bindText(insert_stmt, 1, artifact_id);
+    try facet_sqlite.bindText(insert_stmt, 2, slug);
+    try facet_sqlite.bindText(insert_stmt, 3, workspace_id);
+    try facet_sqlite.bindText(insert_stmt, 4, public_label);
+    try facet_sqlite.bindText(insert_stmt, 5, definition_json);
+    try facet_sqlite.stepDone(insert_stmt);
+
+    try db.exec("COMMIT");
+    return .{
+        .row = (try getArtifact(db, allocator, artifact_id)) orelse return error.MissingRow,
+        .created = true,
+        .idempotent = false,
+    };
+}
+
 pub fn refreshLiveAnswerView(db: Database, allocator: std.mem.Allocator, artifact_id: []const u8) !ArtifactRow {
     try db.exec("BEGIN IMMEDIATE");
     errdefer db.exec("ROLLBACK") catch {};
@@ -118,7 +193,7 @@ pub fn refreshLiveAnswerView(db: Database, allocator: std.mem.Allocator, artifac
     const from_version = row.current_version;
     const to_version = from_version + 1;
     const payload_json = if (row.workspace_id) |workspace_id|
-        try materializeWorkspacePayload(db, allocator, workspace_id)
+        try materializeWorkspacePayload(db, allocator, row.payload_json, workspace_id)
     else
         try allocator.dupe(u8, row.payload_json);
     defer allocator.free(payload_json);
@@ -297,15 +372,122 @@ fn countRowsByWorkspace(db: Database, sql: []const u8, workspace_id: []const u8)
     return @intCast(c.sqlite3_column_int64(stmt, 0));
 }
 
-fn materializeWorkspacePayload(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) ![]const u8 {
+fn materializeWorkspacePayload(
+    db: Database,
+    allocator: std.mem.Allocator,
+    existing_payload_json: []const u8,
+    workspace_id: []const u8,
+) ![]const u8 {
     const graph_entities = try countRowsByWorkspace(db, "SELECT COUNT(*) FROM graph_entity WHERE workspace_id = ?1 AND deprecated_at IS NULL", workspace_id);
     const graph_relations = try countRowsByWorkspace(db, "SELECT COUNT(*) FROM graph_relation WHERE workspace_id = ?1 AND deprecated_at IS NULL", workspace_id);
     const facts = try countRowsByWorkspace(db, "SELECT COUNT(*) FROM agent_facts WHERE workspace_id = ?1", workspace_id);
-    return try std.fmt.allocPrint(
-        allocator,
-        "{{\"workspace_id\":{f},\"graph_entities\":{},\"graph_relations\":{},\"facts\":{}}}",
-        .{ std.json.fmt(workspace_id, .{}), graph_entities, graph_relations, facts },
+
+    var payload = std.json.parseFromSlice(std.json.Value, allocator, existing_payload_json, .{}) catch
+        return error.InvalidArtifactPayload;
+    defer payload.deinit();
+    if (payload.value != .object) return error.InvalidArtifactPayload;
+
+    const arena_allocator = payload.arena.allocator();
+    var materialized = std.json.ObjectMap.empty;
+    try materialized.put(arena_allocator, "workspace_id", .{ .string = workspace_id });
+    try materialized.put(arena_allocator, "graph_entities", .{ .integer = @intCast(graph_entities) });
+    try materialized.put(arena_allocator, "graph_relations", .{ .integer = @intCast(graph_relations) });
+    try materialized.put(arena_allocator, "facts", .{ .integer = @intCast(facts) });
+    try payload.value.object.put(arena_allocator, "materialized", .{ .object = materialized });
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{f}", .{std.json.fmt(payload.value, .{})});
+    return try out.toOwnedSlice();
+}
+
+fn workspaceExists(db: Database, workspace_id: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db, "SELECT 1 FROM workspaces WHERE workspace_id = ?1 LIMIT 1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return false;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return true;
+}
+
+fn workspaceSlugExists(db: Database, workspace_id: []const u8, slug: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT 1
+        \\FROM mindbrain_answer_artifacts
+        \\WHERE workspace_id = ?1 AND artifact_kind = 'live_answer_view' AND slug = ?2
+        \\LIMIT 1
     );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    try facet_sqlite.bindText(stmt, 2, slug);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return false;
+    if (rc != c.SQLITE_ROW) return error.StepFailed;
+    return true;
+}
+
+fn validExplicitSlug(slug: []const u8) bool {
+    if (slug.len == 0 or slug.len > 80 or slug[0] == '_' or slug[slug.len - 1] == '_') return false;
+    for (slug) |ch| {
+        if ((ch >= 'a' and ch <= 'z') or std.ascii.isDigit(ch) or ch == '_') continue;
+        return false;
+    }
+    return true;
+}
+
+fn liveAnswerDefinitionMatches(
+    row: ArtifactRow,
+    workspace_id: []const u8,
+    slug: []const u8,
+    public_label: []const u8,
+    definition: std.json.Value,
+    allocator: std.mem.Allocator,
+) bool {
+    if (!std.mem.eql(u8, row.artifact_kind, "live_answer_view")) return false;
+    if (row.workspace_id == null or !std.mem.eql(u8, row.workspace_id.?, workspace_id)) return false;
+    if (!std.mem.eql(u8, row.slug, slug) or !std.mem.eql(u8, row.public_label, public_label)) return false;
+
+    var payload = std.json.parseFromSlice(std.json.Value, allocator, row.payload_json, .{}) catch return false;
+    defer payload.deinit();
+    if (definition != .object or payload.value != .object) return false;
+
+    const payload_extra: usize = if (payload.value.object.contains("materialized")) 1 else 0;
+    if (payload.value.object.count() != definition.object.count() + payload_extra) return false;
+    var iterator = definition.object.iterator();
+    while (iterator.next()) |entry| {
+        const stored = payload.value.object.get(entry.key_ptr.*) orelse return false;
+        if (!jsonValuesEqual(entry.value_ptr.*, stored)) return false;
+    }
+    return true;
+}
+
+fn jsonValuesEqual(left: std.json.Value, right: std.json.Value) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |value| value == right.bool,
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .number_string => |value| std.mem.eql(u8, value, right.number_string),
+        .string => |value| std.mem.eql(u8, value, right.string),
+        .array => |values| blk: {
+            if (values.items.len != right.array.items.len) break :blk false;
+            for (values.items, right.array.items) |left_item, right_item| {
+                if (!jsonValuesEqual(left_item, right_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |values| blk: {
+            if (values.count() != right.object.count()) break :blk false;
+            var iterator = values.iterator();
+            while (iterator.next()) |entry| {
+                const right_value = right.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!jsonValuesEqual(entry.value_ptr.*, right_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 const ProjectionContentMetadata = struct {
@@ -743,7 +925,7 @@ test "live answer view refresh increments version and writes event" {
         \\INSERT INTO mindbrain_answer_artifacts(
         \\  artifact_id, slug, workspace_id, artifact_kind, public_label, lifecycle, state, payload_json
         \\) VALUES (
-        \\  'live_answer_view__weekly', 'weekly', 'ws-a', 'live_answer_view', 'Weekly', 'stale', 'dirty', '{}'
+        \\  'live_answer_view__weekly', 'weekly', 'ws-a', 'live_answer_view', 'Weekly', 'stale', 'dirty', '{"business_question":"Weekly status"}'
         \\);
     );
 
@@ -751,6 +933,8 @@ test "live answer view refresh increments version and writes event" {
     defer row.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 2), row.current_version);
     try std.testing.expectEqualStrings("refreshed", row.state);
+    try std.testing.expect(std.mem.indexOf(u8, row.payload_json, "\"business_question\":\"Weekly status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.payload_json, "\"materialized\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, row.payload_json, "\"workspace_id\":\"ws-a\"") != null);
 
     const events = try listEvents(db, std.testing.allocator, "live_answer_view__weekly", 10);
@@ -761,6 +945,122 @@ test "live answer view refresh increments version and writes event" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqual(@as(i64, 1), events[0].from_version.?);
     try std.testing.expectEqual(@as(i64, 2), events[0].to_version.?);
+}
+
+test "live answer view creation is governed idempotent and conflict safe" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES
+        \\  ('ws-a', 'ws-a', 'Workspace A'),
+        \\  ('ws-b', 'ws-b', 'Workspace B')
+    );
+
+    var created = try createLiveAnswerView(
+        db,
+        std.testing.allocator,
+        "ws-a",
+        "weekly_status",
+        "  Weekly status  ",
+        "{\"business_question\":\"What changed?\",\"refresh_checks\":[\"facts present\"]}",
+    );
+    defer created.deinit(std.testing.allocator);
+    try std.testing.expect(created.created);
+    try std.testing.expect(!created.idempotent);
+    try std.testing.expectEqualStrings("live_answer_view__weekly_status", created.row.artifact_id);
+    try std.testing.expectEqualStrings("Weekly status", created.row.public_label);
+    try std.testing.expectEqualStrings("stale", created.row.lifecycle);
+    try std.testing.expectEqualStrings("dirty", created.row.state);
+    try std.testing.expectEqual(@as(i64, 1), created.row.current_version);
+
+    var replay = try createLiveAnswerView(
+        db,
+        std.testing.allocator,
+        "ws-a",
+        "weekly_status",
+        "Weekly status",
+        "{\"refresh_checks\":[\"facts present\"],\"business_question\":\"What changed?\"}",
+    );
+    defer replay.deinit(std.testing.allocator);
+    try std.testing.expect(!replay.created);
+    try std.testing.expect(replay.idempotent);
+
+    try std.testing.expectError(
+        error.ArtifactConflict,
+        createLiveAnswerView(
+            db,
+            std.testing.allocator,
+            "ws-a",
+            "weekly_status",
+            "Weekly status",
+            "{\"business_question\":\"Different\"}",
+        ),
+    );
+    try std.testing.expectError(
+        error.MissingWorkspace,
+        createLiveAnswerView(db, std.testing.allocator, "missing", "new_view", "New view", "{\"summary\":\"x\"}"),
+    );
+    try std.testing.expectError(
+        error.ArtifactConflict,
+        createLiveAnswerView(db, std.testing.allocator, "ws-b", "weekly_status", "Weekly status", "{\"business_question\":\"What changed?\",\"refresh_checks\":[\"facts present\"]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidArtifactRequest,
+        createLiveAnswerView(db, std.testing.allocator, "ws-a", "Bad-Slug", "New view", "{\"summary\":\"x\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidArtifactRequest,
+        createLiveAnswerView(db, std.testing.allocator, "ws-a", "new_view", "New view", "{\"materialized\":{}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidArtifactRequest,
+        createLiveAnswerView(db, std.testing.allocator, "ws-a", "new_view", "New view", "{}"),
+    );
+}
+
+test "live answer view replay after refresh preserves mutable state" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec("INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws-a', 'ws-a', 'Workspace A')");
+
+    var created = try createLiveAnswerView(db, std.testing.allocator, "ws-a", "weekly", "Weekly", "{\"summary\":\"Weekly definition\"}");
+    created.deinit(std.testing.allocator);
+    var refreshed = try refreshLiveAnswerView(db, std.testing.allocator, "live_answer_view__weekly");
+    defer refreshed.deinit(std.testing.allocator);
+
+    var replay = try createLiveAnswerView(db, std.testing.allocator, "ws-a", "weekly", "Weekly", "{\"summary\":\"Weekly definition\"}");
+    defer replay.deinit(std.testing.allocator);
+    try std.testing.expect(replay.idempotent);
+    try std.testing.expectEqual(@as(i64, 2), replay.row.current_version);
+    try std.testing.expectEqualStrings("refreshed", replay.row.state);
+    try std.testing.expect(std.mem.indexOf(u8, replay.row.payload_json, "\"materialized\":{") != null);
+}
+
+test "live answer view refresh rejects non object payload without mutation" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO mindbrain_answer_artifacts(
+        \\  artifact_id, slug, workspace_id, artifact_kind, public_label, lifecycle, state, payload_json
+        \\) VALUES (
+        \\  'live_answer_view__legacy_array', 'legacy_array', 'ws-a', 'live_answer_view', 'Legacy', 'stale', 'dirty', '[]'
+        \\)
+    );
+
+    try std.testing.expectError(
+        error.InvalidArtifactPayload,
+        refreshLiveAnswerView(db, std.testing.allocator, "live_answer_view__legacy_array"),
+    );
+    var row = (try getArtifact(db, std.testing.allocator, "live_answer_view__legacy_array")).?;
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1), row.current_version);
+    try std.testing.expectEqualStrings("[]", row.payload_json);
+    const events = try listEvents(db, std.testing.allocator, row.artifact_id, 10);
+    defer std.testing.allocator.free(events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
 }
 
 test "workspace writes can mark live answer views stale" {

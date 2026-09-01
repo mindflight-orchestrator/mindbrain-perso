@@ -240,6 +240,7 @@ GhostCrab SQLite integrations can consume MindBrain-owned read behavior.
 | `POST` | `/api/mindbrain/ghostcrab/search` | JSON body, see search write endpoints | JSON fused search matches for GhostCrab SQLite integrations |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projections/relevance` | `agent_id`, `entity_name`, `query` optional, `scope` optional, `limit` optional | JSON projection rows ranked by graph-context relevance |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/projection-get` | `workspace_id`, `projection_id`, `collection_id` optional, `include_evidence` optional, `include_deltas` optional | JSON projection result bundle with `artifact_kind: "answer_snapshot"` and `legacy_kind: "projection_type_b"`, plus linked evidence, deltas, and report |
+| `POST` | `/api/mindbrain/ghostcrab/artifact` | JSON `workspace_id`, `slug`, `public_label`, `definition` | Creates a governed `live_answer_view`; returns 201 for a new row, 200 for an identical retry, and 409 for conflicting identity/definition |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}` | none | JSON answer artifact registry row |
 | `POST` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}/refresh` | none | Refreshes a `live_answer_view`, increments `current_version`, writes one `answer_update_event`, and returns the new version/state |
 | `GET`/`HEAD` | `/api/mindbrain/ghostcrab/artifact/{artifact_id}/events` | `limit` optional | JSON retained `answer_update_event` rows for the artifact |

@@ -31,6 +31,11 @@ Slugs are deterministic ASCII labels generated from label-like input, scope, or
 legacy refs. Non-ASCII and punctuation collapse to `_`; duplicate slugs receive
 `__2`, `__3`, and so on within the relevant scope shape.
 
+The public live-answer create API is stricter: callers provide an already
+canonical slug, MindBrain never renames it, and a collision returns an explicit
+conflict. This keeps retries deterministic and prevents a caller from mistaking
+a suffixed artifact for the requested identity.
+
 ## Scope
 
 - `analysis_plan`: agent and scope scoped unless promoted later.
@@ -73,7 +78,13 @@ automatically recompute payloads.
 
 Refreshing a `live_answer_view` increments `current_version` and writes one
 `answer_update_event` in the same transaction. If no live recompute engine is
-available, refresh records a small signal and preserves the existing payload.
+available, refresh preserves the definition fields and replaces only the
+server-owned `materialized` count snapshot inside the existing JSON object.
+
+`POST /api/mindbrain/ghostcrab/artifact` is the governed creation surface. It
+requires a concrete existing workspace and stores a non-empty definition at
+version 1 with lifecycle `stale` and state `dirty`. Identical retries are
+idempotent; different definitions for the same public id are conflicts.
 
 ## Edition Policy
 
