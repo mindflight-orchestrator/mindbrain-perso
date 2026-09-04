@@ -11,6 +11,11 @@ const chunker = @import("chunker.zig");
 const nanoid = @import("nanoid.zig");
 const vector_blob = @import("vector_blob.zig");
 const tokenization_sqlite = @import("tokenization_sqlite.zig");
+const zig16_compat = @import("zig16_compat.zig");
+
+/// Cap on how many skipped cross-workspace relations are named on stderr; the
+/// full count is always reported through `skipped_cross_workspace_relations`.
+const max_reported_skipped_relations: u64 = 20;
 
 pub const FacetRegistration = struct {
     table_id: u64,
@@ -80,6 +85,14 @@ pub const Pipeline = struct {
     /// caller merges once at the end (see reindexFacets). A per-document
     /// merge rewrites each posting blob once per document touching it.
     defer_facet_merges: bool = false,
+    /// When true, a relation whose endpoints are not both in the workspace
+    /// aborts the reindex (pre-0.6.7 behaviour). When false, such relations
+    /// are skipped and counted in `skipped_cross_workspace_relations` so one
+    /// dangling edge in a large import cannot void the whole projection.
+    strict_cross_workspace_relations: bool = false,
+    /// Number of relations skipped by the last `reindexGraphWithDocumentTable`
+    /// because an endpoint was missing from the workspace.
+    skipped_cross_workspace_relations: u64 = 0,
 
     // ---- Memoized scaffolding state ---------------------------------------
     // ingestDocumentChunked used to re-ensure workspace/collection/ontology
@@ -890,6 +903,7 @@ pub const Pipeline = struct {
     /// `graph_entity_chunk`.
     pub fn reindexGraphWithDocumentTable(self: *Pipeline, workspace_id: []const u8, document_table_id: ?u64) !u64 {
         var projected_count: u64 = 0;
+        self.skipped_cross_workspace_relations = 0;
         var workspace_entity_ids = std.ArrayList(u32).empty;
         defer workspace_entity_ids.deinit(self.allocator);
 
@@ -987,7 +1001,29 @@ pub const Pipeline = struct {
             const metadata_json = try facet_sqlite.dupeColumnText(self.allocator, stmt, 7);
             defer self.allocator.free(metadata_json);
 
-            try graph_sqlite.assertRelationEndpointsInWorkspace(self.db.*, workspace_id, src, tgt);
+            // A single dangling edge used to abort the entire projection with
+            // an opaque CrossWorkspaceRelation, leaving the derived graph
+            // empty after the purge above. Skip and count it instead; the
+            // caller reports the total and the first offenders.
+            if (!try graph_sqlite.relationEndpointsInWorkspace(self.db.*, workspace_id, src, tgt)) {
+                if (self.strict_cross_workspace_relations) return error.CrossWorkspaceRelation;
+                self.skipped_cross_workspace_relations += 1;
+                if (self.skipped_cross_workspace_relations <= max_reported_skipped_relations) {
+                    // Name the offending endpoint: the operator has to find the
+                    // row in relations_raw and "one of the two" does not help.
+                    const source_ok = graph_sqlite.entityIsInWorkspace(self.db.*, src, workspace_id) catch true;
+                    const which: []const u8 = if (!source_ok) "source" else "target";
+                    const bad_id = if (!source_ok) src else tgt;
+                    var stderr_file_writer = std.Io.File.stderr().writer(zig16_compat.io(), &.{});
+                    const stderr = &stderr_file_writer.interface;
+                    stderr.print(
+                        "[ghostcrab] reindex: skipping relation {d} ({s}) in workspace '{s}': {s} entity {d} is not in this workspace\n",
+                        .{ rid, edge, workspace_id, which, bad_id },
+                    ) catch {};
+                    stderr.flush() catch {};
+                }
+                continue;
+            }
             try self.graph.addRelation(.{
                 .relation_id = rid,
                 .source_id = src,
@@ -2209,4 +2245,59 @@ test "resolveAlias and resolveTerms stay scoped to the requested workspace" {
     defer ws_a_terms.deinit();
     try std.testing.expect(ws_a_terms.contains(1));
     try std.testing.expect(!ws_a_terms.contains(2));
+}
+
+test "graph reindex skips dangling cross-workspace relations instead of aborting" {
+    // Reported on a 3480-node / 4313-relation import: one relation whose
+    // endpoint lived in another workspace aborted the whole projection with
+    // an opaque CrossWorkspaceRelation, leaving the derived graph empty after
+    // the purge. The valid relations must survive and the bad ones be counted.
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    var search = search_store.Store.init(std.testing.allocator);
+    defer search.deinit();
+    var facets = facet_store.Store.init(std.testing.allocator);
+    defer facets.deinit();
+    var graph = graph_store.Store.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var pipeline = Pipeline{
+        .allocator = std.testing.allocator,
+        .db = &db,
+        .search = &search,
+        .facets = &facets,
+        .graph = &graph,
+    };
+
+    try seedWorkspaceGraph(&pipeline, "ws_a", "ws_a::core", 1, 2, 100);
+    try seedWorkspaceGraph(&pipeline, "ws_b", "ws_b::core", 3, 4, 200);
+
+    // Relation 101 lives in ws_a but points at entity 3, which belongs to ws_b.
+    {
+        const sql =
+            \\INSERT INTO relations_raw
+            \\  (workspace_id, ontology_id, relation_id, edge_type, source_entity_id, target_entity_id, confidence)
+            \\VALUES ('ws_a', 'ws_a::core', 101, 'works_for', 1, 3, 0.9)
+        ;
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.stepDone(stmt);
+    }
+
+    _ = try pipeline.reindexGraph("ws_a");
+
+    try std.testing.expectEqual(@as(u64, 1), pipeline.skipped_cross_workspace_relations);
+    try expectRelationExists(db, 100);
+    try expectRelationMissing(db, 101);
+    try expectRelationExists(db, 200);
+
+    // A clean workspace resets the counter rather than accumulating it.
+    _ = try pipeline.reindexGraph("ws_b");
+    try std.testing.expectEqual(@as(u64, 0), pipeline.skipped_cross_workspace_relations);
+
+    // Strict mode keeps the pre-0.6.7 hard failure for callers that want it.
+    pipeline.strict_cross_workspace_relations = true;
+    try std.testing.expectError(error.CrossWorkspaceRelation, pipeline.reindexGraph("ws_a"));
 }

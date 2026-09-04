@@ -286,7 +286,59 @@ pub fn parseGenerateContentResponse(allocator: std.mem.Allocator, raw_json: []u8
     var text = std.Io.Writer.Allocating.init(allocator);
     errdefer text.deinit();
     try appendTextParts(&text, parts);
-    return .{ .content = try text.toOwnedSlice(), .raw_json = raw_json };
+    const finish_reason = try parseFinishReason(allocator, parsed.value);
+    errdefer if (finish_reason) |reason| allocator.free(reason);
+
+    return .{
+        .content = try text.toOwnedSlice(),
+        .raw_json = raw_json,
+        .finish_reason = finish_reason,
+        .usage = parseUsage(parsed.value),
+    };
+}
+
+/// Maps Gemini `candidates[0].finishReason` onto the OpenAI vocabulary used by
+/// `ChatResponse.finish_reason`, so a truncated completion is detectable the
+/// same way regardless of provider.
+fn parseFinishReason(allocator: std.mem.Allocator, root: std.json.Value) !?[]u8 {
+    if (root != .object) return null;
+    const candidates = root.object.get("candidates") orelse return null;
+    if (candidates != .array or candidates.array.items.len == 0) return null;
+    const first = candidates.array.items[0];
+    if (first != .object) return null;
+    const value = first.object.get("finishReason") orelse return null;
+    if (value != .string) return null;
+    const normalized = if (std.mem.eql(u8, value.string, "MAX_TOKENS"))
+        "length"
+    else if (std.mem.eql(u8, value.string, "STOP"))
+        "stop"
+    else
+        value.string;
+    return try allocator.dupe(u8, normalized);
+}
+
+/// Gemini reports the thinking budget separately as `thoughtsTokenCount`,
+/// which maps directly onto `reasoning_tokens`.
+fn parseUsage(root: std.json.Value) types.TokenUsage {
+    if (root != .object) return .{};
+    const usage_value = root.object.get("usageMetadata") orelse return .{};
+    if (usage_value != .object) return .{};
+    const usage = usage_value.object;
+    return .{
+        .prompt_tokens = jsonU64(usage.get("promptTokenCount")),
+        .completion_tokens = jsonU64(usage.get("candidatesTokenCount")),
+        .reasoning_tokens = jsonU64(usage.get("thoughtsTokenCount")),
+        .total_tokens = jsonU64(usage.get("totalTokenCount")),
+    };
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| if (n < 0) null else @intCast(n),
+        .float => |f| if (f < 0) null else @intFromFloat(f),
+        else => null,
+    };
 }
 
 /// Takes ownership of `raw_json`: on success it is stored in the returned
@@ -468,4 +520,33 @@ test "parseGenerateContentResponseResult normalizes to ResponseResult" {
     try std.testing.expectEqualStrings("gem_1", result.id);
     try std.testing.expectEqualStrings("hello", result.output_text);
     try std.testing.expectEqual(@as(usize, 1), result.output_items.len);
+}
+
+test "parseGenerateContentResponse maps MAX_TOKENS onto length and thoughts onto reasoning" {
+    const raw =
+        \\{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}],
+        \\"usageMetadata":{"promptTokenCount":3200,"candidatesTokenCount":0,
+        \\"thoughtsTokenCount":1024,"totalTokenCount":4224}}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseGenerateContentResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", response.content);
+    try std.testing.expect(response.truncated());
+    try std.testing.expectEqual(@as(?u64, 1024), response.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?u64, 4224), response.usage.total_tokens);
+}
+
+test "parseGenerateContentResponse maps STOP onto stop" {
+    const raw =
+        \\{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseGenerateContentResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("{}", response.content);
+    try std.testing.expectEqualStrings("stop", response.finish_reason.?);
+    try std.testing.expect(!response.truncated());
 }

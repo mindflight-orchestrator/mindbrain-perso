@@ -1802,6 +1802,7 @@ pub const MindbrainHttpApp = struct {
             .projected_count = result.projected_count,
             .document_table_id = result.document_table_id,
             .adjacency_rebuilt = result.adjacency_rebuilt,
+            .skipped_cross_workspace_relations = result.skipped_cross_workspace_relations,
         };
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
@@ -1856,6 +1857,7 @@ pub const MindbrainHttpApp = struct {
             .graph_projected = result.graph_projected,
             .facet_assignments = result.facet_assignments,
             .bm25_documents = result.bm25_documents,
+            .skipped_cross_workspace_relations = result.skipped_cross_workspace_relations,
         };
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();

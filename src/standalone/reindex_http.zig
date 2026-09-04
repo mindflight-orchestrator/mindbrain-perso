@@ -20,12 +20,17 @@ pub const ReindexGraphResult = struct {
     /// reindex. The native pipeline always rebuilds it; only the GhostCrab SQL
     /// fallback path leaves it stale.
     adjacency_rebuilt: bool = true,
+    /// Relations skipped because an endpoint was missing from the workspace.
+    /// Non-zero means the raw layer holds dangling edges: the projection is
+    /// complete for everything else, but those edges are absent from the graph.
+    skipped_cross_workspace_relations: u64 = 0,
 };
 
 pub const ReindexAllResult = struct {
     graph_projected: u64,
     facet_assignments: u64,
     bm25_documents: u64,
+    skipped_cross_workspace_relations: u64 = 0,
 };
 
 pub const CollectionFacetMatch = struct {
@@ -88,6 +93,7 @@ pub fn reindexGraph(
         .projected_count = projected,
         .document_table_id = document_table_id,
         .adjacency_rebuilt = true,
+        .skipped_cross_workspace_relations = bundle.pipeline.skipped_cross_workspace_relations,
     };
 }
 
@@ -122,6 +128,7 @@ pub fn reindexAll(
         .graph_projected = graph,
         .facet_assignments = facets,
         .bm25_documents = bm25.documents,
+        .skipped_cross_workspace_relations = bundle.pipeline.skipped_cross_workspace_relations,
     };
 }
 

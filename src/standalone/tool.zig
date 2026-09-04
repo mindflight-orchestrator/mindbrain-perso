@@ -2591,6 +2591,63 @@ fn writeLlmQualificationFailure(allocator: Allocator, failure: LlmQualificationF
     try stderr.flush();
 }
 
+const LlmBudgetFailure = struct {
+    reason: []const u8,
+    finish_reason: ?[]const u8 = null,
+    max_tokens: u32,
+    completion_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
+    content_bytes: usize,
+    hint: []const u8,
+};
+
+fn writeLlmBudgetFailure(allocator: Allocator, failure: LlmBudgetFailure) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, failure, .{});
+    defer allocator.free(json);
+    var stderr_file_writer = std.Io.File.stderr().writer(mindbrain.zig16_compat.io(), &.{});
+    const stderr = &stderr_file_writer.interface;
+    try stderr.print("LLM_BUDGET_FAILURE_JSON={s}\n", .{json});
+    try stderr.print(
+        "[ghostcrab] LLM returned no usable JSON: {s}. {s}\n",
+        .{ failure.reason, failure.hint },
+    );
+    try stderr.flush();
+}
+
+/// Guards the silent failure mode reported on reasoning-capped servers: the
+/// model spends the whole completion budget on hidden thinking, the provider
+/// returns `finish_reason: "length"` with empty content, and the JSON parser
+/// then reports an opaque syntax error on an empty string. Fail here instead,
+/// naming the budget that was exhausted and what to change.
+fn ensureUsableLlmContent(allocator: Allocator, response: llm.ChatResponse, max_tokens: u32) !void {
+    const blank = std.mem.trim(u8, response.content, " \t\r\n").len == 0;
+    const truncated = response.truncated();
+    if (!blank and !truncated) return;
+
+    const reason: []const u8 = if (truncated and blank)
+        "completion budget exhausted before any content was emitted"
+    else if (truncated)
+        "completion truncated at the token cap, so the JSON is incomplete"
+    else
+        "provider returned empty content";
+
+    const hint: []const u8 = if (response.usage.reasoning_tokens != null or truncated)
+        "Raise --max-tokens (the profile JSON itself needs ~400 tokens; reasoning models need several thousand more), or disable/lower the server-side reasoning budget."
+    else
+        "Check the model and base URL: the provider answered without content.";
+
+    try writeLlmBudgetFailure(allocator, .{
+        .reason = reason,
+        .finish_reason = response.finish_reason,
+        .max_tokens = max_tokens,
+        .completion_tokens = response.usage.completion_tokens,
+        .reasoning_tokens = response.usage.reasoning_tokens,
+        .content_bytes = response.content.len,
+        .hint = hint,
+    });
+    return if (truncated) error.LlmTokenBudgetExhausted else error.LlmEmptyResponse;
+}
+
 fn validateQualificationEnvelope(allocator: Allocator, json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(QualificationEnvelope, allocator, json, .{
         .allocate = .alloc_always,
@@ -5747,7 +5804,11 @@ fn runDocumentProfileCommand(allocator: Allocator, args: []const []const u8, env
     var model: ?[]const u8 = null;
     var sample_chars: usize = 12_000;
     var temperature: f32 = 0.0;
-    var max_tokens: u32 = 1200;
+    // The profile JSON itself needs ~400 tokens; the rest is headroom for
+    // models that bill hidden reasoning against the same cap. 8192 clears a
+    // typical reasoning budget while still fitting a 16k-context local server
+    // next to a 12k-char sample.
+    var max_tokens: u32 = 8192;
     var dry_run = false;
     var mock_profile_file: ?[]const u8 = null;
 
@@ -5908,6 +5969,8 @@ fn profileDocumentContent(allocator: Allocator, opts: DocumentProfileOptions) ![
         return err;
     };
     defer response.deinit(allocator);
+
+    try ensureUsableLlmContent(allocator, response, opts.max_tokens);
 
     var parsed = try corpus_profile.parseJson(allocator, response.content);
     defer parsed.deinit();
@@ -6072,7 +6135,11 @@ fn runDocumentProfileWorkerCommand(allocator: Allocator, args: []const []const u
     var api_key: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var temperature: f32 = 0.0;
-    var max_tokens: u32 = 1200;
+    // The profile JSON itself needs ~400 tokens; the rest is headroom for
+    // models that bill hidden reasoning against the same cap. 8192 clears a
+    // typical reasoning budget while still fitting a 16k-context local server
+    // next to a 12k-char sample.
+    var max_tokens: u32 = 8192;
     var mock_profile_file: ?[]const u8 = null;
     var archive_failures = false;
     var contextual_retrieval = false;

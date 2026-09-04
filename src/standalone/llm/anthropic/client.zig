@@ -170,7 +170,56 @@ pub fn parseMessagesResponse(allocator: std.mem.Allocator, raw_json: []u8) !type
         const value = part.object.get("text") orelse continue;
         if (value == .string) try text.writer.writeAll(value.string);
     }
-    return .{ .content = try text.toOwnedSlice(), .raw_json = raw_json };
+    const finish_reason = try parseStopReason(allocator, parsed.value);
+    errdefer if (finish_reason) |reason| allocator.free(reason);
+
+    return .{
+        .content = try text.toOwnedSlice(),
+        .raw_json = raw_json,
+        .finish_reason = finish_reason,
+        .usage = parseUsage(parsed.value),
+    };
+}
+
+/// Maps Anthropic `stop_reason` onto the OpenAI vocabulary used by
+/// `ChatResponse.finish_reason`, so a truncated completion is detectable the
+/// same way regardless of provider.
+fn parseStopReason(allocator: std.mem.Allocator, root: std.json.Value) !?[]u8 {
+    const value = root.object.get("stop_reason") orelse return null;
+    if (value != .string) return null;
+    const normalized = if (std.mem.eql(u8, value.string, "max_tokens"))
+        "length"
+    else if (std.mem.eql(u8, value.string, "tool_use"))
+        "tool_calls"
+    else if (std.mem.eql(u8, value.string, "end_turn") or std.mem.eql(u8, value.string, "stop_sequence"))
+        "stop"
+    else
+        value.string;
+    return try allocator.dupe(u8, normalized);
+}
+
+/// Anthropic bills extended thinking inside `output_tokens` and does not break
+/// it out, so `reasoning_tokens` stays null here: "not reported", not "none".
+fn parseUsage(root: std.json.Value) types.TokenUsage {
+    const usage_value = root.object.get("usage") orelse return .{};
+    if (usage_value != .object) return .{};
+    const usage = usage_value.object;
+    const input = jsonU64(usage.get("input_tokens"));
+    const output = jsonU64(usage.get("output_tokens"));
+    return .{
+        .prompt_tokens = input,
+        .completion_tokens = output,
+        .total_tokens = if (input != null and output != null) input.? + output.? else null,
+    };
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| if (n < 0) null else @intCast(n),
+        .float => |f| if (f < 0) null else @intFromFloat(f),
+        else => null,
+    };
 }
 
 test "renderMessagesRequest maps system to top-level field" {
@@ -209,4 +258,31 @@ test "parseMessagesResponse rejects malformed payloads without crashing or leaki
         const owned = try std.testing.allocator.dupe(u8, raw);
         try std.testing.expectError(error.InvalidResponse, parseMessagesResponse(std.testing.allocator, owned));
     }
+}
+
+test "parseMessagesResponse maps max_tokens stop reason onto length" {
+    const raw =
+        \\{"content":[{"type":"thinking","thinking":"..."}],"stop_reason":"max_tokens",
+        \\"usage":{"input_tokens":3200,"output_tokens":1024}}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseMessagesResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", response.content);
+    try std.testing.expect(response.truncated());
+    try std.testing.expectEqual(@as(?u64, 4224), response.usage.total_tokens);
+}
+
+test "parseMessagesResponse maps end_turn onto stop" {
+    const raw =
+        \\{"content":[{"type":"text","text":"{}"}],"stop_reason":"end_turn"}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseMessagesResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("{}", response.content);
+    try std.testing.expectEqualStrings("stop", response.finish_reason.?);
+    try std.testing.expect(!response.truncated());
 }

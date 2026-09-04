@@ -112,14 +112,38 @@ pub const ToolCall = struct {
     }
 };
 
+/// Token accounting reported by the provider. `reasoning_tokens` is the
+/// hidden thinking budget billed against the completion cap: a server with a
+/// fixed reasoning allowance can spend the whole cap there and return empty
+/// content, so callers that need parseable output must inspect it.
+pub const TokenUsage = struct {
+    prompt_tokens: ?u64 = null,
+    completion_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
+    total_tokens: ?u64 = null,
+};
+
 pub const ChatResponse = struct {
     content: []u8,
     raw_json: []u8,
     tool_calls: []ToolCall = &.{},
+    /// Provider stop reason normalized to the OpenAI vocabulary ("stop",
+    /// "length", "tool_calls", "content_filter"). Anthropic `max_tokens` and
+    /// Gemini `MAX_TOKENS` both map to "length" so callers can detect a
+    /// truncated completion without knowing which provider answered.
+    finish_reason: ?[]u8 = null,
+    usage: TokenUsage = .{},
+
+    /// True when the provider stopped because the completion cap was reached.
+    pub fn truncated(self: ChatResponse) bool {
+        const reason = self.finish_reason orelse return false;
+        return std.mem.eql(u8, reason, "length");
+    }
 
     pub fn deinit(self: ChatResponse, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
         allocator.free(self.raw_json);
+        if (self.finish_reason) |reason| allocator.free(reason);
         for (self.tool_calls) |call| call.deinit(allocator);
         if (self.tool_calls.len > 0) allocator.free(self.tool_calls);
     }

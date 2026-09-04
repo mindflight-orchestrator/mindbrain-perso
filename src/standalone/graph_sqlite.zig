@@ -1219,8 +1219,28 @@ pub fn assertRelationEndpointsInWorkspace(
     source_id: u32,
     target_id: u32,
 ) !void {
-    if (!try entityInWorkspace(db, source_id, workspace_id)) return error.CrossWorkspaceRelation;
-    if (!try entityInWorkspace(db, target_id, workspace_id)) return error.CrossWorkspaceRelation;
+    if (!try relationEndpointsInWorkspace(db, workspace_id, source_id, target_id))
+        return error.CrossWorkspaceRelation;
+}
+
+/// Non-throwing form of `assertRelationEndpointsInWorkspace`, for bulk paths
+/// that must report every dangling edge in one pass instead of aborting the
+/// whole batch on the first one.
+pub fn relationEndpointsInWorkspace(
+    db: Database,
+    workspace_id: []const u8,
+    source_id: u32,
+    target_id: u32,
+) !bool {
+    if (!try entityInWorkspace(db, source_id, workspace_id)) return false;
+    if (!try entityInWorkspace(db, target_id, workspace_id)) return false;
+    return true;
+}
+
+/// Public form of `entityInWorkspace`, so bulk callers can name the offending
+/// endpoint of a rejected relation instead of reporting "one of the two".
+pub fn entityIsInWorkspace(db: Database, entity_id: u32, workspace_id: []const u8) !bool {
+    return entityInWorkspace(db, entity_id, workspace_id);
 }
 
 fn entityInWorkspace(db: Database, entity_id: u32, workspace_id: []const u8) !bool {

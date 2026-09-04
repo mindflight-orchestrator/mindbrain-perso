@@ -203,7 +203,62 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw_json: []u8) !types.ChatRe
         if (tool_calls.len > 0) allocator.free(tool_calls);
     }
 
-    return .{ .content = content, .raw_json = raw_json, .tool_calls = tool_calls };
+    const finish_reason = try parseFinishReason(allocator, first);
+    errdefer if (finish_reason) |reason| allocator.free(reason);
+
+    return .{
+        .content = content,
+        .raw_json = raw_json,
+        .tool_calls = tool_calls,
+        .finish_reason = finish_reason,
+        .usage = parseUsage(parsed.value),
+    };
+}
+
+/// Reads `choices[0].finish_reason`. Some OpenAI-compatible servers report the
+/// cap hit as "max_tokens" instead of "length"; both are normalized to
+/// "length" so `ChatResponse.truncated()` works across backends.
+fn parseFinishReason(allocator: std.mem.Allocator, choice: std.json.Value) !?[]u8 {
+    const value = choice.object.get("finish_reason") orelse return null;
+    if (value != .string) return null;
+    const normalized = if (std.mem.eql(u8, value.string, "max_tokens"))
+        "length"
+    else
+        value.string;
+    return try allocator.dupe(u8, normalized);
+}
+
+/// Reads the `usage` block, including the reasoning tokens nested under
+/// `completion_tokens_details` (OpenAI) or `reasoning_tokens` (vLLM and
+/// several local servers). Missing fields stay null rather than zero so
+/// callers can tell "not reported" from "reported as none".
+fn parseUsage(root: std.json.Value) types.TokenUsage {
+    const usage_value = root.object.get("usage") orelse return .{};
+    if (usage_value != .object) return .{};
+    const usage = usage_value.object;
+
+    var reasoning = jsonU64(usage.get("reasoning_tokens"));
+    if (reasoning == null) {
+        if (usage.get("completion_tokens_details")) |details| {
+            if (details == .object) reasoning = jsonU64(details.object.get("reasoning_tokens"));
+        }
+    }
+
+    return .{
+        .prompt_tokens = jsonU64(usage.get("prompt_tokens")),
+        .completion_tokens = jsonU64(usage.get("completion_tokens")),
+        .reasoning_tokens = reasoning,
+        .total_tokens = jsonU64(usage.get("total_tokens")),
+    };
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| if (n < 0) null else @intCast(n),
+        .float => |f| if (f < 0) null else @intFromFloat(f),
+        else => null,
+    };
 }
 
 fn parseToolCalls(allocator: std.mem.Allocator, message: std.json.Value) ![]types.ToolCall {
@@ -376,4 +431,54 @@ test "parseResponse preserves raw JSON when assistant content is empty" {
 
     try std.testing.expectEqualStrings("", response.content);
     try std.testing.expect(std.mem.indexOf(u8, response.raw_json, "\"finish_reason\":\"length\"") != null);
+}
+
+test "parseResponse reports the length stop reason and reasoning tokens" {
+    // The failure mode this guards: a reasoning-capped server spends the whole
+    // completion budget on hidden thinking and returns null content. Without
+    // finish_reason + reasoning_tokens the caller only sees a JSON parse error
+    // on an empty string.
+    const raw =
+        \\{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}],
+        \\"usage":{"prompt_tokens":3200,"completion_tokens":1024,"total_tokens":4224,
+        \\"completion_tokens_details":{"reasoning_tokens":1024}}}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", response.content);
+    try std.testing.expect(response.truncated());
+    try std.testing.expectEqualStrings("length", response.finish_reason.?);
+    try std.testing.expectEqual(@as(?u64, 1024), response.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?u64, 1024), response.usage.completion_tokens);
+    try std.testing.expectEqual(@as(?u64, 3200), response.usage.prompt_tokens);
+}
+
+test "parseResponse normalizes the max_tokens stop reason used by some local servers" {
+    const raw =
+        \\{"choices":[{"message":{"content":"{}"},"finish_reason":"max_tokens"}],
+        \\"usage":{"reasoning_tokens":512}}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("length", response.finish_reason.?);
+    try std.testing.expect(response.truncated());
+    try std.testing.expectEqual(@as(?u64, 512), response.usage.reasoning_tokens);
+}
+
+test "parseResponse leaves usage unset when the provider reports none" {
+    const raw =
+        \\{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}
+    ;
+    const owned = try std.testing.allocator.dupe(u8, raw);
+    var response = try parseResponse(std.testing.allocator, owned);
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("stop", response.finish_reason.?);
+    try std.testing.expect(!response.truncated());
+    try std.testing.expectEqual(@as(?u64, null), response.usage.completion_tokens);
+    try std.testing.expectEqual(@as(?u64, null), response.usage.reasoning_tokens);
 }
