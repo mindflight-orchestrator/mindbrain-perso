@@ -110,6 +110,10 @@ fn commitTransaction(db: facet_sqlite.Database, transaction_active: *bool) !void
     transaction_active.* = false;
 }
 
+// valid_from marks when the fact started being true; re-writing the same
+// source_ref must never move it, so a null in the request leaves it alone.
+// valid_until is deliberately not COALESCE'd: re-writing a fact is how a caller
+// changes or clears its expiry.
 fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref: []const u8) !bool {
     const sql =
         \\UPDATE agent_facts
@@ -122,7 +126,7 @@ fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref
         \\    updated_at = CURRENT_TIMESTAMP,
         \\    updated_at_unix = unixepoch(),
         \\    version = version + 1,
-        \\    valid_from_unix = ?6,
+        \\    valid_from_unix = COALESCE(?6, valid_from_unix),
         \\    valid_until_unix = ?7
         \\WHERE workspace_id = ?8 AND source_ref = ?9
     ;
