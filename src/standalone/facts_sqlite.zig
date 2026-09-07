@@ -5,6 +5,26 @@ const nanoid = @import("nanoid.zig");
 
 const c = facet_sqlite.c;
 
+/// SQL predicate for "this fact row is current".
+///
+/// A row is current when now falls inside [valid_from_unix, valid_until_unix):
+/// `valid_from_unix` is NULL on rows written before the column was wired, and
+/// `valid_until_unix` is NULL for facts that never expire. Both IS NULL guards
+/// are load-bearing — without them every pre-existing row would drop out of all
+/// reads at once.
+///
+/// Mirrors activeFactWindowSql() in ghostcrab-personal-mcp's src/db/temporal.ts.
+/// The two must agree: a single ghostcrab_search call is answered partly by the
+/// TypeScript SQL paths and partly by these native ones, and a fact that shows
+/// up in one but not the other is a difference no caller can explain.
+///
+/// `alias` is a table qualifier including its dot ("af."), or "" when a single
+/// fact table is in scope.
+pub fn activeWindowSql(comptime alias: []const u8) []const u8 {
+    return "(" ++ alias ++ "valid_until_unix IS NULL OR " ++ alias ++ "valid_until_unix > strftime('%s','now'))" ++
+        " AND (" ++ alias ++ "valid_from_unix IS NULL OR " ++ alias ++ "valid_from_unix <= strftime('%s','now'))";
+}
+
 pub const FactWrite = struct {
     id: ?[]const u8 = null,
     workspace_id: []const u8 = "default",
@@ -112,6 +132,10 @@ fn commitTransaction(db: facet_sqlite.Database, transaction_active: *bool) !void
 
 // valid_from marks when the fact started being true; re-writing the same
 // source_ref must never move it, so a null in the request leaves it alone.
+// embedding_blob follows the same rule as created_by: a request that carries no
+// vector is not a request to delete the stored one. Callers that re-write a fact
+// with embeddings turned off would otherwise strip a vector that still matches
+// the content, and the row would silently drop out of semantic search.
 // valid_until is deliberately not COALESCE'd: re-writing a fact is how a caller
 // changes or clears its expiry.
 fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref: []const u8) !bool {
@@ -121,7 +145,7 @@ fn updateFactBySourceRef(db: facet_sqlite.Database, write: FactWrite, source_ref
         \\    content = ?2,
         \\    facets = ?3,
         \\    facets_json = ?3,
-        \\    embedding_blob = ?4,
+        \\    embedding_blob = COALESCE(?4, embedding_blob),
         \\    created_by = COALESCE(?5, created_by),
         \\    updated_at = CURRENT_TIMESTAMP,
         \\    updated_at_unix = unixepoch(),
@@ -316,6 +340,41 @@ test "writeFact upserts sourced facts by workspace and source_ref" {
     try std.testing.expect(second.updated);
     try std.testing.expectEqual(first.doc_id, second.doc_id);
     try std.testing.expectEqualStrings(first.id, second.id);
+}
+
+test "writeFact keeps the stored vector when the rewrite carries none" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const first = try writeFact(db, std.testing.allocator, .{
+        .workspace_id = "ws",
+        .schema_id = "ghostcrab.fact",
+        .content = "vectorised",
+        .facets_json = "{\"kind\":\"state\"}",
+        .embedding_blob = "vector-bytes",
+        .source_ref = "sync:state:vec",
+    });
+    defer deinitFactWriteResult(std.testing.allocator, first);
+
+    const second = try writeFact(db, std.testing.allocator, .{
+        .workspace_id = "ws",
+        .schema_id = "ghostcrab.fact",
+        .content = "vectorised",
+        .facets_json = "{\"kind\":\"state\"}",
+        .source_ref = "sync:state:vec",
+    });
+    defer deinitFactWriteResult(std.testing.allocator, second);
+
+    try std.testing.expect(second.updated);
+
+    const stmt = try facet_sqlite.prepare(db, "SELECT embedding_blob FROM agent_facts WHERE source_ref = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, "sync:state:vec");
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.MissingRow;
+    const stored = try facet_sqlite.dupeColumnText(std.testing.allocator, stmt, 0);
+    defer std.testing.allocator.free(stored);
+    try std.testing.expectEqualStrings("vector-bytes", stored);
 }
 
 test "writeFact rejects non-object facets_json" {

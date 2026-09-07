@@ -1,6 +1,7 @@
 const std = @import("std");
 const interfaces = @import("interfaces.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
+const facts_sqlite = @import("facts_sqlite.zig");
 const search_store = @import("search_store.zig");
 const search_compact_store = @import("search_compact_store.zig");
 const vector_blob = @import("vector_blob.zig");
@@ -392,14 +393,16 @@ pub fn searchFts5Bm25Workspace(
     defer allocator.free(match_query);
     if (match_query.len == 0) return allocator.alloc(Bm25Match, 0);
 
-    const sql =
+    const sql = comptime
         \\SELECT d.doc_id, -bm25(search_fts) AS score
         \\FROM search_fts
         \\JOIN search_fts_docs d ON d.fts_rowid = search_fts.rowid
         \\JOIN agent_facts af ON af.doc_id = d.doc_id
         \\WHERE d.table_id = ?1 AND search_fts MATCH ?2
         \\  AND af.workspace_id = ?3
-        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+        \\  AND 
+    ++ facts_sqlite.activeWindowSql("af.") ++
+        \\
         \\ORDER BY bm25(search_fts) ASC
         \\LIMIT ?4
     ;
@@ -440,13 +443,14 @@ pub fn searchEmbeddingExactTopKWorkspace(
 ) ![]interfaces.VectorSearchMatch {
     if (limit == 0 or query_vector.len == 0) return allocator.alloc(interfaces.VectorSearchMatch, 0);
 
-    const sql =
+    const sql = comptime
         \\SELECT e.doc_id, e.dimensions, e.embedding_blob
         \\FROM search_embeddings e
         \\JOIN agent_facts af ON af.doc_id = e.doc_id
         \\WHERE e.table_id = ?1 AND e.dimensions = ?2
         \\  AND af.workspace_id = ?3
-        \\  AND (af.valid_until_unix IS NULL OR af.valid_until_unix > strftime('%s','now'))
+        \\  AND 
+    ++ facts_sqlite.activeWindowSql("af.")
     ;
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
@@ -1801,6 +1805,45 @@ test "search sqlite fts upsert updates bm25 results" {
 
     const collection_stats = try bm25_repo.getCollectionStatsFn(bm25_repo.ctx, std.testing.allocator, 1);
     try std.testing.expectEqual(@as(u64, 1), collection_stats.total_documents);
+}
+
+test "workspace bm25 hides facts outside their validity window" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    // Three facts with the same term: one current, one closed (what an upsert
+    // archive looks like), one whose validity has not started yet.
+    const insert =
+        \\INSERT INTO agent_facts
+        \\  (id, schema_id, content, facets, facets_json, workspace_id, doc_id,
+        \\   created_at_unix, updated_at_unix, valid_from_unix, valid_until_unix)
+        \\VALUES (?1, 'ghostcrab:task', ?2, '{}', '{}', 'ws', ?3,
+        \\        unixepoch(), unixepoch(), ?4, ?5)
+    ;
+    const rows = [_]struct { id: []const u8, doc_id: u64, from: ?i64, until: ?i64 }{
+        .{ .id = "live", .doc_id = 1, .from = null, .until = null },
+        .{ .id = "closed", .doc_id = 2, .from = null, .until = 1000 },
+        .{ .id = "future", .doc_id = 3, .from = 4102444800, .until = null },
+    };
+    for (rows) |row| {
+        const stmt = try prepare(db, insert);
+        defer finalize(stmt);
+        try bindText(stmt, 1, row.id);
+        try bindText(stmt, 2, "roaring bitmaps");
+        try bindInt64(stmt, 3, row.doc_id);
+        if (row.from) |from| try bindInt64(stmt, 4, from) else try facet_sqlite.bindNull(stmt, 4);
+        if (row.until) |until| try bindInt64(stmt, 5, until) else try facet_sqlite.bindNull(stmt, 5);
+        try facet_sqlite.stepDone(stmt);
+
+        try upsertSearchDocument(db, 1, row.doc_id, "roaring bitmaps", "english");
+    }
+    try rebuildSearchArtifacts(db, std.testing.allocator);
+
+    const matches = try searchFts5Bm25Workspace(db, std.testing.allocator, 1, "ws", "roaring", 10);
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(@as(u64, 1), matches[0].doc_id);
 }
 
 test "search sqlite delete removes fts bm25 rows" {

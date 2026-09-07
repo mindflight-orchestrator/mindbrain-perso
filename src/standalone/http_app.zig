@@ -5726,11 +5726,12 @@ fn filterVectorMatchesByWorkspace(
     return try filtered.toOwnedSlice(allocator);
 }
 
+const agent_fact_doc_in_workspace_sql =
+    "SELECT 1 FROM agent_facts WHERE workspace_id = ?1 AND doc_id = ?2 AND " ++
+    facts_sqlite.activeWindowSql("") ++ " LIMIT 1";
+
 fn agentFactDocInWorkspace(db: facet_sqlite.Database, doc_id: u64, workspace_id: []const u8) !bool {
-    const stmt = try facet_sqlite.prepare(
-        db,
-        "SELECT 1 FROM agent_facts WHERE workspace_id = ?1 AND doc_id = ?2 AND (valid_until_unix IS NULL OR valid_until_unix > strftime('%s','now')) LIMIT 1",
-    );
+    const stmt = try facet_sqlite.prepare(db, agent_fact_doc_in_workspace_sql);
     defer facet_sqlite.finalize(stmt);
     try facet_sqlite.bindText(stmt, 1, workspace_id);
     try facet_sqlite.bindInt64(stmt, 2, doc_id);
