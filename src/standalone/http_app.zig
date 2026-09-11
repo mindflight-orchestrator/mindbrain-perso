@@ -1890,7 +1890,15 @@ pub const MindbrainHttpApp = struct {
         else
             25;
 
-        const search_result = try reindex_http.searchCollectionFacets(
+        const target_kind = try queryValue(allocator, query, "target_kind");
+        defer if (target_kind) |value| allocator.free(value);
+        const ontology_id = try queryValue(allocator, query, "ontology_id");
+        defer if (ontology_id) |value| allocator.free(value);
+        const doc_id_text = try queryValue(allocator, query, "doc_id");
+        defer if (doc_id_text) |value| allocator.free(value);
+        const chunk_index_text = try queryValue(allocator, query, "chunk_index");
+        defer if (chunk_index_text) |value| allocator.free(value);
+        const search_result = try reindex_http.searchCollectionFacetsFiltered(
             allocator,
             db,
             workspace_id,
@@ -1900,6 +1908,12 @@ pub const MindbrainHttpApp = struct {
             dimension,
             value_query,
             @min(limit, 100),
+            .{
+                .target_kind = target_kind,
+                .ontology_id = ontology_id,
+                .doc_id = if (doc_id_text) |value| try parseQueryInt(u64, value) else null,
+                .chunk_index = if (chunk_index_text) |value| try parseQueryInt(u32, value) else null,
+            },
         );
         const rows = search_result.matches;
         defer {
@@ -3615,7 +3629,7 @@ pub const MindbrainHttpApp = struct {
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{},"live_answer_view_create":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"collection_facet_targets":true,"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{},"live_answer_view_create":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -5077,9 +5091,9 @@ fn printUsage() !void {
         \\  GET /api/mindbrain/traverse?start=...&direction=...&depth=...
         \\  GET /api/mindbrain/collections/facet-search?workspace_id=...&collection_id=...
         \\  GET /api/mindbrain/pack?user_id=...&query=...&scope=...&limit=...
-        \\  GET /api/mindbrain/ghostcrab/artifact/{artifact_id}
-        \\  POST /api/mindbrain/ghostcrab/artifact/{artifact_id}/refresh
-        \\  GET /api/mindbrain/ghostcrab/artifact/{artifact_id}/events
+        \\  GET /api/mindbrain/ghostcrab/artifact/{{artifact_id}}
+        \\  POST /api/mindbrain/ghostcrab/artifact/{{artifact_id}}/refresh
+        \\  GET /api/mindbrain/ghostcrab/artifact/{{artifact_id}}/events
         \\
         \\notes:
         \\  Use bracketed IPv6 in MINDBRAIN_HTTP_ADDR / --addr, for example [::1]:8091.

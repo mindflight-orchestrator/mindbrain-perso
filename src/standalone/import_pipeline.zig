@@ -773,7 +773,7 @@ pub const Pipeline = struct {
         const sql =
             \\SELECT doc_id, namespace, dimension, value
             \\FROM facet_assignments_raw
-            \\WHERE workspace_id = ?1 AND collection_id = ?2 AND target_kind = 'doc'
+            \\WHERE workspace_id = ?1 AND collection_id = ?2 AND target_kind = 'doc' AND doc_id BETWEEN 0 AND 4294967295
             \\ORDER BY doc_id
         ;
         const stmt = try facet_sqlite.prepare(self.db.*, sql);
@@ -783,6 +783,12 @@ pub const Pipeline = struct {
 
         var tx = try facet_sqlite.Transaction.begin(self.db.*);
         defer tx.deinit();
+        inline for (.{ "facet_postings", "facet_deltas" }) |table| {
+            const clear = try facet_sqlite.prepare(self.db.*, "DELETE FROM " ++ table ++ " WHERE table_id=?1");
+            defer facet_sqlite.finalize(clear);
+            try facet_sqlite.bindInt64(clear, 1, table_id);
+            try facet_sqlite.stepDone(clear);
+        }
         const previous_defer = self.defer_facet_merges;
         self.defer_facet_merges = true;
         defer self.defer_facet_merges = previous_defer;
@@ -797,7 +803,6 @@ pub const Pipeline = struct {
             pending.deinit(self.allocator);
         }
 
-        var total: u64 = 0;
         while (true) {
             const status = facet_sqlite.c.sqlite3_step(stmt);
             if (status == facet_sqlite.c.SQLITE_DONE) break;
@@ -824,10 +829,10 @@ pub const Pipeline = struct {
                 .facet_name = facet_name,
                 .facet_value = value,
             });
-            total += 1;
         }
         if (current_doc) |cd| try flushFacetGroup(self, table_id, cd, &pending);
         _ = try facet_sqlite.mergeDeltasSafe(self.db.*, table_id, null);
+        const total = try @import("collection_facet_index.zig").rebuild(self.allocator, self.db.*, workspace_id, collection_id);
         try tx.commit();
         return total;
     }

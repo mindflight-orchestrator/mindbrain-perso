@@ -1340,3 +1340,45 @@ CREATE INDEX IF NOT EXISTS external_links_raw_doc_idx
 
 CREATE INDEX IF NOT EXISTS external_links_raw_uri_idx
     ON external_links_raw(target_uri);
+
+-- Rebuildable collection facet projection. Dense bitmap IDs are local to each
+-- workspace/collection; document IDs remain full-width SQLite integers.
+CREATE TABLE IF NOT EXISTS collection_facet_index_state (
+    workspace_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    dirty INTEGER NOT NULL DEFAULT 1 CHECK(dirty IN (0,1)),
+    PRIMARY KEY(workspace_id, collection_id)
+);
+CREATE TABLE IF NOT EXISTS collection_facet_targets (
+    workspace_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    dense_id INTEGER NOT NULL CHECK(dense_id BETWEEN 0 AND 4294967295),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('doc','chunk')),
+    doc_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, collection_id, dense_id),
+    UNIQUE(workspace_id, collection_id, target_kind, doc_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS collection_facet_postings (
+    workspace_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    ontology_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    dimension TEXT NOT NULL,
+    value TEXT NOT NULL,
+    posting_blob BLOB NOT NULL,
+    PRIMARY KEY(workspace_id, collection_id, ontology_id, namespace, dimension, value)
+);
+CREATE TRIGGER IF NOT EXISTS collection_facet_dirty_insert AFTER INSERT ON facet_assignments_raw BEGIN
+    UPDATE collection_facet_index_state SET dirty=1
+    WHERE workspace_id=NEW.workspace_id AND collection_id=NEW.collection_id;
+END;
+CREATE TRIGGER IF NOT EXISTS collection_facet_dirty_delete AFTER DELETE ON facet_assignments_raw BEGIN
+    UPDATE collection_facet_index_state SET dirty=1
+    WHERE workspace_id=OLD.workspace_id AND collection_id=OLD.collection_id;
+END;
+CREATE TRIGGER IF NOT EXISTS collection_facet_dirty_update AFTER UPDATE ON facet_assignments_raw BEGIN
+    UPDATE collection_facet_index_state SET dirty=1
+    WHERE (workspace_id=OLD.workspace_id AND collection_id=OLD.collection_id)
+       OR (workspace_id=NEW.workspace_id AND collection_id=NEW.collection_id);
+END;

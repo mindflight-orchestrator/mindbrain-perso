@@ -9,6 +9,7 @@ const interfaces = @import("interfaces.zig");
 const search_sqlite = @import("search_sqlite.zig");
 const search_store = @import("search_store.zig");
 const roaring = @import("roaring.zig");
+const collection_facet_index = @import("collection_facet_index.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = facet_sqlite.Database;
@@ -40,11 +41,31 @@ pub const CollectionFacetMatch = struct {
     dimension: []const u8,
     value: []const u8,
     weight: f32,
+    target_kind: []const u8,
+    ontology_id: []const u8,
+    assignment_source: ?[]const u8,
+
+    pub fn jsonStringify(self: CollectionFacetMatch, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(CollectionFacetMatch).@"struct".fields) |field| {
+            try jw.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "doc_id")) {
+                if (self.doc_id > 9007199254740991) {
+                    var buffer: [20]u8 = undefined;
+                    try jw.write(std.fmt.bufPrint(&buffer, "{d}", .{self.doc_id}) catch unreachable);
+                } else try jw.write(self.doc_id);
+            } else try jw.write(@field(self, field.name));
+        }
+        try jw.endObject();
+    }
 
     pub fn deinit(self: CollectionFacetMatch, allocator: Allocator) void {
         allocator.free(self.namespace);
         allocator.free(self.dimension);
         allocator.free(self.value);
+        allocator.free(self.target_kind);
+        allocator.free(self.ontology_id);
+        if (self.assignment_source) |source| allocator.free(source);
     }
 };
 
@@ -132,17 +153,6 @@ pub fn reindexAll(
     };
 }
 
-fn valueMatchesQuery(facet_value: []const u8, value_query: ?[]const u8) bool {
-    const query = value_query orelse return true;
-    if (query.len == 0) return true;
-    if (query.len > facet_value.len) return false;
-    var i: usize = 0;
-    while (i + query.len <= facet_value.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(facet_value[i .. i + query.len], query)) return true;
-    }
-    return false;
-}
-
 fn appendFmt(
     allocator: Allocator,
     list: *std.ArrayList(u8),
@@ -180,6 +190,13 @@ fn tryResolveFacetTable(
     };
 }
 
+pub const CollectionFacetFilters = struct {
+    target_kind: ?[]const u8 = null,
+    doc_id: ?u64 = null,
+    chunk_index: ?u32 = null,
+    ontology_id: ?[]const u8 = null,
+};
+
 fn searchCollectionFacetsRaw(
     allocator: Allocator,
     db: Database,
@@ -189,14 +206,16 @@ fn searchCollectionFacetsRaw(
     dimension: ?[]const u8,
     value_query: ?[]const u8,
     limit: usize,
+    bitmap: ?roaring.Bitmap,
+    filters: CollectionFacetFilters,
 ) ![]CollectionFacetMatch {
     var sql = std.ArrayList(u8).empty;
     defer sql.deinit(allocator);
-    try sql.appendSlice(allocator,
-        \\SELECT doc_id, chunk_index, namespace, dimension, value, weight
-        \\FROM facet_assignments_raw
-        \\WHERE workspace_id = ?1 AND collection_id = ?2
-    );
+    try sql.appendSlice(allocator, "SELECT a.doc_id,a.chunk_index,a.namespace,a.dimension,a.value,a.weight,a.target_kind,a.ontology_id,a.source");
+    if (bitmap != null) try sql.appendSlice(allocator, ", t.dense_id");
+    try sql.appendSlice(allocator, " FROM facet_assignments_raw a");
+    if (bitmap != null) try sql.appendSlice(allocator, " JOIN collection_facet_targets t ON t.workspace_id=a.workspace_id AND t.collection_id=a.collection_id AND t.target_kind=a.target_kind AND t.doc_id=a.doc_id AND t.chunk_index=a.chunk_index");
+    try sql.appendSlice(allocator, " WHERE a.workspace_id=?1 AND a.collection_id=?2");
 
     var params = std.ArrayList([]const u8).empty;
     defer params.deinit(allocator);
@@ -207,19 +226,32 @@ fn searchCollectionFacetsRaw(
     defer if (value_pattern) |pattern| allocator.free(pattern);
 
     if (namespace) |ns| {
-        try appendFmt(allocator, &sql, " AND namespace = ?{d}", .{params.items.len + 1});
+        try appendFmt(allocator, &sql, " AND a.namespace = ?{d}", .{params.items.len + 1});
         try params.append(allocator, ns);
     }
     if (dimension) |dim| {
-        try appendFmt(allocator, &sql, " AND dimension = ?{d}", .{params.items.len + 1});
+        try appendFmt(allocator, &sql, " AND a.dimension = ?{d}", .{params.items.len + 1});
         try params.append(allocator, dim);
     }
     if (value_query) |vq| {
-        try appendFmt(allocator, &sql, " AND value LIKE ?{d}", .{params.items.len + 1});
+        try appendFmt(allocator, &sql, " AND a.value LIKE ?{d}", .{params.items.len + 1});
         value_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{vq});
         try params.append(allocator, value_pattern.?);
     }
-    try appendFmt(allocator, &sql, " ORDER BY weight DESC, doc_id ASC LIMIT {d}", .{limit});
+    var doc_buffer: [21]u8 = undefined;
+    var chunk_buffer: [10]u8 = undefined;
+    const doc_text: ?[]const u8 = if (filters.doc_id) |id| try std.fmt.bufPrint(&doc_buffer, "{d}", .{@as(i64, @bitCast(id))}) else null;
+    const chunk_text: ?[]const u8 = if (filters.chunk_index) |index| try std.fmt.bufPrint(&chunk_buffer, "{d}", .{index}) else null;
+    const columns = [_][]const u8{ "target_kind", "doc_id", "chunk_index", "ontology_id" };
+    for ([_]?[]const u8{ filters.target_kind, doc_text, chunk_text, filters.ontology_id }, columns) |param, column| {
+        if (param) |value| {
+            try appendFmt(allocator, &sql, " AND a.{s}=?{d}", .{ column, params.items.len + 1 });
+            try params.append(allocator, value);
+        }
+    }
+    if (filters.chunk_index != null) try sql.appendSlice(allocator, " AND a.target_kind='chunk'");
+    try sql.appendSlice(allocator, " ORDER BY a.weight DESC,a.doc_id,a.chunk_index,a.ontology_id,a.namespace,a.dimension,a.value");
+    if (bitmap == null) try appendFmt(allocator, &sql, " LIMIT {d}", .{limit});
 
     const stmt = try facet_sqlite.prepare(db, sql.items);
     defer facet_sqlite.finalize(stmt);
@@ -234,11 +266,14 @@ fn searchCollectionFacetsRaw(
     }
 
     const c = facet_sqlite.c;
-    while (true) {
+    while (rows.items.len < limit) {
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) return error.StepFailed;
 
+        if (bitmap) |allowed| {
+            if (!allowed.contains(try facet_sqlite.columnU32(stmt, 9))) continue;
+        }
         const chunk_index_raw = c.sqlite3_column_int64(stmt, 1);
         const chunk_index: ?u32 = if (chunk_index_raw < 0 or chunk_index_raw > std.math.maxInt(u32))
             null
@@ -252,138 +287,10 @@ fn searchCollectionFacetsRaw(
             .dimension = try facet_sqlite.dupeColumnText(allocator, stmt, 3),
             .value = try facet_sqlite.dupeColumnText(allocator, stmt, 4),
             .weight = @floatCast(c.sqlite3_column_double(stmt, 5)),
+            .target_kind = try facet_sqlite.dupeColumnText(allocator, stmt, 6),
+            .ontology_id = try facet_sqlite.dupeColumnText(allocator, stmt, 7),
+            .assignment_source = if (c.sqlite3_column_type(stmt, 8) == c.SQLITE_NULL) null else try facet_sqlite.dupeColumnText(allocator, stmt, 8),
         });
-    }
-
-    return rows.toOwnedSlice(allocator);
-}
-
-fn searchCollectionFacetsPostings(
-    allocator: Allocator,
-    db: Database,
-    table_config: interfaces.FacetTableConfig,
-    namespace: []const u8,
-    dimension: []const u8,
-    value_query: ?[]const u8,
-    limit: usize,
-) ![]CollectionFacetMatch {
-    const facet_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ namespace, dimension });
-    defer allocator.free(facet_name);
-
-    const facet_id = facet_sqlite.loadFacetId(db, table_config.table_id, facet_name) catch |err| switch (err) {
-        error.MissingRow => return &.{},
-        else => return err,
-    };
-
-    var rows = std.ArrayList(CollectionFacetMatch).empty;
-    errdefer {
-        for (rows.items) |row| row.deinit(allocator);
-        rows.deinit(allocator);
-    }
-
-    var seen_docs = try roaring.Bitmap.empty();
-    defer seen_docs.deinit();
-
-    // Single scan over the facet's postings ordered by value: group the chunk
-    // blobs per facet_value in-stream instead of issuing one postings query
-    // per distinct value (which was O(values) statements per request).
-    const sql = try std.fmt.allocPrint(
-        allocator,
-        "SELECT facet_value, chunk_id, posting_blob FROM facet_postings WHERE table_id = {d} AND facet_id = {d} ORDER BY facet_value, chunk_id",
-        .{ table_config.table_id, facet_id },
-    );
-    defer allocator.free(sql);
-    const stmt = try facet_sqlite.prepare(db, sql);
-    defer facet_sqlite.finalize(stmt);
-
-    const c = facet_sqlite.c;
-
-    var group_value: ?[]const u8 = null;
-    defer if (group_value) |value| allocator.free(value);
-    var group_postings = std.ArrayList(interfaces.FacetPosting).empty;
-    defer {
-        for (group_postings.items) |posting| {
-            var bitmap = posting.bitmap;
-            bitmap.deinit();
-        }
-        group_postings.deinit(allocator);
-    }
-
-    while (true) {
-        const rc = c.sqlite3_step(stmt);
-        if (rc != c.SQLITE_ROW and rc != c.SQLITE_DONE) return error.StepFailed;
-        const end_of_rows = rc == c.SQLITE_DONE;
-
-        var row_value: ?[]const u8 = null;
-        errdefer if (row_value) |value| allocator.free(value);
-        if (!end_of_rows) row_value = try facet_sqlite.dupeColumnText(allocator, stmt, 0);
-
-        const same_group = group_value != null and row_value != null and
-            std.mem.eql(u8, group_value.?, row_value.?);
-
-        var collect = same_group;
-        if (!same_group) {
-            // Flush the completed group before starting the next one.
-            if (group_value) |value| {
-                if (try facet_sqlite.reconstructFacetBitmapFromPostings(
-                    allocator,
-                    table_config.chunk_bits,
-                    group_postings.items,
-                )) |reconstructed| {
-                    var facet_bitmap = reconstructed;
-                    defer facet_bitmap.deinit();
-                    var iter = roaring.Bitmap.UInt32Iterator.init(facet_bitmap);
-                    while (iter.hasValue()) {
-                        if (rows.items.len >= limit) break;
-                        const doc_id = iter.currentValue();
-                        iter.advance();
-                        if (seen_docs.contains(doc_id)) continue;
-                        seen_docs.add(doc_id);
-
-                        try rows.append(allocator, .{
-                            .doc_id = doc_id,
-                            .chunk_index = null,
-                            .namespace = try allocator.dupe(u8, namespace),
-                            .dimension = try allocator.dupe(u8, dimension),
-                            .value = try allocator.dupe(u8, value),
-                            .weight = 1.0,
-                        });
-                    }
-                }
-                for (group_postings.items) |posting| {
-                    var bitmap = posting.bitmap;
-                    bitmap.deinit();
-                }
-                group_postings.clearRetainingCapacity();
-                allocator.free(value);
-                group_value = null;
-            }
-
-            if (end_of_rows or rows.items.len >= limit) {
-                if (row_value) |value| allocator.free(value);
-                break;
-            }
-
-            if (valueMatchesQuery(row_value.?, value_query)) {
-                group_value = row_value;
-                row_value = null; // ownership moved to group_value
-                collect = true;
-            }
-        }
-
-        if (collect) {
-            const chunk_id_raw = c.sqlite3_column_int64(stmt, 1);
-            if (chunk_id_raw < 0 or chunk_id_raw > std.math.maxInt(u32)) return error.StepFailed;
-            const blob_len = c.sqlite3_column_bytes(stmt, 2);
-            const blob_ptr = c.sqlite3_column_blob(stmt, 2) orelse return error.MissingRow;
-            const blob: []const u8 = @as([*]const u8, @ptrCast(blob_ptr))[0..@intCast(blob_len)];
-            try group_postings.append(allocator, .{
-                .chunk_id = @intCast(chunk_id_raw),
-                .bitmap = try roaring.Bitmap.deserializePortable(blob),
-            });
-        }
-
-        if (row_value) |value| allocator.free(value);
     }
 
     return rows.toOwnedSlice(allocator);
@@ -400,47 +307,47 @@ pub fn searchCollectionFacets(
     value_query: ?[]const u8,
     limit: usize,
 ) !SearchCollectionFacetsResult {
-    if (try tryResolveFacetTable(db, allocator, collection_id, table_id_param)) |table_config| {
-        defer {
-            allocator.free(table_config.schema_name);
-            allocator.free(table_config.table_name);
-        }
-
-        const posting_count = try facet_sqlite.countFacetPostingsForTable(db, table_config.table_id);
-        if (posting_count > 0 and namespace != null and dimension != null) {
-            const matches = try searchCollectionFacetsPostings(
-                allocator,
-                db,
-                table_config,
-                namespace.?,
-                dimension.?,
-                value_query,
-                limit,
-            );
-            return .{
-                .matches = matches,
-                .source = "facet_postings",
-            };
-        }
-    }
-
-    const matches = try searchCollectionFacetsRaw(
-        allocator,
-        db,
-        workspace_id,
-        collection_id,
-        namespace,
-        dimension,
-        value_query,
-        limit,
-    );
-    return .{
-        .matches = matches,
-        .source = "facet_assignments_raw",
-    };
+    return searchCollectionFacetsFiltered(allocator, db, workspace_id, collection_id, table_id_param, namespace, dimension, value_query, limit, .{});
 }
 
-test "searchCollectionFacets decodes facet_postings Roaring bitmaps after reindex" {
+pub fn searchCollectionFacetsFiltered(
+    allocator: Allocator,
+    db: Database,
+    workspace_id: []const u8,
+    collection_id: []const u8,
+    table_id_param: ?u64,
+    namespace: ?[]const u8,
+    dimension: ?[]const u8,
+    value_query: ?[]const u8,
+    limit: usize,
+    filters: CollectionFacetFilters,
+) !SearchCollectionFacetsResult {
+    if (filters.target_kind) |kind| {
+        if (!std.mem.eql(u8, kind, "doc") and !std.mem.eql(u8, kind, "chunk")) return error.BadRequest;
+        if (std.mem.eql(u8, kind, "doc") and filters.chunk_index != null) return error.BadRequest;
+    }
+    // State check, bitmap read and identity decoding share one SQLite snapshot.
+    try db.exec("SAVEPOINT collection_facet_read");
+    errdefer {
+        db.exec("ROLLBACK TO collection_facet_read") catch {};
+        db.exec("RELEASE collection_facet_read") catch {};
+    }
+    if (try tryResolveFacetTable(db, allocator, collection_id, table_id_param)) |config| {
+        allocator.free(config.schema_name);
+        allocator.free(config.table_name);
+    }
+    var bitmap = try collection_facet_index.matching(allocator, db, workspace_id, collection_id, namespace, dimension, value_query);
+    defer if (bitmap) |*value| value.deinit();
+    const matches = try searchCollectionFacetsRaw(allocator, db, workspace_id, collection_id, namespace, dimension, value_query, limit, bitmap, filters);
+    errdefer {
+        for (matches) |row| row.deinit(allocator);
+        allocator.free(matches);
+    }
+    try db.exec("RELEASE collection_facet_read");
+    return .{ .matches = matches, .source = if (bitmap != null) "facet_postings" else "facet_assignments_raw" };
+}
+
+test "searchCollectionFacets preserves chunk identities in Roaring bitmaps after reindex" {
     var db = try facet_sqlite.Database.openInMemory();
     defer db.close();
     try db.applyStandaloneSchema();
@@ -465,6 +372,8 @@ test "searchCollectionFacets decodes facet_postings Roaring bitmaps after reinde
         \\  'ws1', 'ws1::main', 'doc', 42, -1,
         \\  'ws1::core', 'topic', 'category', 'legal', 1.0, 'test'
         \\);
+        \\INSERT INTO facet_assignments_raw (workspace_id, collection_id, target_kind, doc_id, chunk_index, ontology_id, namespace, dimension, value, weight, source)
+        \\VALUES ('ws1', 'ws1::main', 'chunk', 42, 0, 'ws1::core', 'topic', 'category', 'legal', 0.75, 'chunk-test');
     );
 
     var search = search_store.Store.init(std.testing.allocator);
@@ -491,7 +400,7 @@ test "searchCollectionFacets decodes facet_postings Roaring bitmaps after reinde
     });
 
     const indexed = try pipeline.reindexFacets("ws1", "ws1::main", 7);
-    try std.testing.expectEqual(@as(u64, 1), indexed);
+    try std.testing.expectEqual(@as(u64, 2), indexed);
     try std.testing.expectEqual(@as(u64, 1), try facet_sqlite.countFacetPostingsForTable(db, 7));
 
     const result = try searchCollectionFacets(
@@ -511,9 +420,11 @@ test "searchCollectionFacets decodes facet_postings Roaring bitmaps after reinde
     }
 
     try std.testing.expectEqualStrings("facet_postings", result.source);
-    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expectEqual(@as(usize, 2), result.matches.len);
     try std.testing.expectEqual(@as(u64, 42), result.matches[0].doc_id);
     try std.testing.expectEqualStrings("legal", result.matches[0].value);
+    try std.testing.expectEqual(@as(?u32, 0), result.matches[1].chunk_index);
+    try std.testing.expectEqual(@as(f32, 0.75), result.matches[1].weight);
 }
 
 test "searchCollectionFacets falls back to facet_assignments_raw without postings" {
@@ -654,4 +565,147 @@ test "reindexAll registers facet table config and rebuilds derived indexes" {
         try std.testing.expectEqual(facet_sqlite.c.SQLITE_ROW, facet_sqlite.c.sqlite3_step(stmt));
         try std.testing.expectEqual(@as(i64, 1), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
     }
+}
+
+fn facetTestDatabase() !Database {
+    var db = try Database.openInMemory();
+    errdefer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id,workspace_id,label) VALUES ('ws','ws','ws'),('neighbor','neighbor','neighbor');
+        \\INSERT INTO collections(collection_id,workspace_id,name,key_kind,chunk_bits)
+        \\VALUES ('ws::docs','ws','docs','integer',4),('neighbor::docs','neighbor','docs','integer',4);
+        \\INSERT INTO ontologies(ontology_id,workspace_id,name) VALUES ('a','ws','a'),('b','ws','b'),('neighbor','neighbor','n');
+        \\INSERT INTO facet_assignments_raw(workspace_id,collection_id,target_kind,doc_id,chunk_index,ontology_id,namespace,dimension,value,weight,source) VALUES
+        \\('ws','ws::docs','chunk',9007199254740993,0,'a','topic','category','shared',0.4,'first'),
+        \\('ws','ws::docs','chunk',9007199254740993,0,'b','topic','category','shared',0.8,'second'),
+        \\('ws','ws::docs','chunk',9007199254740993,1,'a','topic','category','different',0.6,NULL),
+        \\('ws','ws::docs','doc',-1,-1,'a','topic','category','unsigned',0.2,'max-u64'),
+        \\('neighbor','neighbor::docs','chunk',9007199254740993,0,'neighbor','topic','category','shared',1,'neighbor');
+    );
+    return db;
+}
+
+fn rebuildTestFacets(db: Database) !void {
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+    _ = try collection_facet_index.rebuild(std.testing.allocator, db, "ws", "ws::docs");
+    try tx.commit();
+}
+
+fn freeFacetTestResult(result: SearchCollectionFacetsResult) void {
+    for (result.matches) |row| row.deinit(std.testing.allocator);
+    std.testing.allocator.free(result.matches);
+}
+
+fn findTestFacets(db: Database, value: ?[]const u8, limit: usize) !SearchCollectionFacetsResult {
+    return searchCollectionFacets(std.testing.allocator, db, "ws", "ws::docs", null, "topic", "category", value, limit);
+}
+
+test "collection facet index preserves taxonomy weights provenance and full width IDs through vacuum" {
+    var db = try facetTestDatabase();
+    defer db.close();
+    try rebuildTestFacets(db);
+    // Rowids may change during VACUUM. The projection uses explicit target keys.
+    try db.exec("VACUUM");
+    const result = try findTestFacets(db, null, 10);
+    defer freeFacetTestResult(result);
+    try std.testing.expectEqualStrings("facet_postings", result.source);
+    try std.testing.expectEqual(@as(usize, 4), result.matches.len);
+    try std.testing.expectEqual(@as(u64, 9007199254740993), result.matches[0].doc_id);
+    try std.testing.expectEqual(@as(?u32, 0), result.matches[0].chunk_index);
+    try std.testing.expectEqualStrings("b", result.matches[0].ontology_id);
+    try std.testing.expectEqualStrings("second", result.matches[0].assignment_source.?);
+    try std.testing.expectEqualStrings("chunk", result.matches[0].target_kind);
+    try std.testing.expectEqual(@as(?u32, 1), result.matches[1].chunk_index);
+    try std.testing.expectEqualStrings("a", result.matches[2].ontology_id);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), result.matches[3].doc_id);
+    try std.testing.expectEqual(@as(?u32, null), result.matches[3].chunk_index);
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.matches, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"doc_id\":\"9007199254740993\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"doc_id\":\"18446744073709551615\"") != null);
+    const limited = try findTestFacets(db, "shared", 1);
+    defer freeFacetTestResult(limited);
+    try std.testing.expectEqual(@as(usize, 1), limited.matches.len);
+    try std.testing.expectEqualStrings("b", limited.matches[0].ontology_id);
+}
+
+test "collection facet index invalidates late insert update and delete and rebuilds empty scopes" {
+    var db = try facetTestDatabase();
+    defer db.close();
+    try rebuildTestFacets(db);
+    // A neighboring workspace must not invalidate this collection.
+    try db.exec("UPDATE facet_assignments_raw SET weight=0.5 WHERE workspace_id='neighbor'");
+    const unaffected = try findTestFacets(db, "shared", 10);
+    defer freeFacetTestResult(unaffected);
+    try std.testing.expectEqualStrings("facet_postings", unaffected.source);
+    try db.exec(
+        \\INSERT INTO facet_assignments_raw(workspace_id,collection_id,target_kind,doc_id,chunk_index,ontology_id,namespace,dimension,value,weight)
+        \\VALUES ('ws','ws::docs','chunk',7,0,'a','topic','category','late',0.9);
+    );
+    const late = try findTestFacets(db, "late", 10);
+    defer freeFacetTestResult(late);
+    try std.testing.expectEqualStrings("facet_assignments_raw", late.source);
+    try std.testing.expectEqual(@as(usize, 1), late.matches.len);
+    try rebuildTestFacets(db);
+    try db.exec("UPDATE facet_assignments_raw SET value='edited',weight=0.3 WHERE workspace_id='ws' AND value='late'");
+    const edited = try findTestFacets(db, "edited", 10);
+    defer freeFacetTestResult(edited);
+    try std.testing.expectEqualStrings("facet_assignments_raw", edited.source);
+    try std.testing.expectEqual(@as(f32, 0.3), edited.matches[0].weight);
+    try rebuildTestFacets(db);
+    try db.exec("DELETE FROM facet_assignments_raw WHERE workspace_id='ws'");
+    const deleted = try findTestFacets(db, null, 10);
+    defer freeFacetTestResult(deleted);
+    try std.testing.expectEqualStrings("facet_assignments_raw", deleted.source);
+    try std.testing.expectEqual(@as(usize, 0), deleted.matches.len);
+    try rebuildTestFacets(db);
+    const empty = try findTestFacets(db, null, 10);
+    defer freeFacetTestResult(empty);
+    try std.testing.expectEqualStrings("facet_postings", empty.source);
+    try std.testing.expectEqual(@as(usize, 0), empty.matches.len);
+}
+
+test "collection facet bitmap is decoded and failed rebuild publication rolls back" {
+    var db = try facetTestDatabase();
+    defer db.close();
+    try rebuildTestFacets(db);
+    {
+        var tx = try facet_sqlite.Transaction.begin(db);
+        defer tx.deinit(); // Simulate interruption before commit.
+        try db.exec("DELETE FROM facet_assignments_raw WHERE workspace_id='ws'");
+        try std.testing.expectEqual(@as(u64, 0), try collection_facet_index.rebuild(std.testing.allocator, db, "ws", "ws::docs"));
+    }
+    const restored = try findTestFacets(db, null, 10);
+    defer freeFacetTestResult(restored);
+    try std.testing.expectEqualStrings("facet_postings", restored.source);
+    try std.testing.expectEqual(@as(usize, 4), restored.matches.len);
+    // Prove that this path consumes actual bitmap bytes, not just the raw rows.
+    try db.exec("UPDATE collection_facet_postings SET posting_blob=x'00' WHERE workspace_id='ws'");
+    try std.testing.expectError(error.DeserializeFailed, findTestFacets(db, null, 10));
+    // The failed read must release its savepoint and leave the connection usable.
+    try rebuildTestFacets(db);
+    const recovered = try findTestFacets(db, "shared", 10);
+    defer freeFacetTestResult(recovered);
+    try std.testing.expectEqual(@as(usize, 2), recovered.matches.len);
+}
+
+test "collection facet exact filters run before ranking and limits" {
+    var db = try facetTestDatabase();
+    defer db.close();
+    try rebuildTestFacets(db);
+    const exact = try searchCollectionFacetsFiltered(std.testing.allocator, db, "ws", "ws::docs", null, "topic", "category", "shared", 1, .{
+        .target_kind = "chunk",
+        .doc_id = 9007199254740993,
+        .chunk_index = 0,
+        .ontology_id = "a",
+    });
+    defer freeFacetTestResult(exact);
+    try std.testing.expectEqualStrings("facet_postings", exact.source);
+    try std.testing.expectEqual(@as(usize, 1), exact.matches.len);
+    try std.testing.expectEqualStrings("a", exact.matches[0].ontology_id);
+    try std.testing.expectEqual(@as(f32, 0.4), exact.matches[0].weight);
+    try std.testing.expectError(error.BadRequest, searchCollectionFacetsFiltered(std.testing.allocator, db, "ws", "ws::docs", null, null, null, null, 10, .{ .target_kind = "doc", .chunk_index = 0 }));
+    try std.testing.expectError(error.BadRequest, searchCollectionFacetsFiltered(std.testing.allocator, db, "ws", "ws::docs", null, null, null, null, 10, .{ .target_kind = "invalid" }));
 }
