@@ -90,3 +90,16 @@ idempotent; different definitions for the same public id are conflicts.
 
 This implementation is SQLite-first. Postgres parity is a sibling contract and
 must be implemented separately when the plan is widened.
+
+### Exact legacy analysis-plan selection
+
+`GET /api/mindbrain/ghostcrab/pack-projections` accepts
+`selection_mode=exact` with explicit `workspace_id`, `agent_id` and `scope`.
+An optional `plan_id` selects the exact projection row id. This mode ignores
+`query` for plan selection and returns at most two active, unexpired rows;
+two rows mean ambiguity, not permission to choose the first. Global null scopes
+and foreign workspace scopes never substitute for the requested plan. The
+response echoes `selection_mode` and includes each row's `scope` and `id`.
+Consumers must verify that echo before trusting an older backend. Default
+`selection_mode=search` preserves text discovery. The question used to retrieve
+facts belongs to the consumer and need not match the plan definition.

@@ -3971,19 +3971,28 @@ pub const MindbrainHttpApp = struct {
             15;
         if (limit == 0 or limit > 500) return error.BadRequest;
 
-        const rows = try ontology_sqlite.materializePackProjections(
-            db,
-            allocator,
-            agent_id,
-            workspace_id,
-            scope,
-            query_text,
-            limit,
-        );
+        const selection_mode = (try queryValue(allocator, query, "selection_mode")) orelse "search";
+        const exact = std.mem.eql(u8, selection_mode, "exact");
+        if (!exact and !std.mem.eql(u8, selection_mode, "search")) return error.BadRequest;
+        const plan_id = try queryValue(allocator, query, "plan_id");
+        if (!exact and plan_id != null) return error.BadRequest;
+        const rows = if (exact)
+            try ontology_sqlite.selectExactPackProjections(db, allocator, agent_id, workspace_id orelse return error.BadRequest, scope orelse return error.BadRequest, plan_id)
+        else
+            try ontology_sqlite.materializePackProjections(
+                db,
+                allocator,
+                agent_id,
+                workspace_id,
+                scope,
+                query_text,
+                limit,
+            );
         defer ontology_sqlite.deinitProjectionRows(allocator, rows);
 
         const ResponseRow = struct {
             id: []const u8,
+            scope: ?[]const u8,
             proj_type: []const u8,
             content: []const u8,
             weight: f32,
@@ -3998,6 +4007,7 @@ pub const MindbrainHttpApp = struct {
         for (rows, 0..) |row, index| {
             response_rows[index] = .{
                 .id = row.id,
+                .scope = row.scope,
                 .proj_type = row.proj_type,
                 .content = row.content,
                 .weight = row.weight,
@@ -4015,6 +4025,7 @@ pub const MindbrainHttpApp = struct {
             .query = query_text,
             .scope = scope,
             .rows = response_rows,
+            .selection_mode = selection_mode,
         };
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();

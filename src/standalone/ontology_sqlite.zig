@@ -295,6 +295,40 @@ pub fn materializeProjections(
     return materialized.toOwnedSlice(allocator);
 }
 
+/// Exact legacy plan selection: never substitutes a global scope. Two rows
+/// intentionally signal ambiguity to the caller, regardless of its pack limit.
+pub fn selectExactPackProjections(
+    db: Database,
+    allocator: std.mem.Allocator,
+    agent_id: []const u8,
+    workspace_id: []const u8,
+    scope: []const u8,
+    plan_id: ?[]const u8,
+) ![]ProjectionRecord {
+    if (workspace_id.len == 0 or scope.len == 0 or agent_id.len == 0) return error.BadRequest;
+    if (!matchesProjectionScope(workspace_id, scope)) return allocator.alloc(ProjectionRecord, 0);
+    const stmt = try prepare(db, "SELECT id, agent_id, scope, proj_type, content, weight, source_ref, source_type, status FROM projections " ++
+        "WHERE agent_id = ?1 AND scope = ?2 AND (?3 IS NULL OR id = ?3) " ++
+        "AND status IN ('active','blocking') AND (expires_at_unix IS NULL OR expires_at_unix > strftime('%s','now')) " ++
+        "ORDER BY id LIMIT 2");
+    defer finalize(stmt);
+    try bindText(stmt, 1, agent_id);
+    try bindText(stmt, 2, scope);
+    if (plan_id) |id| try bindText(stmt, 3, id) else try bindNull(stmt, 3);
+    var rows = std.ArrayList(ProjectionRecord).empty;
+    errdefer {
+        for (rows.items) |row| deinitProjectionRecord(allocator, row);
+        rows.deinit(allocator);
+    }
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try rows.append(allocator, try projectionFromRow(allocator, stmt));
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
 pub fn materializePackProjections(
     db: Database,
     allocator: std.mem.Allocator,
@@ -1731,4 +1765,36 @@ test "taxonomy import rejects chunk_bits and doc_id outside posting range" {
         4,
         &.{big_node},
     ));
+}
+
+test "exact pack selects identity and rejects foreign global expired and ambiguous plans" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec("INSERT INTO projections(id,agent_id,scope,proj_type,content,status) VALUES ('p1','agent','ws:plan','GOAL','Launch method','active'), ('global','agent',NULL,'GOAL','Global method','active'), ('foreign','agent','other:plan','GOAL','Foreign','active'), ('expired','agent','ws:expired','GOAL','Old','active')");
+    try db.exec("UPDATE projections SET expires_at_unix=1 WHERE id='expired'");
+    const a = std.testing.allocator;
+    const exact = try selectExactPackProjections(db, a, "agent", "ws", "ws:plan", null);
+    defer deinitProjectionRows(a, exact);
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
+    try std.testing.expectEqualStrings("p1", exact[0].id);
+    for ([_][]const u8{ "ws:absent", "ws:expired", "other:plan" }) |scope| {
+        const absent = try selectExactPackProjections(db, a, "agent", "ws", scope, null);
+        defer deinitProjectionRows(a, absent);
+        try std.testing.expectEqual(@as(usize, 0), absent.len);
+    }
+    const wrong_agent = try selectExactPackProjections(db, a, "other", "ws", "ws:plan", null);
+    defer deinitProjectionRows(a, wrong_agent);
+    try std.testing.expectEqual(@as(usize, 0), wrong_agent.len);
+    try db.exec("INSERT INTO projections(id,agent_id,scope,proj_type,content,status) VALUES ('p2','agent','ws:plan','GOAL','Second','active')");
+    const ambiguous = try selectExactPackProjections(db, a, "agent", "ws", "ws:plan", null);
+    defer deinitProjectionRows(a, ambiguous);
+    try std.testing.expectEqual(@as(usize, 2), ambiguous.len);
+    const by_id = try selectExactPackProjections(db, a, "agent", "ws", "ws:plan", "p2");
+    defer deinitProjectionRows(a, by_id);
+    try std.testing.expectEqual(@as(usize, 1), by_id.len);
+    try std.testing.expectEqualStrings("p2", by_id[0].id);
+    const wrong_id = try selectExactPackProjections(db, a, "agent", "ws", "ws:plan", "foreign");
+    defer deinitProjectionRows(a, wrong_id);
+    try std.testing.expectEqual(@as(usize, 0), wrong_id.len);
 }
