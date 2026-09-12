@@ -28,6 +28,9 @@ comptime {
     _ = @import("schema_column_migrations.zig");
     _ = @import("facet_sqlite.zig");
     _ = @import("facts_sqlite.zig");
+    _ = @import("facts_index.zig");
+    _ = @import("entity_reference.zig");
+    _ = @import("evidence_sqlite.zig");
     _ = @import("facet_store.zig");
     _ = @import("fixture_loader.zig");
     _ = @import("fixture_repositories.zig");

@@ -658,7 +658,7 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     try db.exec("PRAGMA defer_foreign_keys = ON");
 
     if (options.overwrite_existing_workspace) {
-        try purgeBundleWorkspaceInOpenTransaction(db, bundle.scope.workspace_id);
+        try purgeBundleWorkspaceInOpenTransaction(db, allocator, bundle.scope.workspace_id);
     }
 
     for (bundle.workspaces) |row| {
@@ -1124,7 +1124,17 @@ fn logForeignKeyViolations(db: Database) void {
     }
 }
 
-fn purgeBundleWorkspaceInOpenTransaction(db: Database, workspace_id: []const u8) !void {
+fn purgeBundleWorkspaceInOpenTransaction(db: Database, allocator: Allocator, workspace_id: []const u8) !void {
+    // Facts share search table 1 across workspaces; remove only their own artifacts.
+    const facts = try facet_sqlite.prepare(db, "SELECT doc_id FROM agent_facts WHERE workspace_id=?1 AND doc_id IS NOT NULL");
+    defer facet_sqlite.finalize(facts);
+    try facet_sqlite.bindText(facts, 1, workspace_id);
+    while (true) {
+        const rc = c.sqlite3_step(facts);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try @import("search_sqlite.zig").syncDeleteSearchDocument(db, allocator, 1, try facet_sqlite.columnU64(facts, 0));
+    }
     const statements = [_][]const u8{
         \\DELETE FROM mindbrain_answer_events
         \\WHERE artifact_id IN (

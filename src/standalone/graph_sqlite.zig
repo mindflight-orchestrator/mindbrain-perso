@@ -60,6 +60,8 @@ pub const TraverseDirection = enum {
 };
 
 pub const TraverseRow = struct {
+    entity_id: u32 = 0,
+    path_entity_ids: []u32 = &.{},
     node_id: []const u8,
     node_label: []const u8,
     node_type: []const u8,
@@ -82,6 +84,7 @@ pub const TraverseResult = struct {
             if (row.edge_label) |edge_label| allocator.free(edge_label);
             for (row.path) |segment| allocator.free(segment);
             allocator.free(row.path);
+            allocator.free(row.path_entity_ids);
         }
         allocator.free(self.rows);
         self.* = undefined;
@@ -2657,9 +2660,6 @@ pub fn traverseWorkspace(
     depth: usize,
     target_name: ?[]const u8,
 ) !TraverseResult {
-    const filter: interfaces.GraphEdgeFilter = .{
-        .edge_types = edge_types,
-    };
     const start = loadTraverseEntityByName(db, allocator, workspace_id, start_name) catch |err| switch (err) {
         error.MissingRow => {
             return .{
@@ -2679,6 +2679,13 @@ pub fn traverseWorkspace(
     else
         null;
 
+    return traverseWorkspaceById(db, allocator, workspace_id, start.entity_id, direction, edge_types, depth, target_id);
+}
+
+pub fn traverseWorkspaceById(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8, start_id: u32, direction: TraverseDirection, edge_types: ?[]const []const u8, depth: usize, target_id: ?u32) !TraverseResult {
+    const filter: interfaces.GraphEdgeFilter = .{ .edge_types = edge_types };
+    const start = try loadTraverseEntityByIdInWorkspace(db, allocator, workspace_id, start_id);
+    defer deinitTraverseEntitySummary(allocator, start);
     var discovered_order = std.ArrayList(u32).empty;
     defer discovered_order.deinit(allocator);
     try discovered_order.append(allocator, start.entity_id);
@@ -4507,6 +4514,7 @@ fn buildTraverseRows(
             if (row.edge_label) |edge_label| allocator.free(edge_label);
             for (row.path) |segment| allocator.free(segment);
             allocator.free(row.path);
+            allocator.free(row.path_entity_ids);
         }
         allocator.free(rows);
     }
@@ -4516,7 +4524,7 @@ fn buildTraverseRows(
         const visit = visits.get(node_id) orelse return error.MissingRow;
 
         const path_ids = try buildTraversePathIds(allocator, visits, node_id);
-        defer allocator.free(path_ids);
+        errdefer allocator.free(path_ids);
         const path = try allocator.alloc([]const u8, path_ids.len);
         var path_initialized: usize = 0;
         errdefer {
@@ -4547,6 +4555,8 @@ fn buildTraverseRows(
         const metadata_json = try allocator.dupe(u8, summary.metadata_json);
 
         rows[index] = .{
+            .entity_id = node_id,
+            .path_entity_ids = path_ids,
             .node_id = node_id_text,
             .node_label = node_label,
             .node_type = node_type,

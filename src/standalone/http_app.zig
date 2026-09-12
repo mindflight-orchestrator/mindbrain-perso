@@ -2,6 +2,10 @@ const std = @import("std");
 const answer_artifacts = @import("answer_artifacts.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
 const facts_sqlite = @import("facts_sqlite.zig");
+const facts_index = @import("facts_index.zig");
+const entity_reference = @import("entity_reference.zig");
+const evidence_sqlite = @import("evidence_sqlite.zig");
+const knowledge_results = @import("knowledge_results.zig");
 const graph_diagnostics = @import("graph_diagnostics.zig");
 const graph_pattern_bridge = @import("graph_pattern_bridge.zig");
 const graph_sqlite = @import("graph_sqlite.zig");
@@ -105,6 +109,9 @@ const GhostcrabSearchRequest = struct {
     limit: usize = 50,
     table_id: ?u64 = null,
     collection_id: ?[]const u8 = null,
+    schema_id: ?[]const u8 = null,
+    filters: ?std.json.Value = null,
+    require_ready: bool = false,
 };
 
 const ReindexGraphRequest = struct {
@@ -1022,6 +1029,9 @@ pub const MindbrainHttpApp = struct {
                     error.UnsupportedQuery => .bad_request,
                     error.InvalidWorkspaceId => .bad_request,
                     error.NotFound => .not_found,
+                    error.AmbiguousReference, error.StaleCursor, error.IndexNotReady => .conflict,
+                    error.EvidenceProfileUnavailable => .not_found,
+                    error.InvalidEvidenceProfile, error.EvidenceLimitExceeded => .bad_request,
                     error.Forbidden => .forbidden,
                     error.MethodNotAllowed => .method_not_allowed,
                     else => .internal_server_error,
@@ -1197,6 +1207,38 @@ pub const MindbrainHttpApp = struct {
             return try self.handleSqlWriteStatus(allocator);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/evidence")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            const body = try self.readPostBody(allocator, request, body_buffer);
+            var input = try std.json.parseFromSliceLeaky(evidence_sqlite.Request, allocator, body, .{ .allocate = .alloc_always });
+            input.workspace_id = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
+            var db = try self.openDb();
+            defer db.close();
+            return toResponse(try helper_api.jsonResponse(allocator, try evidence_sqlite.get(db, allocator, input)));
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/ghostcrab/facts-index")) {
+            if (request.head.method == .GET) {
+                const workspace = try canonicalizeRequiredWorkspaceId(allocator, (try queryValue(allocator, query, "workspace_id")) orelse return error.BadRequest);
+                var db = try self.openDb();
+                defer db.close();
+                return toResponse(try helper_api.jsonResponse(allocator, .{ .workspace_id = workspace, .index = try facts_index.status(db, workspace) }));
+            }
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            const body = try self.readPostBody(allocator, request, body_buffer);
+            const input = try std.json.parseFromSliceLeaky(struct { workspace_id: []const u8 }, allocator, body, .{});
+            const workspace = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
+            self.writer_mutex.lockUncancelable(self.io);
+            defer self.writer_mutex.unlock(self.io);
+            if (self.writerSessionBlocking()) return try self.writerSessionBusyResponse(allocator);
+            const repair = try facts_index.reconcile(self.writer_db, allocator, workspace);
+            return toResponse(try helper_api.jsonResponse(allocator, .{ .workspace_id = workspace, .before = repair.before, .after = repair.after, .indexed = repair.indexed, .unchanged = repair.unchanged, .skipped = repair.skipped, .failed = repair.failed }));
+        }
+        if (std.mem.eql(u8, path, "/api/mindbrain/traverse")) {
+            if (request.head.method == .POST) return self.handleTypedTraverse(allocator, request, body_buffer);
+            if (request.head.method != .GET) return error.MethodNotAllowed;
+            return self.handleTraverse(allocator, query);
+        }
+
         if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
 
         if (std.mem.eql(u8, path, "/health")) {
@@ -1295,9 +1337,6 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/graph/subgraph")) {
             return try self.handleGraphSubgraph(allocator, query);
         }
-        if (std.mem.eql(u8, path, "/api/mindbrain/traverse")) {
-            return self.handleTraverse(allocator, query);
-        }
         if (std.mem.eql(u8, path, "/api/mindbrain/pack")) {
             return self.handlePack(allocator, query);
         }
@@ -1394,16 +1433,7 @@ pub const MindbrainHttpApp = struct {
             };
         }
 
-        // Keep the BM25/FTS surface warm on the write path so a freshly written
-        // fact is immediately searchable, instead of relying on the best-effort
-        // per-search catch-up in the MCP layer. table_id 1 is the agent_facts
-        // search table (FACETS_SEARCH_TABLE_ID). No-op unless the bm25 sync
-        // trigger for table_id 1 is registered. The fact is already committed;
-        // a sync error is logged but does not fail the response.
-        search_sqlite.syncSearchDocumentIfTriggered(self.writer_db, allocator, 1, result.doc_id, content, "english") catch |err| {
-            self.writer_failed += 1;
-            self.recordWriterError(self.writer_db, "facts.write.fts_sync", err);
-        };
+        // Fact/index synchronization is transactional in facts_sqlite.writeFact.
         _ = answer_artifacts.markWorkspaceLiveViewsStale(self.writer_db, workspace_id) catch |err| {
             self.writer_failed += 1;
             self.recordWriterError(self.writer_db, "facts.write.artifact_stale", err);
@@ -1634,6 +1664,12 @@ pub const MindbrainHttpApp = struct {
 
         var db = try self.openDb();
         defer db.close();
+        try db.exec("BEGIN");
+        defer db.exec("ROLLBACK") catch {};
+        const readiness = try facts_index.status(db, search_workspace_id);
+        if (search_request.require_ready and !readiness.ready) return error.IndexNotReady;
+        if (search_request.filters) |filters| if (filters != .object) return error.BadRequest;
+        const filters = search_sqlite.FactFilters{ .schema_id = search_request.schema_id, .json = if (search_request.filters) |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else "{}" };
 
         const table_id = (try search_sqlite.resolveSearchTableId(
             db,
@@ -1650,7 +1686,7 @@ pub const MindbrainHttpApp = struct {
         const bm25_matches = if (search_request.query.len == 0)
             try allocator.alloc(search_sqlite.Bm25Match, 0)
         else if (table_id == 1)
-            try search_sqlite.searchFts5Bm25Workspace(db, allocator, table_id, search_workspace_id, search_request.query, candidate_limit)
+            try search_sqlite.searchFts5Bm25WorkspaceFiltered(db, allocator, table_id, search_workspace_id, search_request.query, candidate_limit, filters)
         else
             try search_sqlite.searchFts5Bm25(db, allocator, table_id, search_request.query, candidate_limit);
         defer allocator.free(bm25_matches);
@@ -1658,7 +1694,7 @@ pub const MindbrainHttpApp = struct {
         const vector_matches = if (query_vector_f32.len == 0)
             try allocator.alloc(interfaces.VectorSearchMatch, 0)
         else if (table_id == 1)
-            try search_sqlite.searchEmbeddingExactTopKWorkspace(
+            try search_sqlite.searchEmbeddingExactTopKWorkspaceFiltered(
                 db,
                 allocator,
                 table_id,
@@ -1666,6 +1702,7 @@ pub const MindbrainHttpApp = struct {
                 query_vector_f32,
                 candidate_limit,
                 .cosine,
+                filters,
             )
         else
             try search_sqlite.searchEmbeddingExactTopK(
@@ -1705,6 +1742,8 @@ pub const MindbrainHttpApp = struct {
             .candidate_limit = candidate_limit,
             .returned = matches.len,
             .matches = matches,
+            .index = readiness,
+            .facts = if (table_id == 1) try knowledge_results.load(db, allocator, search_workspace_id, matches) else &.{},
         };
 
         var out: std.Io.Writer.Allocating = .init(allocator);
@@ -3629,7 +3668,7 @@ pub const MindbrainHttpApp = struct {
         };
         const body = try std.fmt.allocPrint(
             allocator,
-            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"collection_facet_targets":true,"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{},"live_answer_view_create":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
+            \\{{"kind":"mindbrain_capabilities","mindbrain_version":"{s}","features":{{"collection_facet_targets":true,"typed_entity_references":true,"native_fact_index":true,"evidence_get":true,"graph_diagnostics":{},"graph_gap_rules":{},"graph_gap_rules_import":{},"graph_gap_rules_delete":{},"graph_rule_evaluations":{},"graph_rule_evaluations_run":{},"graph_rule_events":{},"graph_pattern_query":{},"ontology_import":{},"ontology_compile_linkml":{},"ontology_inspect":{},"ontology_reconciliation":{},"quality_convergence":{},"quality_remediation_actions":{},"live_answer_view_create":{}}},"bitmap":{{"bitmap_mode_configured":"{s}","bitmap_mode_effective":"{s}","direct64_supported":false,"bitmap_element_domain":"u32_dense_ids"}}}}
         ,
             .{
                 mindbrain_version,
@@ -3872,6 +3911,23 @@ pub const MindbrainHttpApp = struct {
                 .body = body,
             };
         }
+    }
+
+    fn handleTypedTraverse(self: *MindbrainHttpApp, allocator: std.mem.Allocator, request: *http.Server.Request, body_buffer: []u8) !Response {
+        const Input = struct { workspace_id: []const u8, start_ref: entity_reference.Reference, target_ref: ?entity_reference.Reference = null, direction: graph_sqlite.TraverseDirection = .outbound, edge_labels: []const []const u8 = &.{}, depth: usize = 3 };
+        const body = try self.readPostBody(allocator, request, body_buffer);
+        const input = try std.json.parseFromSliceLeaky(Input, allocator, body, .{ .allocate = .alloc_always });
+        if (input.depth == 0 or input.depth > max_graph_traversal_depth or input.edge_labels.len > 50) return error.BadRequest;
+        const workspace = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
+        var db = try self.openDb();
+        defer db.close();
+        try db.exec("BEGIN");
+        defer db.exec("ROLLBACK") catch {};
+        const start = try entity_reference.resolve(db, workspace, input.start_ref);
+        const target: ?u32 = if (input.target_ref) |ref| try entity_reference.resolve(db, workspace, ref) else null;
+        var result = try graph_sqlite.traverseWorkspaceById(db, allocator, workspace, start, input.direction, if (input.edge_labels.len == 0) null else input.edge_labels, input.depth, target);
+        defer result.deinit(allocator);
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .workspace_id = workspace, .resolved_start_id = start, .resolved_target_id = target, .target_found = result.target_found, .rows = result.rows }));
     }
 
     fn handleTraverse(self: *MindbrainHttpApp, allocator: std.mem.Allocator, query: []const u8) !Response {

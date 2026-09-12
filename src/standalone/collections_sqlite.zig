@@ -1158,15 +1158,19 @@ fn ensureEntityRawAutoWith(db: Database, cache: ?*const RawGraphUpsertCache, spe
 /// from pre-UNIQUE exports), dropping the incoming external_id and rewiring
 /// relations onto the wrong entity.
 pub fn upsertEntityRawByExternalIdStrict(db: Database, spec: EntityRawAutoSpec) !u64 {
-    const existing_id: ?u64 = selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+    return upsertEntityRawByExternalIdStrictCached(db, null, spec);
+}
+
+pub fn upsertEntityRawByExternalIdStrictCached(db: Database, cache: ?*const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    const existing_id: ?u64 = selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (existing_id) |id| {
-        try updateEntityRawAutoById(db, id, spec);
+        try updateEntityRawAutoByIdWith(db, cache, id, spec);
         return id;
     }
-    if (selectEntityRawIdByNaturalKey(db, spec.workspace_id, spec.entity_type, spec.name)) |conflict_id| {
+    if (selectEntityRawIdByNaturalKeyWith(db, cache, spec.workspace_id, spec.entity_type, spec.name)) |conflict_id| {
         std.log.warn(
             "bundle import: entity external_id '{s}' is new, but workspace '{s}' already has a '{s}' named '{s}' (entity_id {d}) under a different identity; refusing to merge them",
             .{ spec.external_id, spec.workspace_id, spec.entity_type, spec.name, conflict_id },
@@ -1176,8 +1180,15 @@ pub fn upsertEntityRawByExternalIdStrict(db: Database, spec: EntityRawAutoSpec) 
         error.NotFound => {},
         else => return err,
     }
-    try insertEntityRawAutoWith(db, null, spec, .upsert);
-    return try selectEntityRawIdByExternalId(db, spec.workspace_id, spec.external_id);
+    try insertEntityRawAutoWith(db, cache, spec, .upsert);
+    return try selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id);
+}
+
+pub fn ensureEntityRawByExternalIdStrictCached(db: Database, cache: ?*const RawGraphUpsertCache, spec: EntityRawAutoSpec) !u64 {
+    return selectEntityRawIdByExternalIdWith(db, cache, spec.workspace_id, spec.external_id) catch |err| switch (err) {
+        error.NotFound => upsertEntityRawByExternalIdStrictCached(db, cache, spec),
+        else => err,
+    };
 }
 
 const EntityInsertKind = enum { upsert, ensure };
@@ -2447,4 +2458,24 @@ test "isOntologyFrozen reflects ontologies.frozen column" {
         .frozen = true,
     });
     try std.testing.expect(try isOntologyFrozen(db, "frozen_test::core"));
+}
+
+test "cached strict import preserves external identity and endpoint content" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try ensureWorkspace(db, .{ .workspace_id = "b1", .label = "b1" });
+    try ensureOntology(db, .{ .workspace_id = "b1", .ontology_id = "legal", .name = "legal" });
+    var cache = try RawGraphUpsertCache.init(db);
+    defer cache.deinit();
+    const spec: EntityRawAutoSpec = .{ .workspace_id = "b1", .ontology_id = "legal", .external_id = "assertion:a", .entity_type = "Assertion", .name = "same text" };
+    const first = try upsertEntityRawByExternalIdStrictCached(db, &cache, spec);
+    var duplicate = spec;
+    duplicate.external_id = "assertion:b";
+    try std.testing.expectError(error.EntityNaturalKeyCollision, upsertEntityRawByExternalIdStrictCached(db, &cache, duplicate));
+    var endpoint = spec;
+    endpoint.name = spec.external_id;
+    try std.testing.expectEqual(first, try ensureEntityRawByExternalIdStrictCached(db, &cache, endpoint));
+    try std.testing.expectEqual(first, try selectEntityRawIdByNaturalKey(db, "b1", "Assertion", "same text"));
+    try std.testing.expectError(error.NotFound, selectEntityRawIdByExternalId(db, "b1", "assertion:b"));
 }

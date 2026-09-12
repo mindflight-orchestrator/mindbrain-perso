@@ -387,6 +387,18 @@ pub fn searchFts5Bm25Workspace(
     query: []const u8,
     limit: usize,
 ) ![]Bm25Match {
+    return searchFts5Bm25WorkspaceFiltered(db, allocator, table_id, workspace_id, query, limit, .{});
+}
+
+pub fn searchFts5Bm25WorkspaceFiltered(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query: []const u8,
+    limit: usize,
+    filters: FactFilters,
+) ![]Bm25Match {
     if (limit == 0) return allocator.alloc(Bm25Match, 0);
 
     const match_query = try buildFts5OrQuery(allocator, query);
@@ -401,7 +413,7 @@ pub fn searchFts5Bm25Workspace(
         \\WHERE d.table_id = ?1 AND search_fts MATCH ?2
         \\  AND af.workspace_id = ?3
         \\  AND 
-    ++ facts_sqlite.activeWindowSql("af.") ++
+    ++ facts_sqlite.activeWindowSql("af.") ++ factFilterSql ++
         \\
         \\ORDER BY bm25(search_fts) ASC
         \\LIMIT ?4
@@ -413,6 +425,7 @@ pub fn searchFts5Bm25Workspace(
     try bindText(stmt, 2, match_query);
     try bindText(stmt, 3, workspace_id);
     try bindInt64(stmt, 4, limit);
+    try bindFactFilters(stmt, filters);
 
     var matches = std.ArrayList(Bm25Match).empty;
     defer matches.deinit(allocator);
@@ -441,6 +454,19 @@ pub fn searchEmbeddingExactTopKWorkspace(
     limit: usize,
     metric: interfaces.VectorDistanceMetric,
 ) ![]interfaces.VectorSearchMatch {
+    return searchEmbeddingExactTopKWorkspaceFiltered(db, allocator, table_id, workspace_id, query_vector, limit, metric, .{});
+}
+
+pub fn searchEmbeddingExactTopKWorkspaceFiltered(
+    db: Database,
+    allocator: std.mem.Allocator,
+    table_id: u64,
+    workspace_id: []const u8,
+    query_vector: []const f32,
+    limit: usize,
+    metric: interfaces.VectorDistanceMetric,
+    filters: FactFilters,
+) ![]interfaces.VectorSearchMatch {
     if (limit == 0 or query_vector.len == 0) return allocator.alloc(interfaces.VectorSearchMatch, 0);
 
     const sql = comptime
@@ -450,13 +476,13 @@ pub fn searchEmbeddingExactTopKWorkspace(
         \\WHERE e.table_id = ?1 AND e.dimensions = ?2
         \\  AND af.workspace_id = ?3
         \\  AND 
-    ++ facts_sqlite.activeWindowSql("af.")
-    ;
+    ++ facts_sqlite.activeWindowSql("af.") ++ factFilterSql;
     const stmt = try prepare(db, sql);
     defer finalize(stmt);
     try bindInt64(stmt, 1, table_id);
     try bindInt64(stmt, 2, query_vector.len);
     try bindText(stmt, 3, workspace_id);
+    try bindFactFilters(stmt, filters);
 
     var matches = std.ArrayList(interfaces.VectorSearchMatch).empty;
     defer matches.deinit(allocator);
@@ -1933,4 +1959,17 @@ test "search sqlite compact snapshot reports persisted artifact counts" {
     const toon = try compactSearchSnapshotToon(db, std.testing.allocator);
     defer std.testing.allocator.free(toon);
     try std.testing.expect(std.mem.indexOf(u8, toon, "kind: search_compact_snapshot") != null);
+}
+
+pub const FactFilters = struct { schema_id: ?[]const u8 = null, json: []const u8 = "{}" };
+const factFilterSql =
+    \\ AND (?5 IS NULL OR af.schema_id=?5)
+    \\ AND NOT EXISTS (SELECT 1 FROM json_each(?6) wanted WHERE NOT EXISTS (
+    \\ SELECT 1 FROM json_each(af.facets_json) actual WHERE actual.key=wanted.key
+    \\ AND ((wanted.type!='array' AND actual.type=wanted.type AND actual.value IS wanted.value)
+    \\ OR (wanted.type='array' AND EXISTS(SELECT 1 FROM json_each(wanted.value) choice WHERE choice.type=actual.type AND choice.value IS actual.value)))))
+;
+fn bindFactFilters(stmt: *c.sqlite3_stmt, filters: FactFilters) !void {
+    if (filters.schema_id) |value| try bindText(stmt, 5, value) else try facet_sqlite.bindNull(stmt, 5);
+    try bindText(stmt, 6, filters.json);
 }

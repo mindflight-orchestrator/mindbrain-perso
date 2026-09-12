@@ -1080,9 +1080,9 @@ fn applyFacetRecord(
         .metadata_json = entity_metadata,
     };
     _ = if (batch) |b|
-        try collections_sqlite.upsertEntityRawAutoCached(db, &b.graph_cache, entity_spec)
+        try collections_sqlite.upsertEntityRawByExternalIdStrictCached(db, &b.graph_cache, entity_spec)
     else
-        try collections_sqlite.upsertEntityRawAuto(db, entity_spec);
+        try collections_sqlite.upsertEntityRawByExternalIdStrict(db, entity_spec);
     report.entities_upserted += 1;
 
     if (effective.edges_mode != .provided) {
@@ -1428,6 +1428,25 @@ fn applyFromWsTables(
     return report;
 }
 
+fn registerEvidenceProfiles(a: std.mem.Allocator, db: facet_sqlite.Database, opts: ApplyOptions, mapping: ?std.json.Value) !void {
+    const value = mapping orelse return;
+    if (value != .object) return error.InvalidMapping;
+    const declared = value.object.get("evidence_profiles") orelse return;
+    const evidence = @import("evidence_sqlite.zig");
+    const profiles = std.json.parseFromValue([]evidence.Profile, a, declared, .{}) catch return error.InvalidEvidenceProfile;
+    defer profiles.deinit();
+    try evidence.validateProfiles(profiles.value);
+    const json = try std.json.Stringify.valueAlloc(a, declared, .{});
+    defer a.free(json);
+    const stmt = try facet_sqlite.prepare(db, "UPDATE ontologies SET metadata_json=json_set(metadata_json,'$.evidence_profiles',json(?3)) WHERE workspace_id=?1 AND ontology_id=?2 AND frozen=0");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, opts.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, opts.ontology_id);
+    try facet_sqlite.bindText(stmt, 3, json);
+    try facet_sqlite.stepDone(stmt);
+    if (facet_sqlite.c.sqlite3_changes(db.handle) == 0) return error.InvalidEvidenceProfile;
+}
+
 pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database, opts: ApplyOptions) !ApplyReport {
     var effective = opts;
     if (opts.mapping) |mapping| {
@@ -1452,11 +1471,17 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
         .workspace_id = effective.workspace_id,
         .label = effective.workspace_id,
     });
-    try collections_sqlite.ensureOntology(db, .{
-        .ontology_id = effective.ontology_id,
-        .workspace_id = effective.workspace_id,
-        .name = effective.ontology_id,
-    });
+    // Importing more data must preserve the declared ontology contract.
+    const ontology = try facet_sqlite.prepare(db, "INSERT INTO ontologies(ontology_id,workspace_id,name) VALUES(?1,?2,?1) ON CONFLICT(ontology_id) DO NOTHING");
+    defer facet_sqlite.finalize(ontology);
+    try facet_sqlite.bindText(ontology, 1, effective.ontology_id);
+    try facet_sqlite.bindText(ontology, 2, effective.workspace_id);
+    try facet_sqlite.stepDone(ontology);
+    const owner = try facet_sqlite.prepare(db, "SELECT 1 FROM ontologies WHERE ontology_id=?1 AND workspace_id=?2");
+    defer facet_sqlite.finalize(owner);
+    try facet_sqlite.bindText(owner, 1, effective.ontology_id);
+    try facet_sqlite.bindText(owner, 2, effective.workspace_id);
+    if (facet_sqlite.c.sqlite3_step(owner) != facet_sqlite.c.SQLITE_ROW) return error.WorkspaceMismatch;
 
     const contract_relations = if (opts.mapping) |mapping| mapping.contract_relations else &[_]ContractRelation{};
 
@@ -1471,7 +1496,8 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
         };
         var batch = try ApplyBatch.init(allocator, db);
         defer batch.deinit();
-        if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
+        try registerEvidenceProfiles(allocator, db, effective, mapping_value);
+        if (effective.mode == .reset) try purgeTaggedImport(allocator, db, effective.workspace_id, effective.source_tag);
         const report = try applyFromWsTables(allocator, db, effective, contract_relations, map, &batch);
         try db.exec("COMMIT");
         transaction_active = false;
@@ -1501,7 +1527,8 @@ pub fn applyImportReady(allocator: std.mem.Allocator, db: facet_sqlite.Database,
     };
     var batch = try ApplyBatch.init(allocator, db);
     defer batch.deinit();
-    if (effective.mode == .reset) try purgeTaggedImport(db, effective.workspace_id, effective.source_tag);
+    try registerEvidenceProfiles(allocator, db, effective, mapping_value);
+    if (effective.mode == .reset) try purgeTaggedImport(allocator, db, effective.workspace_id, effective.source_tag);
 
     var report = ApplyReport{};
     for (facets.rows, 0..) |_, row_idx| {
@@ -1593,13 +1620,13 @@ fn applyEdgeRow(allocator: std.mem.Allocator, db: facet_sqlite.Database, edges: 
         .metadata_json = metadata,
     };
     const source_id = if (batch) |b|
-        try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, source_spec)
+        try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, &b.graph_cache, source_spec)
     else
-        try collections_sqlite.ensureEntityRawAuto(db, source_spec);
+        try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, null, source_spec);
     const target_id = if (batch) |b|
-        try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, target_spec)
+        try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, &b.graph_cache, target_spec)
     else
-        try collections_sqlite.ensureEntityRawAuto(db, target_spec);
+        try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, null, target_spec);
 
     const edge_ext = try edgeExternalId(allocator, source, label, target);
     defer allocator.free(edge_ext);
@@ -1678,13 +1705,13 @@ fn deriveEdgesFromFacetRow(allocator: std.mem.Allocator, db: facet_sqlite.Databa
             .metadata_json = metadata,
         };
         const source_id = if (ctx.batch) |b|
-            try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, source_spec)
+            try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, &b.graph_cache, source_spec)
         else
-            try collections_sqlite.ensureEntityRawAuto(db, source_spec);
+            try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, null, source_spec);
         const target_id = if (ctx.batch) |b|
-            try collections_sqlite.ensureEntityRawAutoCached(db, &b.graph_cache, target_spec)
+            try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, &b.graph_cache, target_spec)
         else
-            try collections_sqlite.ensureEntityRawAuto(db, target_spec);
+            try collections_sqlite.ensureEntityRawByExternalIdStrictCached(db, null, target_spec);
         const relation_spec = collections_sqlite.RelationRawAutoSpec{
             .workspace_id = ctx.workspace_id,
             .ontology_id = ctx.ontology_id,
@@ -1847,7 +1874,17 @@ fn entityTypeFromSourceRef(allocator: std.mem.Allocator, workspace_id: []const u
     return endpointEntityType(allocator, workspace_id, source_ref);
 }
 
-fn purgeTaggedImport(db: facet_sqlite.Database, workspace_id: []const u8, source_tag: []const u8) !void {
+fn purgeTaggedImport(allocator: std.mem.Allocator, db: facet_sqlite.Database, workspace_id: []const u8, source_tag: []const u8) !void {
+    const indexed = try facet_sqlite.prepare(db, "SELECT doc_id FROM agent_facts WHERE workspace_id=?1 AND doc_id IS NOT NULL AND " ++ taggedJsonSourceSql);
+    defer facet_sqlite.finalize(indexed);
+    try facet_sqlite.bindText(indexed, 1, workspace_id);
+    try bindTaggedSourceTags(indexed, source_tag, 2);
+    while (true) {
+        const rc = facet_sqlite.c.sqlite3_step(indexed);
+        if (rc == facet_sqlite.c.SQLITE_DONE) break;
+        if (rc != facet_sqlite.c.SQLITE_ROW) return error.StepFailed;
+        try search_sqlite.syncDeleteSearchDocument(db, allocator, 1, try facet_sqlite.columnU64(indexed, 0));
+    }
     const del_facts =
         \\DELETE FROM agent_facts
         \\WHERE workspace_id = ?1
@@ -1975,7 +2012,7 @@ fn reindexProvenanceFactsSearch(allocator: std.mem.Allocator, db: *facet_sqlite.
         const doc_id = try facet_sqlite.columnU64(stmt, 0);
         const content = try facet_sqlite.dupeColumnText(allocator, stmt, 1);
         defer allocator.free(content);
-        search_sqlite.syncSearchDocumentIfTriggered(db.*, allocator, AgentFactsSearchTableId, doc_id, content, "english") catch continue;
+        try search_sqlite.syncSearchDocument(db.*, allocator, AgentFactsSearchTableId, doc_id, content, "english");
         synced += 1;
     }
     return synced;
@@ -2000,7 +2037,7 @@ fn reindexAgentFactsSearch(allocator: std.mem.Allocator, db: *facet_sqlite.Datab
         const doc_id = try facet_sqlite.columnU64(stmt, 0);
         const content = try facet_sqlite.dupeColumnText(allocator, stmt, 1);
         defer allocator.free(content);
-        search_sqlite.syncSearchDocumentIfTriggered(db.*, allocator, AgentFactsSearchTableId, doc_id, content, "english") catch continue;
+        try search_sqlite.syncSearchDocument(db.*, allocator, AgentFactsSearchTableId, doc_id, content, "english");
         synced += 1;
     }
     return synced;
@@ -2511,4 +2548,68 @@ test "applyFromWsTables works after stale raw graph migration marker repair" {
     try std.testing.expectEqual(@as(u64, 1), report.entities_upserted);
     try std.testing.expectEqual(@as(u64, 1), try countRows(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = 'ws-legacy-import'"));
     try std.testing.expectEqual(@as(u64, 1), try countRows(db, "SELECT COUNT(*) FROM structured_import_provenance WHERE workspace_id = 'ws-legacy-import'"));
+}
+
+test "structured B1 import indexes original facts and resolves declared source evidence" {
+    const evidence = @import("evidence_sqlite.zig");
+    const refs = @import("entity_reference.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "b1", .label = "b1" });
+    try collections_sqlite.ensureOntology(db, .{ .workspace_id = "b1", .ontology_id = "legal", .name = "legal" });
+    const mapping = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"evidence_profiles":[{"id":"legal-direct","representation":"direct_support","assertion_type":"b1:assertion","passage_type":"b1:passage","document_type":"b1:document","steps":[{"predicate":"SUPPORTS","direction":"inbound"},{"predicate":"CONTAINS_PASSAGE","direction":"inbound"}]}]}
+    , .{});
+    const opts: ApplyOptions = .{ .workspace_id = "b1", .ontology_id = "legal" };
+    try registerEvidenceProfiles(a, db, opts, mapping);
+    const relations = [_]ContractRelation{
+        .{ .source_type = "document", .target_type = "passage", .edge_label = "CONTAINS_PASSAGE", .source_ref_column = "document_ref" },
+        .{ .source_type = "passage", .target_type = "assertion", .edge_label = "SUPPORTS", .source_ref_column = "passage_ref" },
+    };
+    const source = "le 13.04.2023 à 16 heures.";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    const passage_meta = try std.json.Stringify.valueAlloc(a, .{ .entity_type = "passage", .document_ref = "document:document:d", .document_version = "v1", .start = 0, .end = source.len, .offset_unit = "utf8_bytes", .sha256 = hash[0..] }, .{});
+    const document_meta = try std.json.Stringify.valueAlloc(a, .{ .entity_type = "document", .source_text = source, .text_version = "v1" }, .{});
+    var report: ApplyReport = .{};
+    const records = [_]FacetRecord{
+        .{ .source_ref = "document:document:d", .schema_id = "legal:document", .content = "Ordonnance", .facets_json_raw = document_meta },
+        .{ .source_ref = "passage:passage:p", .schema_id = "legal:passage", .content = source, .facets_json_raw = passage_meta },
+        .{ .source_ref = "assertion:asrt_884ffc127f6a", .schema_id = "legal:assertion", .content = "Remise de l’ordonnance au greffe par mise à disposition.", .facets_json_raw = "{\"entity_type\":\"assertion\",\"passage_ref\":\"passage:passage:p\"}" },
+    };
+    for (records) |record| try applyFacetRecord(a, db, opts, record, &relations, &report, null);
+    _ = try reindexStructured(a, &db, "b1", .{ .scope = .graph });
+    const hits = try search_sqlite.searchFts5Bm25WorkspaceFiltered(db, a, 1, "b1", "Quand l'ordonnance de référé a-t-elle été remise au greffe par mise à disposition ?", 1, .{ .schema_id = "legal:assertion" });
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    const reference: refs.Reference = .{ .kind = .external_id, .value = .{ .string = records[2].source_ref } };
+    const resolved = try refs.resolve(db, "b1", reference);
+    var paths = try @import("graph_sqlite.zig").traverseWorkspaceById(db, a, "b1", resolved, .inbound, &.{"SUPPORTS"}, 1, null);
+    defer paths.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), paths.rows.len);
+    try std.testing.expect(paths.rows[0].entity_id > 0);
+    const request: evidence.Request = .{ .workspace_id = "b1", .assertion_ref = reference };
+    const result = try evidence.get(db, a, request);
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(usize, 1), result.paths.len);
+    try std.testing.expect(result.paths[0].evidence_ref == null);
+    try std.testing.expectEqualStrings("verified", result.paths[0].text_status);
+    try std.testing.expectEqualStrings(source, result.paths[0].text.?);
+    try std.testing.expect(result.paths[0].document.?.metadata.object.get("source_text") == null);
+    try std.testing.expectError(error.NotFound, evidence.get(db, a, .{ .workspace_id = "foreign", .assertion_ref = reference }));
+    try db.exec("UPDATE entities_raw SET metadata_json=json_set(metadata_json,'$.sha256','wrong') WHERE external_id='passage:passage:p'");
+    _ = try reindexStructured(a, &db, "b1", .{ .scope = .graph });
+    const invalid = try evidence.get(db, a, request);
+    try std.testing.expect(!invalid.complete);
+    try std.testing.expectEqualStrings("hash_mismatch", invalid.paths[0].text_status);
+    try std.testing.expect(invalid.paths[0].text == null);
+    try std.testing.expectError(error.StaleCursor, evidence.get(db, a, .{ .workspace_id = "b1", .assertion_ref = reference, .cursor = try std.fmt.allocPrint(a, "{s}:0", .{result.snapshot}) }));
+    try db.exec("UPDATE entities_raw SET metadata_json=json_remove(metadata_json,'$.source_text') WHERE external_id='document:document:d'");
+    _ = try reindexStructured(a, &db, "b1", .{ .scope = .graph });
+    const missing = try evidence.get(db, a, request);
+    try std.testing.expectEqualStrings("not_stored", missing.paths[0].text_status);
 }

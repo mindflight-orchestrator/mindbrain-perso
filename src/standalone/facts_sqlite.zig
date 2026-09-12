@@ -1,4 +1,5 @@
 const std = @import("std");
+const search_sqlite = @import("search_sqlite.zig");
 
 const facet_sqlite = @import("facet_sqlite.zig");
 const nanoid = @import("nanoid.zig");
@@ -92,6 +93,8 @@ pub fn writeFactWithOptions(
         const updated = try updateFactBySourceRef(db, write, source_ref);
         if (updated) {
             const selected = try selectFactBySourceRef(db, allocator, write.workspace_id, source_ref);
+            errdefer allocator.free(selected.id);
+            try search_sqlite.syncSearchDocument(db, allocator, 1, selected.doc_id, write.content, "english");
             if (options.manage_transaction) try commitTransaction(db, &transaction_active);
             return .{
                 .id = selected.id,
@@ -110,6 +113,7 @@ pub fn writeFactWithOptions(
 
     try insertFact(db, write, id);
     const doc_id = try selectDocIdById(db, id);
+    try search_sqlite.syncSearchDocument(db, allocator, 1, doc_id, write.content, "english");
     if (options.manage_transaction) try commitTransaction(db, &transaction_active);
     return .{
         .id = id,
