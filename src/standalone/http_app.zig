@@ -4136,11 +4136,11 @@ pub const MindbrainHttpApp = struct {
             create_request.public_label,
             definition_json,
         ) catch |err| switch (err) {
-            error.InvalidArtifactRequest => return jsonResponseWithStatus(allocator, .bad_request, .{
+            error.InvalidArtifactRequest, error.InvalidProjectionContract, error.ProjectionOntologyMismatch => return jsonResponseWithStatus(allocator, .bad_request, .{
                 .ok = false,
                 .@"error" = .{
                     .code = "invalid_artifact_request",
-                    .message = "invalid live answer view slug, label or definition",
+                    .message = "invalid live answer view slug, label, projection contract or ontology binding",
                 },
             }),
             error.MissingWorkspace => return jsonResponseWithStatus(allocator, .not_found, .{
@@ -4185,10 +4185,15 @@ pub const MindbrainHttpApp = struct {
     fn handleGhostcrabArtifactGet(self: *MindbrainHttpApp, allocator: std.mem.Allocator, artifact_id: []const u8) !Response {
         var db = try self.openDb();
         defer db.close();
+        try db.exec("BEGIN");
+        defer db.exec("ROLLBACK") catch {};
         const row = (try answer_artifacts.getArtifact(db, allocator, artifact_id)) orelse return error.NotFound;
         defer row.deinit(allocator);
+        const answer_json = if (row.workspace_id) |ws| try @import("projection_contract.zig").readAnswer(db, allocator, ws, row.payload_json) else null;
+        defer if (answer_json) |value| allocator.free(value);
         return jsonResponseWithStatus(allocator, .ok, .{
             .artifact_id = row.artifact_id,
+            .answer_json = answer_json,
             .slug = row.slug,
             .workspace_id = row.workspace_id,
             .agent_id = row.agent_id,

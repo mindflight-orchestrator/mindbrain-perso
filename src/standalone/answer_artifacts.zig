@@ -3,6 +3,7 @@ const facet_sqlite = @import("facet_sqlite.zig");
 
 const Database = facet_sqlite.Database;
 const c = facet_sqlite.c;
+const projection_contract = @import("projection_contract.zig");
 
 pub const ArtifactRow = struct {
     artifact_id: []const u8,
@@ -135,7 +136,7 @@ pub fn createLiveAnswerView(
     if (definition.value != .object or definition.value.object.count() == 0) {
         return error.InvalidArtifactRequest;
     }
-    if (definition.value.object.contains("materialized")) return error.InvalidArtifactRequest;
+    if (definition.value.object.contains("materialized") or definition.value.object.contains("qualified_result")) return error.InvalidArtifactRequest;
 
     const artifact_id = try std.fmt.allocPrint(allocator, "live_answer_view__{s}", .{slug});
     defer allocator.free(artifact_id);
@@ -144,6 +145,7 @@ pub fn createLiveAnswerView(
     errdefer db.exec("ROLLBACK") catch {};
 
     if (!try workspaceExists(db, workspace_id)) return error.MissingWorkspace;
+    if (definition.value.object.get("projection_contract")) |contract| try projection_contract.validate(db, allocator, workspace_id, contract);
 
     if (try getArtifact(db, allocator, artifact_id)) |existing| {
         if (!liveAnswerDefinitionMatches(existing, workspace_id, slug, public_label, definition.value, allocator)) {
@@ -193,7 +195,7 @@ pub fn refreshLiveAnswerView(db: Database, allocator: std.mem.Allocator, artifac
     const from_version = row.current_version;
     const to_version = from_version + 1;
     const payload_json = if (row.workspace_id) |workspace_id|
-        try materializeWorkspacePayload(db, allocator, row.payload_json, workspace_id)
+        (try projection_contract.materialize(db, allocator, workspace_id, row.payload_json)) orelse try materializeWorkspacePayload(db, allocator, row.payload_json, workspace_id)
     else
         try allocator.dupe(u8, row.payload_json);
     defer allocator.free(payload_json);
@@ -452,7 +454,7 @@ fn liveAnswerDefinitionMatches(
     defer payload.deinit();
     if (definition != .object or payload.value != .object) return false;
 
-    const payload_extra: usize = if (payload.value.object.contains("materialized")) 1 else 0;
+    const payload_extra: usize = @as(usize, if (payload.value.object.contains("materialized")) 1 else 0) + @as(usize, if (payload.value.object.contains("qualified_result")) 1 else 0);
     if (payload.value.object.count() != definition.object.count() + payload_extra) return false;
     var iterator = definition.object.iterator();
     while (iterator.next()) |entry| {
