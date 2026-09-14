@@ -10,6 +10,7 @@ and search APIs that compose with BM25/vector retrieval.
 | `GET` | `/api/mindbrain/collections/facet-search` | Search raw/derived collection facets by workspace, collection, optional table id, namespace, dimension, value, and limit. |
 | `GET` | `/api/mindbrain/search-compact-info` | TOON snapshot of compact search artifacts. |
 | `POST` | `/api/mindbrain/search-embedding-upsert` | Store `{table_id, doc_id, embedding}` JSON arrays into `search_embeddings.embedding_blob` as little-endian `f32` bytes. |
+| `POST` | `/api/mindbrain/search-embedding-batch-upsert` | Store up to 1000 `{table_id, doc_id, embedding}` items transactionally; all vectors must share one dimension. |
 | `POST` | `/api/mindbrain/ghostcrab/search` | Resolve a workspace search table, run BM25, vector, or hybrid retrieval, and return fused JSON matches for GhostCrab SQLite consumers. |
 
 `/api/mindbrain/collections/facet-search` accepts:

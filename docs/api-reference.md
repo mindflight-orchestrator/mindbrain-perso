@@ -167,11 +167,14 @@ Required string fields must be non-empty. `value_id` must be non-negative.
 | Method | Path | Body | Response |
 |--------|------|------|----------|
 | `POST` | `/api/mindbrain/search-embedding-upsert` | `{ "table_id": 77, "doc_id": 123, "embedding": [0.1, 0.2] }` | `{ ok, table_id, doc_id, dimensions, bytes }` |
+| `POST` | `/api/mindbrain/search-embedding-batch-upsert` | `{ "items": [{ "table_id": 77, "doc_id": 123, "embedding": [0.1, 0.2] }] }` | `{ ok, processed, dimensions }` |
 | `POST` | `/api/mindbrain/ghostcrab/search` | `{ "workspace_id": "ws", "query": "...", "embedding": [...], "vector_weight": 0.5, "limit": 50, "table_id": 77, "collection_id": "ws::docs" }` | JSON fused BM25/vector matches |
 | `POST` | `/api/mindbrain/graph/pattern-query` | `{ "query": "WORKSPACE ws ...", "backend": "sqlite"\|"postgres", "options": {}, "debug": false }` | JSON GPQ result; `503` when the Postgres backend cannot execute |
 
-`search-embedding-upsert` and `ghostcrab/search` accept JSON number arrays and
-convert them to packed little-endian `f32` vectors. `ghostcrab/search` requires
+The embedding write endpoints and `ghostcrab/search` accept JSON number arrays
+and convert them to packed little-endian `f32` vectors. Batch writes are
+transactional, limited to 1000 items, and require one shared dimension.
+`ghostcrab/search` requires
 a non-empty `workspace_id`, `limit` in `1..1000`, and `vector_weight` in
 `0..1`. If both text query and embedding are supplied, results are hybrid
 BM25/vector; with only one input, the route runs the corresponding retrieval

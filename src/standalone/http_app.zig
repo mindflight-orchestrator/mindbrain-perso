@@ -101,6 +101,16 @@ const SearchEmbeddingUpsertRequest = struct {
     embedding: []const f64 = &.{},
 };
 
+const SearchEmbeddingBatchItem = struct {
+    table_id: ?u64 = null,
+    doc_id: ?u64 = null,
+    embedding: []const f64 = &.{},
+};
+
+const SearchEmbeddingBatchUpsertRequest = struct {
+    items: []const SearchEmbeddingBatchItem = &.{},
+};
+
 const GhostcrabSearchRequest = struct {
     workspace_id: []const u8,
     query: []const u8 = "",
@@ -1083,6 +1093,11 @@ pub const MindbrainHttpApp = struct {
             return try self.handleSearchEmbeddingUpsert(allocator, request, body_buffer);
         }
 
+        if (std.mem.eql(u8, path, "/api/mindbrain/search-embedding-batch-upsert")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleSearchEmbeddingBatchUpsert(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/sql")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleSqlRequest(allocator, request, body_buffer, false);
@@ -1487,6 +1502,43 @@ pub const MindbrainHttpApp = struct {
                 .bytes = values.len * @sizeOf(f32),
             }),
         );
+    }
+
+    fn handleSearchEmbeddingBatchUpsert(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        body_buffer: []u8,
+    ) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        const batch = try parseSearchEmbeddingBatchUpsertBody(allocator, body);
+
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writerSessionBlocking()) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+
+        const dimensions = upsertSearchEmbeddingBatch(self.writer_db, allocator, batch.items) catch |err| switch (err) {
+            error.BadRequest => return error.BadRequest,
+            else => {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "search_embedding.batch", err);
+                return try self.sqliteErrorResponse(allocator, self.writer_db, .internal_server_error, "search_embedding.batch", err, null);
+            },
+        };
+        self.writer_completed += 1;
+
+        return toResponse(try helper_api.jsonResponse(allocator, .{
+            .ok = true,
+            .processed = batch.items.len,
+            .dimensions = dimensions,
+        }));
     }
 
     fn parseSearchEmbeddingUpsertRequest(
@@ -5136,6 +5188,7 @@ fn printUsage() !void {
         \\  POST /api/mindbrain/sql/session/close
         \\  POST /api/mindbrain/facts/write
         \\  POST /api/mindbrain/search-embedding-upsert
+        \\  POST /api/mindbrain/search-embedding-batch-upsert
         \\  POST /api/mindbrain/ghostcrab/search
         \\  POST /api/mindbrain/ghostcrab/artifact
         \\  POST /api/mindbrain/reindex/graph
@@ -5860,6 +5913,61 @@ fn parseSearchEmbeddingUpsertBody(allocator: std.mem.Allocator, body: []const u8
     };
 }
 
+fn parseSearchEmbeddingBatchUpsertBody(allocator: std.mem.Allocator, body: []const u8) !SearchEmbeddingBatchUpsertRequest {
+    return std.json.parseFromSliceLeaky(
+        SearchEmbeddingBatchUpsertRequest,
+        allocator,
+        body,
+        .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.BadRequest,
+    };
+}
+
+fn upsertSearchEmbeddingBatch(
+    db: facet_sqlite.Database,
+    allocator: std.mem.Allocator,
+    items: []const SearchEmbeddingBatchItem,
+) !usize {
+    if (items.len == 0 or items.len > 1000) return error.BadRequest;
+
+    var dimensions: ?usize = null;
+    for (items) |item| {
+        if (item.table_id == null or item.doc_id == null) return error.BadRequest;
+        const values = try copyFiniteEmbeddingF32(allocator, item.embedding);
+        defer allocator.free(values);
+        if (dimensions) |expected| {
+            if (values.len != expected) return error.BadRequest;
+        } else {
+            dimensions = values.len;
+        }
+    }
+
+    try db.exec("BEGIN IMMEDIATE");
+    var transaction_active = true;
+    errdefer if (transaction_active) db.exec("ROLLBACK") catch {};
+
+    for (items) |item| {
+        const values = try copyFiniteEmbeddingF32(allocator, item.embedding);
+        defer allocator.free(values);
+        try search_sqlite.upsertSearchEmbedding(
+            db,
+            allocator,
+            item.table_id.?,
+            item.doc_id.?,
+            values,
+        );
+    }
+
+    try db.exec("COMMIT");
+    transaction_active = false;
+    return dimensions.?;
+}
+
 fn testCountSqlRows(db: facet_sqlite.Database, sql: []const u8) !i64 {
     const stmt = try facet_sqlite.prepare(db, sql);
     defer facet_sqlite.finalize(stmt);
@@ -6559,6 +6667,38 @@ test "http search embedding request rejects malformed JSON bodies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.BadRequest, parseSearchEmbeddingUpsertBody(arena.allocator(), "{\"table_id\":1,\"doc_id\":2,\"embedding\":[0.1],\"extra\":true}"));
+}
+
+test "http search embedding batch request parses strict vector items" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const batch = try parseSearchEmbeddingBatchUpsertBody(arena.allocator(), "{\"items\":[{\"table_id\":1,\"doc_id\":2,\"embedding\":[0.25,-0.5]},{\"table_id\":1,\"doc_id\":3,\"embedding\":[0.5,0.25]}]}");
+    try std.testing.expectEqual(@as(usize, 2), batch.items.len);
+    try std.testing.expectEqual(@as(?u64, 3), batch.items[1].doc_id);
+    try std.testing.expectEqual(@as(usize, 2), batch.items[0].embedding.len);
+    try std.testing.expectError(error.BadRequest, parseSearchEmbeddingBatchUpsertBody(arena.allocator(), "{\"items\":[],\"extra\":true}"));
+}
+
+test "http search embedding batch persists packed vectors transactionally" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    for ([_]u64{ 2, 3, 4, 5 }) |doc_id| {
+        try search_sqlite.upsertSearchDocument(db, 1, doc_id, "batch embedding fixture", "english");
+    }
+
+    const dimensions = try upsertSearchEmbeddingBatch(db, std.testing.allocator, &.{
+        .{ .table_id = 1, .doc_id = 2, .embedding = &.{ 0.25, -0.5 } },
+        .{ .table_id = 1, .doc_id = 3, .embedding = &.{ 0.5, 0.25 } },
+    });
+    try std.testing.expectEqual(@as(usize, 2), dimensions);
+    try std.testing.expectEqual(@as(i64, 2), try testCountSqlRows(db, "SELECT COUNT(*) FROM search_embeddings WHERE table_id = 1"));
+
+    try std.testing.expectError(error.BadRequest, upsertSearchEmbeddingBatch(db, std.testing.allocator, &.{
+        .{ .table_id = 1, .doc_id = 4, .embedding = &.{0.5} },
+        .{ .table_id = 1, .doc_id = 5, .embedding = &.{ 0.5, 0.25 } },
+    }));
+    try std.testing.expectEqual(@as(i64, 0), try testCountSqlRows(db, "SELECT COUNT(*) FROM search_embeddings WHERE doc_id IN (4, 5)"));
 }
 
 test "decodeQueryComponent handles plus and colon encoding" {
