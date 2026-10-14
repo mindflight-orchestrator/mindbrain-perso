@@ -542,14 +542,21 @@ pub const MindbrainHttpApp = struct {
                 log.warn("database has {d} pre-existing foreign key violations; affected parent deletes will fail (set MINDBRAIN_SQLITE_FOREIGN_KEYS=off to bypass)", .{fk_violations});
             }
         }
-        try workspace_sqlite.upsertWorkspace(
-            db,
-            self.default_workspace_id_owned,
-            self.default_workspace_domain_json_owned,
-        );
-        if (self.default_workspace_label_owned != null or self.default_workspace_description_owned != null) {
-            try self.updateDefaultWorkspaceMetadata(db);
+        // Defaults seed a new workspace; restarting an occupied database must
+        // preserve its owner-defined metadata. Serialize the check and seed.
+        try db.exec("BEGIN IMMEDIATE");
+        errdefer db.exec("ROLLBACK") catch {};
+        if (!try workspace_sqlite.workspaceExists(db, self.default_workspace_id_owned)) {
+            try workspace_sqlite.upsertWorkspace(
+                db,
+                self.default_workspace_id_owned,
+                self.default_workspace_domain_json_owned,
+            );
+            if (self.default_workspace_label_owned != null or self.default_workspace_description_owned != null) {
+                try self.updateDefaultWorkspaceMetadata(db);
+            }
         }
+        try db.exec("COMMIT");
 
         if (self.warn_on_empty_graph and try self.graphEntityCount(db) == 0) {
             log.warn("standalone sqlite is empty at {s}; bootstrap it with the baseline SQL before starting the dashboard", .{self.db_path});
@@ -1083,6 +1090,11 @@ pub const MindbrainHttpApp = struct {
         query: []const u8,
         body_buffer: []u8,
     ) !Response {
+        if (std.mem.eql(u8, path, "/api/mindbrain/facts/delete")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleFactDelete(allocator, request, body_buffer);
+        }
+
         if (std.mem.eql(u8, path, "/api/mindbrain/facts/write")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleFactWrite(allocator, request, body_buffer);
@@ -1126,6 +1138,11 @@ pub const MindbrainHttpApp = struct {
         if (std.mem.eql(u8, path, "/api/mindbrain/reindex/graph")) {
             if (request.head.method != .POST) return error.MethodNotAllowed;
             return try self.handleReindexGraph(allocator, request, body_buffer);
+        }
+
+        if (std.mem.eql(u8, path, "/api/mindbrain/graph/business-adjacency")) {
+            if (request.head.method != .POST) return error.MethodNotAllowed;
+            return try self.handleBusinessAdjacency(allocator, request, body_buffer);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/reindex/all")) {
@@ -1380,6 +1397,31 @@ pub const MindbrainHttpApp = struct {
         }
 
         return self.handleStatic(allocator, path);
+    }
+
+    fn handleFactDelete(self: *MindbrainHttpApp, allocator: std.mem.Allocator, request: *http.Server.Request, body_buffer: []u8) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        var input = std.json.parseFromSliceLeaky(facts_sqlite.FactDelete, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadRequest;
+        input.workspace_id = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writerSessionBlocking()) return try self.writerSessionBusyResponse(allocator);
+        const result = facts_sqlite.deleteFact(self.writer_db, allocator, input) catch |err| switch (err) {
+            error.InvalidFactDelete => return error.BadRequest,
+            error.VersionConflict => return jsonResponseWithStatus(allocator, .conflict, .{ .ok = false, .@"error" = .{ .code = "version_conflict", .message = "The record version changed; read it again." } }),
+            else => return err,
+        };
+        if (result.deleted) {
+            _ = answer_artifacts.markWorkspaceLiveViewsStale(self.writer_db, input.workspace_id) catch |err| {
+                self.writer_failed += 1;
+                self.recordWriterError(self.writer_db, "facts.delete.artifact_stale", err);
+            };
+        }
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .found = result.found, .deleted = result.deleted, .version = result.version }));
     }
 
     fn handleFactWrite(
@@ -1852,6 +1894,21 @@ pub const MindbrainHttpApp = struct {
             .content_type = "application/json; charset=utf-8",
             .body = try out.toOwnedSlice(),
         };
+    }
+
+    fn handleBusinessAdjacency(self: *MindbrainHttpApp, allocator: std.mem.Allocator, request: *http.Server.Request, body_buffer: []u8) !Response {
+        const content_length = request.head.content_length orelse return error.BadRequest;
+        if (content_length == 0 or content_length > self.max_body_bytes) return error.BadRequest;
+        const reader = request.readerExpectNone(body_buffer);
+        const body = try reader.readAlloc(allocator, @intCast(content_length));
+        const Input = struct { workspace_id: []const u8 };
+        const input = try std.json.parseFromSliceLeaky(Input, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
+        self.writer_mutex.lockUncancelable(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (self.writerSessionBlocking()) return try self.writerSessionBusyResponse(allocator);
+        const count = try graph_sqlite.rebuildBusinessWorkspaceAdjacency(self.writer_db, allocator, workspace_id);
+        return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .workspace_id = workspace_id, .adjacency_rebuilt = true, .entity_count = count }));
     }
 
     fn handleReindexGraph(

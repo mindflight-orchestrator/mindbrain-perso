@@ -2386,6 +2386,40 @@ pub fn rebuildAdjacencyForWorkspace(
     try rebuildLjForEntitiesInWorkspace(db, entity_ids, workspace_id, allocator);
 }
 
+/// Reconcile only the adjacency/degree indices belonging to this workspace.
+/// Does not replay raw data or remove diagnostic history or ontology rows.
+pub fn rebuildBusinessWorkspaceAdjacency(db: Database, allocator: std.mem.Allocator, workspace_id: []const u8) !usize {
+    const stmt = try prepare(db, "SELECT entity_id FROM graph_entity WHERE workspace_id=?1 AND deprecated_at IS NULL ORDER BY entity_id");
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(allocator);
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return error.StepFailed;
+        try ids.append(allocator, try columnU32(stmt, 0));
+    }
+    try rebuildAdjacencyForWorkspace(db, allocator, workspace_id, ids.items);
+    return ids.items.len;
+}
+
+test "business adjacency repairs removed relations without touching foreign workspace" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec("INSERT INTO graph_entity(entity_id,workspace_id,entity_type,name) VALUES(1,'own','building','A'),(2,'own','building','B'),(3,'foreign','building','C'),(4,'foreign','building','D')");
+    try db.exec("INSERT INTO graph_relation(relation_id,workspace_id,relation_type,source_id,target_id) VALUES(10,'own','contains',1,2),(20,'foreign','contains',3,4)");
+    _ = try rebuildBusinessWorkspaceAdjacency(db, std.testing.allocator, "own");
+    _ = try rebuildBusinessWorkspaceAdjacency(db, std.testing.allocator, "foreign");
+    try db.exec("DELETE FROM graph_relation WHERE relation_id=10");
+    try std.testing.expectEqual(@as(usize, 2), try rebuildBusinessWorkspaceAdjacency(db, std.testing.allocator, "own"));
+    var runtime = try loadRuntime(db, std.testing.allocator);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(?usize, null), try runtime.shortestPathHops(std.testing.allocator, 1, 2, .{}, 2));
+    try std.testing.expectEqual(@as(?usize, 1), try runtime.shortestPathHops(std.testing.allocator, 3, 4, .{}, 2));
+}
+
 pub fn rebuildLjForEntities(db: Database, entity_ids: []const u32, allocator: std.mem.Allocator) !void {
     try rebuildLjForEntitiesInWorkspace(db, entity_ids, null, allocator);
 }

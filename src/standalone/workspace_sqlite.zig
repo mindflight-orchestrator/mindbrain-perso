@@ -83,6 +83,17 @@ pub const GenerationHints = struct {
     time_window_days: u32,
 };
 
+/// Startup checks run inside a writer transaction; explicit upserts keep their semantics.
+pub fn workspaceExists(db: Database, workspace_id: []const u8) !bool {
+    const stmt = try prepare(db, "SELECT 1 FROM workspaces WHERE workspace_id = ?1 LIMIT 1");
+    defer finalize(stmt);
+    try bindText(stmt, 1, workspace_id);
+    const status = c.sqlite3_step(stmt);
+    if (status == c.SQLITE_ROW) return true;
+    if (status == c.SQLITE_DONE) return false;
+    return error.StepFailed;
+}
+
 pub fn upsertWorkspace(
     db: Database,
     workspace_id: []const u8,

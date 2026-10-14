@@ -507,3 +507,91 @@ test "standalone schema allocates legacy agent_facts doc_id and has source_ref i
         try std.testing.expect(!found_legacy_compat);
     }
 }
+
+pub const FactDelete = struct {
+    workspace_id: []const u8,
+    schema_id: []const u8,
+    id: []const u8,
+    expected_version: u64,
+};
+
+pub const FactDeleteResult = struct { found: bool, deleted: bool, version: ?u64 = null };
+
+/// Remove one exact record and every native search copy atomically.
+/// Closed version history remains history; this is not a purge operation.
+pub fn deleteFact(db: facet_sqlite.Database, allocator: std.mem.Allocator, request: FactDelete) !FactDeleteResult {
+    if (request.id.len == 0 or request.workspace_id.len == 0 or request.schema_id.len == 0 or request.expected_version == 0) return error.InvalidFactDelete;
+    var tx = try facet_sqlite.Transaction.begin(db);
+    defer tx.deinit();
+    const stmt = try facet_sqlite.prepare(db, "SELECT doc_id, version FROM agent_facts WHERE workspace_id=?1 AND schema_id=?2 AND id=?3");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, request.workspace_id);
+    try facet_sqlite.bindText(stmt, 2, request.schema_id);
+    try facet_sqlite.bindText(stmt, 3, request.id);
+    const step = c.sqlite3_step(stmt);
+    if (step == c.SQLITE_DONE) {
+        try tx.commit();
+        return .{ .found = false, .deleted = false };
+    }
+    if (step != c.SQLITE_ROW) return error.StepFailed;
+    const doc_id = try facet_sqlite.columnU64(stmt, 0);
+    const version = try facet_sqlite.columnU64(stmt, 1);
+    if (version != request.expected_version) return error.VersionConflict;
+    _ = c.sqlite3_reset(stmt);
+    try search_sqlite.deleteSearchArtifactsForDocument(db, allocator, 1, doc_id);
+    try search_sqlite.deleteSearchDocument(db, 1, doc_id);
+    const remove = try facet_sqlite.prepare(db, "DELETE FROM agent_facts WHERE workspace_id=?1 AND schema_id=?2 AND id=?3 AND version=?4");
+    defer facet_sqlite.finalize(remove);
+    try facet_sqlite.bindText(remove, 1, request.workspace_id);
+    try facet_sqlite.bindText(remove, 2, request.schema_id);
+    try facet_sqlite.bindText(remove, 3, request.id);
+    try facet_sqlite.bindInt64(remove, 4, version);
+    try facet_sqlite.stepDone(remove);
+    if (c.sqlite3_changes(db.handle) != 1) return error.DeleteVerificationFailed;
+    try tx.commit();
+    return .{ .found = true, .deleted = true, .version = version };
+}
+
+test "deleteFact scopes and versions the deletion and removes every native search copy" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const allocator = std.testing.allocator;
+    const row = try writeFact(db, allocator, .{ .workspace_id = "app", .schema_id = "app:task", .content = "uniquenativedeletiontoken" });
+    defer deinitFactWriteResult(allocator, row);
+    try search_sqlite.upsertSearchEmbedding(db, allocator, 1, row.doc_id, &.{ 1, 0, 0 });
+    const request = FactDelete{ .workspace_id = "app", .schema_id = "app:task", .id = row.id, .expected_version = 1 };
+    var wrong = request;
+    wrong.workspace_id = "other";
+    try std.testing.expect(!(try deleteFact(db, allocator, wrong)).found);
+    wrong = request;
+    wrong.schema_id = "app:prospect";
+    try std.testing.expect(!(try deleteFact(db, allocator, wrong)).found);
+    wrong = request;
+    wrong.expected_version = 2;
+    try std.testing.expectError(error.VersionConflict, deleteFact(db, allocator, wrong));
+    try std.testing.expect((try deleteFact(db, allocator, request)).deleted);
+    try std.testing.expect(!(try deleteFact(db, allocator, request)).deleted);
+    for ([_][]const u8{ "agent_facts", "search_documents", "search_embeddings", "search_fts", "search_fts_docs", "search_document_stats", "search_term_frequencies", "search_term_stats", "search_postings" }) |table| {
+        const text = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}", .{table});
+        defer allocator.free(text);
+        const stmt = try facet_sqlite.prepare(db, text);
+        defer facet_sqlite.finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+        try std.testing.expectEqual(@as(u64, 0), try facet_sqlite.columnU64(stmt, 0));
+    }
+}
+
+test "deleteFact rolls back search cleanup when the exact row cannot be removed" {
+    var db = try facet_sqlite.Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const allocator = std.testing.allocator;
+    const row = try writeFact(db, allocator, .{ .workspace_id = "app", .schema_id = "app:task", .content = "rollbackdeletiontoken" });
+    defer deinitFactWriteResult(allocator, row);
+    try db.exec("CREATE TRIGGER reject_fact_delete BEFORE DELETE ON agent_facts BEGIN SELECT RAISE(ABORT,'reject deletion'); END");
+    try std.testing.expectError(error.StepFailed, deleteFact(db, allocator, .{ .workspace_id = "app", .schema_id = "app:task", .id = row.id, .expected_version = 1 }));
+    const hits = try search_sqlite.searchFts5Bm25Workspace(db, allocator, 1, "app", "rollbackdeletiontoken", 10);
+    defer allocator.free(hits);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+}

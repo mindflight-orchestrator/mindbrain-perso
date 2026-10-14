@@ -1920,11 +1920,12 @@ fn runWorkspaceCreateCommand(allocator: Allocator, args: []const []const u8) !vo
     var label: ?[]const u8 = null;
     var description: ?[]const u8 = null;
     var profile: ?[]const u8 = null;
+    var if_absent = false;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--label")) label = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--description")) description = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else return CliError.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--label")) label = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--description")) description = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--if-absent")) if_absent = true else return CliError.InvalidArguments;
     }
 
     var ws_slug_buf: [512]u8 = undefined;
@@ -1937,12 +1938,20 @@ fn runWorkspaceCreateCommand(allocator: Allocator, args: []const []const u8) !vo
     var db = try facet_sqlite.Database.open(db_path.?);
     defer db.close();
     try db.applyStandaloneSchema();
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer db.exec("ROLLBACK") catch {};
+    if (if_absent and try workspace_sqlite.workspaceExists(db, workspace_id.?)) {
+        try db.exec("COMMIT");
+        try writeStdout("workspace {s} ready\n", .{workspace_id.?});
+        return;
+    }
     try collections_sqlite.ensureWorkspace(db, .{
         .workspace_id = workspace_id.?,
         .label = label,
         .description = description,
         .domain_profile = profile,
     });
+    try db.exec("COMMIT");
     try writeStdout("workspace {s} ready\n", .{workspace_id.?});
 }
 
