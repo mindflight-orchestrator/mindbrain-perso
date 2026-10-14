@@ -6022,3 +6022,22 @@ test "projectRelationPropertiesForIds chunk boundary — all 501 ids projected a
     }
     try std.testing.expectEqual(@as(usize, 2), spot.len);
 }
+
+test "business adjacency joins caller transaction and rolls back on repair failure" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec("INSERT INTO graph_entity(entity_id,workspace_id,entity_type,name) VALUES(1,'own','building','A'),(2,'own','building','B')");
+    try db.exec("INSERT INTO graph_relation(relation_id,workspace_id,relation_type,source_id,target_id) VALUES(10,'own','contains',1,2)");
+    _ = try rebuildBusinessWorkspaceAdjacency(db, std.testing.allocator, "own");
+    try db.exec("CREATE TRIGGER reject_adjacency BEFORE DELETE ON graph_lj_out BEGIN SELECT RAISE(ABORT,'injected'); END");
+    {
+        var tx = try facet_sqlite.Transaction.begin(db);
+        defer tx.deinit();
+        try db.exec("DELETE FROM graph_relation WHERE relation_id=10");
+        try std.testing.expectError(error.StepFailed, rebuildBusinessWorkspaceAdjacency(db, std.testing.allocator, "own"));
+    }
+    var runtime = try loadRuntime(db, std.testing.allocator);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(?usize, 1), try runtime.shortestPathHops(std.testing.allocator, 1, 2, .{}, 2));
+}

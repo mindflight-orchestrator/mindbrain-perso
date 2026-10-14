@@ -1898,15 +1898,24 @@ pub const MindbrainHttpApp = struct {
 
     fn handleBusinessAdjacency(self: *MindbrainHttpApp, allocator: std.mem.Allocator, request: *http.Server.Request, body_buffer: []u8) !Response {
         const content_length = request.head.content_length orelse return error.BadRequest;
-        if (content_length == 0 or content_length > self.max_body_bytes) return error.BadRequest;
+        if (content_length == 0) return error.BadRequest;
+        if (content_length > self.max_body_bytes) return error.RequestTooLarge;
         const reader = request.readerExpectNone(body_buffer);
         const body = try reader.readAlloc(allocator, @intCast(content_length));
-        const Input = struct { workspace_id: []const u8 };
-        const input = try std.json.parseFromSliceLeaky(Input, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        const Input = struct { workspace_id: []const u8, session_id: ?u64 = null };
+        const input = std.json.parseFromSliceLeaky(Input, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadRequest;
         const workspace_id = try canonicalizeRequiredWorkspaceId(allocator, input.workspace_id);
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (self.writerSessionBlocking()) return try self.writerSessionBusyResponse(allocator);
+        if (input.session_id) |session_id| {
+            if (!self.writerSessionBlocking() or self.writer_active_session_id != session_id)
+                return try self.writerSessionMismatchResponse(allocator, session_id);
+            self.writer_session_last_activity_ms = milliTimestamp();
+        } else if (self.writerSessionBlocking()) {
+            return try self.writerSessionBusyResponse(allocator);
+        }
+        // Transaction.begin joins an existing SQL session, so a failed rebuild
+        // can roll back the caller's entity/relation changes as well.
         const count = try graph_sqlite.rebuildBusinessWorkspaceAdjacency(self.writer_db, allocator, workspace_id);
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .workspace_id = workspace_id, .adjacency_rebuilt = true, .entity_count = count }));
     }
