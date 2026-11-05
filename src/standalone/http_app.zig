@@ -391,76 +391,81 @@ pub const MindbrainHttpApp = struct {
         io: std.Io,
         options: MindbrainHttpOptions,
     ) !MindbrainHttpApp {
-        const listen_addr = try http_config.parseListenAddress(options.addr_text);
-        const listen_addr_text_owned = try allocator.dupe(u8, options.addr_text);
-        errdefer allocator.free(listen_addr_text_owned);
-        const db_path_owned = try allocator.dupe(u8, options.db_path);
-        errdefer allocator.free(db_path_owned);
-        const static_dir_owned = try allocator.dupe(u8, options.static_dir);
-        errdefer allocator.free(static_dir_owned);
-        const service_name_owned = try allocator.dupe(u8, options.service_name);
-        errdefer allocator.free(service_name_owned);
-        const default_workspace_id_owned = try allocator.dupe(u8, options.default_workspace.id);
-        errdefer allocator.free(default_workspace_id_owned);
-        const default_workspace_domain_json_owned = try allocator.dupe(u8, options.default_workspace.domain_profile_json);
-        errdefer allocator.free(default_workspace_domain_json_owned);
-        const default_workspace_label_owned = if (options.default_workspace.label) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (default_workspace_label_owned) |value| allocator.free(value);
-        const default_workspace_description_owned = if (options.default_workspace.description) |value|
-            try allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (default_workspace_description_owned) |value| allocator.free(value);
+        // Everything allocated below is released by these errdefers only until
+        // the app value owns it. Keeping them in this block stops them running
+        // again, after app.deinit(), when initDatabase() fails (double free).
+        var app = blk: {
+            const listen_addr = try http_config.parseListenAddress(options.addr_text);
+            const listen_addr_text_owned = try allocator.dupe(u8, options.addr_text);
+            errdefer allocator.free(listen_addr_text_owned);
+            const db_path_owned = try allocator.dupe(u8, options.db_path);
+            errdefer allocator.free(db_path_owned);
+            const static_dir_owned = try allocator.dupe(u8, options.static_dir);
+            errdefer allocator.free(static_dir_owned);
+            const service_name_owned = try allocator.dupe(u8, options.service_name);
+            errdefer allocator.free(service_name_owned);
+            const default_workspace_id_owned = try allocator.dupe(u8, options.default_workspace.id);
+            errdefer allocator.free(default_workspace_id_owned);
+            const default_workspace_domain_json_owned = try allocator.dupe(u8, options.default_workspace.domain_profile_json);
+            errdefer allocator.free(default_workspace_domain_json_owned);
+            const default_workspace_label_owned = if (options.default_workspace.label) |value|
+                try allocator.dupe(u8, value)
+            else
+                null;
+            errdefer if (default_workspace_label_owned) |value| allocator.free(value);
+            const default_workspace_description_owned = if (options.default_workspace.description) |value|
+                try allocator.dupe(u8, value)
+            else
+                null;
+            errdefer if (default_workspace_description_owned) |value| allocator.free(value);
 
-        if (std.fs.path.dirname(db_path_owned)) |dir| {
-            if (dir.len != 0 and !std.mem.eql(u8, dir, ".")) {
-                try std.Io.Dir.cwd().createDirPath(io, dir);
+            if (std.fs.path.dirname(db_path_owned)) |dir| {
+                if (dir.len != 0 and !std.mem.eql(u8, dir, ".")) {
+                    try std.Io.Dir.cwd().createDirPath(io, dir);
+                }
             }
-        }
-        var writer_db = try facet_sqlite.Database.open(db_path_owned);
-        errdefer writer_db.close();
-        try applyWriterConnectionPragmas(writer_db, options.sqlite_busy_timeout_ms);
+            var writer_db = try facet_sqlite.Database.open(db_path_owned);
+            errdefer writer_db.close();
+            try applyWriterConnectionPragmas(writer_db, options.sqlite_busy_timeout_ms);
 
-        var app = MindbrainHttpApp{
-            .allocator = allocator,
-            .io = io,
-            .db_path = db_path_owned,
-            .static_dir = static_dir_owned,
-            .listen_addr = listen_addr,
-            .listen_addr_text = listen_addr_text_owned,
-            .service_name = service_name_owned,
-            .init_only = options.init_only,
-            .max_body_bytes = options.max_body_bytes,
-            .max_connections = options.max_connections,
-            .warn_on_empty_graph = options.warn_on_empty_graph,
-            .enable_lab_routes = options.enable_lab_routes,
-            .graph_bitmap_mode = options.graph_bitmap_mode,
-            .db_path_owned = db_path_owned,
-            .static_dir_owned = static_dir_owned,
-            .listen_addr_text_owned = listen_addr_text_owned,
-            .service_name_owned = service_name_owned,
-            .default_workspace_id_owned = default_workspace_id_owned,
-            .default_workspace_domain_json_owned = default_workspace_domain_json_owned,
-            .default_workspace_label_owned = default_workspace_label_owned,
-            .default_workspace_description_owned = default_workspace_description_owned,
-            .sql_sessions_mutex = .init,
-            .sql_sessions = std.AutoHashMap(u64, *SqlSession).init(allocator),
-            .next_sql_session_id = 1,
-            .writer_db = writer_db,
-            .writer_mutex = .init,
-            .writer_active_session_id = null,
-            .writer_session_last_activity_ms = 0,
-            .writer_completed = 0,
-            .writer_failed = 0,
-            .writer_last_error_operation = null,
-            .writer_last_error_kind = null,
-            .writer_last_error_message = null,
-            .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
-            .connection_slots_mutex = .init,
-            .active_connections = 0,
+            break :blk MindbrainHttpApp{
+                .allocator = allocator,
+                .io = io,
+                .db_path = db_path_owned,
+                .static_dir = static_dir_owned,
+                .listen_addr = listen_addr,
+                .listen_addr_text = listen_addr_text_owned,
+                .service_name = service_name_owned,
+                .init_only = options.init_only,
+                .max_body_bytes = options.max_body_bytes,
+                .max_connections = options.max_connections,
+                .warn_on_empty_graph = options.warn_on_empty_graph,
+                .enable_lab_routes = options.enable_lab_routes,
+                .graph_bitmap_mode = options.graph_bitmap_mode,
+                .db_path_owned = db_path_owned,
+                .static_dir_owned = static_dir_owned,
+                .listen_addr_text_owned = listen_addr_text_owned,
+                .service_name_owned = service_name_owned,
+                .default_workspace_id_owned = default_workspace_id_owned,
+                .default_workspace_domain_json_owned = default_workspace_domain_json_owned,
+                .default_workspace_label_owned = default_workspace_label_owned,
+                .default_workspace_description_owned = default_workspace_description_owned,
+                .sql_sessions_mutex = .init,
+                .sql_sessions = std.AutoHashMap(u64, *SqlSession).init(allocator),
+                .next_sql_session_id = 1,
+                .writer_db = writer_db,
+                .writer_mutex = .init,
+                .writer_active_session_id = null,
+                .writer_session_last_activity_ms = 0,
+                .writer_completed = 0,
+                .writer_failed = 0,
+                .writer_last_error_operation = null,
+                .writer_last_error_kind = null,
+                .writer_last_error_message = null,
+                .sqlite_busy_timeout_ms = options.sqlite_busy_timeout_ms,
+                .connection_slots_mutex = .init,
+                .active_connections = 0,
+            };
         };
         errdefer app.deinit();
         try app.initDatabase();
@@ -6980,6 +6985,50 @@ test "http sql binds parameters inserts rows and runs multi-statement text" {
     _ = try app.executeSql(arena, app.writer_db, "INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_commit', 'ws_commit', 'Yes')", &.{});
     try app.writer_db.exec("COMMIT");
     try std.testing.expectEqual(@as(i64, 1), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM workspaces WHERE id = 'ws_commit'"));
+}
+
+test "init refuses an unmigratable legacy database without freeing twice" {
+    // An analysis_plan whose scope names no workspace cannot be assigned one:
+    // the strict-workspace migration refuses on purpose. Startup must fail with
+    // an error and release its allocations exactly once (the testing allocator
+    // reports a double free or a leak).
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-legacy-artifact-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    {
+        var legacy = try facet_sqlite.Database.open(db_path);
+        defer legacy.close();
+        try legacy.exec(
+            \\CREATE TABLE mindbrain_answer_artifacts (
+            \\    artifact_id TEXT PRIMARY KEY,
+            \\    slug TEXT NOT NULL,
+            \\    workspace_id TEXT,
+            \\    agent_id TEXT,
+            \\    scope TEXT,
+            \\    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('analysis_plan', 'live_answer_view', 'answer_snapshot', 'evidence_pack')),
+            \\    public_label_key TEXT,
+            \\    public_label TEXT NOT NULL,
+            \\    lifecycle TEXT NOT NULL,
+            \\    state TEXT NOT NULL,
+            \\    current_version INTEGER NOT NULL DEFAULT 1,
+            \\    payload_json TEXT NOT NULL DEFAULT '{}',
+            \\    legacy_ref TEXT,
+            \\    created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch())
+            \\);
+            \\INSERT INTO mindbrain_answer_artifacts(artifact_id, slug, agent_id, scope, artifact_kind, public_label, lifecycle, state)
+            \\VALUES ('a1', 'plan', 'agent', 'ghost-workspace:alignment:plan', 'analysis_plan', 'Plan', 'active', 'ready');
+        );
+    }
+
+    try std.testing.expectError(error.ExecFailed, MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    }));
 }
 
 test "http sql session open query close commits or rolls back" {
