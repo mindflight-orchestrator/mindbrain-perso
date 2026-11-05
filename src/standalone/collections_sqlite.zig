@@ -448,6 +448,19 @@ pub fn ensureOntology(db: Database, spec: OntologySpec) !void {
     try facet_sqlite.stepDone(stmt);
 }
 
+/// An ontology_id is global, so a reimport under another workspace would rewrite
+/// that workspace's registry. Unowned and unknown ontologies pass.
+pub fn requireOntologyWorkspace(db: Database, ontology_id: []const u8, workspace_id: ?[]const u8) !void {
+    const stmt = try facet_sqlite.prepare(db, "SELECT workspace_id FROM ontologies WHERE ontology_id = ?1");
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    if (facet_sqlite.c.sqlite3_step(stmt) != facet_sqlite.c.SQLITE_ROW) return;
+    if (facet_sqlite.c.sqlite3_column_type(stmt, 0) == facet_sqlite.c.SQLITE_NULL) return;
+    const owner = std.mem.span(facet_sqlite.c.sqlite3_column_text(stmt, 0));
+    const incoming = workspace_id orelse return error.OntologyWorkspaceConflict;
+    if (!std.mem.eql(u8, owner, incoming)) return error.OntologyWorkspaceConflict;
+}
+
 pub fn isOntologyFrozen(db: Database, ontology_id: []const u8) !bool {
     const stmt = try facet_sqlite.prepare(db, "SELECT frozen FROM ontologies WHERE ontology_id = ?1");
     defer facet_sqlite.finalize(stmt);

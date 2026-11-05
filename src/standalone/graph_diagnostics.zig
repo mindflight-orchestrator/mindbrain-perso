@@ -324,6 +324,12 @@ pub fn importRulesJson(db: Database, allocator: std.mem.Allocator, json: []const
         const ontology_id = rule.ontology_id orelse envelope.ontology_id orelse return error.InvalidArguments;
         const workspace_id = rule.workspace_id orelse envelope.workspace_id orelse return error.MissingWorkspace;
         if (strict_validation and !try gapRuleReferencesOntology(db, ontology_id, rule)) return error.InvalidArguments;
+        var rule_filter = try RuleFilter.init(allocator, rule.metadata_json);
+        defer rule_filter.deinit();
+        if (rule_filter.invalid) {
+            std.log.warn("gap rule '{s}' rejected: invalid entity_filter in metadata_json", .{rule.rule_id});
+            return error.InvalidArguments;
+        }
 
         try facet_sqlite.resetStatement(stmt);
         try facet_sqlite.bindText(stmt, 1, rule.rule_id);
@@ -399,18 +405,6 @@ fn metadataFieldString(allocator: std.mem.Allocator, metadata_json: []const u8, 
     };
 }
 
-fn stringInList(value: []const u8, list: []const std.json.Value) bool {
-    for (list) |item| {
-        switch (item) {
-            .string => |text| {
-                if (std.mem.eql(u8, value, text)) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
 const filter_operators = [_][]const u8{ "eq", "one_of", "not_one_of", "gt", "gte", "lt", "lte" };
 
 fn isKnownFilterOperator(key: []const u8) bool {
@@ -420,12 +414,81 @@ fn isKnownFilterOperator(key: []const u8) bool {
     return false;
 }
 
-fn fieldFilterHasUnknownOperator(filter: std.json.ObjectMap) bool {
-    var iterator = filter.iterator();
+fn isScalarFilterValue(value: std.json.Value) bool {
+    return switch (value) {
+        .string, .integer, .float, .bool => true,
+        else => false,
+    };
+}
+
+fn orderedThresholdIsValid(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .string => |text| parseIsoInstant(text) != null or parseExactNumber(text) != null,
+        else => false,
+    };
+}
+
+/// A field filter must be a non-empty object of known operators whose operands
+/// can actually be evaluated. Anything else used to select every entity or none.
+fn fieldFilterIsValid(filter_value: std.json.Value) bool {
+    if (filter_value != .object) return false;
+    if (filter_value.object.count() == 0) return false;
+    var iterator = filter_value.object.iterator();
     while (iterator.next()) |entry| {
-        if (!isKnownFilterOperator(entry.key_ptr.*)) return true;
+        const key = entry.key_ptr.*;
+        const operand = entry.value_ptr.*;
+        if (!isKnownFilterOperator(key)) return false;
+        if (std.mem.eql(u8, key, "eq")) {
+            if (!isScalarFilterValue(operand)) return false;
+        } else if (std.mem.eql(u8, key, "one_of") or std.mem.eql(u8, key, "not_one_of")) {
+            if (operand != .array) return false;
+            if (std.mem.eql(u8, key, "one_of") and operand.array.items.len == 0) return false;
+            for (operand.array.items) |item| {
+                if (!isScalarFilterValue(item)) return false;
+            }
+        } else if (!orderedThresholdIsValid(operand)) {
+            return false;
+        }
     }
-    return false;
+    return true;
+}
+
+/// `entity_filters`, `entityFilter`, `entity-filter`: misspellings that would
+/// otherwise evaluate the rule against every entity of its type.
+fn isMisspelledEntityFilterKey(key: []const u8) bool {
+    if (std.mem.eql(u8, key, "entity_filter")) return false;
+    const expected = "entityfilter";
+    var matched: usize = 0;
+    for (key) |ch| {
+        if (ch == '_' or ch == '-') continue;
+        if (matched == expected.len) return true;
+        if (std.ascii.toLower(ch) != expected[matched]) return false;
+        matched += 1;
+    }
+    return matched == expected.len;
+}
+
+fn ruleMetadataFilterIsValid(root: std.json.Value) bool {
+    if (root != .object) return true;
+    var root_iterator = root.object.iterator();
+    while (root_iterator.next()) |entry| {
+        if (isMisspelledEntityFilterKey(entry.key_ptr.*)) return false;
+    }
+    const entity_filter = root.object.get("entity_filter") orelse return true;
+    if (entity_filter != .object) return false;
+    var filter_iterator = entity_filter.object.iterator();
+    while (filter_iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "metadata")) return false;
+    }
+    const metadata = entity_filter.object.get("metadata") orelse return true;
+    if (metadata != .object) return false;
+    var field_iterator = metadata.object.iterator();
+    while (field_iterator.next()) |entry| {
+        if (!fieldFilterIsValid(entry.value_ptr.*)) return false;
+    }
+    return true;
 }
 
 fn jsonValueAsCompareText(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
@@ -445,7 +508,8 @@ fn parseExactNumber(text: []const u8) ?f64 {
         const numeric = (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '+' or ch == 'e' or ch == 'E';
         if (!numeric) return null;
     }
-    return std.fmt.parseFloat(f64, trimmed) catch null;
+    const number = std.fmt.parseFloat(f64, trimmed) catch return null;
+    return if (std.math.isFinite(number)) number else null;
 }
 
 fn daysFromCivil(year: i32, month: u32, day: u32) i64 {
@@ -461,60 +525,99 @@ fn daysFromCivil(year: i32, month: u32, day: u32) i64 {
     return @as(i64, era) * 146097 + @as(i64, doe) - 719468;
 }
 
+fn parseDigits(text: []const u8) ?u32 {
+    if (text.len == 0) return null;
+    for (text) |ch| {
+        if (ch < '0' or ch > '9') return null;
+    }
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
+
+fn daysInMonth(year: u32, month: u32) u32 {
+    return switch (month) {
+        2 => if ((year % 4 == 0 and year % 100 != 0) or year % 400 == 0) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// ISO-8601 date or date-time, in milliseconds since the epoch. A date is
+/// midnight UTC, and a date-time without a zone is read as UTC.
 fn parseIsoInstant(text: []const u8) ?i64 {
     const trimmed = std.mem.trim(u8, text, " \t");
     if (trimmed.len < 10 or trimmed[4] != '-' or trimmed[7] != '-') return null;
-    const year = std.fmt.parseInt(i32, trimmed[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u32, trimmed[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u32, trimmed[8..10], 10) catch return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
-    var hour: u32 = 0;
-    var minute: u32 = 0;
-    var second: u32 = 0;
-    if (trimmed.len == 10) {
-        return daysFromCivil(year, month, day) * 86400;
-    }
-    if (trimmed.len < 20 or (trimmed[10] != 'T' and trimmed[10] != 't')) return null;
+    const year = parseDigits(trimmed[0..4]) orelse return null;
+    const month = parseDigits(trimmed[5..7]) orelse return null;
+    const day = parseDigits(trimmed[8..10]) orelse return null;
+    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month)) return null;
+    const midnight_ms = daysFromCivil(@intCast(year), month, day) * 86_400_000;
+    if (trimmed.len == 10) return midnight_ms;
+
+    if (trimmed.len < 19 or (trimmed[10] != 'T' and trimmed[10] != 't')) return null;
     if (trimmed[13] != ':' or trimmed[16] != ':') return null;
-    hour = std.fmt.parseInt(u32, trimmed[11..13], 10) catch return null;
-    minute = std.fmt.parseInt(u32, trimmed[14..16], 10) catch return null;
-    second = std.fmt.parseInt(u32, trimmed[17..19], 10) catch return null;
+    const hour = parseDigits(trimmed[11..13]) orelse return null;
+    const minute = parseDigits(trimmed[14..16]) orelse return null;
+    const second = parseDigits(trimmed[17..19]) orelse return null;
     if (hour > 23 or minute > 59 or second > 60) return null;
+
     var index: usize = 19;
+    var millis: i64 = 0;
     if (index < trimmed.len and trimmed[index] == '.') {
         index += 1;
-        while (index < trimmed.len and trimmed[index] >= '0' and trimmed[index] <= '9') index += 1;
+        const fraction_start = index;
+        var scale: i64 = 100;
+        while (index < trimmed.len and trimmed[index] >= '0' and trimmed[index] <= '9') : (index += 1) {
+            millis += @as(i64, trimmed[index] - '0') * scale;
+            scale = @divTrunc(scale, 10);
+        }
+        if (index == fraction_start) return null;
     }
-    if (index >= trimmed.len) return null;
+
+    var offset_ms: i64 = 0;
     const zone = trimmed[index..];
-    if (!(std.mem.eql(u8, zone, "Z") or std.mem.eql(u8, zone, "z") or std.mem.eql(u8, zone, "+00:00") or std.mem.eql(u8, zone, "-00:00"))) {
-        return null;
+    if (zone.len == 0 or std.mem.eql(u8, zone, "Z") or std.mem.eql(u8, zone, "z")) {
+        offset_ms = 0;
+    } else {
+        if (zone.len != 6 or (zone[0] != '+' and zone[0] != '-') or zone[3] != ':') return null;
+        const zone_hour = parseDigits(zone[1..3]) orelse return null;
+        const zone_minute = parseDigits(zone[4..6]) orelse return null;
+        if (zone_hour > 23 or zone_minute > 59) return null;
+        offset_ms = (@as(i64, zone_hour) * 60 + @as(i64, zone_minute)) * 60_000;
+        if (zone[0] == '-') offset_ms = -offset_ms;
     }
-    return daysFromCivil(year, month, day) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    return midnight_ms + @as(i64, hour) * 3_600_000 + @as(i64, minute) * 60_000 + @as(i64, second) * 1000 + millis - offset_ms;
 }
 
 const OrderedCmp = enum { gt, gte, lt, lte };
 
-fn orderedCompare(entity_value: []const u8, expected: std.json.Value, op: OrderedCmp) bool {
+const FilterOutcome = enum {
+    selected,
+    excluded,
+    /// The entity carries a value the filter cannot read. Not a subject, but
+    /// reported: treating it as out of scope would turn a rule silently green.
+    unreadable,
+};
+
+/// The threshold decides the kind: a date threshold needs a date value.
+fn orderedCompare(entity_value: []const u8, expected: std.json.Value, op: OrderedCmp) FilterOutcome {
     switch (expected) {
-        .integer => |number| return compareNumbers(parseExactNumber(entity_value), @floatFromInt(number), op),
-        .float => |number| return compareNumbers(parseExactNumber(entity_value), number, op),
+        .integer => |number| return compareNumber(entity_value, @floatFromInt(number), op),
+        .float => |number| return compareNumber(entity_value, number, op),
         .string => |text| {
-            if (parseIsoInstant(entity_value)) |left| {
-                if (parseIsoInstant(text)) |right| return compareInts(left, right, op);
+            if (parseIsoInstant(text)) |right| {
+                const left = parseIsoInstant(entity_value) orelse return .unreadable;
+                return if (compareOrd(left, right, op)) .selected else .excluded;
             }
-            return compareNumbers(parseExactNumber(entity_value), parseExactNumber(text), op);
+            const right = parseExactNumber(text) orelse return .unreadable;
+            return compareNumber(entity_value, right, op);
         },
-        else => return false,
+        else => return .unreadable,
     }
 }
 
-fn compareNumbers(left: ?f64, right: ?f64, op: OrderedCmp) bool {
-    return compareOrd(left orelse return false, right orelse return false, op);
-}
-
-fn compareInts(left: i64, right: i64, op: OrderedCmp) bool {
-    return compareOrd(left, right, op);
+fn compareNumber(entity_value: []const u8, right: f64, op: OrderedCmp) FilterOutcome {
+    const left = parseExactNumber(entity_value) orelse return .unreadable;
+    return if (compareOrd(left, right, op)) .selected else .excluded;
 }
 
 fn compareOrd(left: anytype, right: anytype, op: OrderedCmp) bool {
@@ -526,44 +629,53 @@ fn compareOrd(left: anytype, right: anytype, op: OrderedCmp) bool {
     };
 }
 
-fn fieldFilterMatches(allocator: std.mem.Allocator, entity_value: ?[]const u8, filter_value: std.json.Value) !bool {
-    if (filter_value != .object) return true;
-    const filter = filter_value.object;
-    if (fieldFilterHasUnknownOperator(filter)) return error.InvalidFilterOperator;
-
+/// Expects a filter accepted by `fieldFilterIsValid`. An explicit exclusion
+/// outranks an unreadable value on another operator of the same field.
+fn fieldFilterOutcome(allocator: std.mem.Allocator, entity_value: ?[]const u8, filter: std.json.ObjectMap) !FilterOutcome {
     if (filter.get("one_of")) |one_of| {
-        if (one_of != .array) return true;
-        if (entity_value == null) return false;
-        if (!stringInList(entity_value.?, one_of.array.items)) return false;
+        if (entity_value == null or !try scalarInList(allocator, entity_value.?, one_of.array.items)) return .excluded;
     }
 
     if (filter.get("not_one_of")) |not_one_of| {
-        if (not_one_of != .array) return true;
         if (entity_value) |value| {
-            if (stringInList(value, not_one_of.array.items)) return false;
+            if (try scalarInList(allocator, value, not_one_of.array.items)) return .excluded;
         }
     }
 
     if (filter.get("eq")) |eq| {
-        const expected = try jsonValueAsCompareText(allocator, eq) orelse return true;
+        const expected = (try jsonValueAsCompareText(allocator, eq)) orelse return .excluded;
         defer allocator.free(expected);
-        if (entity_value == null or !std.mem.eql(u8, entity_value.?, expected)) return false;
+        if (entity_value == null or !std.mem.eql(u8, entity_value.?, expected)) return .excluded;
     }
 
-    if (filter.get("gt")) |gt| {
-        if (entity_value == null or entity_value.?.len == 0 or !orderedCompare(entity_value.?, gt, .gt)) return false;
+    const ordered = [_]struct { key: []const u8, op: OrderedCmp }{
+        .{ .key = "gt", .op = .gt },
+        .{ .key = "gte", .op = .gte },
+        .{ .key = "lt", .op = .lt },
+        .{ .key = "lte", .op = .lte },
+    };
+    var unreadable = false;
+    for (ordered) |item| {
+        const threshold = filter.get(item.key) orelse continue;
+        // No value at all means the field does not apply to this entity.
+        const value = entity_value orelse return .excluded;
+        if (std.mem.trim(u8, value, " \t").len == 0) return .excluded;
+        switch (orderedCompare(value, threshold, item.op)) {
+            .selected => {},
+            .excluded => return .excluded,
+            .unreadable => unreadable = true,
+        }
     }
-    if (filter.get("gte")) |gte| {
-        if (entity_value == null or entity_value.?.len == 0 or !orderedCompare(entity_value.?, gte, .gte)) return false;
-    }
-    if (filter.get("lt")) |lt| {
-        if (entity_value == null or entity_value.?.len == 0 or !orderedCompare(entity_value.?, lt, .lt)) return false;
-    }
-    if (filter.get("lte")) |lte| {
-        if (entity_value == null or entity_value.?.len == 0 or !orderedCompare(entity_value.?, lte, .lte)) return false;
-    }
+    return if (unreadable) .unreadable else .selected;
+}
 
-    return true;
+fn scalarInList(allocator: std.mem.Allocator, value: []const u8, list: []const std.json.Value) !bool {
+    for (list) |item| {
+        const text = (try jsonValueAsCompareText(allocator, item)) orelse continue;
+        defer allocator.free(text);
+        if (std.mem.eql(u8, value, text)) return true;
+    }
+    return false;
 }
 
 /// Pre-parsed `entity_filter.metadata` object from a rule's metadata JSON.
@@ -572,36 +684,33 @@ fn fieldFilterMatches(allocator: std.mem.Allocator, entity_value: ?[]const u8, f
 const RuleFilter = struct {
     parsed: ?std.json.Parsed(std.json.Value) = null,
     metadata: ?std.json.ObjectMap = null,
-    invalid_operator: bool = false,
+    /// Stored rules can predate import validation, so evaluation re-checks.
+    invalid: bool = false,
 
     fn init(allocator: std.mem.Allocator, rule_metadata_json: []const u8) !RuleFilter {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rule_metadata_json, .{
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, rule_metadata_json, .{
             .allocate = .alloc_if_needed,
             .ignore_unknown_fields = true,
-        });
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .invalid = true },
+        };
+        if (!ruleMetadataFilterIsValid(parsed.value)) {
+            parsed.deinit();
+            return .{ .invalid = true };
+        }
         const metadata: ?std.json.ObjectMap = blk: {
             const root = parsed.value;
             if (root != .object) break :blk null;
             const entity_filter = root.object.get("entity_filter") orelse break :blk null;
-            if (entity_filter != .object) break :blk null;
             const metadata_value = entity_filter.object.get("metadata") orelse break :blk null;
-            if (metadata_value != .object) break :blk null;
             break :blk metadata_value.object;
         };
         if (metadata == null) {
             parsed.deinit();
             return .{};
         }
-        var invalid_operator = false;
-        var iterator = metadata.?.iterator();
-        while (iterator.next()) |entry| {
-            if (entry.value_ptr.* != .object) continue;
-            if (fieldFilterHasUnknownOperator(entry.value_ptr.object)) {
-                invalid_operator = true;
-                break;
-            }
-        }
-        return .{ .parsed = parsed, .metadata = metadata, .invalid_operator = invalid_operator };
+        return .{ .parsed = parsed, .metadata = metadata };
     }
 
     fn deinit(self: *RuleFilter) void {
@@ -609,16 +718,20 @@ const RuleFilter = struct {
         self.* = .{};
     }
 
-    fn matches(self: RuleFilter, allocator: std.mem.Allocator, entity_metadata_json: []const u8) !bool {
-        if (self.invalid_operator) return false;
-        const metadata = self.metadata orelse return true;
+    fn outcome(self: RuleFilter, allocator: std.mem.Allocator, entity_metadata_json: []const u8) !FilterOutcome {
+        const metadata = self.metadata orelse return .selected;
+        var unreadable = false;
         var iterator = metadata.iterator();
         while (iterator.next()) |entry| {
             const field_value = try metadataFieldString(allocator, entity_metadata_json, entry.key_ptr.*);
             defer if (field_value) |value| allocator.free(value);
-            if (!try fieldFilterMatches(allocator, field_value, entry.value_ptr.*)) return false;
+            switch (try fieldFilterOutcome(allocator, field_value, entry.value_ptr.object)) {
+                .selected => {},
+                .excluded => return .excluded,
+                .unreadable => unreadable = true,
+            }
         }
-        return true;
+        return if (unreadable) .unreadable else .selected;
     }
 };
 
@@ -813,33 +926,28 @@ pub fn runRuleEvaluations(db: Database, allocator: std.mem.Allocator, options: R
         try facet_sqlite.resetStatement(entity_stmt);
         try facet_sqlite.bindText(entity_stmt, 1, options.workspace_id);
         try facet_sqlite.bindText(entity_stmt, 2, rule.entity_type);
-        if (rule_filter.invalid_operator) {
+        if (rule_filter.invalid) {
             if (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW) {
                 const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
-                const state = "invalid";
                 invalid_count += 1;
                 evaluated += 1;
-                const previous_state = try loadEvaluationState(state_stmt, allocator, options.workspace_id, ontology_id, rule.rule_id, entity_id);
-                defer if (previous_state) |value| allocator.free(value);
-                const from_state = previous_state orelse "unknown";
-                try upsertEvaluationState(upsert_stmt, options.workspace_id, ontology_id, rule, entity_id, state, 0);
-                if (previous_state == null or !std.mem.eql(u8, previous_state.?, state)) {
-                    changed += 1;
-                    const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, from_state, state, 0);
-                    events_created += 1;
-                    if (events.items.len < options.limit) {
-                        try events.append(allocator, event);
-                    } else {
-                        event.deinit(allocator);
-                    }
-                }
+                try recordInvalidEvaluation(db, allocator, state_stmt, upsert_stmt, options, ontology_id, run_id, rule, entity_id, &changed, &events_created, &events);
             }
             continue;
         }
         while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW) {
             const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
             const entity_metadata = columnText(entity_stmt, 1);
-            if (!try rule_filter.matches(allocator, entity_metadata)) continue;
+            switch (try rule_filter.outcome(allocator, entity_metadata)) {
+                .selected => {},
+                .excluded => continue,
+                .unreadable => {
+                    invalid_count += 1;
+                    evaluated += 1;
+                    try recordInvalidEvaluation(db, allocator, state_stmt, upsert_stmt, options, ontology_id, run_id, rule, entity_id, &changed, &events_created, &events);
+                    continue;
+                },
+            }
 
             const observed = try counter.count(options.workspace_id, entity_id, rule);
             const state = ruleState(observed, rule);
@@ -1037,6 +1145,35 @@ fn ruleState(observed: i64, rule: GapRule) []const u8 {
         if (observed > max_count) return "invalid";
     }
     return "valid";
+}
+
+fn recordInvalidEvaluation(
+    db: Database,
+    allocator: std.mem.Allocator,
+    state_stmt: *c.sqlite3_stmt,
+    upsert_stmt: *c.sqlite3_stmt,
+    options: RuleEvaluationOptions,
+    ontology_id: []const u8,
+    run_id: []const u8,
+    rule: GapRule,
+    entity_id: u64,
+    changed: *usize,
+    events_created: *usize,
+    events: *std.ArrayList(RuleEvent),
+) !void {
+    const state = "invalid";
+    const previous_state = try loadEvaluationState(state_stmt, allocator, options.workspace_id, ontology_id, rule.rule_id, entity_id);
+    defer if (previous_state) |value| allocator.free(value);
+    try upsertEvaluationState(upsert_stmt, options.workspace_id, ontology_id, rule, entity_id, state, 0);
+    if (previous_state != null and std.mem.eql(u8, previous_state.?, state)) return;
+    changed.* += 1;
+    const event = try insertRuleEvent(db, allocator, options.workspace_id, ontology_id, run_id, rule, entity_id, previous_state orelse "unknown", state, 0);
+    events_created.* += 1;
+    if (events.items.len < options.limit) {
+        try events.append(allocator, event);
+    } else {
+        event.deinit(allocator);
+    }
 }
 
 fn loadEvaluationState(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator, workspace_id: []const u8, ontology_id: []const u8, rule_id: []const u8, subject_entity_id: u64) !?[]u8 {
@@ -1604,7 +1741,7 @@ fn evaluateRules(db: Database, allocator: std.mem.Allocator, options: Diagnostic
     for (rules) |rule| {
         var rule_filter = try RuleFilter.init(allocator, rule.metadata_json);
         defer rule_filter.deinit();
-        if (rule_filter.invalid_operator) {
+        if (rule_filter.invalid) {
             try appendIssue(allocator, issues, .{
                 .kind = "invalid_filter_operator",
                 .severity = "error",
@@ -1621,7 +1758,21 @@ fn evaluateRules(db: Database, allocator: std.mem.Allocator, options: Diagnostic
         while (c.sqlite3_step(entity_stmt) == c.SQLITE_ROW and issues.items.len < options.limit) {
             const entity_id: u64 = @intCast(c.sqlite3_column_int64(entity_stmt, 0));
             const entity_metadata = columnText(entity_stmt, 1);
-            if (!try rule_filter.matches(allocator, entity_metadata)) continue;
+            switch (try rule_filter.outcome(allocator, entity_metadata)) {
+                .selected => {},
+                .excluded => continue,
+                .unreadable => {
+                    try appendIssue(allocator, issues, .{
+                        .kind = "unreadable_filter_value",
+                        .severity = "error",
+                        .label = rule.label,
+                        .suggested_action = "fix_entity_value_or_rule_filter",
+                        .entity_id = entity_id,
+                        .rule_id = rule.rule_id,
+                    });
+                    continue;
+                },
+            }
             const observed = try counter.count(options.workspace_id, entity_id, rule);
             if (observed < rule.min_count) {
                 try appendIssue(allocator, issues, .{
@@ -2231,6 +2382,23 @@ test "entity_filter excludes vacant units from syndic rules" {
     try std.testing.expectEqual(@as(?u64, 2), report.issues[0].entity_id);
 }
 
+/// Subjects the filter selected when `min_count` is 0: unreadable values are `invalid`.
+fn expectValidIds(db: Database, workspace_id: []const u8, expected: []const i64) !void {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT subject_entity_id FROM graph_rule_evaluations
+        \\WHERE workspace_id = ?1 AND state = 'valid' ORDER BY subject_entity_id
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, workspace_id);
+    var index: usize = 0;
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        try std.testing.expect(index < expected.len);
+        try std.testing.expectEqual(expected[index], c.sqlite3_column_int64(stmt, 0));
+        index += 1;
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
 fn expectEvaluatedIds(db: Database, workspace_id: []const u8, expected: []const i64) !void {
     const stmt = try facet_sqlite.prepare(db,
         \\SELECT subject_entity_id FROM graph_rule_evaluations
@@ -2271,7 +2439,7 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var gt_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer gt_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{ 1, 2 });
+    try expectValidIds(db, "ws_cmp", &.{ 1, 2 });
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
     _ = try importRulesJson(db, std.testing.allocator,
@@ -2279,7 +2447,7 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var gte_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer gte_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{ 1, 2, 3, 5 });
+    try expectValidIds(db, "ws_cmp", &.{ 1, 2, 3, 5 });
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
     _ = try importRulesJson(db, std.testing.allocator,
@@ -2287,7 +2455,7 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var lt_amount_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer lt_amount_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{4});
+    try expectValidIds(db, "ws_cmp", &.{4});
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
     _ = try importRulesJson(db, std.testing.allocator,
@@ -2295,7 +2463,7 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var lte_amount_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer lte_amount_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{ 3, 4, 5 });
+    try expectValidIds(db, "ws_cmp", &.{ 3, 4, 5 });
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
     try db.exec(
@@ -2311,7 +2479,7 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var lt_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer lt_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{11});
+    try expectValidIds(db, "ws_cmp", &.{11});
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
     _ = try importRulesJson(db, std.testing.allocator,
@@ -2319,11 +2487,13 @@ test "entity_filter compares numbers and ISO dates and rejects unknown operators
     );
     var lte_run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer lte_run.deinit(std.testing.allocator);
-    try expectEvaluatedIds(db, "ws_cmp", &.{ 11, 12, 14 });
+    try expectValidIds(db, "ws_cmp", &.{ 11, 12, 14 });
 
     try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
-    _ = try importRulesJson(db, std.testing.allocator,
-        \\{"ontology_id":"ws_cmp::core","workspace_id":"ws_cmp","replace":true,"rules":[{"rule_id":"bad-op","entity_type":"charge","relation_type":"pays","direction":"out","min_count":0,"severity":"error","label":"unknown op","metadata_json":"{\"entity_filter\":{\"metadata\":{\"amount\":{\"neq\":2400}}}}"}]}
+    try db.exec(
+        \\DELETE FROM graph_gap_rules;
+        \\INSERT INTO graph_gap_rules(rule_id, ontology_id, workspace_id, entity_type, relation_type, direction, min_count, severity, label, enabled, metadata_json)
+        \\VALUES ('bad-op', 'ws_cmp::core', 'ws_cmp', 'charge', 'pays', 'out', 0, 'error', 'bad op', 1, '{"entity_filter":{"metadata":{"amount":{"neq":1}}}}');
     );
     var report = try buildReport(db, std.testing.allocator, .{ .workspace_id = "ws_cmp", .limit = 50 });
     defer report.deinit(std.testing.allocator);
@@ -2680,4 +2850,126 @@ test "ontology reconciliation reports registry and graph drift" {
     try std.testing.expect(std.mem.indexOf(u8, json, "runtime_relation_endpoint_mismatch") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "gap_rule_unknown_entity_type") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"issues_total\":") != null);
+}
+
+test "gap rule import rejects filters that cannot be evaluated" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_v', 'ws_v', 'V');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_v::core', 'ws_v', 'core');
+    );
+    const invalid = [_][]const u8{
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"neq\":1}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"gt\":\"soon\"}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"gt\":true}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"gte\":null}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"lt\":[1]}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"lt\":\"2026-02-31\"}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":5000}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"one_of\":\"x\"}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"one_of\":[]}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"eq\":[1]}}}}",
+        "{\"entity_filter\":{\"metadata\":{\"a\":{\"eq\":null}}}}",
+        "{\"entity_filter\":{\"metadata\":\"a\"}}",
+        "{\"entity_filter\":{\"metdata\":{\"a\":{\"eq\":1}}}}",
+        "{\"entity_filter\":true}",
+        "{\"entity_filters\":{\"metadata\":{\"a\":{\"gt\":1}}}}",
+        "{\"entityFilter\":{\"metadata\":{\"a\":{\"gt\":1}}}}",
+        "not json",
+    };
+    for (invalid) |metadata_json| {
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+            .ontology_id = "ws_v::core",
+            .workspace_id = "ws_v",
+            .rules = &[_]struct {
+                rule_id: []const u8 = "r",
+                entity_type: []const u8 = "charge",
+                relation_type: []const u8 = "pays",
+                direction: []const u8 = "out",
+                label: []const u8 = "r",
+                metadata_json: []const u8,
+            }{.{ .metadata_json = metadata_json }},
+        }, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.InvalidArguments, importRulesJson(db, std.testing.allocator, json));
+    }
+    try std.testing.expectEqual(@as(usize, 1), try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_v::core","workspace_id":"ws_v","rules":[{"rule_id":"ok","entity_type":"charge","relation_type":"pays","direction":"out","label":"ok","metadata_json":"{\"note\":\"free text\",\"entity_filter\":{\"metadata\":{\"a\":{\"gte\":\"2026-02-28\",\"lt\":\"2026-03-01T00:00:00+01:00\"}}}}"}]}
+    ));
+}
+
+test "parseIsoInstant handles offsets fractions and impossible dates" {
+    const midnight = parseIsoInstant("2026-03-01").?;
+    try std.testing.expectEqual(midnight, parseIsoInstant("2026-03-01T00:00:00Z").?);
+    try std.testing.expectEqual(midnight, parseIsoInstant("2026-03-01T00:00:00").?);
+    try std.testing.expectEqual(midnight, parseIsoInstant("2026-03-01T01:00:00+01:00").?);
+    try std.testing.expectEqual(midnight, parseIsoInstant("2026-02-28T19:00:00-05:00").?);
+    try std.testing.expectEqual(midnight + 900, parseIsoInstant("2026-03-01T00:00:00.900Z").?);
+    try std.testing.expect(parseIsoInstant("2024-02-29") != null);
+    for ([_][]const u8{ "2026-02-29", "2026-02-31", "2026-04-31", "15/02/2026", "2026-13-01", "+026-03-01", "2026-03-01T25:00:00Z", "2026-03-01T00:00:00+0100", "2026-03-01T00:00:00." }) |text| {
+        try std.testing.expect(parseIsoInstant(text) == null);
+    }
+    try std.testing.expect(parseExactNumber("1e999") == null);
+    try std.testing.expectEqual(@as(?f64, 2400), parseExactNumber("2400"));
+}
+
+test "entity_filter reports unreadable values instead of hiding them" {
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try db.exec(
+        \\INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_u', 'ws_u', 'U');
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_u::core', 'ws_u', 'core');
+        \\INSERT INTO workspace_settings(workspace_id, default_ontology_id) VALUES ('ws_u', 'ws_u::core');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type, label) VALUES ('ws_u::core', 'charge', 'Charge');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name, metadata_json) VALUES
+        \\ (1, 'ws_u', 'charge', 'iso', '{"due_on":"2026-02-15","usage":"a"}'),
+        \\ (2, 'ws_u', 'charge', 'paris', '{"due_on":"2026-02-15T10:00:00+01:00","usage":"a"}'),
+        \\ (3, 'ws_u', 'charge', 'no_zone', '{"due_on":"2026-02-15T10:00:00","usage":"a"}'),
+        \\ (4, 'ws_u', 'charge', 'french', '{"due_on":"15/02/2026","usage":"a"}'),
+        \\ (5, 'ws_u', 'charge', 'impossible', '{"due_on":"2026-02-31","usage":"a"}'),
+        \\ (6, 'ws_u', 'charge', 'missing', '{"usage":"a"}'),
+        \\ (7, 'ws_u', 'charge', 'empty', '{"due_on":"","usage":"a"}'),
+        \\ (8, 'ws_u', 'charge', 'later', '{"due_on":"2026-06-01","usage":"a"}'),
+        \\ (9, 'ws_u', 'charge', 'french_other_usage', '{"due_on":"15/02/2026","usage":"b"}');
+    );
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_u::core","workspace_id":"ws_u","rules":[{"rule_id":"due","entity_type":"charge","relation_type":"pays","direction":"out","min_count":1,"severity":"error","label":"due","metadata_json":"{\"entity_filter\":{\"metadata\":{\"usage\":{\"eq\":\"a\"},\"due_on\":{\"lt\":\"2026-03-01\"}}}}"}]}
+    );
+
+    var report = try buildReport(db, std.testing.allocator, .{ .workspace_id = "ws_u", .limit = 50 });
+    defer report.deinit(std.testing.allocator);
+    var missing_relation: [16]u64 = undefined;
+    var missing_count: usize = 0;
+    var unreadable: [16]u64 = undefined;
+    var unreadable_count: usize = 0;
+    for (report.issues) |issue| {
+        if (std.mem.eql(u8, issue.kind, "missing_required_relation")) {
+            missing_relation[missing_count] = issue.entity_id.?;
+            missing_count += 1;
+        } else if (std.mem.eql(u8, issue.kind, "unreadable_filter_value")) {
+            unreadable[unreadable_count] = issue.entity_id.?;
+            unreadable_count += 1;
+        }
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, missing_relation[0..missing_count]);
+    try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, unreadable[0..unreadable_count]);
+
+    var run = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_u", .limit = 50 });
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), run.evaluated);
+    try std.testing.expectEqual(@as(usize, 5), run.invalid_count);
+
+    // With nothing required, only the unreadable values stay invalid.
+    try db.exec("DELETE FROM graph_rule_events; DELETE FROM graph_rule_evaluations;");
+    _ = try importRulesJson(db, std.testing.allocator,
+        \\{"ontology_id":"ws_u::core","workspace_id":"ws_u","replace":true,"rules":[{"rule_id":"due","entity_type":"charge","relation_type":"pays","direction":"out","min_count":0,"severity":"error","label":"due","metadata_json":"{\"entity_filter\":{\"metadata\":{\"usage\":{\"eq\":\"a\"},\"due_on\":{\"lt\":\"2026-03-01\"}}}}"}]}
+    );
+    var lenient = try runRuleEvaluations(db, std.testing.allocator, .{ .workspace_id = "ws_u", .limit = 50 });
+    defer lenient.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), lenient.invalid_count);
+    try expectValidIds(db, "ws_u", &.{ 1, 2, 3 });
 }

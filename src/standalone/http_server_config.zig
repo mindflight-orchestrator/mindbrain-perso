@@ -120,6 +120,33 @@ pub fn listenModeLabel(text: []const u8) []const u8 {
     return if (isLoopbackListenText(text)) "loopback-only" else "non-loopback";
 }
 
+fn isLoopbackHostHeader(host: []const u8) bool {
+    var name = host;
+    if (std.mem.startsWith(u8, host, "[")) {
+        const end = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+        name = host[1..end];
+    } else if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+        name = host[0..colon];
+    }
+    return std.ascii.eqlIgnoreCase(name, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(name, "localhost") or
+        std.ascii.eqlIgnoreCase(name, "::1");
+}
+
+/// Loopback stops the LAN, not a page open in a local browser. A loopback server
+/// only answers to a loopback Host (DNS rebinding), and any server refuses an
+/// Origin other than its own (cross-site requests). Clients that send no Origin,
+/// such as the MCP server and curl, are unaffected.
+pub fn isRequestSourceAllowed(listen_addr_text: []const u8, host: ?[]const u8, origin: ?[]const u8) bool {
+    if (isLoopbackListenText(listen_addr_text)) {
+        if (!isLoopbackHostHeader(host orelse return false)) return false;
+    }
+    const origin_text = origin orelse return true;
+    const scheme_end = std.mem.indexOf(u8, origin_text, "://") orelse return false;
+    const expected_host = host orelse return false;
+    return std.ascii.eqlIgnoreCase(origin_text[scheme_end + 3..], expected_host);
+}
+
 fn parsePort(text: []const u8) !u16 {
     return std.fmt.parseInt(u16, text, 10);
 }
@@ -238,6 +265,28 @@ test "loopback listen text detection matches secure default" {
     try std.testing.expectEqualStrings("loopback-only", listenModeLabel("[::1]:8091"));
     try std.testing.expectEqualStrings("non-loopback", listenModeLabel(":8091"));
     try std.testing.expectEqualStrings("non-loopback", listenModeLabel("0.0.0.0:8091"));
+}
+
+test "request source check blocks DNS rebinding and cross-site requests" {
+    const loopback = "127.0.0.1:8091";
+    try std.testing.expect(isRequestSourceAllowed(loopback, "127.0.0.1:8091", null));
+    try std.testing.expect(isRequestSourceAllowed(loopback, "localhost:8091", null));
+    try std.testing.expect(isRequestSourceAllowed(loopback, "[::1]:8091", null));
+    try std.testing.expect(isRequestSourceAllowed(loopback, "LOCALHOST", null));
+    try std.testing.expect(isRequestSourceAllowed(loopback, "127.0.0.1:8091", "http://127.0.0.1:8091"));
+
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "evil.example", null));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "evil.example:8091", "http://evil.example:8091"));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "127.0.0.1.evil.example", null));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, null, null));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "127.0.0.1:8091", "https://evil.example"));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "127.0.0.1:8091", "null"));
+    try std.testing.expect(!isRequestSourceAllowed(loopback, "127.0.0.1:8091", "http://localhost:8091"));
+
+    const open = "0.0.0.0:8091";
+    try std.testing.expect(isRequestSourceAllowed(open, "192.168.1.5:8091", null));
+    try std.testing.expect(isRequestSourceAllowed(open, "192.168.1.5:8091", "http://192.168.1.5:8091"));
+    try std.testing.expect(!isRequestSourceAllowed(open, "192.168.1.5:8091", "https://evil.example"));
 }
 
 test "graph bitmap mode accepts supported enum values" {

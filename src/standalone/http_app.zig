@@ -61,6 +61,37 @@ fn ontologyIsFrozenIfExists(db: facet_sqlite.Database, ontology_id: []const u8) 
     };
 }
 
+fn ontologyImportRefusedResponse(allocator: std.mem.Allocator, code: []const u8, message: []const u8) !Response {
+    return MindbrainHttpApp.jsonResponseWithStatus(allocator, .conflict, .{
+        .ok = false,
+        .@"error" = .{ .code = code, .message = message },
+    });
+}
+
+/// Client SQL must not reach the filesystem. `ATTACH` and `VACUUM INTO` create or
+/// read arbitrary paths; a plain `VACUUM` attaches an empty name and stays allowed.
+fn sqlRouteAuthorizer(
+    _: ?*anyopaque,
+    action: c_int,
+    arg1: [*c]const u8,
+    arg2: [*c]const u8,
+    _: [*c]const u8,
+    _: [*c]const u8,
+) callconv(.c) c_int {
+    const c = facet_sqlite.c;
+    switch (action) {
+        c.SQLITE_ATTACH => {
+            if (arg1 == null or std.mem.span(arg1).len == 0) return c.SQLITE_OK;
+            return c.SQLITE_DENY;
+        },
+        c.SQLITE_FUNCTION => {
+            if (arg2 != null and std.ascii.eqlIgnoreCase(std.mem.span(arg2), "load_extension")) return c.SQLITE_DENY;
+            return c.SQLITE_OK;
+        },
+        else => return c.SQLITE_OK,
+    }
+}
+
 fn setBusyTimeout(db: facet_sqlite.Database, busy_timeout_ms: u32) !void {
     if (facet_sqlite.c.sqlite3_busy_timeout(db.handle, @intCast(busy_timeout_ms)) != facet_sqlite.c.SQLITE_OK) {
         return error.ExecFailed;
@@ -214,6 +245,8 @@ const OntologyCompileLinkmlRequest = struct {
     name: ?[]const u8 = null,
     profile: ?[]const u8 = null,
     materialize_graph: bool = false,
+    mode: []const u8 = "merge",
+    allow_empty_replace: bool = false,
 };
 
 const QualityConvergenceRunRequest = struct {
@@ -465,6 +498,12 @@ pub const MindbrainHttpApp = struct {
                 self.max_connections,
             },
         );
+        if (!http_config.isLoopbackListenText(self.listen_addr_text)) {
+            log.warn(
+                "{s} is reachable beyond this machine on {s}: its SQL routes run arbitrary queries without authentication",
+                .{ self.service_name, self.listen_addr_text },
+            );
+        }
         while (true) {
             const connection = listener.accept(self.io) catch |err| {
                 log.err("accept failed: {s}", .{@errorName(err)});
@@ -884,6 +923,9 @@ pub const MindbrainHttpApp = struct {
         params: []const std.json.Value,
     ) !Response {
         const c = facet_sqlite.c;
+        // Scoped to this call: the engine's own VACUUM and maintenance use the same handle.
+        if (c.sqlite3_set_authorizer(db.handle, sqlRouteAuthorizer, null) != c.SQLITE_OK) return error.ExecFailed;
+        defer _ = c.sqlite3_set_authorizer(db.handle, null, null);
         const has_multiple_statements = params.len == 0 and countSqlStatements(sql) > 1;
 
         if (has_multiple_statements) {
@@ -1050,6 +1092,11 @@ pub const MindbrainHttpApp = struct {
                 };
                 return;
             }
+            if (!self.isRequestSourceAllowed(&request)) {
+                try self.respondError(request_allocator, &request, .forbidden, "RequestSourceRefused", parsed.path, parsed.query);
+                continue;
+            }
+
             const path_owned = try request_allocator.dupe(u8, parsed.path);
             const query_owned = try request_allocator.dupe(u8, parsed.query);
 
@@ -1094,6 +1141,17 @@ pub const MindbrainHttpApp = struct {
                 },
             );
         }
+    }
+
+    fn isRequestSourceAllowed(self: *MindbrainHttpApp, request: *http.Server.Request) bool {
+        var host: ?[]const u8 = null;
+        var origin: ?[]const u8 = null;
+        var headers = request.iterateHeaders();
+        while (headers.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "host")) host = header.value;
+            if (std.ascii.eqlIgnoreCase(header.name, "origin")) origin = header.value;
+        }
+        return http_config.isRequestSourceAllowed(self.listen_addr_text, host, origin);
     }
 
     fn dispatch(
@@ -2947,7 +3005,7 @@ pub const MindbrainHttpApp = struct {
         var read_buf: [65536]u8 = undefined;
         var fr = in_file.reader(self.io, &read_buf);
 
-        const summary = try owl2_import.importNTriplesReader(
+        const summary = owl2_import.importNTriplesReader(
             self.writer_db,
             allocator,
             import_workspace_id,
@@ -2958,7 +3016,10 @@ pub const MindbrainHttpApp = struct {
                 .materialize_graph = import_request.materialize_graph,
                 .merge = import_request.merge,
             },
-        );
+        ) catch |err| switch (err) {
+            error.OntologyWorkspaceConflict => return try ontologyImportRefusedResponse(allocator, "ontology_workspace_conflict", "this ontology_id belongs to another workspace"),
+            else => |e| return e,
+        };
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{
             .ontology_id = summary.ontology_id,
@@ -2993,6 +3054,7 @@ pub const MindbrainHttpApp = struct {
         if (compile_request.profile) |profile| {
             if (!std.mem.eql(u8, profile, "syndic")) return error.BadRequest;
         }
+        const import_mode = linkml_interchange.parseImportMode(compile_request.mode) orelse return error.BadRequest;
 
         var result = try linkml_interchange.compileLinkmlToBundle(allocator, .{
             .input_path = compile_request.input_path,
@@ -3015,7 +3077,14 @@ pub const MindbrainHttpApp = struct {
             .workspace_id = compile_workspace_id,
             .domain_profile = if (compile_request.profile != null) "syndic" else null,
         });
-        try linkml_interchange.importCompiledBundle(self.writer_db, allocator, result.bundle_json);
+        linkml_interchange.importCompiledBundle(self.writer_db, allocator, result.bundle_json, .{
+            .mode = import_mode,
+            .allow_empty_replace = compile_request.allow_empty_replace,
+        }) catch |err| switch (err) {
+            error.OntologyWorkspaceConflict => return try ontologyImportRefusedResponse(allocator, "ontology_workspace_conflict", "this ontology_id belongs to another workspace"),
+            error.EmptyOntologyReplace => return try ontologyImportRefusedResponse(allocator, "empty_ontology_replace", "the schema declares nothing and would empty this ontology; set allow_empty_replace to confirm"),
+            else => |e| return e,
+        };
         if (compile_request.profile != null) {
             try syndic_profile_seed.seedSyndicProfile(self.writer_db, compile_workspace_id, compile_request.ontology_id);
         }
@@ -3028,6 +3097,7 @@ pub const MindbrainHttpApp = struct {
             .edge_types = result.edge_type_count,
             .enum_values = result.enum_value_count,
             .triples = result.triple_count,
+            .mode = @tagName(import_mode),
             .imported = true,
         }));
     }
@@ -3291,7 +3361,10 @@ pub const MindbrainHttpApp = struct {
             return try self.writerSessionBusyResponse(allocator);
         }
 
-        const imported = try graph_diagnostics.importRulesJson(self.writer_db, allocator, body);
+        const imported = graph_diagnostics.importRulesJson(self.writer_db, allocator, body) catch |err| switch (err) {
+            error.InvalidArguments => return error.BadRequest,
+            else => |e| return e,
+        };
         self.writer_completed += 1;
         return toResponse(try helper_api.jsonResponse(allocator, .{ .ok = true, .imported = imported }));
     }
@@ -7044,6 +7117,7 @@ test "ontology compile linkml HTTP shrink matches CLI counts and drops removed t
         .ontology_id = "ws_http_shrink::core",
         .input_path = shrink_path,
         .name = "core",
+        .mode = "replace",
     });
     try std.testing.expectEqual(http.Status.ok, second.status);
     try std.testing.expect(std.mem.indexOf(u8, second.body, try std.fmt.allocPrint(arena, "\"entity_types\":{}", .{cli_shrink.entity_type_count})) != null);
@@ -7056,4 +7130,43 @@ test "ontology compile linkml HTTP shrink matches CLI counts and drops removed t
     try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"entity_type\":\"Building\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"entity_type\":\"Unit\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"value\":\"vacant\"") == null);
+}
+
+test "http sql refuses filesystem access through client SQL" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-sql-auth-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+    const target = try std.fmt.allocPrint(std.testing.allocator, "{s}.leak", .{db_path});
+    defer std.testing.allocator.free(target);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), target) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const statements = [_][]const u8{
+        try std.fmt.allocPrint(arena, "ATTACH DATABASE '{s}' AS a", .{target}),
+        try std.fmt.allocPrint(arena, "ATTACH DATABASE '{s}' AS a; CREATE TABLE a.t(x);", .{target}),
+        try std.fmt.allocPrint(arena, "VACUUM INTO '{s}'", .{target}),
+    };
+    for (statements) |sql| {
+        const response = try app.executeSql(arena, app.writer_db, sql, &.{});
+        try std.testing.expect(response.status != http.Status.ok);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(zig16_compat.io(), target, .{}));
+    }
+
+    const plain = try app.executeSql(arena, app.writer_db, "VACUUM", &.{});
+    try std.testing.expectEqual(http.Status.ok, plain.status);
+    const select = try app.executeSql(arena, app.writer_db, "SELECT 1", &.{});
+    try std.testing.expectEqual(http.Status.ok, select.status);
+    // The authorizer does not outlive the client call.
+    try std.testing.expectEqual(facet_sqlite.c.SQLITE_OK, facet_sqlite.c.sqlite3_set_authorizer(app.writer_db.handle, null, null));
 }

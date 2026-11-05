@@ -24,12 +24,20 @@ pub const ExportOptions = struct {
     include_vectors: bool = true,
 };
 
+pub const OntologyRegistryMode = enum {
+    /// Additive: existing types stay, values keep their ids, known triples are not repeated.
+    merge,
+    /// The bundle becomes the registry: absent types, values, and triples are dropped.
+    replace,
+};
+
 pub const ImportOptions = struct {
     overwrite_existing_workspace: bool = false,
-    /// Drop registry rows for ontologies present in the bundle before upserting.
-    /// Used by LinkML compile reimport so removed classes, enums, and triples
-    /// do not collide with leftover UNIQUE keys. Does not touch instance graph rows.
-    replace_ontology_registry: bool = false,
+    /// How a compiled schema lands on an existing ontology. Null keeps the plain
+    /// bundle restore. Neither mode touches instance graph rows.
+    ontology_registry_mode: ?OntologyRegistryMode = null,
+    /// Lets `.replace` empty a populated ontology from a bundle with no registry rows.
+    allow_empty_replace: bool = false,
 };
 
 pub const BundleSummary = struct {
@@ -665,9 +673,24 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try purgeBundleWorkspaceInOpenTransaction(db, allocator, bundle.scope.workspace_id);
     }
 
-    if (options.replace_ontology_registry) {
+    var registry_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer registry_arena_state.deinit();
+    const registry_arena = registry_arena_state.allocator();
+    var value_ids: ?StableValueIds = null;
+    if (options.ontology_registry_mode) |mode| {
         for (bundle.ontologies) |row| {
-            try purgeOntologyRegistryInOpenTransaction(db, row.ontology_id);
+            try collections_sqlite.requireOntologyWorkspace(db, row.ontology_id, row.workspace_id);
+        }
+        value_ids = try StableValueIds.load(db, registry_arena, bundle.ontologies);
+        if (mode == .replace) {
+            for (bundle.ontologies) |row| {
+                if (!options.allow_empty_replace and !bundleDeclaresRegistry(bundle, row.ontology_id) and
+                    try ontologyRegistryHasRows(db, row.ontology_id))
+                {
+                    return error.EmptyOntologyReplace;
+                }
+                try purgeOntologyRegistryInOpenTransaction(db, row.ontology_id);
+            }
         }
     }
 
@@ -736,11 +759,15 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     }
 
     for (bundle.ontology_values) |row| {
+        const stable_value_id = if (value_ids) |*ids|
+            try ids.resolve(registry_arena, row.ontology_id, row.namespace, row.dimension, row.value, row.value_id)
+        else
+            row.value_id;
         try collections_sqlite.ensureValue(db, .{
             .ontology_id = row.ontology_id,
             .namespace = row.namespace,
             .dimension = row.dimension,
-            .value_id = std.math.cast(u32, row.value_id) orelse return error.ValueOutOfRange,
+            .value_id = std.math.cast(u32, stable_value_id) orelse return error.ValueOutOfRange,
             .value = row.value,
             .parent_value_id = if (row.parent_value_id) |v| std.math.cast(u32, v) orelse return error.ValueOutOfRange else null,
             .label = row.label,
@@ -790,9 +817,14 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
     }
 
     for (bundle.ontology_triples) |row| {
+        var triple_index = row.triple_index;
+        if (options.ontology_registry_mode == .merge) {
+            if (try ontologyTripleExists(db, row)) continue;
+            triple_index = @intCast(try collections_sqlite.nextOntologyTripleIndex(db, row.ontology_id));
+        }
         try collections_sqlite.upsertOntologyTriple(db, .{
             .ontology_id = row.ontology_id,
-            .triple_index = std.math.cast(u64, row.triple_index) orelse return error.ValueOutOfRange,
+            .triple_index = std.math.cast(u64, triple_index) orelse return error.ValueOutOfRange,
             .subject_kind = row.subject_kind,
             .subject = row.subject,
             .predicate = row.predicate,
@@ -1133,6 +1165,107 @@ fn logForeignKeyViolations(db: Database) void {
         shown += 1;
     }
 }
+
+fn bundleDeclaresRegistry(bundle: anytype, ontology_id: []const u8) bool {
+    for (bundle.ontology_entity_types) |row| if (std.mem.eql(u8, row.ontology_id, ontology_id)) return true;
+    for (bundle.ontology_edge_types) |row| if (std.mem.eql(u8, row.ontology_id, ontology_id)) return true;
+    for (bundle.ontology_values) |row| if (std.mem.eql(u8, row.ontology_id, ontology_id)) return true;
+    for (bundle.ontology_dimensions) |row| if (std.mem.eql(u8, row.ontology_id, ontology_id)) return true;
+    return false;
+}
+
+fn ontologyRegistryHasRows(db: Database, ontology_id: []const u8) !bool {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT EXISTS(SELECT 1 FROM ontology_entity_types WHERE ontology_id = ?1)
+        \\    OR EXISTS(SELECT 1 FROM ontology_edge_types WHERE ontology_id = ?1)
+        \\    OR EXISTS(SELECT 1 FROM ontology_dimensions WHERE ontology_id = ?1)
+        \\    OR EXISTS(SELECT 1 FROM ontology_triples_raw WHERE ontology_id = ?1)
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, ontology_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_int64(stmt, 0) != 0;
+}
+
+fn ontologyTripleExists(db: Database, row: anytype) !bool {
+    const stmt = try facet_sqlite.prepare(db,
+        \\SELECT 1 FROM ontology_triples_raw
+        \\WHERE ontology_id = ?1 AND subject_kind = ?2 AND subject = ?3 AND predicate = ?4
+        \\  AND object_kind = ?5 AND object_value = ?6
+        \\  AND object_datatype IS ?7 AND object_language IS ?8
+        \\LIMIT 1
+    );
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, row.ontology_id);
+    try facet_sqlite.bindText(stmt, 2, row.subject_kind);
+    try facet_sqlite.bindText(stmt, 3, row.subject);
+    try facet_sqlite.bindText(stmt, 4, row.predicate);
+    try facet_sqlite.bindText(stmt, 5, row.object_kind);
+    try facet_sqlite.bindText(stmt, 6, row.object_value);
+    if (row.object_datatype) |value| try facet_sqlite.bindText(stmt, 7, value) else try facet_sqlite.bindNull(stmt, 7);
+    if (row.object_language) |value| try facet_sqlite.bindText(stmt, 8, value) else try facet_sqlite.bindNull(stmt, 8);
+    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+}
+
+/// Keeps `value_id` stable across schema reimports. Compilation numbers enum
+/// members by position, so removing or reordering a member would otherwise
+/// renumber the survivors and leave facet assignments pointing at the wrong id.
+/// Ids of removed values are not handed to new values.
+const StableValueIds = struct {
+    known: std.StringHashMapUnmanaged(i64) = .empty,
+    used: std.StringHashMapUnmanaged(void) = .empty,
+    max_by_dimension: std.StringHashMapUnmanaged(i64) = .empty,
+
+    fn dimensionKey(arena: Allocator, ontology_id: []const u8, namespace: []const u8, dimension: []const u8) ![]u8 {
+        return std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ ontology_id, namespace, dimension });
+    }
+
+    fn reserve(self: *StableValueIds, arena: Allocator, dimension_key: []const u8, value_id: i64) !void {
+        const used_key = try std.fmt.allocPrint(arena, "{s}\x00{d}", .{ dimension_key, value_id });
+        try self.used.put(arena, used_key, {});
+        const entry = try self.max_by_dimension.getOrPutValue(arena, dimension_key, value_id);
+        if (value_id > entry.value_ptr.*) entry.value_ptr.* = value_id;
+    }
+
+    fn load(db: Database, arena: Allocator, ontologies: anytype) !StableValueIds {
+        var self = StableValueIds{};
+        const stmt = try facet_sqlite.prepare(db, "SELECT namespace, dimension, value, value_id FROM ontology_values WHERE ontology_id = ?1");
+        defer facet_sqlite.finalize(stmt);
+        for (ontologies) |ontology| {
+            try facet_sqlite.resetStatement(stmt);
+            try facet_sqlite.bindText(stmt, 1, ontology.ontology_id);
+            while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                const namespace = std.mem.span(c.sqlite3_column_text(stmt, 0));
+                const dimension = std.mem.span(c.sqlite3_column_text(stmt, 1));
+                const value = std.mem.span(c.sqlite3_column_text(stmt, 2));
+                const value_id = c.sqlite3_column_int64(stmt, 3);
+                const key = try dimensionKey(arena, ontology.ontology_id, namespace, dimension);
+                try self.reserve(arena, key, value_id);
+                try self.known.put(arena, try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ key, value }), value_id);
+            }
+        }
+        return self;
+    }
+
+    fn resolve(
+        self: *StableValueIds,
+        arena: Allocator,
+        ontology_id: []const u8,
+        namespace: []const u8,
+        dimension: []const u8,
+        value: []const u8,
+        bundle_value_id: i64,
+    ) !i64 {
+        const key = try dimensionKey(arena, ontology_id, namespace, dimension);
+        const value_key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ key, value });
+        if (self.known.get(value_key)) |value_id| return value_id;
+        const bundle_key = try std.fmt.allocPrint(arena, "{s}\x00{d}", .{ key, bundle_value_id });
+        const value_id = if (self.used.contains(bundle_key)) (self.max_by_dimension.get(key) orelse 0) + 1 else bundle_value_id;
+        try self.reserve(arena, key, value_id);
+        try self.known.put(arena, value_key, value_id);
+        return value_id;
+    }
+};
 
 fn purgeOntologyRegistryInOpenTransaction(db: Database, ontology_id: []const u8) !void {
     const statements = [_][]const u8{

@@ -431,6 +431,7 @@ pub fn importNTriplesReader(
     // the same stable ids later in the transaction; check FKs at COMMIT.
     try db.exec("PRAGMA defer_foreign_keys = ON");
 
+    try collections_sqlite.requireOntologyWorkspace(db, ontology_id, workspace_id);
     try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = workspace_id, .label = workspace_id });
     try collections_sqlite.ensureOntology(db, .{
         .ontology_id = ontology_id,
@@ -1275,6 +1276,30 @@ test "re-importing an ontology replaces its previous content" {
     try std.testing.expectEqualStrings(
         "<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .\n",
         exported,
+    );
+}
+
+test "import refuses an ontology owned by another workspace" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+    const triples =
+        \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-owner", "onto-owned", triples, .{});
+    try std.testing.expectError(
+        error.OntologyWorkspaceConflict,
+        importNTriples(db, allocator, "ws-other", "onto-owned", triples, .{}),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = 'onto-owned'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontologies WHERE ontology_id = 'onto-owned' AND workspace_id = 'ws-owner'"),
     );
 }
 

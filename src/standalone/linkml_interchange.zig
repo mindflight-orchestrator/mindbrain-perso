@@ -373,9 +373,21 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
     };
 }
 
-pub fn importCompiledBundle(db: Database, allocator: Allocator, bundle_json: []const u8) !void {
+pub const ImportMode = collections_io.OntologyRegistryMode;
+
+pub const ImportOptions = struct {
+    mode: ImportMode = .merge,
+    allow_empty_replace: bool = false,
+};
+
+pub fn parseImportMode(text: []const u8) ?ImportMode {
+    return std.meta.stringToEnum(ImportMode, text);
+}
+
+pub fn importCompiledBundle(db: Database, allocator: Allocator, bundle_json: []const u8, options: ImportOptions) !void {
     try collections_io.importBundleJsonWithOptions(db, allocator, bundle_json, .{
-        .replace_ontology_registry = true,
+        .ontology_registry_mode = options.mode,
+        .allow_empty_replace = options.allow_empty_replace,
     });
 }
 
@@ -1412,7 +1424,7 @@ test "compile import sets default_ontology_id" {
     defer db.close();
     try db.applyStandaloneSchema();
     try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-compile" });
-    try importCompiledBundle(db, std.testing.allocator, result.bundle_json);
+    try importCompiledBundle(db, std.testing.allocator, result.bundle_json, .{});
     try collections_sqlite.setDefaultOntology(db, "ws-compile", "ws-compile::core");
 
     const default_id = try collections_sqlite.defaultOntology(db, std.testing.allocator, "ws-compile");
@@ -1433,7 +1445,7 @@ test "compile import ensures workspace row exists for target workspace" {
     defer db.close();
     try db.applyStandaloneSchema();
     try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-only" });
-    try importCompiledBundle(db, std.testing.allocator, result.bundle_json);
+    try importCompiledBundle(db, std.testing.allocator, result.bundle_json, .{});
 
     const stmt = try facet_sqlite.prepare(db, "SELECT COUNT(*) FROM workspaces WHERE workspace_id = ?1");
     defer facet_sqlite.finalize(stmt);
@@ -1532,7 +1544,7 @@ test "LinkML reimport removes classes enums and edges without StepFailed" {
         .ontology_id = "ws-shrink::core",
     });
     defer first.deinit(std.testing.allocator);
-    try importCompiledBundle(db, std.testing.allocator, first.bundle_json);
+    try importCompiledBundle(db, std.testing.allocator, first.bundle_json, .{});
 
     try db.exec(
         \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws-shrink::sibling', 'ws-shrink', 'sibling');
@@ -1548,7 +1560,7 @@ test "LinkML reimport removes classes enums and edges without StepFailed" {
         .ontology_id = "ws-shrink::core",
     });
     defer second.deinit(std.testing.allocator);
-    try importCompiledBundle(db, std.testing.allocator, second.bundle_json);
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json, .{ .mode = .replace });
 
     try std.testing.expectEqual(
         @as(i64, 1),
@@ -1599,12 +1611,12 @@ test "LinkML reimport removes classes enums and edges without StepFailed" {
         try countBound(db, "SELECT COUNT(*) FROM graph_entity WHERE workspace_id = ?1 AND entity_type = 'Unit'", "ws-shrink"),
     );
 
-    const max_index = try countBound(db, "SELECT COALESCE(MAX(triple_index), 0) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core");
     const triple_count = try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core");
-    try std.testing.expect(max_index <= triple_count or triple_count == 0);
+    try std.testing.expectEqual(@as(i64, @intCast(second.triple_count)), triple_count);
+    try std.testing.expectEqual(triple_count - 1, try countBound(db, "SELECT COALESCE(MAX(triple_index), -1) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core"));
     const occupied_id = try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-shrink::core");
 
-    try importCompiledBundle(db, std.testing.allocator, second.bundle_json);
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json, .{ .mode = .replace });
     try std.testing.expectEqual(triple_count, try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core"));
     try std.testing.expectEqual(occupied_id, try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-shrink::core"));
     try std.testing.expectEqual(
@@ -1618,15 +1630,173 @@ test "LinkML reimport removes classes enums and edges without StepFailed" {
         .ontology_id = "ws-shrink::core",
     });
     defer reordered.deinit(std.testing.allocator);
-    try importCompiledBundle(db, std.testing.allocator, reordered.bundle_json);
+    const works_id = try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'works'", "ws-shrink::core");
+    try std.testing.expectEqual(@as(i64, 3), works_id);
+    try importCompiledBundle(db, std.testing.allocator, reordered.bundle_json, .{ .mode = .replace });
     try std.testing.expectEqual(
         @as(i64, 2),
         try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1 AND dimension = 'Usage'", "ws-shrink::core"),
     );
+    try std.testing.expectEqual(occupied_id, try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-shrink::core"));
+    try std.testing.expectEqual(works_id, try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'works'", "ws-shrink::core"));
 
     const exported = try exportLinkmlFromDb(std.testing.allocator, db, "ws-shrink::core");
     defer std.testing.allocator.free(exported);
     try std.testing.expect(std.mem.indexOf(u8, exported, "Building") != null);
     try std.testing.expect(std.mem.indexOf(u8, exported, "Unit") == null);
     try std.testing.expect(std.mem.indexOf(u8, exported, "vacant") == null);
+}
+
+fn testCompile(tmp: *std.testing.TmpDir, name: []const u8, yaml: []const u8, workspace_id: []const u8, ontology_id: []const u8) !CompileResult {
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = name, .data = yaml, .flags = .{ .truncate = true } });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], name });
+    defer std.testing.allocator.free(path);
+    return compileLinkmlToBundle(std.testing.allocator, .{ .input_path = path, .workspace_id = workspace_id, .ontology_id = ontology_id });
+}
+
+test "LinkML merge is additive, idempotent, and survives enum changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-m" });
+
+    var first = try testCompile(&tmp, "a.yaml",
+        \\id: https://example.org/m
+        \\name: m
+        \\default_prefix: m
+        \\classes:
+        \\  Part1:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Part1
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      occupied:
+        \\      vacant:
+        \\      works:
+        \\
+    , "ws-m", "ws-m::core");
+    defer first.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, first.bundle_json, .{});
+    const first_triples = try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-m::core");
+
+    try importCompiledBundle(db, std.testing.allocator, first.bundle_json, .{});
+    try std.testing.expectEqual(first_triples, try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-m::core"));
+
+    // The enum shrink that used to raise StepFailed under the upsert path.
+    var second = try testCompile(&tmp, "b.yaml",
+        \\id: https://example.org/m
+        \\name: m
+        \\default_prefix: m
+        \\classes:
+        \\  Part2:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Part2
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      works:
+        \\      added:
+        \\
+    , "ws-m", "ws-m::core");
+    defer second.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json, .{});
+
+    try std.testing.expectEqual(@as(i64, 2), try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "ws-m::core"));
+    try std.testing.expectEqual(@as(i64, 1), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-m::core"));
+    try std.testing.expectEqual(@as(i64, 2), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'vacant'", "ws-m::core"));
+    try std.testing.expectEqual(@as(i64, 3), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'works'", "ws-m::core"));
+    try std.testing.expectEqual(@as(i64, 4), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'added'", "ws-m::core"));
+    const merged_triples = try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-m::core");
+    try std.testing.expect(merged_triples > first_triples);
+    try std.testing.expectEqual(merged_triples - 1, try countBound(db, "SELECT MAX(triple_index) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-m::core"));
+    const part1_triples = try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1 AND subject LIKE '%Part1%'", "ws-m::core");
+    try std.testing.expect(part1_triples > 0);
+}
+
+test "LinkML replace keeps surviving value ids and does not reuse removed ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-r" });
+    var first = try testCompile(&tmp, "a.yaml",
+        \\id: https://example.org/r
+        \\name: r
+        \\default_prefix: r
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      a:
+        \\      b:
+        \\      c:
+        \\
+    , "ws-r", "ws-r::core");
+    defer first.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, first.bundle_json, .{});
+    var second = try testCompile(&tmp, "b.yaml",
+        \\id: https://example.org/r
+        \\name: r
+        \\default_prefix: r
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      c:
+        \\      fresh:
+        \\
+    , "ws-r", "ws-r::core");
+    defer second.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json, .{ .mode = .replace });
+    try std.testing.expectEqual(@as(i64, 2), try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1", "ws-r::core"));
+    try std.testing.expectEqual(@as(i64, 3), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'c'", "ws-r::core"));
+    try std.testing.expectEqual(@as(i64, 4), try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'fresh'", "ws-r::core"));
+}
+
+test "LinkML import refuses another workspace's ontology and an empty replace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-a" });
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-b" });
+    const yaml =
+        \\id: https://example.org/g
+        \\name: g
+        \\default_prefix: g
+        \\classes:
+        \\  Alpha:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Alpha
+        \\
+    ;
+    const empty_yaml =
+        \\id: https://example.org/g
+        \\name: g
+        \\default_prefix: g
+        \\
+    ;
+    var owner = try testCompile(&tmp, "a.yaml", yaml, "ws-a", "shared");
+    defer owner.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, owner.bundle_json, .{});
+
+    var intruder = try testCompile(&tmp, "b.yaml", yaml, "ws-b", "shared");
+    defer intruder.deinit(std.testing.allocator);
+    try std.testing.expectError(error.OntologyWorkspaceConflict, importCompiledBundle(db, std.testing.allocator, intruder.bundle_json, .{}));
+    try std.testing.expectError(error.OntologyWorkspaceConflict, importCompiledBundle(db, std.testing.allocator, intruder.bundle_json, .{ .mode = .replace }));
+    try std.testing.expectEqual(@as(i64, 1), try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "shared"));
+
+    var empty = try testCompile(&tmp, "e.yaml", empty_yaml, "ws-a", "shared");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectError(error.EmptyOntologyReplace, importCompiledBundle(db, std.testing.allocator, empty.bundle_json, .{ .mode = .replace }));
+    try std.testing.expectEqual(@as(i64, 1), try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "shared"));
+
+    try importCompiledBundle(db, std.testing.allocator, empty.bundle_json, .{});
+    try std.testing.expectEqual(@as(i64, 1), try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "shared"));
+
+    try importCompiledBundle(db, std.testing.allocator, empty.bundle_json, .{ .mode = .replace, .allow_empty_replace = true });
+    try std.testing.expectEqual(@as(i64, 0), try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1", "shared"));
 }

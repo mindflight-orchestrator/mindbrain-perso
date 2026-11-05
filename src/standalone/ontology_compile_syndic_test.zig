@@ -20,7 +20,7 @@ test "syndic compile profile leaves core as default after ingest bootstrap" {
         .workspace_id = "ws-syndic-lab",
         .domain_profile = "syndic",
     });
-    try linkml_interchange.importCompiledBundle(db, std.testing.allocator, result.bundle_json);
+    try linkml_interchange.importCompiledBundle(db, std.testing.allocator, result.bundle_json, .{});
     try syndic_profile_seed.seedSyndicProfile(db, "ws-syndic-lab", "ws-syndic-lab::core");
     try collections_sqlite.setDefaultOntology(db, "ws-syndic-lab", "ws-syndic-lab::core");
 

@@ -5229,11 +5229,13 @@ fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u
     var db_path: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var profile: ?[]const u8 = null;
+    var mode_text: []const u8 = "merge";
+    var allow_empty_replace = false;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ntriples")) ntriples_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else return CliError.InvalidArguments;
+        if (std.mem.eql(u8, arg, "--mode")) mode_text = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--allow-empty-replace")) allow_empty_replace = true else if (std.mem.eql(u8, arg, "--workspace-id")) workspace_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ontology-id")) ontology_id = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--input")) input_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--output")) output_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--ntriples")) ntriples_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--db")) db_path = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--name")) name = try requireArg(args, &index) else if (std.mem.eql(u8, arg, "--profile")) profile = try requireArg(args, &index) else return CliError.InvalidArguments;
     }
 
     var ws_slug_buf: [512]u8 = undefined;
@@ -5243,6 +5245,7 @@ fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u
     }
     if (workspace_id == null or ontology_id == null or input_path == null) return CliError.InvalidArguments;
     if (profile != null and !std.mem.eql(u8, profile.?, "syndic")) return CliError.InvalidArguments;
+    const import_mode = linkml_interchange.parseImportMode(mode_text) orelse return CliError.InvalidArguments;
 
     var result = try linkml_interchange.compileLinkmlToBundle(allocator, .{
         .input_path = input_path.?,
@@ -5278,7 +5281,10 @@ fn runOntologyCompileLinkmlCommand(allocator: Allocator, args: []const []const u
             .workspace_id = workspace_id.?,
             .domain_profile = if (profile != null) "syndic" else null,
         });
-        try linkml_interchange.importCompiledBundle(db, allocator, result.bundle_json);
+        try linkml_interchange.importCompiledBundle(db, allocator, result.bundle_json, .{
+            .mode = import_mode,
+            .allow_empty_replace = allow_empty_replace,
+        });
         if (profile != null) {
             try syndic_profile_seed.seedSyndicProfile(db, workspace_id.?, ontology_id.?);
         }
