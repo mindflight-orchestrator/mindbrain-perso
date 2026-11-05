@@ -1278,22 +1278,63 @@ test "re-importing an ontology replaces its previous content" {
     );
 }
 
+test "removed owl class remains in ontology_entity_types" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(":memory:");
+    defer db.close();
+    try db.applyStandaloneSchema();
+
+    const first =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#Widget> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://a.example/ns#Person> .
+        \\<http://a.example/ns#w1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://a.example/ns#Widget> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-keep-types", "onto-keep-types", first, .{});
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-keep-types' AND entity_type = 'Widget'"),
+    );
+
+    const second =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://a.example/ns#Person> .
+        \\
+    ;
+    _ = try importNTriples(db, allocator, "ws-keep-types", "onto-keep-types", second, .{});
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-keep-types' AND entity_type = 'Widget'"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-keep-types' AND entity_type = 'Person'"),
+    );
+}
+
 test "merge accumulates a second import's new content on top of the first" {
     const allocator = std.testing.allocator;
     var db = try Database.open(":memory:");
     defer db.close();
     try db.applyStandaloneSchema();
 
-    // First file: alice<->bob (2 triples, triple_index 1..2, entities alice/bob).
+    // First file: alice<->bob plus a registered class (instance rdf:type) that merge must keep.
     const first =
+        \\<http://a.example/ns#Person> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .
+        \\<http://a.example/ns#alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://a.example/ns#Person> .
         \\<http://a.example/ns#alice> <http://x.example/ns#knows> <http://a.example/ns#bob> .
         \\<http://a.example/ns#bob> <http://x.example/ns#knows> <http://a.example/ns#alice> .
         \\
     ;
     _ = try importNTriples(db, allocator, "ws-merge", "onto-merge", first, .{ .materialize_graph = true });
     try std.testing.expectEqual(
-        @as(i64, 2),
+        @as(i64, 4),
         try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-merge' AND entity_type = 'Person'"),
     );
 
     // Second file with genuinely NEW content merged on top: carol<->dave.
@@ -1308,11 +1349,14 @@ test "merge accumulates a second import's new content on top of the first" {
     });
     try std.testing.expectEqual(@as(usize, 2), summary.triples);
 
-    // Raw triples APPEND (indices 3..4), not overwrite 1..2: total is 4, and both
-    // the first import's and the second import's relations are exported.
+    // Raw triples APPEND (class + typed alice/bob, then carol/dave): total is 6.
     try std.testing.expectEqual(
-        @as(i64, 4),
+        @as(i64, 6),
         try countRowsBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "onto-merge"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countRows(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'onto-merge' AND entity_type = 'Person'"),
     );
     const exported = try exportNTriples(db, allocator, "onto-merge");
     defer allocator.free(exported);

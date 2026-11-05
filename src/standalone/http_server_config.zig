@@ -116,6 +116,10 @@ pub fn isLoopbackListenText(text: []const u8) bool {
         std.mem.eql(u8, host, "0:0:0:0:0:0:0:1");
 }
 
+pub fn listenModeLabel(text: []const u8) []const u8 {
+    return if (isLoopbackListenText(text)) "loopback-only" else "non-loopback";
+}
+
 fn parsePort(text: []const u8) !u16 {
     return std.fmt.parseInt(u16, text, 10);
 }
@@ -230,6 +234,10 @@ test "loopback listen text detection matches secure default" {
     try std.testing.expect(isLoopbackListenText("[::1]:8091"));
     try std.testing.expect(!isLoopbackListenText(":8091"));
     try std.testing.expect(!isLoopbackListenText("0.0.0.0:8091"));
+    try std.testing.expectEqualStrings("loopback-only", listenModeLabel("127.0.0.1:8091"));
+    try std.testing.expectEqualStrings("loopback-only", listenModeLabel("[::1]:8091"));
+    try std.testing.expectEqualStrings("non-loopback", listenModeLabel(":8091"));
+    try std.testing.expectEqualStrings("non-loopback", listenModeLabel("0.0.0.0:8091"));
 }
 
 test "graph bitmap mode accepts supported enum values" {

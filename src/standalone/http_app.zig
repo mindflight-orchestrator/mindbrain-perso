@@ -460,7 +460,7 @@ pub const MindbrainHttpApp = struct {
             .{
                 self.service_name,
                 self.listen_addr_text,
-                if (http_config.isLoopbackListenText(self.listen_addr_text)) "loopback-only" else "non-loopback",
+                http_config.listenModeLabel(self.listen_addr_text),
                 self.max_body_bytes,
                 self.max_connections,
             },
@@ -653,7 +653,13 @@ pub const MindbrainHttpApp = struct {
     ) !Response {
         _ = request;
         _ = body_buffer;
+        return self.openWriterSqlSession(allocator);
+    }
 
+    fn openWriterSqlSession(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+    ) !Response {
         self.writer_mutex.lockUncancelable(self.io);
         defer self.writer_mutex.unlock(self.io);
 
@@ -704,7 +710,15 @@ pub const MindbrainHttpApp = struct {
         const sql_request = try self.parseSqlRequest(allocator, request, body_buffer);
         const session_id = sql_request.session_id orelse return error.BadRequest;
         const commit = sql_request.commit orelse true;
+        return self.closeWriterSqlSession(allocator, session_id, commit);
+    }
 
+    fn closeWriterSqlSession(
+        self: *MindbrainHttpApp,
+        allocator: std.mem.Allocator,
+        session_id: u64,
+        commit: bool,
+    ) !Response {
         const session = try self.takeSqlSession(session_id);
         defer self.allocator.destroy(session);
         session.active = false;
@@ -1274,15 +1288,7 @@ pub const MindbrainHttpApp = struct {
         if (request.head.method != .GET and request.head.method != .HEAD) return error.MethodNotAllowed;
 
         if (std.mem.eql(u8, path, "/health")) {
-            return .{
-                .status = .ok,
-                .content_type = "application/json; charset=utf-8",
-                .body = try std.json.Stringify.valueAlloc(allocator, .{
-                    .kind = "mindbrain_health",
-                    .status = "ok",
-                    .mindbrain_version = mindbrain_version,
-                }, .{}),
-            };
+            return self.handleHealth(allocator);
         }
 
         if (std.mem.eql(u8, path, "/api/mindbrain/capabilities")) {
@@ -3763,6 +3769,18 @@ pub const MindbrainHttpApp = struct {
             .status = .ok,
             .content_type = "text/plain; charset=utf-8",
             .body = body,
+        };
+    }
+
+    fn handleHealth(_: *MindbrainHttpApp, allocator: std.mem.Allocator) !Response {
+        return .{
+            .status = .ok,
+            .content_type = "application/json; charset=utf-8",
+            .body = try std.json.Stringify.valueAlloc(allocator, .{
+                .kind = "mindbrain_health",
+                .status = "ok",
+                .mindbrain_version = mindbrain_version,
+            }, .{}),
         };
     }
 
@@ -6827,4 +6845,215 @@ test "capabilities expose configured auto bitmap mode" {
     try std.testing.expect(response.status == .ok);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"bitmap_mode_configured\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"bitmap_mode_effective\":\"dense32\"") != null);
+}
+
+test "http sql binds parameters inserts rows and runs multi-statement text" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-sql-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+    try std.testing.expect(http_config.isLoopbackListenText(app.listen_addr_text));
+    try std.testing.expect(!http_config.isLoopbackListenText("0.0.0.0:8091"));
+    try std.testing.expectEqualStrings("loopback-only", http_config.listenModeLabel(app.listen_addr_text));
+    try std.testing.expectEqualStrings("non-loopback", http_config.listenModeLabel("0.0.0.0:8091"));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const health_like = try app.handleCapabilities(arena);
+    try std.testing.expectEqual(http.Status.ok, health_like.status);
+
+    const empty = try app.executeSql(arena, app.writer_db, "", &.{});
+    try std.testing.expectEqual(http.Status.bad_request, empty.status);
+
+    const bound = try app.executeSql(arena, app.writer_db, "SELECT ?1 AS n", &.{.{ .integer = 7 }});
+    try std.testing.expectEqual(http.Status.ok, bound.status);
+    try std.testing.expect(std.mem.indexOf(u8, bound.body, "7") != null);
+
+    const inserted = try app.executeSql(
+        arena,
+        app.writer_db,
+        "INSERT INTO workspaces(id, workspace_id, label) VALUES (?1, ?1, ?2)",
+        &.{ .{ .string = "ws_sql" }, .{ .string = "Sql" } },
+    );
+    try std.testing.expectEqual(http.Status.ok, inserted.status);
+    const selected = try app.executeSql(arena, app.writer_db, "SELECT label FROM workspaces WHERE id = ?1", &.{.{ .string = "ws_sql" }});
+    try std.testing.expect(std.mem.indexOf(u8, selected.body, "Sql") != null);
+
+    const multi = try app.executeSql(
+        arena,
+        app.writer_db,
+        "INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws_sql::core', 'ws_sql', 'core'); INSERT INTO ontology_entity_types(ontology_id, entity_type) VALUES ('ws_sql::core', 'unit');",
+        &.{},
+    );
+    try std.testing.expectEqual(http.Status.ok, multi.status);
+    try std.testing.expectEqual(@as(i64, 1), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'ws_sql::core'"));
+
+    try app.writer_db.exec("BEGIN IMMEDIATE");
+    _ = try app.executeSql(arena, app.writer_db, "INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_rollback', 'ws_rollback', 'Nope')", &.{});
+    try app.writer_db.exec("ROLLBACK");
+    try std.testing.expectEqual(@as(i64, 0), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM workspaces WHERE id = 'ws_rollback'"));
+
+    try app.writer_db.exec("BEGIN IMMEDIATE");
+    _ = try app.executeSql(arena, app.writer_db, "INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_commit', 'ws_commit', 'Yes')", &.{});
+    try app.writer_db.exec("COMMIT");
+    try std.testing.expectEqual(@as(i64, 1), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM workspaces WHERE id = 'ws_commit'"));
+}
+
+test "http sql session open query close commits or rolls back" {
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-sql-session-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const health = try app.handleHealth(arena);
+    try std.testing.expectEqual(http.Status.ok, health.status);
+    try std.testing.expect(std.mem.indexOf(u8, health.body, "\"kind\":\"mindbrain_health\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health.body, "\"status\":\"ok\"") != null);
+
+    const caps = try app.handleCapabilities(arena);
+    try std.testing.expectEqual(http.Status.ok, caps.status);
+    try std.testing.expect(std.mem.indexOf(u8, caps.body, "\"kind\":\"mindbrain_capabilities\"") != null);
+
+    const opened = try app.openWriterSqlSession(arena);
+    try std.testing.expectEqual(http.Status.ok, opened.status);
+    const open_parsed = try std.json.parseFromSliceLeaky(struct { ok: bool, session_id: u64 }, arena, opened.body, .{});
+    _ = try app.executeSql(arena, app.writer_db, "INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_session_rb', 'ws_session_rb', 'Nope')", &.{});
+    const rolled = try app.closeWriterSqlSession(arena, open_parsed.session_id, false);
+    try std.testing.expectEqual(http.Status.ok, rolled.status);
+    try std.testing.expect(std.mem.indexOf(u8, rolled.body, "\"committed\":false") != null);
+    try std.testing.expectEqual(@as(i64, 0), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM workspaces WHERE id = 'ws_session_rb'"));
+
+    const opened_commit = try app.openWriterSqlSession(arena);
+    try std.testing.expectEqual(http.Status.ok, opened_commit.status);
+    const commit_parsed = try std.json.parseFromSliceLeaky(struct { ok: bool, session_id: u64 }, arena, opened_commit.body, .{});
+    _ = try app.executeSql(arena, app.writer_db, "INSERT INTO workspaces(id, workspace_id, label) VALUES ('ws_session_ok', 'ws_session_ok', 'Yes')", &.{});
+    const committed = try app.closeWriterSqlSession(arena, commit_parsed.session_id, true);
+    try std.testing.expectEqual(http.Status.ok, committed.status);
+    try std.testing.expect(std.mem.indexOf(u8, committed.body, "\"committed\":true") != null);
+    try std.testing.expectEqual(@as(i64, 1), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM workspaces WHERE id = 'ws_session_ok'"));
+}
+
+test "ontology compile linkml HTTP shrink matches CLI counts and drops removed types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const full_yaml =
+        \\id: https://example.org/http-shrink
+        \\name: http-shrink
+        \\default_prefix: shrink
+        \\classes:
+        \\  Building:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Building
+        \\  Unit:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Unit
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      occupied:
+        \\      vacant:
+        \\      works:
+        \\
+    ;
+    const shrink_yaml =
+        \\id: https://example.org/http-shrink
+        \\name: http-shrink
+        \\default_prefix: shrink
+        \\classes:
+        \\  Building:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Building
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      occupied:
+        \\      works:
+        \\
+    ;
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = "full.yaml", .data = full_yaml, .flags = .{ .truncate = true } });
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = "shrink.yaml", .data = shrink_yaml, .flags = .{ .truncate = true } });
+    const full_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/full.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(full_path);
+    const shrink_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shrink.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(shrink_path);
+
+    var cli_full = try linkml_interchange.compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = full_path,
+        .workspace_id = "ws_http_shrink",
+        .ontology_id = "ws_http_shrink::core",
+    });
+    defer cli_full.deinit(std.testing.allocator);
+    var cli_shrink = try linkml_interchange.compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = shrink_path,
+        .workspace_id = "ws_http_shrink",
+        .ontology_id = "ws_http_shrink::core",
+    });
+    defer cli_shrink.deinit(std.testing.allocator);
+
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/mindbrain-linkml-shrink-api-{d}.sqlite", .{std.Io.Timestamp.now(zig16_compat.io(), .real).toNanoseconds()});
+    defer std.testing.allocator.free(db_path);
+    defer std.Io.Dir.cwd().deleteFile(zig16_compat.io(), db_path) catch {};
+
+    var app = try MindbrainHttpApp.initWithOptions(std.testing.allocator, zig16_compat.io(), .{
+        .addr_text = "127.0.0.1:0",
+        .db_path = db_path,
+        .static_dir = "",
+        .init_only = true,
+        .warn_on_empty_graph = false,
+    });
+    defer app.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try app.runOntologyCompileLinkmlRequest(arena, .{
+        .workspace_id = "ws_http_shrink",
+        .ontology_id = "ws_http_shrink::core",
+        .input_path = full_path,
+        .name = "core",
+    });
+    try std.testing.expectEqual(http.Status.ok, first.status);
+    try std.testing.expect(std.mem.indexOf(u8, first.body, try std.fmt.allocPrint(arena, "\"entity_types\":{}", .{cli_full.entity_type_count})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body, try std.fmt.allocPrint(arena, "\"enum_values\":{}", .{cli_full.enum_value_count})) != null);
+
+    const second = try app.runOntologyCompileLinkmlRequest(arena, .{
+        .workspace_id = "ws_http_shrink",
+        .ontology_id = "ws_http_shrink::core",
+        .input_path = shrink_path,
+        .name = "core",
+    });
+    try std.testing.expectEqual(http.Status.ok, second.status);
+    try std.testing.expect(std.mem.indexOf(u8, second.body, try std.fmt.allocPrint(arena, "\"entity_types\":{}", .{cli_shrink.entity_type_count})) != null);
+    try std.testing.expectEqual(@as(i64, 1), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'ws_http_shrink::core' AND entity_type = 'Building'"));
+    try std.testing.expectEqual(@as(i64, 0), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = 'ws_http_shrink::core' AND entity_type = 'Unit'"));
+    try std.testing.expectEqual(@as(i64, 0), try testCountSqlRows(app.writer_db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = 'ws_http_shrink::core' AND value = 'vacant'"));
+
+    const inspect = try app.handleOntologyInspect(arena, "ontology_id=ws_http_shrink%3A%3Acore&workspace_id=ws_http_shrink");
+    try std.testing.expectEqual(http.Status.ok, inspect.status);
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"entity_type\":\"Building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"entity_type\":\"Unit\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect.body, "\"value\":\"vacant\"") == null);
 }

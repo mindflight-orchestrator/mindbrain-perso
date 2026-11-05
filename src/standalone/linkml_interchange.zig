@@ -2,6 +2,7 @@ const std = @import("std");
 const collections_io = @import("collections_io.zig");
 const collections_sqlite = @import("collections_sqlite.zig");
 const facet_sqlite = @import("facet_sqlite.zig");
+const graph_diagnostics = @import("graph_diagnostics.zig");
 const zig16_compat = @import("zig16_compat.zig");
 
 const Allocator = std.mem.Allocator;
@@ -373,7 +374,9 @@ pub fn compileLinkmlToBundle(allocator: Allocator, options: CompileOptions) !Com
 }
 
 pub fn importCompiledBundle(db: Database, allocator: Allocator, bundle_json: []const u8) !void {
-    try collections_io.importBundleJson(db, allocator, bundle_json);
+    try collections_io.importBundleJsonWithOptions(db, allocator, bundle_json, .{
+        .replace_ontology_registry = true,
+    });
 }
 
 pub fn exportLinkmlFromDb(allocator: Allocator, db: Database, ontology_id: []const u8) ![]const u8 {
@@ -1437,4 +1440,193 @@ test "compile import ensures workspace row exists for target workspace" {
     try facet_sqlite.bindText(stmt, 1, "ws-only");
     try std.testing.expect(facet_sqlite.c.sqlite3_step(stmt) == facet_sqlite.c.SQLITE_ROW);
     try std.testing.expectEqual(@as(i64, 1), facet_sqlite.c.sqlite3_column_int64(stmt, 0));
+}
+
+fn countBound(db: Database, sql: []const u8, value: []const u8) !i64 {
+    const stmt = try facet_sqlite.prepare(db, sql);
+    defer facet_sqlite.finalize(stmt);
+    try facet_sqlite.bindText(stmt, 1, value);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StepFailed;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+test "LinkML reimport removes classes enums and edges without StepFailed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const full_yaml =
+        \\id: https://example.org/shrink
+        \\name: shrink
+        \\default_prefix: shrink
+        \\classes:
+        \\  Building:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Building
+        \\  Unit:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Unit
+        \\slots:
+        \\  contains:
+        \\    domain: Building
+        \\    range: Unit
+        \\    annotations:
+        \\      ghostcrab.native_edge_type: contains
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      occupied:
+        \\      vacant:
+        \\      works:
+        \\
+    ;
+    const shrink_yaml =
+        \\id: https://example.org/shrink
+        \\name: shrink
+        \\default_prefix: shrink
+        \\classes:
+        \\  Building:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Building
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      occupied:
+        \\      works:
+        \\
+    ;
+    const reorder_yaml =
+        \\id: https://example.org/shrink
+        \\name: shrink
+        \\default_prefix: shrink
+        \\classes:
+        \\  Building:
+        \\    annotations:
+        \\      ghostcrab.native_entity_type: Building
+        \\enums:
+        \\  Usage:
+        \\    permissible_values:
+        \\      works:
+        \\      occupied:
+        \\
+    ;
+
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = "full.yaml", .data = full_yaml, .flags = .{ .truncate = true } });
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = "shrink.yaml", .data = shrink_yaml, .flags = .{ .truncate = true } });
+    try tmp.dir.writeFile(zig16_compat.io(), .{ .sub_path = "reorder.yaml", .data = reorder_yaml, .flags = .{ .truncate = true } });
+
+    const full_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/full.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(full_path);
+    const shrink_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shrink.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(shrink_path);
+    const reorder_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reorder.yaml", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(reorder_path);
+
+    var db = try Database.openInMemory();
+    defer db.close();
+    try db.applyStandaloneSchema();
+    try collections_sqlite.ensureWorkspace(db, .{ .workspace_id = "ws-shrink" });
+
+    var first = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = full_path,
+        .workspace_id = "ws-shrink",
+        .ontology_id = "ws-shrink::core",
+    });
+    defer first.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, first.bundle_json);
+
+    try db.exec(
+        \\INSERT INTO ontologies(ontology_id, workspace_id, name) VALUES ('ws-shrink::sibling', 'ws-shrink', 'sibling');
+        \\INSERT INTO ontology_entity_types(ontology_id, entity_type) VALUES ('ws-shrink::sibling', 'KeepMe');
+        \\INSERT INTO entities_raw(workspace_id, ontology_id, entity_type, name) VALUES ('ws-shrink', 'ws-shrink::core', 'Building', 'Instance Building');
+        \\INSERT INTO ontology_entities_raw(ontology_id, entity_id, entity_type, name) VALUES ('ws-shrink::core', 99, 'Building', 'Keep schema instance');
+        \\INSERT INTO graph_entity(entity_id, workspace_id, entity_type, name) VALUES (50, 'ws-shrink', 'Unit', 'Stale unit');
+    );
+
+    var second = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = shrink_path,
+        .workspace_id = "ws-shrink",
+        .ontology_id = "ws-shrink::core",
+    });
+    defer second.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json);
+
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1 AND entity_type = 'Building'", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1 AND entity_type = 'Unit'", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_edge_types WHERE ontology_id = ?1 AND edge_type = 'contains'", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1 AND dimension = 'Usage'", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1 AND value = 'vacant'", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_entity_types WHERE ontology_id = ?1 AND entity_type = 'KeepMe'", "ws-shrink::sibling"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM entities_raw WHERE workspace_id = ?1 AND name = 'Instance Building'", "ws-shrink"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_entities_raw WHERE ontology_id = ?1 AND entity_id = 99", "ws-shrink::core"),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM graph_entity WHERE workspace_id = ?1 AND entity_type = 'Unit'", "ws-shrink"),
+    );
+
+    const recon = try graph_diagnostics.reconciliationJson(db, std.testing.allocator, .{
+        .workspace_id = "ws-shrink",
+        .ontology_id = "ws-shrink::core",
+        .limit = 50,
+    });
+    defer std.testing.allocator.free(recon);
+    try std.testing.expect(std.mem.indexOf(u8, recon, "runtime_entity_unknown_type") != null);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try countBound(db, "SELECT COUNT(*) FROM graph_entity WHERE workspace_id = ?1 AND entity_type = 'Unit'", "ws-shrink"),
+    );
+
+    const max_index = try countBound(db, "SELECT COALESCE(MAX(triple_index), 0) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core");
+    const triple_count = try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core");
+    try std.testing.expect(max_index <= triple_count or triple_count == 0);
+    const occupied_id = try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-shrink::core");
+
+    try importCompiledBundle(db, std.testing.allocator, second.bundle_json);
+    try std.testing.expectEqual(triple_count, try countBound(db, "SELECT COUNT(*) FROM ontology_triples_raw WHERE ontology_id = ?1", "ws-shrink::core"));
+    try std.testing.expectEqual(occupied_id, try countBound(db, "SELECT value_id FROM ontology_values WHERE ontology_id = ?1 AND value = 'occupied'", "ws-shrink::core"));
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1 AND dimension = 'Usage'", "ws-shrink::core"),
+    );
+
+    var reordered = try compileLinkmlToBundle(std.testing.allocator, .{
+        .input_path = reorder_path,
+        .workspace_id = "ws-shrink",
+        .ontology_id = "ws-shrink::core",
+    });
+    defer reordered.deinit(std.testing.allocator);
+    try importCompiledBundle(db, std.testing.allocator, reordered.bundle_json);
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try countBound(db, "SELECT COUNT(*) FROM ontology_values WHERE ontology_id = ?1 AND dimension = 'Usage'", "ws-shrink::core"),
+    );
+
+    const exported = try exportLinkmlFromDb(std.testing.allocator, db, "ws-shrink::core");
+    defer std.testing.allocator.free(exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "Building") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "Unit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "vacant") == null);
 }

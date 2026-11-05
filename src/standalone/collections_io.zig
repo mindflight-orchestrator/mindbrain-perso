@@ -26,6 +26,10 @@ pub const ExportOptions = struct {
 
 pub const ImportOptions = struct {
     overwrite_existing_workspace: bool = false,
+    /// Drop registry rows for ontologies present in the bundle before upserting.
+    /// Used by LinkML compile reimport so removed classes, enums, and triples
+    /// do not collide with leftover UNIQUE keys. Does not touch instance graph rows.
+    replace_ontology_registry: bool = false,
 };
 
 pub const BundleSummary = struct {
@@ -661,6 +665,12 @@ pub fn importBundleJsonWithOptions(db: Database, allocator: Allocator, json_byte
         try purgeBundleWorkspaceInOpenTransaction(db, allocator, bundle.scope.workspace_id);
     }
 
+    if (options.replace_ontology_registry) {
+        for (bundle.ontologies) |row| {
+            try purgeOntologyRegistryInOpenTransaction(db, row.ontology_id);
+        }
+    }
+
     for (bundle.workspaces) |row| {
         try collections_sqlite.ensureWorkspace(db, .{
             .workspace_id = row.workspace_id,
@@ -1121,6 +1131,23 @@ fn logForeignKeyViolations(db: Database) void {
             c.sqlite3_column_int64(stmt, 1),
         });
         shown += 1;
+    }
+}
+
+fn purgeOntologyRegistryInOpenTransaction(db: Database, ontology_id: []const u8) !void {
+    const statements = [_][]const u8{
+        "DELETE FROM ontology_values WHERE ontology_id = ?1",
+        "DELETE FROM ontology_dimensions WHERE ontology_id = ?1",
+        "DELETE FROM ontology_entity_types WHERE ontology_id = ?1",
+        "DELETE FROM ontology_edge_types WHERE ontology_id = ?1",
+        "DELETE FROM ontology_triples_raw WHERE ontology_id = ?1",
+        "DELETE FROM ontology_namespaces WHERE ontology_id = ?1",
+    };
+    for (statements) |sql| {
+        const stmt = try facet_sqlite.prepare(db, sql);
+        defer facet_sqlite.finalize(stmt);
+        try facet_sqlite.bindText(stmt, 1, ontology_id);
+        try execPreparedDone(stmt);
     }
 }
 
@@ -3197,7 +3224,13 @@ fn bindDouble(stmt: *c.sqlite3_stmt, index: c_int, value: f64) !void {
 
 fn execPreparedDone(stmt: *c.sqlite3_stmt) !void {
     const status = c.sqlite3_step(stmt);
-    if (status != c.SQLITE_DONE) return error.StepFailed;
+    if (status != c.SQLITE_DONE) {
+        const db = c.sqlite3_db_handle(stmt);
+        if (db != null) {
+            std.log.err("sqlite step failed: {s}", .{std.mem.span(c.sqlite3_errmsg(db))});
+        }
+        return error.StepFailed;
+    }
 }
 
 fn parseRelationPropertyValueType(value: []const u8) ?collections_sqlite.RelationPropertyValueType {
